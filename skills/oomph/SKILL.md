@@ -1,21 +1,27 @@
 ---
 name: oomph
-description: Make a long-running session memory-aware with oomph (macOS). Check memory pressure, free physical memory, swap and free disk before memory-heavy work — builds, test suites, Docker/VMs, browsers, parallel jobs, sub-agents — back off when memory is tight, find what this session is using, and read oomph incident reports after crashes, killed processes or an "out of application memory" dialog. Use when asked to watch or monitor memory or be "OOM-aware", during long autonomous runs, before starting heavy or parallel work, and after unexplained process deaths.
+description: Make a long-running session memory-aware with oomph (macOS), and coordinate memory with the other Claude sessions on the same Mac. Reserve memory before heavy work — builds, test suites, Docker/VMs, browsers, parallel jobs, sub-agents — so sessions take turns instead of competing for RAM; check memory pressure, free memory, swap and disk; back off when memory is tight; find what this session is using; and read oomph incident reports after crashes, killed processes or an "out of application memory" dialog. Use when asked to watch or monitor memory, be "OOM-aware" or coordinate with other sessions, during long autonomous runs, before starting heavy or parallel work, and after unexplained process deaths.
 ---
 
-# oomph — be memory-aware
+# oomph — be memory-aware, take turns
 
 [oomph](https://github.com/kleinzeug/oomph) measures this Mac's memory, swap and disk,
-and keeps a papertrail of memory incidents. This skill makes you use it so a long
+keeps a papertrail of memory incidents, and keeps a shared queue in which Claude
+sessions reserve memory before heavy work. This skill makes you use it so a long
 session doesn't push the machine into "Your system has run out of application memory",
-where macOS starts killing processes — possibly yours or the user's.
+where macOS starts killing processes — possibly yours, another session's or the user's.
+
+Other Claude sessions may be working on this Mac right now. Each one thinking "there's
+8 GB free, I'll start my build" at the same moment is exactly how the machine runs out.
+So: **announce heavy work before starting it, and start only when oomph grants it.**
 
 ## 1. Find oomph
 
 Use the first one that works and remember it as `OOMPH` for the rest of the session:
 
-1. MCP tools named `memory_check`, `my_session`, `wait_for_memory`, `incidents`,
-   `incident`, `memory_status` (server `oomph`) — prefer these if present.
+1. MCP tools named `memory_check`, `reserve_memory`, `release_memory`, `reservations`,
+   `my_session`, `wait_for_memory`, `incidents`, `incident`, `memory_status` (server
+   `oomph`) — prefer these if present.
 2. `oomph` on the PATH (`command -v oomph`), normally `/usr/local/bin/oomph`.
 3. A checkout: `/usr/bin/python3 -I <checkout>/daemon/oomph.py`.
 
@@ -28,27 +34,85 @@ without their OK:
 - **Checks only, nothing installed system-wide:**
   `git clone --depth 1 https://github.com/kleinzeug/oomph.git ~/.oomph-src`, then use
   `/usr/bin/python3 -I ~/.oomph-src/daemon/oomph.py` as `OOMPH`. Every command below
-  works without the logger; it measures live.
+  works without the logger, reservations included; it measures live.
+
+If `OOMPH reserve` / `reserve_memory` doesn't exist, the installed oomph is older than
+1.2: tell the user once that updating it (click the chip → Update) enables coordination,
+and use the checks in §4 until then.
 
 ## 2. The commands
 
 | Command | What it gives you |
 |---|---|
-| `OOMPH check` | One-line verdict **ok / tight / critical**, reasons, advice. Exit code 0 / 1 / 2. `--json` for structured output. |
+| `OOMPH run --reserve 6G --for "what" [--wait 9m] -- <cmd…>` | Queue for 6 GB, run the command when granted, release when it exits, record its real peak. Exit code is the command's; **75** if it was never granted within `--wait` (then nothing ran). |
+| `OOMPH reserve 6G --for "what" [--wait 5m] [--ttl 30m] [--ticket rN]` | Reserve for multi-step work. Exit 0 = granted, 75 = still queued (prints the ticket and who is ahead) or refused. Re-run with `--ticket` to keep your place or to extend a grant. |
+| `OOMPH release <id \| all>` | Give it back (`all` = everything this session holds). |
+| `OOMPH reservations` | Who holds or waits for how much (with project and actual use), memory available for new reservations, and recent finished reservations with the **peak each really needed**. |
+| `OOMPH check` | One-line verdict **ok / tight / critical**, reasons, advice, and other sessions' reservations. Exit code 0 / 1 / 2. `--json` for structured output. |
 | `OOMPH session` | This Claude session's memory: its whole process tree, total, biggest children (pid, name, MB). |
 | `OOMPH wait --timeout 10m [--free 4G]` | Blocks until memory is ok again. Exit 1 on timeout. |
 | `OOMPH status --json` | Full sample: memory breakdown, swap, disk, top processes and apps, all Claude sessions. |
 | `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger) and their summaries; `--html` opens the report. |
 
-The MCP tools map one-to-one: `memory_check`, `my_session`, `wait_for_memory`
-(timeout ≤ 300 s), `memory_status`, `incidents`, `incident`.
+The MCP tools map one-to-one: `reserve_memory` (gb, purpose, wait_s ≤ 300, ttl_min,
+ticket), `release_memory` (id or "all"), `reservations`, `memory_check`, `my_session`,
+`wait_for_memory` (timeout ≤ 300 s), `memory_status`, `incidents`, `incident`.
+`oomph run` has no MCP twin: run it through your shell.
 
-## 3. When to check
+## 3. Coordinate heavy work with other sessions
+
+**What counts as heavy:** anything likely to add more than ~1 GB — full builds
+(Gradle, Xcode, cargo, C++), large test suites or parallel test runners, `docker run` /
+`docker compose up`, VMs, emulators, headless browsers, model inference, big data
+processing, and every sub-agent you spawn. Trivial commands need no reservation.
+
+**1. Estimate the peak** extra memory the step adds (not the average):
+- First look at `OOMPH reservations` / `reservations`: the "recent" list shows the peak
+  that earlier runs with the same purpose label actually added. Use it, plus ~25%.
+- Otherwise rough guides: Gradle/Android build 4–8 GB · Xcode build 3–6 GB · cargo /
+  C++ `-jN` ≈ 0.5–1 GB per job · Jest/Vitest/pytest-xdist ≈ 0.5–1 GB per worker ·
+  headless Chrome 0.3–1 GB per instance · a container: its memory limit, or 1–2 GB ·
+  a sub-agent 1 GB · a local model: its file size × 1.2.
+- Round up a little, never wildly: over-reserving blocks the other sessions for nothing.
+- Keep the purpose label stable for the same work (`gradle assembleDebug`, `jest full
+  suite`), so its measured peak helps the next estimate.
+
+**2. Reserve, wait for the grant, then start.**
+- **One command:** wrap it — `OOMPH run --reserve 6G --for "gradle assembleDebug" --wait 9m
+  -- ./gradlew assembleDebug`. It queues, runs when granted and releases at exit. Keep
+  `--wait` under your shell tool's own timeout (the Bash tool stops at 10 min), or run it
+  in the background. Exit code 75 means it never got a turn and **did not run**.
+- **Several steps or a long-lived process** (a dev server plus tests, `docker compose up`,
+  sub-agents): `reserve_memory` (or `OOMPH reserve`), start only once `status` is
+  `granted`, and `release_memory` with its `id` as soon as the heavy part is over — not
+  at the end of the session. A grant expires after `ttl_min` (default 30); if the work
+  will take longer, call `reserve_memory` again with `ticket` set to extend it.
+
+**3. When you are queued:**
+- Don't start the work, and don't "just start it anyway" because memory looks free —
+  the memory you see is promised to whoever is ahead of you.
+- Keep your place: ask again with the same `ticket` within 3 minutes (`reserve_memory`
+  with `ticket`, or `OOMPH reserve --ticket rN --wait 5m`). A place you stop polling lapses.
+- Meanwhile do light work that doesn't depend on the step: read code, edit, plan.
+- Tell the user in one line who you're waiting for, e.g. "Waiting for memory: another
+  session (IREngine) is running an 8 GB build; I'm next in line."
+- If you've waited more than ~20 minutes, ask the user whether to keep waiting, run with
+  less (lower parallelism, smaller reservation) or skip the step.
+- If the response is `refused`, the request is larger than this Mac can hold — split
+  the work or lower its parallelism.
+
+**4. Grants and the rest of this skill:** a grant is a turn, not immunity. Still follow
+the levels in §5 while the work runs, and if `memory_check` turns critical, back off
+even with a grant. A grant with a `note` ("granted because no other work is reserved")
+means the work is bigger than free memory: expect swapping, lower parallelism if you can.
+
+Only ever release reservations your session made. Other sessions' entries in
+`reservations` are information, not something to clear.
+
+## 4. When to check
 
 - **At the start** of a long or autonomous task.
-- **Before every memory-heavy step**: full builds, large test suites, `docker run` /
-  `docker compose up`, starting VMs, emulators or headless browsers, data processing,
-  model inference, running jobs in parallel, spawning sub-agents.
+- **Before every memory-heavy step** — and then reserve it (§3).
 - **Periodically** during long runs — roughly every 20–30 minutes of work, or every
   10 or so heavy commands.
 - **After anything suspicious**: a process killed without explanation (exit 137 /
@@ -57,7 +121,7 @@ The MCP tools map one-to-one: `memory_check`, `my_session`, `wait_for_memory`
 
 Checking is cheap (well under a second). Don't check before trivial commands.
 
-## 4. What to do per level
+## 5. What to do per level
 
 **ok** — proceed.
 
@@ -80,7 +144,7 @@ Never kill processes this session didn't start (the user's apps, other sessions,
 system daemons) without asking. oomph only reports; acting is your job, within the
 session's own work.
 
-## 5. Reading the numbers
+## 6. Reading the numbers
 
 - **free** is Activity Monitor's figure: Physical Memory − (App Memory + Wired + Compressed).
   A few GB free is normal; macOS uses spare memory as cache.
@@ -90,3 +154,7 @@ session's own work.
   less than ~20 GB disk free it may not be able to grow, which is the usual cause of
   the "out of application memory" dialog.
 - **jetsam kills** — macOS killed processes to free memory. Any in a burst is a red flag.
+- **available (reservations)** = free − what grants haven't used yet − a safety margin
+  (5% of RAM, at least 1.5 GB). As a granted job's processes grow, its reservation turns
+  into real usage instead of being counted twice. `check` turns **tight** when other
+  sessions' reservations exceed what's free, even if macOS still looks relaxed.

@@ -20,8 +20,9 @@ leading up to it.
 
 Running long Claude Code sessions? Paste the
 [oomph skill](https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md)
-link into one and it becomes memory-aware —
-see [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
+link into one and it becomes memory-aware — and when several sessions run at once,
+they reserve memory through ***oomph*** and take turns with heavy work instead of
+competing for RAM. See [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
 
 The name: **oom** (out of memory) + *oomph* — and the trailing **ph** is the
 author's initials.
@@ -162,6 +163,7 @@ oomph html --last 24h --open    # HTML report for any time range
 ```
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
+`oomph run --reserve`, `oomph reserve` / `release` / `reservations`,
 `oomph status --json`, `oomph hook` and `oomph mcp` — see
 [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
 
@@ -172,7 +174,9 @@ Long-running coding agents are exactly the kind of workload that tips a Mac into
 test suites in parallel. ***oomph*** ships a [Claude skill](skills/oomph/SKILL.md) that
 teaches a session to check memory before heavy work and to back off when it is tight —
 lower parallelism, no new containers or sub-agents, stop what it started, wait, and tell
-you.
+you. With several sessions on one Mac, they also **take turns**: each reserves the memory
+a heavy step will need, and ***oomph*** grants the reservations in order, side by side
+while they fit and one after another when they don't.
 
 **Drop-in, for any session** — paste this into Claude Code:
 
@@ -194,11 +198,14 @@ What a session gets:
 
 | | |
 |---|---|
-| `oomph check` | one-line verdict **ok / tight / critical** with reasons and advice; exit code 0 / 1 / 2; `--json` |
+| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations; exit code 0 / 1 / 2; `--json` |
+| `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
+| `oomph reserve 6G --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
+| `oomph reservations` | who holds or waits for how much (project, purpose, memory actually used), what's available, and the measured peaks of recent work |
 | `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
 | `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
 | `oomph status --json` | the full latest sample |
-| MCP server `oomph mcp` | the same as tools: `memory_check`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` |
+| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `release_memory`, `reservations`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` |
 | `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
@@ -207,6 +214,41 @@ free, under 20 GB free disk, or right after jetsam kills; **critical** at pressu
 commands work without the background logger too — they measure live — so the skill is
 useful even before you click Activate. Already installed an older version? The popup
 shows an **Update** button when the app carries a newer logger than the one installed.
+
+### Taking turns: sessions coordinating memory
+
+Two sessions that each see "8 GB free" and each start a 6 GB build at the same moment
+are how a Mac runs out. So heavy steps are announced first, in a shared queue
+(`/Users/Shared/oomph/ledger.json`, locked with `flock`, no daemon needed):
+
+```
+session A  $ oomph run --reserve 6G --for "gradle assembleDebug" -- ./gradlew assembleDebug
+           → granted r7, build runs
+session B  reserve_memory(gb: 4, purpose: "jest full suite")
+           → queued #1 — only 1.9 GB available; ahead: r7 6.0G gradle assembleDebug (IREngine)
+           … B keeps working on light things and asks again with its ticket …
+session A  build exits → r7 released, peak 4.8 GB recorded
+session B  → granted r8, tests start
+```
+
+- **Admission:** a request is granted when it fits into *free memory − what earlier grants
+  haven't used yet − a safety margin* (5 % of RAM, at least 1.5 GB). Strictly
+  first-come-first-served, so a small request can't overtake a big one that's waiting.
+  Nothing is granted while memory pressure is critical. A request bigger than what's
+  free is granted only when nothing else holds a reservation, so it runs alone instead
+  of waiting forever; one bigger than 90 % of RAM is refused.
+- **No double counting:** as a granted job's processes grow, the growth is taken off its
+  reservation, so memory is never counted once as used and again as reserved. That
+  growth is also how the real peak gets measured, and `oomph reservations` shows it next
+  to what was reserved, so the next estimate is better.
+- **Nothing gets stuck:** a reservation disappears when the process or session holding it
+  exits, a session's grant expires after 30 minutes unless extended, and a queued request
+  lapses if its session stops asking for 3 minutes.
+- **Visible everywhere:** `oomph check` turns *tight* when other sessions' reservations
+  exceed what's free, the menu-bar popup lists every reservation, and the logger records
+  them in each sample, so an incident report shows what was planned at the time.
+- **Advisory:** ***oomph*** still never stops or kills anything. Taking turns is
+  something the sessions agree on through the skill.
 
 ## Files
 
@@ -218,6 +260,7 @@ shows an **Update** button when the app carries a newer logger than the one inst
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
 | `/usr/local/libexec/oomph/` | the installed daemon and CLI |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job |
+| `/Users/Shared/oomph/ledger.json` | the sessions' memory reservations and the last 100 finished ones (shared by all users; advisory) |
 
 All in, that is roughly 50–150 MB of logs. The daemon itself uses about 25 MB of
 memory and no measurable CPU.

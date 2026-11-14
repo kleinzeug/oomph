@@ -323,6 +323,22 @@
     border-radius: 7px; padding: 4px 10px; font: 600 12px -apple-system, BlinkMacSystemFont, sans-serif;
   }
   .copy:hover { background: rgba(255,255,255,.16); }
+  .turns { margin-top: 14px; }
+  .lanes { margin-top: 18px; display: grid; gap: 8px; }
+  .lane { display: grid; grid-template-columns: 78px minmax(0, 1fr); align-items: center; gap: 10px; }
+  .lane .who { font: 12px ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); white-space: nowrap; }
+  .track { position: relative; height: 26px; background: var(--surface-2); border-radius: 7px; overflow: hidden; }
+  .track i {
+    position: absolute; top: 3px; bottom: 3px; border-radius: 5px; padding: 0 8px;
+    display: flex; align-items: center; white-space: nowrap; overflow: hidden;
+    font: 600 11.5px ui-monospace, "SF Mono", Menlo, monospace; font-style: normal; color: #1c222c;
+  }
+  .track .run { background: var(--green); }
+  .track .wait {
+    color: var(--text); border: 1px dashed var(--yellow);
+    background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--yellow) 35%, transparent) 0 5px, transparent 5px 10px);
+  }
+  .lanes .axis { font-size: 12px; color: var(--muted); padding-left: 88px; }
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
   @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
   .two > * { min-width: 0; }
@@ -553,7 +569,7 @@
   <div class="wrap">
     <span class="tc">0x05 · For long-running agents</span>
     <h2>Make any Claude session oom-aware.</h2>
-    <p class="sub">Coding agents are exactly the workload that tips a Mac over: a build here, a container there, three sub-agents running test suites in parallel. <span class="wm">oomph</span> ships a Claude skill that teaches a session to check memory before heavy work and to back off when it's tight — and to tell you.</p>
+    <p class="sub">Coding agents are exactly the workload that tips a Mac over: a build here, a container there, three sub-agents running test suites in parallel. <span class="wm">oomph</span> ships a Claude skill that teaches a session to check memory before heavy work, to back off when it's tight and to tell you — and, with several sessions on one Mac, to take turns.</p>
     <div class="prompt">
       <div class="lbl">Paste into any Claude Code session</div>
       <button class="copy" type="button" data-copy="Use this skill for the rest of the session:&#10;https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md">Copy</button>
@@ -572,8 +588,18 @@
       </div>
       <div class="card">
         <h3>For every session, once</h3>
-        <p><code>oomph setup-claude</code> installs the skill and registers the <span class="wm">oomph</span> MCP server — <code>memory_check</code>, <code>my_session</code>, <code>wait_for_memory</code>, <code>incidents</code> — for all sessions. Add <code>--hook</code> and a quiet hook after each shell command tells the model the moment memory turns tight. <code>--remove</code> undoes it.</p>
+        <p><code>oomph setup-claude</code> installs the skill and registers the <span class="wm">oomph</span> MCP server — <code>memory_check</code>, <code>reserve_memory</code>, <code>release_memory</code>, <code>reservations</code>, <code>incidents</code> — for all sessions. Add <code>--hook</code> and a quiet hook after each shell command tells the model the moment memory turns tight. <code>--remove</code> undoes it.</p>
         <p style="margin-top:10px"><code>oomph session</code> shows what the session itself is using — its whole process tree, biggest children first.</p>
+      </div>
+    </div>
+    <div class="card turns">
+      <h3>Several sessions? They take turns.</h3>
+      <p>Before heavy work a session reserves its peak — <code>oomph run --reserve 6G -- ./gradlew build</code>, or <code>reserve_memory</code> over MCP. <span class="wm">oomph</span> grants reservations first-come-first-served: side by side while they fit, one after another when they don't. Nobody starts early, a running job's memory isn't counted twice, and a session that exits gives its share back. Each finished job's real peak is recorded, so the next estimate is better.</p>
+      <div class="lanes" role="img" aria-label="Session A runs a 6 GB build. Session B asks for 4 GB, waits in the queue until A finishes, then runs. Session C's 1 GB job fits next to B and runs right away.">
+        <div class="lane"><span class="who">session A</span><div class="track"><i class="run" style="left:1%;width:47%">gradle build · 6G</i></div></div>
+        <div class="lane"><span class="who">session B</span><div class="track"><i class="wait" style="left:12%;width:36%">queued #1</i><i class="run" style="left:49%;width:33%">jest · 4G</i></div></div>
+        <div class="lane"><span class="who">session C</span><div class="track"><i class="run" style="left:60%;width:16%">1G</i></div></div>
+        <div class="axis">time →</div>
       </div>
     </div>
   </div>

@@ -503,6 +503,9 @@ class Daemon:
         s["top"] = top
         s["groups"] = groups
         s["claude"] = sessions
+        leases = oomph.ledger_snapshot(procs)
+        if leases:
+            s["leases"] = leases  # memory sessions have reserved through oomph's ledger
         if gone:
             s["gone"] = gone
         if self.incident:

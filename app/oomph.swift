@@ -13,6 +13,10 @@ let agentPlist = NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
 struct Away: Decodable { var idle_s: Int?; var display_on: Bool?; var locked: Bool?; var sleep_preventers: [String]? }
 struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
+struct Lease: Decodable, Identifiable {
+    var id: String; var state: String; var gb: Double; var purpose: String; var project: String?
+    var used_gb: Double?; var for_min: Double?; var waiting_min: Double?
+}
 struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool? }
 
 struct Sample: Decodable {
@@ -31,6 +35,7 @@ struct Sample: Decodable {
     var away: Away?
     var groups: [Group]?
     var claude: [Session]?
+    var leases: [Lease]?
     var daemon: DaemonInfo?
 
     var isAway: Bool {
@@ -272,15 +277,22 @@ struct PopoverView: View {
     private let series = ["Wired", "App", "Compressed", "Swap"]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 0) {
             header
-            if let c = store.current, store.daemonRunning { stats(c) }
-            chart
-            incidentsList
+                .padding(.horizontal, 14).padding(.vertical, 11)
+                .frame(maxWidth: .infinity)
+                .background(Color.primary.opacity(0.045))
             Divider()
-            footer
+            VStack(alignment: .leading, spacing: 10) {
+                if let c = store.current, store.daemonRunning { stats(c) }
+                if let ls = store.current?.leases, !ls.isEmpty, store.daemonRunning { leases(ls) }
+                chart
+                incidentsList
+                Divider()
+                footer
+            }
+            .padding(14)
         }
-        .padding(14)
         .frame(width: 428)
         .alert("oomph", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK") { error = nil }
@@ -288,17 +300,32 @@ struct PopoverView: View {
     }
 
     var header: some View {
-        HStack {
-            Image(systemName: "memorychip").font(.title3)
-            VStack(alignment: .leading, spacing: 0) {
-                Text("Memory").font(.headline)
-                Text(statusLine).font(.caption).foregroundStyle(.secondary)
+        let live = store.current != nil && store.daemonRunning
+        let p = live ? (Pressure(rawValue: store.current!.pressure) ?? .unknown) : .unknown
+        let tint: Color = live ? p.color : .secondary
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "memorychip")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 32, height: 32)
+                .background(tint.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    (Text("oomph").fontWeight(.bold) + Text(": memory monitor").fontWeight(.medium))
+                        .font(.system(size: 14))
+                    if let v = store.bundledVersion {
+                        Text("v" + v).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                            .help(store.needsUpdate ? "Installed logger: v\(store.installedVersion ?? "?")" : "")
+                    }
+                }
+                Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
-            Spacer()
-            if let c = store.current, store.daemonRunning {
-                let p = Pressure(rawValue: c.pressure) ?? .unknown
-                Text(p.label).font(.caption.weight(.semibold)).padding(.horizontal, 8).padding(.vertical, 3)
-                    .background(p.color.opacity(0.2), in: Capsule()).foregroundStyle(p == .normal ? .primary : p.color)
+            Spacer(minLength: 8)
+            if live {
+                Text(p.label).font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(p.color.opacity(0.2), in: Capsule())
+                    .foregroundStyle(p == .normal ? .primary : p.color)
             }
         }
     }
@@ -328,6 +355,29 @@ struct PopoverView: View {
                 Stat(label: "Top app", value: shortTop(c))
             }
         }
+    }
+
+    // Memory Claude sessions have reserved through `oomph reserve` / `oomph run` / the MCP server.
+    func leases(_ ls: [Lease]) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Reserved by sessions").font(.caption).foregroundStyle(.secondary)
+            ForEach(ls) { (l: Lease) in
+                HStack(spacing: 6) {
+                    Circle().fill(l.state == "granted" ? Color.green : Color.orange).frame(width: 6, height: 6)
+                    Text(String(format: "%.1fG", l.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                        .frame(width: 40, alignment: .trailing)
+                    Text(l.purpose).font(.system(size: 11)).lineLimit(1)
+                    if let p = l.project { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
+                    Spacer()
+                    Text(leaseTail(l)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                }
+            }
+        }
+    }
+
+    func leaseTail(_ l: Lease) -> String {
+        if l.state == "granted" { return String(format: "using %.1fG", l.used_gb ?? 0) }
+        return "waiting \(Int(l.waiting_min ?? 0)) min"
     }
 
     func shortTop(_ c: Sample) -> String {
@@ -685,9 +735,29 @@ enum ChipIcon {
     }
 }
 
+@MainActor
+func renderPopup(to path: String, dark: Bool) {
+    let store = Store()
+    store.refreshAll()
+    let view = PopoverView(store: store)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .environment(\.colorScheme, dark ? .dark : .light)
+    let r = ImageRenderer(content: view)
+    r.scale = 2
+    guard let cg = r.cgImage,
+          let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else { return }
+    try? png.write(to: URL(fileURLWithPath: path))
+}
+
 @main
 struct Main {
     static func main() {
+        // Development aid: `oomph --render-popup out.png [--dark]` draws the popup into a PNG and exits.
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
+            MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark")) }
+            return
+        }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate

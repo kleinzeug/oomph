@@ -12,6 +12,9 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD/oomph" "$APP/Contents/MacOS/"
 cp app/Info.plist "$APP/Contents/"
+# one version for everything: stamp the app with the CLI's VERSION
+VER=$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' daemon/oomph.py)
+/usr/bin/plutil -replace CFBundleShortVersionString -string "$VER" "$APP/Contents/Info.plist"
 cp daemon/oomphd.py daemon/oomph.py daemon/local.oomph.daemon.plist install.sh uninstall.sh "$APP/Contents/Resources/"
 mkdir -p "$APP/Contents/Resources/skills/oomph" && cp skills/oomph/SKILL.md "$APP/Contents/Resources/skills/oomph/"
 chmod 755 "$APP/Contents/Resources/"*.sh "$APP/Contents/Resources/"*.py

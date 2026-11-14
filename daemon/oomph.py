@@ -12,8 +12,14 @@ for agents and scripts (work without the daemon too — they measure live):
   oomph session [--json] [--pid N]  memory of the Claude session this runs in (its whole process tree)
   oomph wait [--timeout 10m] [--free 4G]   block until memory is ok again; exit 1 on timeout
   oomph status --json               the latest full sample
+
+coordinating memory between sessions (a shared first-come-first-served ledger):
+  oomph run --reserve 6G [--for "what"] [--wait 30m] -- <cmd…>   wait for a grant, run, release; records the peak
+  oomph reserve <6G> --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]   exit 0 granted, 75 not (yet)
+  oomph release <id | all>          give a reservation back (all = this session's)
+  oomph reservations [--json]       who holds / waits for how much, and past peaks
   oomph hook                        Claude Code PostToolUse hook: silent when ok, warns when tight
-  oomph mcp                         MCP server over stdio (tools: memory_check, my_session, ...)
+  oomph mcp                         MCP server over stdio (memory_check, reserve_memory, release_memory, ...)
   oomph setup-claude [--hook] [--remove]   install the skill + register the MCP server for Claude Code
 """
 import datetime
@@ -27,7 +33,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
 
 # What the daemon streams from the unified log. On macOS 27 memory kills show up as
@@ -437,6 +443,11 @@ def cmd_status():
         print("\nclaude sessions:")
         for s in c["claude"]:
             print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], s.get("cwd")))
+    leases = ledger_snapshot()
+    if leases:
+        print("\nreservations (oomph reservations for details):")
+        for b in leases:
+            print("  " + _fmt_brief(b))
     return 0
 
 
@@ -650,19 +661,30 @@ def verdict_line(v):
         v["swap_total_gb"] or 0, v["disk_free_gb"])
     if v["reasons"]:
         line += "\n  why: " + "; ".join(v["reasons"])
+    c = v.get("coordination") or {}
+    if c.get("others") or c.get("mine"):
+        g = [o for o in c["others"] if o["state"] == "granted"]
+        q = [o for o in c["others"] if o["state"] == "queued"]
+        line += ("\n  reservations: others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG available to you"
+                 % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"]))
     return line + "\n  advice: " + v["advice"]
+
+
+def _session_root(procs, pid):
+    """pid of the outermost `claude` process above `pid`, or None."""
+    cur, root, hops = pid, None, 0
+    while cur in procs and hops < 64:
+        if procs[cur]["name"] == "claude":
+            root = cur  # keep walking: the outermost claude is the session
+        cur, hops = procs[cur]["ppid"], hops + 1
+    return root
 
 
 def find_session(pid=None):
     """The Claude Code session (outermost `claude` process) that `pid` (default: our parent) runs in."""
     d = _daemon_module()
     procs = d.collect_procs()
-    cur = pid or os.getppid()
-    root, hops = None, 0
-    while cur in procs and hops < 64:
-        if procs[cur]["name"] == "claude":
-            root = cur  # keep walking: the outermost claude is the session
-        cur, hops = procs[cur]["ppid"], hops + 1
+    root = _session_root(procs, pid or os.getppid())
     if root is None:
         return None
     children = {}
@@ -685,8 +707,19 @@ def find_session(pid=None):
     }
 
 
+def checked_verdict(mine=None):
+    """verdict() plus what other sessions have reserved or are waiting for."""
+    s = _sample_override() if _sample_override else sample(with_procs=False)
+    v = verdict(s)
+    try:
+        coordination_verdict(v, coordination(mine if mine is not None else holder_for()["pid"], s))
+    except Exception as e:  # the ledger is a bonus; never let it break a check
+        v["coordination"] = {"error": repr(e)}
+    return v
+
+
 def cmd_check(args):
-    v = verdict(sample(with_procs=False))
+    v = checked_verdict()
     print(json.dumps(v) if "--json" in args else verdict_line(v))
     return v["exit_code"]
 
@@ -709,7 +742,9 @@ def cmd_session(args):
 
 
 def _parse_gb(x):
-    x = x.strip().upper().rstrip("B")
+    x = str(x).strip().upper().rstrip("B")
+    if x.endswith("M"):
+        return float(x[:-1]) / 1024
     return float(x[:-1]) if x.endswith("G") else float(x)
 
 
@@ -745,6 +780,495 @@ def cmd_status_json():
     return 0
 
 
+# ------------------------------------------------------ coordination ledger
+# Sessions announce memory-heavy work before starting it ("reserve 6G for the gradle build").
+# Requests queue first-come-first-served in one shared ledger; a request is granted when it
+# fits into free memory minus what earlier grants have not yet used, minus a safety margin.
+# So concurrent heavy steps from different sessions run side by side when there's room, and
+# one after another when there isn't. Advisory: oomph never stops or kills anything.
+LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR", "/Users/Shared/oomph")
+QUEUE_STALE_S = 180          # a queued request lapses if its owner hasn't polled for this long
+DEFAULT_TTL_S = 30 * 60      # session-held grants expire unless released or extended
+MAX_TTL_S = 8 * 3600
+POLL_S = 2
+HISTORY_KEEP = 100
+_sample_override = None      # tests: a function returning the sample to decide on
+
+
+def margin_gb(ram):
+    """Memory kept free on top of all reservations."""
+    return max(1.5, 0.05 * (ram or 0))
+
+
+class Ledger:
+    """`with Ledger() as L:` — exclusive, read-modify-write access to the shared ledger."""
+
+    def __enter__(self):
+        import fcntl
+        self.dir = LEDGER_DIR
+        old = os.umask(0)
+        try:  # shared by every session (and user) on this Mac
+            os.makedirs(self.dir, mode=0o777, exist_ok=True)
+            self.fd = os.open(os.path.join(self.dir, "ledger.lock"), os.O_RDWR | os.O_CREAT, 0o666)
+        finally:
+            os.umask(old)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        self.data = read_ledger()
+        return self.data
+
+    def __exit__(self, et, e, tb):
+        import fcntl
+        try:
+            if et is None:
+                path = os.path.join(self.dir, "ledger.json")
+                tmp = "%s.%d.tmp" % (path, os.getpid())
+                with open(tmp, "w") as f:
+                    json.dump(self.data, f, indent=1)
+                os.chmod(tmp, 0o666)
+                os.replace(tmp, path)
+        finally:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            os.close(self.fd)
+        return False
+
+
+def read_ledger():
+    try:
+        L = json.load(open(os.path.join(LEDGER_DIR, "ledger.json")))
+        if isinstance(L.get("leases"), list):
+            L.setdefault("history", [])
+            L.setdefault("seq", 0)
+            return L
+    except Exception:
+        pass
+    return {"seq": 0, "leases": [], "history": []}
+
+
+def _alive(procs, pid, start):
+    p = procs.get(pid)
+    if p is not None:
+        return start is None or p["start"] == start
+    try:
+        os.kill(pid, 0)
+        return True  # exists, just not visible to us
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _children(procs):
+    ch = {}
+    for p in procs.values():
+        ch.setdefault(p["ppid"], []).append(p["pid"])
+    return ch
+
+
+def _tree_gb(procs, children, root):
+    stack, seen, tot = [root], set(), 0
+    while stack:
+        x = stack.pop()
+        if x in seen or x not in procs:
+            continue
+        seen.add(x)
+        tot += procs[x]["fp"]
+        stack.extend(children.get(x, []))
+    return tot / (1024 ** 3)
+
+
+def _retire(L, r, outcome, now):
+    L["history"].append({
+        "id": r["id"], "purpose": r["purpose"], "project": r.get("project"), "gb": r["gb"],
+        "peak_gb": round(r.get("peak_gb", 0), 2), "outcome": outcome,
+        "requested": r["requested"], "granted": r.get("granted"), "ended": round(now, 1),
+        "waited_s": round((r.get("granted") or now) - r["requested"]),
+        "held_s": round(now - r["granted"]) if r.get("granted") else 0})
+    L["history"] = L["history"][-HISTORY_KEEP:]
+
+
+def _evaluate(L, s, procs, now):
+    """Drop dead, expired and abandoned entries, account for what grants already use, then grant
+    queued requests strictly in arrival order while they fit."""
+    keep = []
+    for r in L["leases"]:
+        h, why = r["holder"], None
+        if not _alive(procs, h["pid"], h.get("start")):
+            why = "holder_gone"
+        elif r["state"] == "granted" and r.get("expires") and now > r["expires"]:
+            why = "expired"
+        elif r["state"] == "queued" and now - r["seen"] > QUEUE_STALE_S:
+            why = "lapsed"
+        if why:
+            _retire(L, r, why, now)
+        else:
+            keep.append(r)
+    L["leases"] = keep
+
+    # Memory a grant's processes have added since it was granted counts against the grant, so
+    # it isn't counted twice (once as used, once as reserved). Grants watching the same process
+    # tree share its growth in grant order.
+    children = _children(procs)
+    groups = {}
+    for r in L["leases"]:
+        if r["state"] == "granted":
+            groups.setdefault(r.get("watch"), []).append(r)
+    for w, rs in groups.items():
+        rs.sort(key=lambda r: r["granted"])
+        grown = 0.0 if w is None or w not in procs else max(0.0, _tree_gb(procs, children, w) - rs[0].get("baseline_gb", 0))
+        for i, r in enumerate(rs):
+            share = grown if i == len(rs) - 1 else min(r["gb"], grown)
+            grown -= share
+            r["used_gb"] = round(min(r["gb"], share), 2)
+            r["peak_gb"] = round(max(r.get("peak_gb", 0), share), 2)
+
+    v = verdict(s)
+    ram = s.get("ram_gb") or 0
+    free = free_physical_gb(s)
+    outstanding = sum(r["gb"] - r.get("used_gb", 0) for r in L["leases"] if r["state"] == "granted")
+    avail = free - outstanding - margin_gb(ram)
+    for r in [x for x in L["leases"] if x["state"] == "queued"]:
+        if v["level"] == "critical":
+            break
+        alone = not any(x["state"] == "granted" for x in L["leases"])
+        if r["gb"] <= avail or (alone and v["level"] == "ok"):
+            if r["gb"] > avail:
+                r["note"] = ("larger than the %.1f GB available now; granted because no other work is reserved — "
+                             "expect swapping" % max(0.0, avail))
+            r["state"], r["granted"] = "granted", round(now, 1)
+            r["expires"] = round(now + r["ttl"], 1) if r.get("ttl") else None
+            w = r.get("watch")
+            r["baseline_gb"] = round(_tree_gb(procs, children, w), 3) if w in procs else 0.0
+            r["used_gb"], r["peak_gb"] = 0.0, 0.0
+            same = [x for x in L["leases"] if x is not r and x["state"] == "granted" and x.get("watch") == w]
+            if same:  # share the first grant's baseline (see above)
+                r["baseline_gb"] = min(x.get("baseline_gb", 0) for x in same)
+            avail -= r["gb"]
+            outstanding += r["gb"]
+        else:
+            break
+    L["state"] = {"t": round(now, 1), "level": v["level"], "free_gb": free, "margin_gb": round(margin_gb(ram), 1),
+                  "reserved_gb": round(outstanding, 1), "available_gb": round(avail, 1)}
+
+
+def _decide_inputs(s=None):
+    s = s or (_sample_override() if _sample_override else live_sample(with_procs=False))
+    return s, _daemon_module().collect_procs(), time.time()
+
+
+def _brief(r, now):
+    b = {"id": r["id"], "state": r["state"], "gb": r["gb"], "purpose": r["purpose"],
+         "project": os.path.basename(r.get("project") or "") or None, "holder_pid": r["holder"]["pid"]}
+    if r["state"] == "granted":
+        b.update(used_gb=r.get("used_gb", 0), for_min=round((now - r["granted"]) / 60, 1))
+        if r.get("expires"):
+            b["expires_in_min"] = round((r["expires"] - now) / 60, 1)
+    else:
+        b["waiting_min"] = round((now - r["requested"]) / 60, 1)
+    return b
+
+
+def _status(L, rid, now):
+    st = L.get("state", {})
+    r = next((x for x in L["leases"] if x["id"] == rid), None)
+    if r is None:
+        h = next((x for x in reversed(L["history"]) if x["id"] == rid), None)
+        return {"status": "gone", "id": rid, "outcome": h and h["outcome"],
+                "advice": "This reservation no longer exists (%s). Request a new one if you still need it."
+                          % (h["outcome"] if h else "unknown id")}
+    out = {"status": r["state"], "id": r["id"], "gb": r["gb"], "purpose": r["purpose"],
+           "available_gb": st.get("available_gb"), "reserved_gb": st.get("reserved_gb"),
+           "free_gb": st.get("free_gb"), "level": st.get("level")}
+    if r["state"] == "granted":
+        out["expires_in_min"] = round((r["expires"] - now) / 60, 1) if r.get("expires") else None
+        if r.get("note"):
+            out["note"] = r["note"]
+        out["advice"] = ("Granted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
+                         "memory-heavy part is over%s." % (r["id"], "" if not r.get("expires") else
+                                                           "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
+    else:
+        queued = [x for x in L["leases"] if x["state"] == "queued"]
+        pos = [x["id"] for x in queued].index(r["id"]) + 1
+        out["position"] = pos
+        out["ahead"] = [_brief(x, now) for x in L["leases"]
+                        if x["state"] == "granted" or (x["state"] == "queued" and x["requested"] < r["requested"])]
+        why = ("memory is critical" if st.get("level") == "critical" else
+               "%d request(s) are ahead of you" % (pos - 1) if pos > 1 else
+               "only %.1f GB is available for new reservations" % max(0.0, st.get("available_gb") or 0))
+        out["advice"] = ("Queued #%d (%s). Don't start this work yet. Ask again with the same ticket (%s) within %d s to "
+                         "keep your place — meanwhile do light work or wait." % (pos, why, r["id"], QUEUE_STALE_S))
+    return out
+
+
+def holder_for(pid=None, kind=None):
+    """Who owns a reservation made from here: the Claude session we run in, else our parent process."""
+    d = _daemon_module()
+    procs = d.collect_procs()
+    start_pid = pid or os.getppid()
+    root = _session_root(procs, start_pid)
+    hp = root or start_pid
+    return {"pid": hp, "start": procs.get(hp, {}).get("start"), "kind": kind or ("session" if root else "process"),
+            "project": d.proc_cwd(hp)}
+
+
+def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder"):
+    """Request (or re-poll with `ticket`) a reservation. Returns its status dict."""
+    s, procs, now = _decide_inputs()
+    with Ledger() as L:
+        r = next((x for x in L["leases"] if x["id"] == ticket), None) if ticket else None
+        if ticket and r is None:
+            return _status(L, ticket, now)
+        if r is None:
+            ram = s.get("ram_gb") or 0
+            if gb <= 0 or (ram and gb > 0.9 * ram):
+                return {"status": "refused", "gb": gb,
+                        "advice": "Can't reserve %.1f GB on a Mac with %.0f GB RAM. Split the work or lower its "
+                                  "parallelism." % (gb, ram)}
+            L["seq"] += 1
+            r = {"id": "r%d" % L["seq"], "state": "queued", "gb": round(gb, 2), "purpose": (purpose or "?")[:80],
+                 "project": holder.get("project"), "holder": {k: holder.get(k) for k in ("pid", "start", "kind")},
+                 "watch": holder["pid"] if watch == "holder" else watch,
+                 "ttl": None if ttl_s is None else min(max(60, ttl_s), MAX_TTL_S),
+                 "requested": round(now, 1), "seen": round(now, 1)}
+            L["leases"].append(r)
+        else:
+            r["seen"] = round(now, 1)
+            if r["state"] == "granted" and r.get("expires") and ttl_s:  # re-asking extends a grant
+                r["expires"] = round(now + min(max(60, ttl_s), MAX_TTL_S), 1)
+        _evaluate(L, s, procs, now)
+        return _status(L, r["id"], now)
+
+
+def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, watch="holder", progress=None):
+    st = reserve(gb, purpose, holder, ttl_s, ticket, watch)
+    t0 = time.time()
+    while st["status"] == "queued" and time.time() - t0 < wait_s:
+        if progress:
+            progress(st)
+        time.sleep(min(POLL_S, max(0.1, wait_s - (time.time() - t0))))
+        st = reserve(gb, purpose, holder, ttl_s, st["id"], watch)
+    return st
+
+
+def release(rid, holder_pid=None, outcome="released"):
+    """Release one reservation, or with rid='all' every one held by `holder_pid`."""
+    s, procs, now = _decide_inputs()
+    with Ledger() as L:
+        gone = [r for r in L["leases"] if r["id"] == rid or (rid == "all" and r["holder"]["pid"] == holder_pid)]
+        _evaluate(L, s, procs, now)  # final usage figures, before removing
+        gone = [r for r in L["leases"] if r["id"] in {g["id"] for g in gone}]
+        for r in gone:
+            _retire(L, r, outcome if r["state"] == "granted" else "cancelled", now)
+        L["leases"] = [r for r in L["leases"] if r not in gone]
+        _evaluate(L, s, procs, now)  # hand the memory to whoever is next
+        return {"released": [h for h in L["history"] if h["id"] in {g["id"] for g in gone}],
+                "available_gb": L["state"]["available_gb"],
+                "next_granted": [r["id"] for r in L["leases"] if r["state"] == "granted" and r.get("granted") == round(now, 1)]}
+
+
+def set_watch(rid, pid):
+    """Point a grant at the process tree that does the work (`oomph run`'s child)."""
+    s, procs, now = _decide_inputs()
+    with Ledger() as L:
+        for r in L["leases"]:
+            if r["id"] == rid:
+                r["watch"], r["baseline_gb"] = pid, 0.0
+        _evaluate(L, s, procs, now)
+
+
+def coordination(mine=None, s=None):
+    """Current reservations (refreshed), seen from session `mine`: what others hold or wait for."""
+    s, procs, now = _decide_inputs(s)
+    with Ledger() as L:
+        _evaluate(L, s, procs, now)
+        st = L["state"]
+        others = [r for r in L["leases"] if r["holder"]["pid"] != mine]
+        own = [r for r in L["leases"] if r["holder"]["pid"] == mine]
+        others_out = sum(r["gb"] - r.get("used_gb", 0) for r in others if r["state"] == "granted")
+        return {
+            "free_gb": st["free_gb"], "margin_gb": st["margin_gb"], "reserved_gb": st["reserved_gb"],
+            "available_gb": st["available_gb"],
+            "reserved_by_others_gb": round(others_out, 1),
+            "available_to_me_gb": round(st["free_gb"] - others_out - st["margin_gb"], 1),
+            "others": [_brief(r, now) for r in others], "mine": [_brief(r, now) for r in own],
+            "history": [dict(h, project=os.path.basename(h.get("project") or "") or None)
+                        for h in L["history"][-15:]][::-1],
+        }
+
+
+def ledger_snapshot(procs=None):
+    """Compact read-only view of live reservations, for the daemon's samples (no lock, no write)."""
+    try:
+        L = read_ledger()
+    except Exception:
+        return []
+    now = time.time()
+    out = []
+    for r in L["leases"]:
+        if procs is not None and not _alive(procs, r["holder"]["pid"], r["holder"].get("start")):
+            continue
+        if r["state"] == "granted" and r.get("expires") and now > r["expires"]:
+            continue
+        if r["state"] == "queued" and now - r["seen"] > QUEUE_STALE_S:
+            continue
+        b = _brief(r, now)
+        b.pop("holder_pid", None)
+        out.append(b)
+    return out
+
+
+def coordination_verdict(v, c):
+    """Fold others' reservations into a check verdict."""
+    v["coordination"] = c
+    if c["others"] and c["available_to_me_gb"] < 0 and v["level"] == "ok":
+        v["level"], v["exit_code"] = "tight", 1
+        v["advice"] = ADVICE["tight"]
+    if c["others"] and c["available_to_me_gb"] < 0:
+        v["reasons"].append("%.1f GB is reserved by other sessions for work they have started or are about to start"
+                            % c["reserved_by_others_gb"])
+    if any(o["state"] == "queued" for o in c["others"]):
+        v["advice"] += (" Other sessions are queued for memory — reserve before your next heavy step "
+                        "(reserve_memory / `oomph run --reserve`) so you take your turn instead of competing.")
+    return v
+
+
+def _fmt_brief(b):
+    tail = ("using %.1fG, %.0f min" % (b.get("used_gb", 0), b["for_min"]) if b["state"] == "granted"
+            else "waiting %.0f min" % b["waiting_min"])
+    return "%-5s %-7s %5.1fG  %-28s %-14s %s" % (b["id"], b["state"], b["gb"], b["purpose"][:28],
+                                                (b.get("project") or "")[:14], tail)
+
+
+def _opt(args, name, default=None):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
+
+
+def cmd_reserve(args):
+    pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in
+                                                                        ("--for", "--wait", "--ttl", "--ticket", "--pid"))]
+    ticket = _opt(args, "--ticket")
+    if not pos and not ticket:
+        print("usage: oomph reserve <size, e.g. 6G> --for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
+        return 2
+    gb = _parse_gb(pos[0]) if pos else 0
+    holder = holder_for(int(_opt(args, "--pid")) if "--pid" in args else None)
+    st = acquire(gb, _opt(args, "--for", "unspecified"), holder, parse_dur(_opt(args, "--ttl", "30m")),
+                 parse_dur(_opt(args, "--wait", "0s")), ticket)
+    if "--json" in args:
+        print(json.dumps(st))
+    else:
+        print("oomph: %s %s — %s" % (st["status"].upper(), st.get("id", ""), st["advice"]))
+        for b in st.get("ahead") or []:
+            print("  ahead: " + _fmt_brief(b))
+        if st.get("note"):
+            print("  note: " + st["note"])
+    return 0 if st["status"] == "granted" else 75
+
+
+def cmd_release(args):
+    if not args or args[0].startswith("--"):
+        print("usage: oomph release <id | all>   (all = every reservation held by this session)")
+        return 2
+    res = release(args[0], holder_for()["pid"] if args[0] == "all" else None)
+    if "--json" in args:
+        print(json.dumps(res))
+        return 0
+    if not res["released"]:
+        print("oomph: nothing to release")
+        return 1
+    for h in res["released"]:
+        print("oomph: released %s (%s) — reserved %.1fG, peak %.1fG, held %ds" % (
+            h["id"], h["purpose"], h["gb"], h["peak_gb"], h["held_s"]))
+    if res["next_granted"]:
+        print("oomph: now granted to " + ", ".join(res["next_granted"]))
+    return 0
+
+
+def cmd_reservations(args):
+    c = coordination(holder_for()["pid"])
+    if "--json" in args:
+        print(json.dumps(c))
+        return 0
+    print("free %.1fG − reserved %.1fG − margin %.1fG = %.1fG available for new reservations" % (
+        c["free_gb"], c["reserved_gb"], c["margin_gb"], c["available_gb"]))
+    rows = [("me", b) for b in c["mine"]] + [("", b) for b in c["others"]]
+    if rows:
+        print("\nactive:")
+        for who, b in sorted(rows, key=lambda x: (x[1]["state"] != "granted", x[1]["id"])):
+            print("  %-3s %s" % (who, _fmt_brief(b)))
+    else:
+        print("\nno active reservations")
+    if c["history"]:
+        print("\nrecent (reserved → peak actually added):")
+        for h in c["history"][:10]:
+            print("  %-5s %5.1fG → %4.1fG  %-28s %-14s %-11s held %s" % (
+                h["id"], h["gb"], h["peak_gb"], h["purpose"][:28], (h.get("project") or "")[:14], h["outcome"],
+                "%dm%02ds" % divmod(h["held_s"], 60)))
+    return 0
+
+
+def cmd_run(args):
+    if "--" not in args or "--reserve" not in args:
+        print("usage: oomph run --reserve 6G [--for \"what\"] [--wait 30m] -- <command> [args…]")
+        return 2
+    i = args.index("--")
+    opts, cmd = args[:i], args[i + 1:]
+    if not cmd:
+        print("oomph run: no command given")
+        return 2
+    import signal
+    gb = _parse_gb(_opt(opts, "--reserve"))
+    purpose = _opt(opts, "--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
+    wait_s = parse_dur(_opt(opts, "--wait", "30m"))
+    ses = holder_for()
+    me = {"pid": os.getpid(), "start": _daemon_module().collect_procs().get(os.getpid(), {}).get("start"),
+          "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd()}
+    last = [0.0]
+
+    def progress(st):
+        if time.time() - last[0] >= 30:
+            last[0] = time.time()
+            ahead = ", ".join("%s %.1fG %s (%s)" % (b["id"], b["gb"], b["purpose"], b.get("project") or "?")
+                              for b in st.get("ahead", [])[:3])
+            sys.stderr.write("oomph: waiting for %.1fG — queued #%s, %.1fG available%s\n" % (
+                gb, st.get("position"), st.get("available_gb") or 0, "; ahead: " + ahead if ahead else ""))
+            sys.stderr.flush()
+
+    st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress)
+    if st["status"] != "granted":
+        if st["status"] == "queued":
+            release(st["id"])
+        sys.stderr.write("oomph: not started — %s\n" % (
+            "still queued after %ds (%s)" % (wait_s, st["advice"]) if st["status"] == "queued" else st["advice"]))
+        return 75
+    if st.get("note"):
+        sys.stderr.write("oomph: note — %s\n" % st["note"])
+    t0 = time.time()
+    try:
+        child = subprocess.Popen(cmd)
+    except OSError as e:
+        release(st["id"])
+        sys.stderr.write("oomph run: %s\n" % e)
+        return 127
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda n, f: child.send_signal(n))
+    rc = None
+    try:
+        set_watch(st["id"], child.pid)
+        while rc is None:
+            try:
+                rc = child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                coordination()  # refresh: records this run's peak, hands spare room to others
+    except KeyboardInterrupt:
+        rc = child.wait()  # the child got the same SIGINT
+    finally:
+        res = release(st["id"])
+    h = (res["released"] or [{}])[0]
+    sys.stderr.write("oomph: %s — reserved %.1fG, peak %.1fG, %ds\n" % (
+        st["id"], gb, h.get("peak_gb", 0), time.time() - t0))
+    return rc if rc >= 0 else 128 - rc
+
+
 def cmd_hook(args):
     """PostToolUse hook. Silent (exit 0) when memory is ok. When tight/critical, prints a short
     warning to stderr and exits 2, which Claude Code shows to the model. Warns again only when
@@ -753,7 +1277,7 @@ def cmd_hook(args):
         sys.stdin.read()  # the hook payload; not needed
     except Exception:
         pass
-    v = verdict(sample(with_procs=False))
+    v = checked_verdict()
     state = os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-hook-%d.json" % os.getppid())
     try:
         prev = json.load(open(state))
@@ -776,6 +1300,32 @@ MCP_TOOLS = [
      "description": "Verdict on this Mac's memory right now: level ok / tight / critical, the reasons, free physical "
                     "memory, pressure, swap and free disk, plus advice on what to do. Call it before memory-heavy "
                     "work (builds, test suites, containers, parallel jobs, sub-agents) and periodically in long runs.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "reserve_memory",
+     "description": "Coordinate memory with other Claude sessions on this Mac. Before memory-heavy work (builds, test "
+                    "suites, containers, browsers, sub-agents, data jobs) reserve its estimated PEAK extra memory. "
+                    "Requests queue first-come-first-served and are granted when they fit next to what others have "
+                    "reserved, so heavy steps run side by side when there's room and one after another when there "
+                    "isn't. Returns status granted (start now), queued (do NOT start yet; call again with ticket=id "
+                    "within 180 s to keep your place, and see who is ahead) or refused. Calling again with the ticket "
+                    "of a granted reservation extends it. Release it with release_memory when the heavy part is over.",
+     "inputSchema": {"type": "object", "required": ["gb", "purpose"], "properties": {
+         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB"},
+         "purpose": {"type": "string", "description": "short label, e.g. 'gradle assembleDebug' — reuse the same "
+                                                       "label for the same work so its measured peak can guide estimates"},
+         "wait_s": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120,
+                    "description": "how long to wait for a grant within this call"},
+         "ttl_min": {"type": "integer", "minimum": 1, "maximum": 480, "default": 30,
+                     "description": "auto-expiry of the grant if it isn't released or extended"},
+         "ticket": {"type": "string", "description": "id from an earlier queued/granted response"}}}},
+    {"name": "release_memory",
+     "description": "Release a reservation (id) — or 'all' of this session's — as soon as the memory-heavy work has "
+                    "finished, so queued sessions can go. Returns the peak memory the work actually added.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "reservations",
+     "description": "All current reservations on this Mac (yours and other sessions': granted and queued, with "
+                    "purpose, project and memory actually used), the memory available for new ones, and recent "
+                    "finished reservations with the peak each really needed — use those peaks to estimate.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "my_session",
      "description": "Memory used by the Claude Code session this server belongs to: its whole process tree, total, "
@@ -804,7 +1354,16 @@ MCP_TOOLS = [
 
 def _mcp_call(name, a):
     if name == "memory_check":
-        return verdict(sample(with_procs=False))
+        return checked_verdict()
+    if name == "reserve_memory":
+        ttl = min(max(int(a.get("ttl_min", 30)), 1), 480) * 60
+        return acquire(float(a["gb"]), str(a.get("purpose", "unspecified")), holder_for(), ttl,
+                       min(max(int(a.get("wait_s", 120)), 0), 300), a.get("ticket"))
+    if name == "release_memory":
+        rid = str(a.get("id", ""))
+        return release(rid, holder_for()["pid"] if rid == "all" else None)
+    if name == "reservations":
+        return coordination(holder_for()["pid"])
     if name == "my_session":
         return find_session() or {"error": "this MCP server is not running under a Claude Code session"}
     if name == "memory_status":
@@ -854,8 +1413,11 @@ def cmd_mcp():
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
                           "serverInfo": {"name": "oomph", "version": VERSION},
-                          "instructions": "oomph reports this Mac's memory, swap and disk. Call memory_check before "
-                                          "memory-heavy work and back off when it says tight or critical."}
+                          "instructions": "oomph reports this Mac's memory, swap and disk, and coordinates memory between "
+                                          "Claude sessions. Before memory-heavy work call reserve_memory with the "
+                                          "work's estimated peak; start only when granted, and release_memory when "
+                                          "done. Call memory_check periodically and back off when it says tight or "
+                                          "critical."}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -965,6 +1527,14 @@ def main(argv):
         return cmd_session(rest)
     if c == "wait":
         return cmd_wait(rest)
+    if c == "reserve":
+        return cmd_reserve(rest)
+    if c == "release":
+        return cmd_release(rest)
+    if c == "reservations":
+        return cmd_reservations(rest)
+    if c == "run":
+        return cmd_run(rest)
     if c == "hook":
         return cmd_hook(rest)
     if c == "mcp":

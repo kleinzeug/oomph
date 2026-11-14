@@ -71,7 +71,12 @@ Two practical lessons that shaped the implementation:
             ▲ reads (no privileges needed)
 ┌───────────┴─────────── user ─────────────────────────────┐
 │ oomph.app (menu bar)        oomph CLI (/usr/local/bin)    │
+│                              oomph mcp ← Claude sessions   │
+│                                 │ flock, read/write        │
+│                                 ▼                          │
+│        /Users/Shared/oomph/ledger.json  (reservations)     │
 └───────────────────────────────────────────────────────────┘
+       (the daemon reads the ledger into each sample)
 ```
 
 ## Decisions
@@ -160,6 +165,24 @@ cache as free and read 24 GB while Activity Monitor showed 8 GB, so it was dropp
 The popup is a borderless `NSPanel` positioned explicitly under the status item (an
 `NSPopover` could end up above the menu bar), closed by clicking the icon again or
 anywhere else.
+
+## Coordinating sessions (1.2)
+
+Several Claude Code sessions on one Mac each make locally sensible decisions — "8 GB
+free, start the build" — that together exhaust memory. 1.2 adds a shared, advisory
+reservation queue that the sessions use through the skill, the CLI and the MCP server.
+
+| Topic | Decision | Why |
+|---|---|---|
+| Where the queue lives | A JSON ledger in `/Users/Shared/oomph/` (dir 777, files 666), every read-modify-write under `flock`, written with an atomic rename | Works without the root daemon, so checks-only installs and CI get it too. RAM is shared by all users, so one ledger per Mac rather than per user. A root daemon as broker would make every request depend on the logger being installed and current. |
+| Unit | A **reservation**: estimated *peak extra* GB + a purpose label + the holder (Claude session, or the `oomph run` process) | Peak, because the peak is what tips the machine over. The label makes past peaks reusable for estimates. |
+| Admission | Strict FIFO. Grant the head while `gb ≤ free − outstanding − margin`; margin = max(1.5 GB, 5 % RAM). Never while pressure is critical. Head bigger than that is granted only when no other grant exists and the verdict is ok; > 90 % of RAM is refused | FIFO is what "one after another" means and prevents starving big jobs. The alone rule prevents a deadlock on requests that can never fit; it is flagged with a note so the agent expects swapping. |
+| Free figure | Activity Monitor's (RAM − app − wired − compressed), from a live sample | Conservative on purpose: cached files are reclaimable, but the point is to space out heavy steps, and the same figure is shown everywhere. |
+| Outstanding | Per grant, `gb − growth`, where growth is the footprint its watched process tree added since the grant (several grants on one tree share it in grant order) | Without it a running job is counted twice — as used memory and as reservation — and the queue stalls. Growth also gives the measured peak recorded in the history. Memory outside the tree (e.g. inside Docker's VM) isn't seen, which errs on the safe side until release. |
+| Liveness | Holder pid + process start time; dead holder → entry dropped. Session-held grants expire (default 30 min, re-asking extends, max 8 h); `oomph run` grants live exactly as long as the run. Queued entries lapse after 180 s without a poll | No entry can block the queue after its owner is gone or has forgotten it. |
+| Waiting | Clients poll every 2 s (CLI) or within the MCP call (≤ 300 s); a queued response carries the position and who is ahead | Polling a locked file is simple and robust; no daemon, sockets or notifications to keep alive. The MCP cap keeps tool calls bounded; the ticket keeps the place across calls. |
+| Visibility | `oomph check` folds in others' reservations (tight when they exceed what's free); the daemon copies live reservations into every sample; the popup lists them | Uncoordinated checks still see planned work, and incidents show what was reserved at the time. |
+| Enforcement | None — advisory, like the rest of oomph | Killing or pausing an agent's work would be worse than the problem. The skill tells sessions never to start reserved-for work early and never to release others' entries. |
 
 ## Out of scope
 

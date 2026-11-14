@@ -15,6 +15,7 @@ from contextlib import redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["OOMPH_DIR"] = tempfile.mkdtemp(prefix="oomph-selftest-")
+os.environ["OOMPH_LEDGER_DIR"] = os.path.join(os.environ["OOMPH_DIR"], "ledger")
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
 
 import oomph  # noqa: E402
@@ -105,13 +106,66 @@ out = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.join(ROOT, "daemon
 resp = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
 check(resp.get(1, {}).get("result", {}).get("serverInfo", {}).get("name") == "oomph", "MCP initialize")
 names = [t["name"] for t in resp.get(2, {}).get("result", {}).get("tools", [])]
-check({"memory_check", "my_session", "wait_for_memory", "incidents", "incident", "memory_status"} <= set(names),
+check({"memory_check", "my_session", "wait_for_memory", "incidents", "incident", "memory_status",
+       "reserve_memory", "release_memory", "reservations"} <= set(names),
       "MCP tools/list: %s" % ", ".join(names))
 txt = resp.get(3, {}).get("result", {}).get("content", [{}])[0].get("text", "{}")
 check(json.loads(txt).get("level") in oomph.LEVELS, "MCP tools/call memory_check")
 inc_list = json.loads(resp.get(4, {}).get("result", {}).get("content", [{}])[0].get("text", "null"))
 check(isinstance(inc_list, list) and len(inc_list) >= 1, "MCP tools/call incidents (%d)" % len(inc_list or []))
 check(os.path.exists(os.path.join(ROOT, "skills", "oomph", "SKILL.md")), "skills/oomph/SKILL.md present")
+
+# --- coordination ledger: decisions against a fixed sample (36 GB RAM, 10 GB free, normal pressure)
+fake = dict(oomph.live_sample(with_procs=False), ram_gb=36.0, app_gb=20.0, wired_gb=4.0, compressed_gb=2.0,
+            pressure=1, disk_free_gb=60.0, swap_used_gb=0.0, swap_total_gb=0.0)
+oomph._sample_override = lambda: dict(fake)
+me = {"pid": os.getpid(), "start": None, "kind": "process", "project": ROOT}
+other_proc = subprocess.Popen(["/bin/sleep", "120"])
+other = {"pid": other_proc.pid, "start": None, "kind": "session", "project": "/tmp/other"}
+a = oomph.reserve(4, "build A", me)
+check(a["status"] == "granted", "ledger: 4G granted with 10G free (%s)" % a["status"])
+b = oomph.reserve(6, "build B", other)
+check(b["status"] == "queued" and b["position"] == 1, "ledger: 6G queued behind it (%s)" % b["status"])
+c = oomph.reserve(0.5, "small C", other)
+check(c["status"] == "queued" and c["position"] == 2, "ledger: small request waits its turn (strict FIFO)")
+v = oomph.checked_verdict(other["pid"])
+check(v["coordination"]["reserved_by_others_gb"] == 4.0, "check: sees 4G reserved by another session")
+r = oomph.release(a["id"])
+check(set(r["next_granted"]) == {b["id"], c["id"]}, "ledger: release hands the room to the queue (%s)" % r["next_granted"])
+huge = oomph.reserve(20, "huge", me)
+check(huge["status"] == "queued", "ledger: oversize request waits while others hold grants")
+other_proc.kill()
+other_proc.wait()
+huge = oomph.reserve(20, "huge", me, ticket=huge["id"])
+check(huge["status"] == "granted" and huge.get("note"), "ledger: dead holder reaped; oversize granted when alone")
+check(oomph.reserve(40, "x", me)["status"] == "refused", "ledger: request larger than RAM refused")
+fake["pressure"] = 4
+crit = oomph.reserve(0.1, "during critical", me)
+check(crit["status"] == "queued", "ledger: nothing granted while memory is critical")
+fake["pressure"] = 1
+oomph.release("all", me["pid"])
+check(not oomph.read_ledger()["leases"], "ledger: release all clears this holder's entries")
+rc = oomph.main(["run", "--reserve", "256M", "--for", "selftest run", "--", "/bin/sh", "-c", "exit 3"])
+hist = oomph.read_ledger()["history"]
+check(rc == 3 and hist[-1]["purpose"] == "selftest run" and hist[-1]["outcome"] == "released",
+      "oomph run: waits for a grant, passes the exit code through, releases")
+oomph._sample_override = None
+
+reqs = [reqs[0], reqs[1],
+        {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "reserve_memory",
+                                                                       "arguments": {"gb": 0.1, "purpose": "mcp", "wait_s": 5}}},
+        {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "reservations", "arguments": {}}},
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "release_memory", "arguments": {"id": "all"}}}]
+out = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.join(ROOT, "daemon", "oomph.py"), "mcp"],
+                     input="\n".join(json.dumps(r) for r in reqs) + "\n", capture_output=True, text=True,
+                     env=dict(os.environ), timeout=60).stdout
+resp = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
+res5 = json.loads(resp.get(5, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
+check(res5.get("status") in ("granted", "queued"), "MCP reserve_memory (%s)" % res5.get("status"))
+res6 = json.loads(resp.get(6, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
+check("available_gb" in res6, "MCP reservations")
+res7 = json.loads(resp.get(7, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
+check(len(res7.get("released", [])) == 1, "MCP release_memory all")
 
 print("\n%s — logs in %s" % ("FAILED (%d)" % len(failures) if failures else "all checks passed", LOG))
 sys.exit(1 if failures else 0)
