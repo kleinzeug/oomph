@@ -85,6 +85,15 @@ final class Store: ObservableObject {
     }
     var installed: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/local.oomph.daemon.plist") }
 
+    static func version(at path: String) -> String? {
+        guard let s = try? String(contentsOfFile: path, encoding: .utf8),
+              let r = s.range(of: #"VERSION = "([^"]+)""#, options: .regularExpression) else { return nil }
+        return String(s[r]).replacingOccurrences(of: "VERSION = ", with: "").replacingOccurrences(of: "\"", with: "")
+    }
+    var installedVersion: String? { Store.version(at: "/usr/local/libexec/oomph/oomph.py") }
+    var bundledVersion: String? { Store.version(at: (Bundle.main.resourcePath ?? "") + "/oomph.py") }
+    var needsUpdate: Bool { installed && installedVersion != nil && bundledVersion != nil && installedVersion != bundledVersion }
+
     var lastSeenIncident: String {
         get { UserDefaults.standard.string(forKey: "lastSeenIncident") ?? "" }
         set { UserDefaults.standard.set(newValue, forKey: "lastSeenIncident"); objectWillChange.send() }
@@ -459,6 +468,12 @@ struct PopoverView: View {
 
     var footer: some View {
         HStack {
+            if store.needsUpdate {
+                Button("Update") {
+                    store.runPrivileged("install.sh") { error = $0 }
+                }.buttonStyle(.borderedProminent).disabled(store.busy)
+                .help("Installed logger is v\(store.installedVersion ?? "?"), this app ships v\(store.bundledVersion ?? "?")")
+            }
             if store.installed {
                 Button("Deactivate") {
                     store.runPrivileged("uninstall.sh") { error = $0 }

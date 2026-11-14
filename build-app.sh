@@ -13,6 +13,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BUILD/oomph" "$APP/Contents/MacOS/"
 cp app/Info.plist "$APP/Contents/"
 cp daemon/oomphd.py daemon/oomph.py daemon/local.oomph.daemon.plist install.sh uninstall.sh "$APP/Contents/Resources/"
+mkdir -p "$APP/Contents/Resources/skills/oomph" && cp skills/oomph/SKILL.md "$APP/Contents/Resources/skills/oomph/"
 chmod 755 "$APP/Contents/Resources/"*.sh "$APP/Contents/Resources/"*.py
 codesign --force --sign - "$APP" >/dev/null
 rm -rf "$BUILD"

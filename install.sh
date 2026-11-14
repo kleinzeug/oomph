@@ -25,6 +25,10 @@ launchctl bootout system/local.oomph.daemon 2>/dev/null || true
 install -d -o root -g wheel -m 755 "$LIB" /usr/local/bin /Library/Logs/oomph
 install -o root -g wheel -m 755 "$SRC/oomphd.py" "$SRC/oomph.py" "$LIB/"
 install -o root -g wheel -m 644 "$SRC/local.oomph.daemon.plist" "$PLIST"
+if [ -f "$HERE/skills/oomph/SKILL.md" ]; then
+  install -d -o root -g wheel -m 755 "$LIB/skills/oomph"
+  install -o root -g wheel -m 644 "$HERE/skills/oomph/SKILL.md" "$LIB/skills/oomph/SKILL.md"
+fi
 ln -sfn "$LIB/oomph.py" /usr/local/bin/oomph
 launchctl enable system/local.oomph.daemon
 launchctl bootstrap system "$PLIST"

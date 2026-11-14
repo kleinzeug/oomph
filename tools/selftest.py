@@ -79,5 +79,39 @@ for args in (["status"], ["report", "--last", "10m"], ["incidents"], ["incident"
 html = open(os.path.join(LOG, "adhoc.html")).read()
 check(html.count("<svg") >= 3, "HTML report contains its charts")
 
+# --- agent protocol: check / verdict / session / MCP
+v = oomph.verdict(oomph.sample(with_procs=False))
+check(v["level"] in oomph.LEVELS and v["exit_code"] == oomph.LEVELS.index(v["level"]),
+      "oomph check: %s, %.1fG free" % (v["level"], v["free_gb"]))
+fake = dict(oomph.live_sample(with_procs=False), pressure=2, disk_free_gb=9.8)
+check(oomph.verdict(fake)["level"] == "tight", "verdict escalates to tight on WARN pressure / low disk")
+fake.update(pressure=4)
+check(oomph.verdict(fake)["level"] == "critical", "verdict escalates to critical on CRITICAL pressure")
+ses = oomph.find_session()
+check(ses is None or ses["total_mb"] >= 0, "oomph session: %s" % ("not under Claude" if ses is None else "pid %s" % ses["pid"]))
+
+import subprocess  # noqa: E402
+reqs = [
+    {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                                  "clientInfo": {"name": "selftest", "version": "0"}}},
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+    {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "memory_check", "arguments": {}}},
+    {"jsonrpc": "2.0", "id": 4, "method": "tools/call", "params": {"name": "incidents", "arguments": {"limit": 3}}},
+]
+out = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.join(ROOT, "daemon", "oomph.py"), "mcp"],
+                     input="\n".join(json.dumps(r) for r in reqs) + "\n", capture_output=True, text=True,
+                     env=dict(os.environ), timeout=60).stdout
+resp = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
+check(resp.get(1, {}).get("result", {}).get("serverInfo", {}).get("name") == "oomph", "MCP initialize")
+names = [t["name"] for t in resp.get(2, {}).get("result", {}).get("tools", [])]
+check({"memory_check", "my_session", "wait_for_memory", "incidents", "incident", "memory_status"} <= set(names),
+      "MCP tools/list: %s" % ", ".join(names))
+txt = resp.get(3, {}).get("result", {}).get("content", [{}])[0].get("text", "{}")
+check(json.loads(txt).get("level") in oomph.LEVELS, "MCP tools/call memory_check")
+inc_list = json.loads(resp.get(4, {}).get("result", {}).get("content", [{}])[0].get("text", "null"))
+check(isinstance(inc_list, list) and len(inc_list) >= 1, "MCP tools/call incidents (%d)" % len(inc_list or []))
+check(os.path.exists(os.path.join(ROOT, "skills", "oomph", "SKILL.md")), "skills/oomph/SKILL.md present")
+
 print("\n%s — logs in %s" % ("FAILED (%d)" % len(failures) if failures else "all checks passed", LOG))
 sys.exit(1 if failures else 0)

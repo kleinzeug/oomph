@@ -63,6 +63,7 @@ jobs:
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }
+          test -f "$APP/Contents/Resources/skills/oomph/SKILL.md" || { echo "::error::Claude skill missing from bundle"; exit 1; }
 
           lipo -info "$APP/Contents/MacOS/oomph"
           codesign --verify --deep --strict --verbose=2 "$APP"

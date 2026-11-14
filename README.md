@@ -18,6 +18,11 @@ swap, disk space and per-process footprints around the clock, watches the system
 for memory kills, and turns every incident into a report with charts of the minutes
 leading up to it.
 
+Running long Claude Code sessions? Paste the
+[oomph skill](https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md)
+link into one and it becomes memory-aware —
+see [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
+
 The name: **oom** (out of memory) + *oomph* — and the trailing **ph** is the
 author's initials.
 
@@ -156,6 +161,53 @@ oomph incident latest --html    # open the latest incident's report
 oomph html --last 24h --open    # HTML report for any time range
 ```
 
+For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
+`oomph status --json`, `oomph hook` and `oomph mcp` — see
+[Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
+
+## Making Claude sessions oom-aware
+
+Long-running coding agents are exactly the kind of workload that tips a Mac into
+"out of application memory": a build here, a container there, three sub-agents running
+test suites in parallel. ***oomph*** ships a [Claude skill](skills/oomph/SKILL.md) that
+teaches a session to check memory before heavy work and to back off when it is tight —
+lower parallelism, no new containers or sub-agents, stop what it started, wait, and tell
+you.
+
+**Drop-in, for any session** — paste this into Claude Code:
+
+```
+Use this skill for the rest of the session:
+https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md
+```
+
+**For every session**, once:
+
+```sh
+oomph setup-claude            # installs the skill to ~/.claude/skills/oomph and
+                              # registers the oomph MCP server for all sessions
+oomph setup-claude --hook     # …and adds a PostToolUse hook (see below)
+oomph setup-claude --remove   # undo all of it
+```
+
+What a session gets:
+
+| | |
+|---|---|
+| `oomph check` | one-line verdict **ok / tight / critical** with reasons and advice; exit code 0 / 1 / 2; `--json` |
+| `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
+| `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
+| `oomph status --json` | the full latest sample |
+| MCP server `oomph mcp` | the same as tools: `memory_check`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` |
+| `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
+
+The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
+free, under 20 GB free disk, or right after jetsam kills; **critical** at pressure
+*critical*, under 5 GB free disk, or full swap on a nearly full disk. All of these
+commands work without the background logger too — they measure live — so the skill is
+useful even before you click Activate. Already installed an older version? The popup
+shows an **Update** button when the app carries a newer logger than the one installed.
+
 ## Files
 
 | Path | What |
@@ -186,6 +238,7 @@ app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Cha
 app/Info.plist
 build-app.sh                      builds oomph.app and bundles the daemon + scripts into it
 install.sh / uninstall.sh         install or remove the daemon (run as root)
+skills/oomph/SKILL.md             the Claude skill (raw link above)
 tools/selftest.py                 unprivileged end-to-end check of daemon + CLI (also run by CI)
 DESIGN.md                         the investigation and the design decisions
 docs/index.html                   the website (GitHub Pages, served from /docs)

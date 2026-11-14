@@ -307,6 +307,29 @@
   .chips .c b { display: block; margin-top: 10px; font-size: 15px; }
   .chips .c span { color: var(--muted); font-size: 13.5px; }
 
+  .card code { white-space: nowrap; }
+  /* claude section */
+  .prompt {
+    margin-top: 30px; position: relative;
+    background: var(--chrome); color: var(--chrome-text); border-radius: 14px;
+    padding: 18px 20px; box-shadow: var(--shadow);
+  }
+  .prompt .lbl { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; opacity: .6; }
+  .prompt pre { margin: 8px 0 0; font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .prompt pre .u { color: var(--green); }
+  .copy {
+    position: absolute; top: 14px; right: 14px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.2); background: rgba(255,255,255,.08); color: inherit;
+    border-radius: 7px; padding: 4px 10px; font: 600 12px -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+  .copy:hover { background: rgba(255,255,255,.16); }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+  .two > * { min-width: 0; }
+  .levels { display: grid; gap: 8px; margin-top: 10px; font-size: 14px; }
+  .levels div { display: flex; gap: 10px; align-items: baseline; }
+  .levels b { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12.5px; padding: 1px 8px; border-radius: 6px; color: #1c222c; flex: none; }
+
   /* numbers band */
   .numbers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 36px; }
   @media (max-width: 900px) { .numbers { grid-template-columns: repeat(2, 1fr); } }
@@ -389,6 +412,7 @@
             <span class="sub mono">github.com/kleinzeug/oomph</span>
           </a>
           <a class="btn ghost" href="#why">Why Macs run out of memory<span class="sub">when you walk away</span></a>
+          <a class="btn ghost" href="#claude">Make Claude oom-aware<span class="sub">one skill link</span></a>
         </div>
         <p class="hint">The page behind this text is a memory map. Scroll down to raise the pressure; move or click to allocate.</p>
       </div>
@@ -525,9 +549,39 @@
   </div>
 </section>
 
+<section id="claude">
+  <div class="wrap">
+    <span class="tc">0x05 · For long-running agents</span>
+    <h2>Make any Claude session oom-aware.</h2>
+    <p class="sub">Coding agents are exactly the workload that tips a Mac over: a build here, a container there, three sub-agents running test suites in parallel. <span class="wm">oomph</span> ships a Claude skill that teaches a session to check memory before heavy work and to back off when it's tight — and to tell you.</p>
+    <div class="prompt">
+      <div class="lbl">Paste into any Claude Code session</div>
+      <button class="copy" type="button" data-copy="Use this skill for the rest of the session:&#10;https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md">Copy</button>
+      <pre class="mono">Use this skill for the rest of the session:
+<span class="u">https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md</span></pre>
+    </div>
+    <div class="two">
+      <div class="card">
+        <h3>What the session does</h3>
+        <p>Checks <code>oomph check</code> at the start, before builds, test suites, containers or sub-agents, and every 20–30 minutes on long runs. Then:</p>
+        <div class="levels">
+          <div><b style="background:var(--green)">ok</b><span>carries on</span></div>
+          <div><b style="background:var(--yellow)">tight</b><span>lowers parallelism, starts no new containers or sub-agents, stops what it no longer needs</span></div>
+          <div><b style="background:var(--red)">critical</b><span>pauses, stops its own heavy processes, waits for memory to recover, tells you</span></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>For every session, once</h3>
+        <p><code>oomph setup-claude</code> installs the skill and registers the <span class="wm">oomph</span> MCP server — <code>memory_check</code>, <code>my_session</code>, <code>wait_for_memory</code>, <code>incidents</code> — for all sessions. Add <code>--hook</code> and a quiet hook after each shell command tells the model the moment memory turns tight. <code>--remove</code> undoes it.</p>
+        <p style="margin-top:10px"><code>oomph session</code> shows what the session itself is using — its whole process tree, biggest children first.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
-    <span class="tc">0x05 · The numbers</span>
+    <span class="tc">0x06 · The numbers</span>
     <h2>Watches everything, costs nothing.</h2>
     <div class="numbers">
       <div class="num"><div class="v">30<em>s</em> / 5<em>s</em></div><div class="k">sampling interval — calm / under pressure</div></div>
@@ -540,7 +594,7 @@
 
 <section>
   <div class="wrap">
-    <span class="tc">0x06 · Good to know</span>
+    <span class="tc">0x07 · Good to know</span>
     <h2>Honest answers.</h2>
     <div class="faq">
       <details>
@@ -562,6 +616,10 @@ open ~/Applications/oomph.app</pre>
       <details>
         <summary>What does it record, and where does it go?</summary>
         <p>Memory and disk figures, process names, app names and the working directories of agent sessions — never command-line arguments or file contents. Everything stays in <code>/Library/Logs/oomph</code> on your Mac. No network access, no telemetry.</p>
+      </details>
+      <details>
+        <summary>Can my Claude sessions use it?</summary>
+        <p>Yes — that's what the skill is for. Paste the skill link into a session, or run <code>oomph setup-claude</code> once to give every session the skill and the MCP tools. The commands work even without the background logger; they measure live.</p>
       </details>
       <details>
         <summary>What does it cost?</summary>
@@ -834,6 +892,15 @@ open ~/Applications/oomph.app</pre>
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () { draw(lastT); });
   new MutationObserver(function () { draw(lastT); })
     .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  document.querySelectorAll(".copy").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var t = b.getAttribute("data-copy");
+      (navigator.clipboard ? navigator.clipboard.writeText(t) : Promise.reject()).then(function () {
+        b.textContent = "Copied"; setTimeout(function () { b.textContent = "Copy"; }, 1500);
+      }, function () { b.textContent = "Select & copy"; });
+    });
+  });
 
   applyState();
   resize();

@@ -6,6 +6,15 @@
   oomph incidents
   oomph incident <id|latest> [--html]
   oomph html [--last 6h | --since ISO [--until ISO]] [-o FILE] [--open]
+
+for agents and scripts (work without the daemon too — they measure live):
+  oomph check [--json]              verdict ok / tight / critical + advice; exit 0 / 1 / 2
+  oomph session [--json] [--pid N]  memory of the Claude session this runs in (its whole process tree)
+  oomph wait [--timeout 10m] [--free 4G]   block until memory is ok again; exit 1 on timeout
+  oomph status --json               the latest full sample
+  oomph hook                        Claude Code PostToolUse hook: silent when ok, warns when tight
+  oomph mcp                         MCP server over stdio (tools: memory_check, my_session, ...)
+  oomph setup-claude [--hook] [--remove]   install the skill + register the MCP server for Claude Code
 """
 import datetime
 import glob
@@ -18,7 +27,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
 
 # What the daemon streams from the unified log. On macOS 27 memory kills show up as
@@ -537,13 +546,431 @@ def cmd_html(args):
     return 0
 
 
+# ------------------------------------------------------------- agent protocol
+HERE = os.path.dirname(os.path.realpath(__file__))
+SKILL_URL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
+LEVELS = ("ok", "tight", "critical")
+_oomphd = None
+
+
+def _daemon_module():
+    global _oomphd
+    if _oomphd is None:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import oomphd as m  # noqa
+        _oomphd = m
+    return _oomphd
+
+
+def _daemon_sample(max_age=45):
+    """The daemon's latest sample if it is fresh, else None."""
+    try:
+        c = json.load(open(os.path.join(LOG_DIR, "current.json")))
+        if time.time() - c["t"] <= max_age:
+            c["source"] = "daemon"
+            return c
+    except Exception:
+        pass
+    return None
+
+
+def live_sample(with_procs=True):
+    d = _daemon_module()
+    s = {"t": round(time.time(), 1), "iso": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+         "source": "live"}
+    s.update(d.system_memory())
+    s["away"] = {k: v for k, v in d.away_state().items() if k in ("idle_s", "display_on", "locked", "sleep_preventers")}
+    if with_procs:
+        top, groups, sessions = d.summarize_procs(d.collect_procs())
+        s["top"], s["groups"], s["claude"] = top, groups, sessions
+    return s
+
+
+def sample(with_procs=True):
+    return _daemon_sample() or live_sample(with_procs)
+
+
+def free_physical_gb(s):
+    """Activity Monitor's figure: Physical Memory - (App Memory + Wired + Compressed)."""
+    return round(max(0.0, s["ram_gb"] - s["app_gb"] - s["wired_gb"] - s["compressed_gb"]), 1)
+
+
+ADVICE = {
+    "ok": "Memory is fine. Go ahead; check again before the next memory-heavy step "
+          "(big builds, test suites, containers, parallel jobs or sub-agents).",
+    "tight": "Memory is tight. Don't start memory-heavy work in parallel: lower build/test parallelism (-j1/-j2), "
+             "start no new containers, VMs, browsers or sub-agents, and stop processes this session started and no "
+             "longer needs. Run `oomph check` again before the next heavy step.",
+    "critical": "Memory is critical. Start nothing heavy. Stop or pause memory-heavy processes this session started "
+                "(see `oomph session`), then `oomph wait` until it recovers, and tell the user what you did. "
+                "If disk space is the problem, ask the user to free some — swap cannot grow on a full disk.",
+}
+
+
+def verdict(s):
+    ram = s.get("ram_gb") or 0
+    free = free_physical_gb(s)
+    disk = s.get("disk_free_gb", 999)
+    swap_full = s.get("swap_total_gb", 0) > 0 and s.get("swap_used_gb", 0) >= 0.9 * s["swap_total_gb"]
+    level, reasons = 0, []
+
+    def bump(lv, why):
+        nonlocal level
+        level = max(level, lv)
+        reasons.append(why)
+
+    p = s.get("pressure", 1)
+    if p >= 4:
+        bump(2, "macOS memory pressure is CRITICAL")
+    elif p >= 2:
+        bump(1, "macOS memory pressure is WARNING")
+    if disk < 5:
+        bump(2, "only %.0f GB disk free — swap cannot grow" % disk)
+    elif disk < 20:
+        bump(1, "only %.0f GB disk free — swap may not be able to grow" % disk)
+    if swap_full and disk < 20:
+        bump(2, "swap is full (%.1f/%.1f GB) and the disk is too full to add more" % (s["swap_used_gb"], s["swap_total_gb"]))
+    if ram and free < 0.05 * ram:
+        bump(1, "only %.1f GB physical memory free" % free)
+    if s.get("jetsam_kills"):
+        bump(1, "macOS just killed %d processes for memory" % s["jetsam_kills"])
+    lv = LEVELS[level]
+    return {
+        "level": lv, "exit_code": level, "reasons": reasons, "advice": ADVICE[lv],
+        "free_gb": free, "ram_gb": ram, "pressure": PRESSURE.get(p, p),
+        "swap_used_gb": s.get("swap_used_gb"), "swap_total_gb": s.get("swap_total_gb"),
+        "disk_free_gb": disk, "source": s.get("source", "daemon"), "at": s.get("iso"),
+    }
+
+
+def verdict_line(v):
+    line = "oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
+        v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
+        v["swap_total_gb"] or 0, v["disk_free_gb"])
+    if v["reasons"]:
+        line += "\n  why: " + "; ".join(v["reasons"])
+    return line + "\n  advice: " + v["advice"]
+
+
+def find_session(pid=None):
+    """The Claude Code session (outermost `claude` process) that `pid` (default: our parent) runs in."""
+    d = _daemon_module()
+    procs = d.collect_procs()
+    cur = pid or os.getppid()
+    root, hops = None, 0
+    while cur in procs and hops < 64:
+        if procs[cur]["name"] == "claude":
+            root = cur  # keep walking: the outermost claude is the session
+        cur, hops = procs[cur]["ppid"], hops + 1
+    if root is None:
+        return None
+    children = {}
+    for p in procs.values():
+        children.setdefault(p["ppid"], []).append(p["pid"])
+    stack, members = [root], []
+    while stack:
+        x = stack.pop()
+        members.append(x)
+        stack.extend(children.get(x, []))
+    mem = [procs[m] for m in members if m in procs]
+    mem.sort(key=lambda p: p["fp"], reverse=True)
+    total = sum(p["fp"] for p in mem)
+    MBf = 1024 * 1024
+    return {
+        "pid": root, "cwd": d.proc_cwd(root), "total_mb": round(total / MBf), "processes": len(mem),
+        "own_mb": round(procs[root]["fp"] / MBf),
+        "biggest": [{"pid": p["pid"], "name": p["name"], "mb": round(p["fp"] / MBf)}
+                    for p in mem if p["pid"] != root][:8],
+    }
+
+
+def cmd_check(args):
+    v = verdict(sample(with_procs=False))
+    print(json.dumps(v) if "--json" in args else verdict_line(v))
+    return v["exit_code"]
+
+
+def cmd_session(args):
+    pid = int(args[args.index("--pid") + 1]) if "--pid" in args else None
+    ses = find_session(pid)
+    if "--json" in args:
+        print(json.dumps(ses))
+        return 0 if ses else 1
+    if not ses:
+        print("oomph: not running inside a Claude Code session (no `claude` ancestor process)")
+        return 1
+    print("session  pid %s · %s" % (ses["pid"], ses["cwd"]))
+    print("memory   %.1f GB in %d processes (claude itself %.1f GB)" % (
+        ses["total_mb"] / 1024, ses["processes"], ses["own_mb"] / 1024))
+    for b in ses["biggest"]:
+        print("  %7d MB  %-30s pid %s" % (b["mb"], b["name"][:30], b["pid"]))
+    return 0
+
+
+def _parse_gb(x):
+    x = x.strip().upper().rstrip("B")
+    return float(x[:-1]) if x.endswith("G") else float(x)
+
+
+def wait_for_memory(timeout_s=600, min_free_gb=0.0, quiet=False):
+    start = time.time()
+    last = None
+    while True:
+        v = verdict(live_sample(with_procs=False))
+        ok = v["level"] == "ok" and v["free_gb"] >= min_free_gb
+        if ok:
+            return True, v, round(time.time() - start)
+        if not quiet and (last is None or time.time() - last > 60):
+            last = time.time()
+            print("oomph: waiting — %s, %.1fG free" % (v["level"], v["free_gb"]), flush=True)
+        if time.time() - start >= timeout_s:
+            return False, v, round(time.time() - start)
+        time.sleep(5)
+
+
+def cmd_wait(args):
+    timeout = parse_dur(args[args.index("--timeout") + 1]) if "--timeout" in args else 600
+    need = _parse_gb(args[args.index("--free") + 1]) if "--free" in args else 0.0
+    ok, v, waited = wait_for_memory(timeout, need)
+    print(("oomph: ok after %ds" if ok else "oomph: still %s after %ds — giving up") % (
+        (waited,) if ok else (v["level"], waited)))
+    if not ok:
+        print(verdict_line(v))
+    return 0 if ok else 1
+
+
+def cmd_status_json():
+    print(json.dumps(sample()))
+    return 0
+
+
+def cmd_hook(args):
+    """PostToolUse hook. Silent (exit 0) when memory is ok. When tight/critical, prints a short
+    warning to stderr and exits 2, which Claude Code shows to the model. Warns again only when
+    the level changes or after 10 minutes."""
+    try:
+        sys.stdin.read()  # the hook payload; not needed
+    except Exception:
+        pass
+    v = verdict(sample(with_procs=False))
+    state = os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-hook-%d.json" % os.getppid())
+    try:
+        prev = json.load(open(state))
+    except Exception:
+        prev = {}
+    if v["level"] == "ok":
+        if prev.get("level") not in (None, "ok"):
+            json.dump({"level": "ok", "t": time.time()}, open(state, "w"))
+        return 0
+    if prev.get("level") == v["level"] and time.time() - prev.get("t", 0) < 600:
+        return 0
+    json.dump({"level": v["level"], "t": time.time()}, open(state, "w"))
+    sys.stderr.write(verdict_line(v) + "\n")
+    return 2
+
+
+# ------------------------------------------------------------------- MCP
+MCP_TOOLS = [
+    {"name": "memory_check",
+     "description": "Verdict on this Mac's memory right now: level ok / tight / critical, the reasons, free physical "
+                    "memory, pressure, swap and free disk, plus advice on what to do. Call it before memory-heavy "
+                    "work (builds, test suites, containers, parallel jobs, sub-agents) and periodically in long runs.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "my_session",
+     "description": "Memory used by the Claude Code session this server belongs to: its whole process tree, total, "
+                    "and the biggest child processes (pid, name, MB). Use it to find what to stop when memory is tight.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "memory_status",
+     "description": "The full latest sample: system memory breakdown, swap, disk, idle state, top processes, top apps "
+                    "and all Claude sessions.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "wait_for_memory",
+     "description": "Block until memory is back to ok (and optionally at least min_free_gb free), polling every 5 s, "
+                    "up to timeout_s (max 300). Returns whether it recovered and the final verdict.",
+     "inputSchema": {"type": "object", "properties": {
+         "timeout_s": {"type": "integer", "minimum": 5, "maximum": 300, "default": 120},
+         "min_free_gb": {"type": "number", "minimum": 0, "default": 0}}}},
+    {"name": "incidents",
+     "description": "Recorded memory incidents (needs the oomph daemon): id, start, triggers, peak swap, minimum free "
+                    "disk, jetsam kills. Use after unexplained process deaths or an 'out of application memory' dialog.",
+     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}}},
+    {"name": "incident",
+     "description": "Full summary of one incident ('latest' or an id): timeline facts, biggest risers, processes and "
+                    "Claude sessions at the peak, most-killed services, and the path of its HTML report.",
+     "inputSchema": {"type": "object", "properties": {"id": {"type": "string", "default": "latest"}}}},
+]
+
+
+def _mcp_call(name, a):
+    if name == "memory_check":
+        return verdict(sample(with_procs=False))
+    if name == "my_session":
+        return find_session() or {"error": "this MCP server is not running under a Claude Code session"}
+    if name == "memory_status":
+        return sample()
+    if name == "wait_for_memory":
+        ok, v, waited = wait_for_memory(min(int(a.get("timeout_s", 120)), 300), float(a.get("min_free_gb", 0)), quiet=True)
+        return {"recovered": ok, "waited_s": waited, "verdict": v}
+    if name == "incidents":
+        incs = list_incidents()[-int(a.get("limit", 10)):]
+        return [{"id": i["id"], "start": i.get("start_iso"), "end": i.get("end_iso"), "open": i.get("open"),
+                 "triggers": [r["desc"] for r in i.get("reasons", [])][:5],
+                 "max_swap_used_gb": (i.get("summary") or {}).get("max_swap_used_gb"),
+                 "min_disk_free_gb": (i.get("summary") or {}).get("min_disk_free_gb"),
+                 "jetsam_kills": (i.get("summary") or {}).get("jetsam_kills")} for i in reversed(incs)]
+    if name == "incident":
+        incs = list_incidents()
+        ident = a.get("id", "latest")
+        inc = (incs[-1] if incs else None) if ident == "latest" else next((i for i in incs if i["id"] == ident), None)
+        if not inc:
+            return {"error": "no such incident (is the oomph daemon installed?)"}
+        out = dict(inc)
+        out["report_html"] = os.path.join(inc["dir"], "report.html")
+        return out
+    raise KeyError(name)
+
+
+def cmd_mcp():
+    """Minimal MCP server (JSON-RPC 2.0, newline-delimited over stdio)."""
+    def send(msg):
+        sys.stdout.write(json.dumps(msg) + "\n")
+        sys.stdout.flush()
+
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except ValueError:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        rid, method, params = req.get("id"), req.get("method"), req.get("params") or {}
+        if rid is None:
+            continue  # notification (e.g. notifications/initialized)
+        try:
+            if method == "initialize":
+                result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                          "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "oomph", "version": VERSION},
+                          "instructions": "oomph reports this Mac's memory, swap and disk. Call memory_check before "
+                                          "memory-heavy work and back off when it says tight or critical."}
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = {"tools": MCP_TOOLS}
+            elif method == "tools/call":
+                try:
+                    data = _mcp_call(params.get("name"), params.get("arguments") or {})
+                    result = {"content": [{"type": "text", "text": json.dumps(data, indent=1)}], "isError": False}
+                except KeyError:
+                    send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown tool"}})
+                    continue
+                except Exception as e:
+                    result = {"content": [{"type": "text", "text": "oomph error: %r" % e}], "isError": True}
+            else:
+                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
+                continue
+            send({"jsonrpc": "2.0", "id": rid, "result": result})
+        except Exception as e:
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": repr(e)}})
+    return 0
+
+
+# ------------------------------------------------------------ claude setup
+def _skill_source():
+    for p in (os.path.join(HERE, "skills", "oomph", "SKILL.md"),                 # installed / app bundle
+              os.path.join(os.path.dirname(HERE), "skills", "oomph", "SKILL.md")):  # repo checkout
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def cmd_setup_claude(args):
+    import shutil
+    home = os.path.expanduser("~")
+    dest_dir = os.path.join(home, ".claude", "skills", "oomph")
+    settings = os.path.join(home, ".claude", "settings.json")
+    me = "/usr/local/bin/oomph" if os.path.exists("/usr/local/bin/oomph") else os.path.realpath(__file__)
+    claude = shutil.which("claude")
+    hook_cmd = me + " hook"
+
+    def edit_settings(add):
+        try:
+            cfg = json.load(open(settings))
+        except FileNotFoundError:
+            cfg = {}
+        hooks = cfg.setdefault("hooks", {})
+        post = [h for h in hooks.get("PostToolUse", [])
+                if not any(x.get("command", "").endswith(" hook") and "oomph" in x.get("command", "")
+                           for x in h.get("hooks", []))]
+        if add:
+            post.append({"matcher": "Bash", "hooks": [{"type": "command", "command": hook_cmd, "timeout": 10}]})
+        if post:
+            hooks["PostToolUse"] = post
+        else:
+            hooks.pop("PostToolUse", None)
+        if not hooks:
+            cfg.pop("hooks", None)
+        if os.path.exists(settings):
+            shutil.copy(settings, settings + ".oomph-backup")
+        os.makedirs(os.path.dirname(settings), exist_ok=True)
+        with open(settings, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.write("\n")
+
+    if "--remove" in args:
+        shutil.rmtree(dest_dir, ignore_errors=True)
+        print("removed skill   %s" % dest_dir)
+        if claude:
+            subprocess.run([claude, "mcp", "remove", "oomph", "--scope", "user"], capture_output=True)
+            print("removed MCP     oomph (user scope)")
+        edit_settings(False)
+        print("removed hook    (if it was installed) from %s" % settings)
+        return 0
+
+    src = _skill_source()
+    if not src:
+        print("oomph: SKILL.md not found next to this script; get it from %s" % SKILL_URL)
+        return 1
+    os.makedirs(dest_dir, exist_ok=True)
+    shutil.copy(src, os.path.join(dest_dir, "SKILL.md"))
+    print("installed skill %s/SKILL.md" % dest_dir)
+    if claude:
+        subprocess.run([claude, "mcp", "remove", "oomph", "--scope", "user"], capture_output=True)
+        r = subprocess.run([claude, "mcp", "add", "--scope", "user", "oomph", "--", me, "mcp"],
+                           capture_output=True, text=True)
+        print(("registered MCP  oomph → %s mcp (user scope)" % me) if r.returncode == 0 else
+              ("MCP registration failed: %s" % (r.stderr or r.stdout).strip()))
+    else:
+        print("claude CLI not found; register the MCP server yourself:\n  claude mcp add --scope user oomph -- %s mcp" % me)
+    if "--hook" in args:
+        edit_settings(True)
+        print("added hook      PostToolUse(Bash) → %s  (backup: %s.oomph-backup)" % (hook_cmd, settings))
+    print("\nNew Claude Code sessions are oom-aware now. Already-running sessions: tell them to use the oomph skill.")
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
     c, rest = argv[0], argv[1:]
     if c == "status":
-        return cmd_status()
+        return cmd_status_json() if "--json" in rest else cmd_status()
+    if c == "check":
+        return cmd_check(rest)
+    if c == "session":
+        return cmd_session(rest)
+    if c == "wait":
+        return cmd_wait(rest)
+    if c == "hook":
+        return cmd_hook(rest)
+    if c == "mcp":
+        return cmd_mcp()
+    if c == "setup-claude":
+        return cmd_setup_claude(rest)
     if c == "report":
         return cmd_report(rest)
     if c == "incidents":
