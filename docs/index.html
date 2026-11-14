@@ -1,0 +1,850 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oomph — walk away, come back to answers</title>
+<meta name="description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — so the next “out of application memory” dialog comes with an explanation. Open source, free.">
+<link rel="canonical" href="https://kleinzeug.github.io/oomph/">
+
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="oomph">
+<meta property="og:title" content="oomph — walk away, come back to answers">
+<meta property="og:description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — so the next “out of application memory” dialog comes with an explanation.">
+<meta property="og:url" content="https://kleinzeug.github.io/oomph/">
+<meta property="og:image" content="https://kleinzeug.github.io/oomph/social-preview.jpg">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="The oomph chip icon showing 4.2G free, the tagline “Walk away. Come back to answers.” over a memory map that fills up from left to right.">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="oomph — walk away, come back to answers">
+<meta name="twitter:description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away.">
+<meta name="twitter:image" content="https://kleinzeug.github.io/oomph/social-preview.jpg">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 18'%3E%3Cg fill='%23272c36'%3E%3Crect x='6.15' y='0.5' width='2.2' height='2'/%3E%3Crect x='10.65' y='0.5' width='2.2' height='2'/%3E%3Crect x='15.15' y='0.5' width='2.2' height='2'/%3E%3Crect x='19.65' y='0.5' width='2.2' height='2'/%3E%3Crect x='6.15' y='15.5' width='2.2' height='2'/%3E%3Crect x='10.65' y='15.5' width='2.2' height='2'/%3E%3Crect x='15.15' y='15.5' width='2.2' height='2'/%3E%3Crect x='19.65' y='15.5' width='2.2' height='2'/%3E%3C/g%3E%3Crect x='3.3' y='3.3' width='21.4' height='11.4' rx='1.2' fill='%238fdb99' stroke='%23272c36' stroke-width='1.6'/%3E%3C/svg%3E">
+<style>
+  :root {
+    --ink: #272c36;
+    --paper: #e9eef4;
+    --green: #8fdb99;      /* the chip: pressure normal */
+    --yellow: #fdd65a;     /* pressure warning */
+    --red: #fa736b;        /* pressure critical */
+    --signal: #2f9a5c;     /* readable green for text/dots on light paper */
+    --accent: #2f6bef;
+    --muted: #56657a;
+    --ground: var(--paper);
+    --surface: #fbfcfe;
+    --surface-2: #d8e4ee;
+    --text: #1c222c;
+    --line: #c6d3e0;
+    --chrome: var(--ink);
+    --chrome-text: #eceff3;
+    --shadow: 0 18px 50px -18px rgba(23, 27, 34, .35);
+    --c-wired: #8e8e93; --c-app: #3b82c4; --c-comp: #e0a030; --c-swap: #d0503c;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground: #04060b;
+      --surface: #0b1019;
+      --surface-2: #070c13;
+      --text: #e2e9f2;
+      --signal: #7fd894;
+      --accent: #4b8bff;
+      --muted: #7c8ea5;
+      --line: #1c2632;
+      --chrome: #272c36;
+      --chrome-text: #eceff3;
+      --shadow: 0 18px 50px -18px rgba(0, 0, 0, .7);
+      --c-wired: #6e6e74; --c-app: #5b9fe0; --c-comp: #e8b450; --c-swap: #ef6b56;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #04060b; --surface: #0b1019; --surface-2: #070c13; --text: #e2e9f2;
+    --signal: #7fd894; --accent: #4b8bff; --muted: #7c8ea5; --line: #1c2632;
+    --chrome: #272c36; --chrome-text: #eceff3; --shadow: 0 18px 50px -18px rgba(0, 0, 0, .7);
+    --c-wired: #6e6e74; --c-app: #5b9fe0; --c-comp: #e8b450; --c-swap: #ef6b56;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; }
+  body {
+    background: var(--ground);
+    color: var(--text);
+    font: 400 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wm { font-style: italic; font-weight: 800; }
+  .mono {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+  a { color: inherit; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 0 24px; }
+  @media (max-width: 480px) { .wrap { padding: 0 16px; } }
+
+  /* ---- address eyebrows: the page reads like a memory map ---- */
+  .tc {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--muted);
+  }
+  .tc::before {
+    content: ""; width: 12px; height: 8px; border-radius: 1.5px;
+    background: var(--green); box-shadow: 0 0 0 1.4px var(--ink) inset; flex: none;
+  }
+
+  /* ---- live memory-map background ---- */
+  #memmap {
+    position: fixed; inset: 0; width: 100%; height: 100%;
+    z-index: -1; pointer-events: none;
+  }
+
+  /* ---------------- hero ---------------- */
+  .hero { padding: 40px 0 72px; position: relative; }
+  .menubar {
+    position: relative;
+    display: flex; align-items: center; gap: 18px;
+    background: var(--chrome); color: var(--chrome-text);
+    border-radius: 10px; padding: 6px 14px;
+    font-size: 13px; box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .menubar .apple { font-size: 15px; }
+  .menubar .appname { font-weight: 600; }
+  .menubar .spacer { flex: 1; }
+  .menubar .glyph { opacity: .55; white-space: nowrap; }
+  @media (max-width: 560px) { .menubar .hide-s { display: none; } }
+  .chipbtn {
+    all: unset; cursor: pointer; display: inline-flex; align-items: center;
+    padding: 2px 4px; border-radius: 5px; color: var(--chrome-text);
+  }
+  .chipbtn:hover { background: rgba(255, 255, 255, .12); }
+  .chipbtn:focus-visible { outline: 2px solid var(--accent); }
+  .chipbtn svg { width: 39px; height: 25px; display: block; }
+
+  .hero-grid {
+    position: relative;
+    display: grid; grid-template-columns: 1.15fr .85fr; gap: 40px;
+    align-items: start; margin-top: 10px;
+  }
+  @media (max-width: 820px) { .hero-grid { grid-template-columns: 1fr; } }
+
+  /* drawn recreation of the oomph popup */
+  .popup {
+    justify-self: end;
+    width: 100%; max-width: 360px; margin-top: 2px;
+    background: color-mix(in srgb, var(--surface) 88%, transparent);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    border: 1px solid var(--line);
+    border-radius: 12px; padding: 14px;
+    font-size: 13px; line-height: 1.35;
+    box-shadow: var(--shadow);
+  }
+  @media (max-width: 820px) { .popup { justify-self: start; } }
+  .popup .head { display: flex; align-items: center; gap: 10px; }
+  .popup .head b { font-size: 14px; }
+  .popup .head .st { color: var(--muted); font-size: 11.5px; }
+  .popup .pill {
+    margin-left: auto; font-size: 11px; font-weight: 700; padding: 2px 9px; border-radius: 999px;
+    background: color-mix(in srgb, var(--green) 35%, transparent);
+  }
+  .popup .pill.warn { background: color-mix(in srgb, var(--yellow) 45%, transparent); }
+  .popup .pill.crit { background: color-mix(in srgb, var(--red) 40%, transparent); }
+  .popup .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px 6px; margin: 12px 0 10px; }
+  .popup .stats .v { font-weight: 650; font-size: 13px; }
+  .popup .stats .k { color: var(--muted); font-size: 10px; }
+  .popup .charthead { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 7px; overflow: hidden; }
+  .seg button {
+    all: unset; cursor: pointer; padding: 1px 10px; font-size: 11px; color: var(--text);
+  }
+  .seg button[aria-pressed="true"] { background: var(--surface-2); font-weight: 600; }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .popup svg.chart { width: 100%; height: auto; display: block; margin-top: 6px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 10px; color: var(--muted); margin-top: 4px; }
+  .legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: -0.5px; }
+  .popup .incs { margin-top: 10px; }
+  .popup .incs .k { color: var(--muted); font-size: 11px; }
+  .popup .inc { display: flex; gap: 8px; align-items: flex-start; padding: 4px 4px; border-radius: 6px; }
+  .popup .inc:hover { background: var(--surface-2); }
+  .popup .inc .d { width: 6px; height: 6px; border-radius: 50%; background: var(--red); margin-top: 6px; flex: none; }
+  .popup .inc .t { font-weight: 600; font-size: 11.5px; }
+  .popup .inc .s { color: var(--muted); font-size: 10.5px; }
+  .popup .inc .n { margin-left: auto; color: var(--c-swap); font-size: 10.5px; white-space: nowrap; }
+  .popup .foot { display: flex; gap: 6px; align-items: center; margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 11px; }
+  .popup .foot span { border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px; }
+  .popup .foot .sp { flex: 1; border: none; }
+
+  .hero h1 {
+    margin: 40px 0 0;
+    font-size: clamp(40px, 6.5vw, 64px);
+    line-height: 1.03; font-weight: 800; letter-spacing: -.025em;
+    text-wrap: balance;
+  }
+  .hero h1 .dot { color: var(--signal); }
+  .hero p.lede {
+    margin: 22px 0 0; max-width: 34em;
+    font-size: 19px; color: var(--muted); text-wrap: pretty;
+  }
+  .statpill {
+    display: inline-flex; align-items: center; gap: 10px;
+    margin-top: 28px; max-width: 100%;
+    background: var(--chrome); color: var(--chrome-text);
+    border-radius: 999px; padding: 9px 18px;
+    font-size: 14px; box-shadow: var(--shadow);
+  }
+  .statpill .led { width: 9px; height: 9px; border-radius: 50%; background: var(--green); flex: none; box-shadow: 0 0 10px var(--green); }
+  .statpill #tick { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .cta-row { display: flex; gap: 12px; margin-top: 28px; flex-wrap: wrap; }
+  .btn {
+    display: inline-block; padding: 12px 22px; border-radius: 10px;
+    font-weight: 600; font-size: 15px; text-decoration: none;
+    border: 1px solid transparent;
+    transition: transform .12s ease, box-shadow .12s ease, background-color .12s ease;
+  }
+  .btn.primary {
+    background: var(--accent); color: #fff;
+    box-shadow: 0 6px 18px -6px color-mix(in srgb, var(--accent) 75%, transparent), inset 0 1px 0 rgba(255, 255, 255, .18);
+  }
+  .btn.primary:hover {
+    background: color-mix(in srgb, var(--accent) 88%, white);
+    transform: translateY(-1px);
+  }
+  .btn.primary:active { transform: translateY(0); }
+  .btn.ghost { border-color: var(--line); color: var(--muted); background: color-mix(in srgb, var(--surface) 60%, transparent); }
+  .btn.ghost:hover { border-color: var(--muted); }
+  .btn .label { display: flex; align-items: center; gap: 8px; }
+  .btn .label svg { width: 17px; height: 17px; fill: currentColor; flex: none; }
+  .btn .sub { display: block; font-size: 11.5px; font-weight: 400; opacity: .8; margin-top: 2px; }
+  .btn.primary .sub { color: #fff; opacity: .75; }
+  .hint { margin-top: 14px; font-size: 13px; color: var(--muted); }
+
+  /* ---------------- sections ---------------- */
+  section { padding: 64px 0; }
+  section + section { border-top: 1px solid var(--line); }
+  h2 {
+    margin: 14px 0 10px;
+    font-size: clamp(26px, 3.6vw, 34px);
+    font-weight: 800; letter-spacing: -.02em; line-height: 1.15;
+    text-wrap: balance;
+  }
+  .sub { color: var(--muted); max-width: 40em; margin: 0; text-wrap: pretty; }
+
+  /* pain strip */
+  .pain {
+    display: grid; grid-template-columns: 1fr auto 1fr; gap: 20px;
+    align-items: center; margin-top: 34px;
+  }
+  @media (max-width: 760px) { .pain { grid-template-columns: 1fr; } .pain .arrow { transform: rotate(90deg); justify-self: center; } }
+  .pain .before, .pain .after {
+    border: 1px solid var(--line); border-radius: 14px; padding: 20px 22px;
+    background: var(--surface);
+  }
+  .pain .before { color: var(--muted); }
+  .dialog { display: flex; gap: 14px; align-items: flex-start; }
+  .dialog .ico { width: 34px; height: 34px; border-radius: 8px; background: var(--surface-2); display: grid; place-items: center; flex: none; font-size: 18px; }
+  .dialog b { color: var(--text); display: block; font-size: 15px; }
+  .dialog p { margin: 4px 0 0; font-size: 13.5px; }
+  .pain .before .then { margin-top: 14px; font-size: 14px; line-height: 1.9; }
+  .pain .before s { opacity: .8; }
+  .pain .after { border-color: color-mix(in srgb, var(--signal) 50%, var(--line)); }
+  .pain .arrow { color: var(--muted); font-size: 22px; }
+  .pain .after .big { font-size: 19px; font-weight: 700; }
+  .pain .after .mono { color: var(--muted); font-size: 13.5px; line-height: 1.75; }
+  .pain .after .mono em { color: var(--c-swap); font-style: normal; font-weight: 600; }
+
+  /* features */
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-top: 36px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 620px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 16.5px; font-weight: 700; }
+  .card p { margin: 0; font-size: 14.5px; color: var(--muted); }
+  .card code, .faq code, .sub code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: .86em; background: var(--surface-2);
+    border: 1px solid var(--line); border-radius: 5px; padding: 0 5px;
+  }
+
+  /* why: the chain of events */
+  .chain {
+    list-style: none; padding: 0; margin: 36px 0 0;
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 10px; counter-reset: step;
+  }
+  @media (max-width: 900px) { .chain { grid-template-columns: 1fr; } }
+  .chain li {
+    position: relative; background: var(--surface); border: 1px solid var(--line);
+    border-radius: 14px; padding: 18px 16px 16px; font-size: 14px; color: var(--muted);
+  }
+  .chain li b { display: block; color: var(--text); font-size: 15px; margin-bottom: 6px; }
+  .chain li::before {
+    counter-increment: step; content: "0x0" counter(step);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px;
+    color: var(--muted); display: block; margin-bottom: 6px; letter-spacing: .08em;
+  }
+  .chain li .bar { height: 6px; border-radius: 3px; margin-top: 12px; background: var(--surface-2); overflow: hidden; }
+  .chain li .bar i { display: block; height: 100%; border-radius: 3px; }
+  .chain li:last-child { border-color: color-mix(in srgb, var(--c-swap) 55%, var(--line)); }
+  .callout {
+    margin-top: 22px; display: flex; gap: 14px; align-items: center;
+    background: var(--chrome); color: var(--chrome-text);
+    border-radius: 14px; padding: 18px 22px; box-shadow: var(--shadow);
+  }
+  .callout .big { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 26px; font-weight: 700; white-space: nowrap; }
+  .callout .big em { color: var(--green); font-style: normal; }
+  .callout p { margin: 0; font-size: 14.5px; opacity: .85; }
+  @media (max-width: 560px) { .callout { flex-direction: column; align-items: flex-start; } }
+
+  /* icon legend */
+  .chips { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 30px; }
+  @media (max-width: 760px) { .chips { grid-template-columns: repeat(2, 1fr); } }
+  .chips .c { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 18px; }
+  .chips .c .well { background: var(--chrome); color: var(--chrome-text); border-radius: 8px; padding: 10px; display: grid; place-items: center; }
+  .chips .c svg { width: 56px; height: 36px; }
+  .chips .c b { display: block; margin-top: 10px; font-size: 15px; }
+  .chips .c span { color: var(--muted); font-size: 13.5px; }
+
+  /* numbers band */
+  .numbers { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-top: 36px; }
+  @media (max-width: 900px) { .numbers { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 420px) { .numbers { grid-template-columns: 1fr; } }
+  .num { background: var(--chrome); color: var(--chrome-text); border-radius: 14px; padding: 22px 20px; }
+  .num .v {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 26px; font-weight: 700; letter-spacing: -.02em;
+  }
+  .num .v em { color: var(--green); font-style: normal; }
+  .num .k { font-size: 13px; opacity: .65; margin-top: 6px; }
+
+  /* faq */
+  .faq { margin-top: 30px; display: grid; gap: 10px; max-width: 760px; }
+  details { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px 20px; }
+  summary { cursor: pointer; font-weight: 600; font-size: 15.5px; }
+  details p { color: var(--muted); font-size: 14.5px; margin: 10px 0 2px; }
+  pre.cmd {
+    margin: 12px 0 2px; padding: 12px 14px; border-radius: 10px; overflow-x: auto;
+    background: var(--chrome); color: var(--chrome-text); font-size: 13px; line-height: 1.6;
+  }
+
+  /* footer */
+  footer { border-top: 1px solid var(--line); padding: 44px 0 64px; font-size: 13.5px; color: var(--muted); }
+  footer .cols { display: flex; gap: 40px; flex-wrap: wrap; justify-content: space-between; }
+  footer .brand { display: flex; align-items: center; gap: 12px; color: var(--text); font-weight: 700; font-size: 16px; }
+  footer .brand svg { width: 52px; height: 34px; color: var(--text); }
+  footer p { max-width: 46em; text-wrap: pretty; }
+
+  /* never let a long mono line widen the page on phones */
+  .hero-grid > *, .pain > *, .grid > *, .chain > *, .chips > *, .numbers > * { min-width: 0; }
+  .mono, pre.cmd { overflow-wrap: anywhere; }
+  pre.cmd { white-space: pre-wrap; }
+  .statpill { max-width: 100%; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { animation: none !important; transition: none !important; }
+  }
+</style>
+
+<canvas id="memmap" aria-hidden="true"></canvas>
+
+<!-- the chip, as drawn by the app: 4 feet top and bottom, label punched out -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <g id="feet" fill="currentColor">
+      <rect x="6.15" y="0.5" width="2.2" height="2"/><rect x="10.65" y="0.5" width="2.2" height="2"/>
+      <rect x="15.15" y="0.5" width="2.2" height="2"/><rect x="19.65" y="0.5" width="2.2" height="2"/>
+      <rect x="6.15" y="15.5" width="2.2" height="2"/><rect x="10.65" y="15.5" width="2.2" height="2"/>
+      <rect x="15.15" y="15.5" width="2.2" height="2"/><rect x="19.65" y="15.5" width="2.2" height="2"/>
+    </g>
+  </defs>
+</svg>
+
+<div class="hero">
+  <div class="wrap">
+    <div class="menubar" role="img" aria-label="macOS menu bar with the oomph chip">
+      <span class="apple"></span>
+      <span class="appname">Terminal</span>
+      <span class="glyph hide-s">Shell</span><span class="glyph hide-s">Edit</span><span class="glyph hide-s">View</span>
+      <span class="spacer"></span>
+      <button class="chipbtn" id="chipbtn" type="button" aria-label="oomph icon — click to cycle through its states">
+        <svg viewBox="0 0 28 18" id="chip-hero"></svg>
+      </button>
+      <span class="glyph mono" id="clock">Fri 18:28</span>
+    </div>
+
+    <div class="hero-grid">
+      <div>
+        <h1>Walk away<span class="dot">.</span><br>Come back to answers<span class="dot">.</span></h1>
+        <p class="lede"><span class="wm">oomph</span> is a tiny macOS menu-bar memory monitor that keeps a <strong>papertrail while you're away</strong> — so the next <em>“Your system has run out of application memory”</em> comes with an explanation: what filled RAM, swap and disk, and when.</p>
+        <div class="statpill mono" aria-label="live sampler readout">
+          <span class="led" id="led"></span>
+          <span id="tick">sample #1 · 12.4G free · swap 2.8/4G</span>
+        </div>
+        <div class="cta-row">
+          <a class="btn primary" href="https://github.com/kleinzeug/oomph">
+            <span class="label"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>Build it from source</span>
+            <span class="sub mono">github.com/kleinzeug/oomph</span>
+          </a>
+          <a class="btn ghost" href="#why">Why Macs run out of memory<span class="sub">when you walk away</span></a>
+        </div>
+        <p class="hint">The page behind this text is a memory map. Scroll down to raise the pressure; move or click to allocate.</p>
+      </div>
+
+      <div class="popup" role="group" aria-label="Recreation of the oomph popup">
+        <div class="head">
+          <svg viewBox="0 0 28 18" width="28" height="18" aria-hidden="true" style="color:var(--text)"><use href="#feet"/><rect x="3.3" y="3.3" width="21.4" height="11.4" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+          <div><b>Memory</b><br><span class="st">Logging every 30 s</span></div>
+          <span class="pill" id="pp">Normal</span>
+        </div>
+        <div class="stats mono">
+          <div><div class="v" id="s-app">10.9 GB</div><div class="k">App memory</div></div>
+          <div><div class="v" id="s-comp">4.1 GB</div><div class="k">Compressed</div></div>
+          <div><div class="v">5.5 GB</div><div class="k">Wired</div></div>
+          <div><div class="v">36 GB</div><div class="k">RAM</div></div>
+          <div><div class="v" id="s-swap">2.8/4 GB</div><div class="k">Swap used/size</div></div>
+          <div><div class="v" id="s-disk">62 GB</div><div class="k">Free disk</div></div>
+          <div><div class="v" id="s-idle">47 min</div><div class="k">Idle</div></div>
+          <div><div class="v">IDEA 5.1G</div><div class="k">Top app</div></div>
+        </div>
+        <div class="charthead">
+          <span>Memory, GB</span>
+          <span class="seg" role="group" aria-label="Chart range">
+            <button type="button" data-r="1">1h</button><button type="button" data-r="6" aria-pressed="true">6h</button><button type="button" data-r="24">24h</button>
+          </span>
+        </div>
+        <svg class="chart" id="chart" viewBox="0 0 332 120" role="img" aria-label="Stacked memory chart with an away period and one incident"></svg>
+        <div class="legend"><span><i style="background:var(--c-wired)"></i>Wired</span><span><i style="background:var(--c-app)"></i>App</span><span><i style="background:var(--c-comp)"></i>Compressed</span><span><i style="background:var(--c-swap)"></i>Swap</span><span><i style="background:rgba(128,128,128,.25)"></i>away</span></div>
+        <div class="incs">
+          <div class="k">Incidents</div>
+          <div class="inc"><span class="d"></span><div><div class="t">Fri 13 Nov 18:28</div><div class="s">macOS is killing processes for memory (412 jetsam kills in 60 s)</div></div><span class="n">60,850 kills</span></div>
+        </div>
+        <div class="foot"><span>Deactivate</span><span>Report</span><span class="sp"></span>☑ Launch at login</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <span class="tc">0x01 · The dialog it explains</span>
+    <h2>You know this dialog.</h2>
+    <p class="sub">You leave the Mac alone with a few long-running jobs. You come back to the Force Quit window, some processes are gone — and by the time Activity Monitor is open, everything looks fine. Whatever happened, happened while nobody was looking. <span class="wm">oomph</span> was looking.</p>
+    <div class="pain">
+      <div class="before">
+        <div class="dialog">
+          <div class="ico" aria-hidden="true">⚠︎</div>
+          <div><b>Your system has run out of application memory.</b><p>To avoid problems with your computer, quit any applications you are not using.</p></div>
+        </div>
+        <div class="then mono">
+          <s>open Activity Monitor → “looks normal”</s><br>
+          <s>guess: a leak? Docker? the browser?</s><br>
+          <s>reboot and hope</s>
+        </div>
+      </div>
+      <div class="arrow">→</div>
+      <div class="after">
+        <div class="big">Incident 18:28 – 19:25</div>
+        <p class="mono" style="margin: 10px 0 0;">
+          you: idle 47 min · display off<br>
+          swap: stuck at <em>4 × 1 GB</em> · disk <em>9.8 GB free</em><br>
+          jetsam: <em>60,850 kills</em> · reason <em>low-swap</em><br>
+          → report.html · syslog.txt
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="tc">0x02 · What it records</span>
+    <h2>A sampler, a log watcher, a report.</h2>
+    <p class="sub">A small root daemon takes a measurement every 30 seconds — every 5 while memory gets tight — and keeps listening to the system log for memory kills. The menu-bar app and the <code>oomph</code> command just read what it wrote.</p>
+    <div class="grid">
+      <div class="card">
+        <h3>System memory, honestly</h3>
+        <p>Pressure level, app memory, wired, compressed, cache and free — plus swap used, swap size and the number of swapfiles. The same arithmetic Activity Monitor uses.</p>
+      </div>
+      <div class="card">
+        <h3>Every process, by footprint</h3>
+        <p>The 25 biggest processes by physical footprint and the 15 biggest apps with all their helpers added up. As root it sees system daemons too — often the ones that grow.</p>
+      </div>
+      <div class="card">
+        <h3>Whether you were there</h3>
+        <p>Seconds since the last keypress, display on or off, screen locked, who is keeping the Mac awake. The “only when I walk away” pattern becomes a shaded band on a chart.</p>
+      </div>
+      <div class="card">
+        <h3>The free disk, too</h3>
+        <p>Swap lives on your startup disk, so free space is part of your memory. <span class="wm">oomph</span> logs it with every sample and warns once below 20 GB.</p>
+      </div>
+      <div class="card">
+        <h3>Agent sessions, grouped</h3>
+        <p>Long-running coding-agent sessions are recorded with their whole process tree and project directory — so “which project blew up?” has an answer.</p>
+      </div>
+      <div class="card">
+        <h3>Incidents, written up</h3>
+        <p>Critical pressure or a burst of jetsam kills opens an incident: one notification, a system-log excerpt, and a self-contained <code>report.html</code> with charts of the minutes leading up to it.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <span class="tc">0x03 · Why it happens when you walk away</span>
+    <h2>It's usually your disk, not your RAM.</h2>
+    <p class="sub">macOS swap isn't a fixed partition. It grows in 1 GB files on your startup disk — and macOS stops adding them when free space runs low. Here is the chain <span class="wm">oomph</span> caught on the machine it was written for:</p>
+    <ol class="chain">
+      <li><b>You step away</b>Your jobs keep running: builds, containers, agent sessions.<div class="bar"><i style="width:55%;background:var(--c-app)"></i></div></li>
+      <li><b>macOS gets busy</b>Idle-only work starts: Spotlight, Siri and Apple Intelligence models, Photos analysis, backups.<div class="bar"><i style="width:72%;background:var(--c-app)"></i></div></li>
+      <li><b>The compressor fills</b>RAM is full, so macOS compresses memory — and then needs to swap.<div class="bar"><i style="width:86%;background:var(--c-comp)"></i></div></li>
+      <li><b>Swap can't grow</b>Another 1 GB swapfile won't fit: the disk had 9.8 GB free.<div class="bar"><i style="width:96%;background:var(--c-swap)"></i></div></li>
+      <li><b>Low swap</b>Jetsam kills processes in a loop and the Force Quit dialog appears. 60,850 kills in one hour.<div class="bar"><i style="width:100%;background:var(--c-swap)"></i></div></li>
+    </ol>
+    <div class="callout">
+      <div class="big">≥ <em>20</em> GB</div>
+      <p>Keep that much disk space free and most of these dialogs never happen. Freeing ~50 GB fixed the original problem — <span class="wm">oomph</span> exists so the next one comes with evidence instead of guesswork.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="tc">0x04 · The icon</span>
+    <h2>One glance at the menu bar.</h2>
+    <p class="sub">The chip shows free physical memory — Physical Memory minus Memory Used, exactly as Activity Monitor computes it — abbreviated to fit. The digits are cut out of the chip, so the menu bar shows through them.</p>
+    <div class="chips">
+      <div class="c"><div class="well"><svg viewBox="0 0 28 18" data-chip="normal" data-label="12G"></svg></div><b>Normal</b><span>plenty of headroom</span></div>
+      <div class="c"><div class="well"><svg viewBox="0 0 28 18" data-chip="warn" data-label="4.2G"></svg></div><b>Warning</b><span>memory pressure rising</span></div>
+      <div class="c"><div class="well"><svg viewBox="0 0 28 18" data-chip="crit" data-label="0.8G"></svg></div><b>Critical</b><span>an incident is likely open</span></div>
+      <div class="c"><div class="well"><svg viewBox="0 0 28 18" data-chip="off"></svg></div><b>Off</b><span>click to activate logging</span></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="tc">0x05 · The numbers</span>
+    <h2>Watches everything, costs nothing.</h2>
+    <div class="numbers">
+      <div class="num"><div class="v">30<em>s</em> / 5<em>s</em></div><div class="k">sampling interval — calm / under pressure</div></div>
+      <div class="num"><div class="v">~<em>0</em>% CPU</div><div class="k">measured; the log watcher is filtered at the source</div></div>
+      <div class="num"><div class="v">~25 <em>MB</em></div><div class="k">memory used by the daemon itself</div></div>
+      <div class="num"><div class="v">14<em>d</em> / 90<em>d</em></div><div class="k">samples / incidents kept, ~50–150 MB total</div></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <span class="tc">0x06 · Good to know</span>
+    <h2>Honest answers.</h2>
+    <div class="faq">
+      <details>
+        <summary>How do I get it?</summary>
+        <p>Clone the repository and build it — it's free, the source is complete, and there are no binaries. You need macOS 14 or later and Xcode; there's no Xcode project to open, just one script:</p>
+        <pre class="cmd mono">git clone https://github.com/kleinzeug/oomph.git
+cd oomph && ./build-app.sh
+open ~/Applications/oomph.app</pre>
+        <p>Then click the chip → <b>Activate</b>. The README walks through the details.</p>
+      </details>
+      <details>
+        <summary>Why does it ask for my administrator password?</summary>
+        <p>Only root can see the memory footprint of every process, including the system daemons that are often the ones growing — and a logger that should keep running while you're away belongs in launchd, not in a terminal. Activating copies the daemon to a root-owned folder (so nothing user-writable ever runs as root) and starts it. Deactivating removes it again.</p>
+      </details>
+      <details>
+        <summary>Will it fix my memory problems?</summary>
+        <p>No — on purpose. <span class="wm">oomph</span> never kills, pauses or throttles anything; it could take down the very job you care about. It tells you what happened. Most of the time the answer turns out to be “free some disk space”, and it warns you about that before it bites.</p>
+      </details>
+      <details>
+        <summary>What does it record, and where does it go?</summary>
+        <p>Memory and disk figures, process names, app names and the working directories of agent sessions — never command-line arguments or file contents. Everything stays in <code>/Library/Logs/oomph</code> on your Mac. No network access, no telemetry.</p>
+      </details>
+      <details>
+        <summary>What does it cost?</summary>
+        <p>Nothing. It's MIT-licensed: clone it, build it, change it, ship your fork. If you improve it, a pull request upstream is appreciated.</p>
+      </details>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <div class="brand"><svg viewBox="0 0 28 18" data-chip="normal" data-label="OOM" aria-hidden="true"></svg><span><span class="wm">oomph</span></span></div>
+        <p style="margin-top: 14px;">A one-purpose tool: a papertrail for the moments you weren't watching.<br>
+        © 2026 Philipp Holzschneider · <span class="mono">v1.0.0</span><br>
+        <a href="https://kleinzeug.github.io/oomph/">kleinzeug.github.io/oomph</a> · <a href="mailto:impressum@kleinzeug.app">impressum@kleinzeug.app</a> · <a href="https://github.com/kleinzeug/oomph">source on GitHub</a><br>
+        oom + oomph, ph for Philipp<br>
+        a <strong>Kleinzeug</strong> tool — small tools, properly made</p>
+      </div>
+      <div>
+        <p><strong>License.</strong> MIT — fork it, build it, and offer your changes back upstream via pull request.</p>
+        <p><a href="https://www.buymeacoffee.com/holzschneider">Buy me a coffee</a> if it saved you a reboot and a guess.</p>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var reduced = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var NS = "http://www.w3.org/2000/svg";
+
+  // ---------------------------------------------------------------- chip icon
+  var FILL = { normal: "var(--green)", warn: "var(--yellow)", crit: "var(--red)" };
+  var maskSeq = 0;
+  function drawChip(svg, state, label) {
+    var id = "m" + (++maskSeq);
+    var body;
+    if (state === "off") {
+      body =
+        '<use href="#feet" opacity=".6"/>' +
+        '<rect x="3.3" y="3.3" width="21.4" height="11.4" rx="1.2" fill="none" stroke="currentColor" stroke-opacity=".5" stroke-width="1.6"/>' +
+        '<path d="M11.9 6.9 L16.1 11.1 M11.9 11.1 L16.1 6.9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>';
+    } else {
+      body =
+        '<mask id="' + id + '"><rect width="28" height="18" fill="#fff"/>' +
+        '<text x="14" y="12.15" text-anchor="middle" font-size="8.5" font-weight="900" letter-spacing="-.25" ' +
+        'font-family="-apple-system, BlinkMacSystemFont, \'SF Pro Display\', \'Helvetica Neue\', Arial Narrow, sans-serif" ' +
+        'font-stretch="condensed" fill="#000">' + label + '</text></mask>' +
+        '<use href="#feet"/>' +
+        '<rect x="3.3" y="3.3" width="21.4" height="11.4" rx="1.2" fill="' + FILL[state] + '" stroke="currentColor" stroke-width="1.6" mask="url(#' + id + ')"/>';
+    }
+    svg.innerHTML = body;
+  }
+  document.querySelectorAll("svg[data-chip]").forEach(function (s) {
+    drawChip(s, s.getAttribute("data-chip"), s.getAttribute("data-label") || "");
+  });
+
+  // hero chip: click cycles through the states and updates the popup + readout
+  var STATES = [
+    { s: "normal", label: "12G", pill: "Normal", cls: "", app: "10.9 GB", comp: "4.1 GB", swap: "2.8/4 GB", disk: "62 GB" },
+    { s: "warn", label: "4.2G", pill: "Warning", cls: "warn", app: "17.6 GB", comp: "8.7 GB", swap: "3.7/4 GB", disk: "9.8 GB" },
+    { s: "crit", label: "0.8G", pill: "Critical", cls: "crit", app: "19.4 GB", comp: "10.3 GB", swap: "4.0/4 GB", disk: "9.8 GB" },
+    { s: "off", label: "", pill: "Off", cls: "", app: "–", comp: "–", swap: "–", disk: "–" },
+  ];
+  var cur = 0;
+  var heroChip = document.getElementById("chip-hero");
+  function applyState() {
+    var st = STATES[cur];
+    drawChip(heroChip, st.s, st.label);
+    var pp = document.getElementById("pp");
+    pp.textContent = st.pill; pp.className = "pill " + st.cls;
+    ["app", "comp", "swap", "disk"].forEach(function (k) { document.getElementById("s-" + k).textContent = st[k]; });
+    document.getElementById("led").style.background = st.s === "off" ? "#777" : FILL[st.s];
+    document.getElementById("led").style.boxShadow = st.s === "off" ? "none" : "0 0 10px " + FILL[st.s];
+    targetPressure = st.s === "crit" ? 0.95 : st.s === "warn" ? 0.7 : null;
+  }
+  document.getElementById("chipbtn").addEventListener("click", function () {
+    cur = (cur + 1) % STATES.length; applyState();
+  });
+
+  // ---------------------------------------------------------------- popup chart
+  function rng(seed) { return function () { seed = (seed * 16807) % 2147483647; return (seed - 1) / 2147483646; }; }
+  function series(hours) {
+    var r = rng(hours * 7919 + 11), n = 72, pts = [];
+    var awayFrom = Math.floor(n * 0.42), awayTo = Math.floor(n * 0.86);
+    var spike = Math.floor(n * (hours === 1 ? 0.7 : 0.76));
+    for (var i = 0; i < n; i++) {
+      var away = i >= awayFrom && i <= awayTo;
+      var ramp = away ? Math.min(1, (i - awayFrom) / (spike - awayFrom + 1)) : 0;
+      var wired = 5.4 + r() * 0.3;
+      var app = 9.6 + Math.sin(i / 5) * 0.8 + r() * 0.6 + ramp * 8;
+      var comp = 3.6 + r() * 0.4 + ramp * 6.2;
+      var swap = 2.7 + r() * 0.1 + ramp * 1.3;
+      if (i > spike + 3 && away) { app -= 3.5; comp -= 2.5; }
+      pts.push({ wired: wired, app: app, comp: comp, swap: Math.min(swap, 4), away: away });
+    }
+    return { pts: pts, spike: spike };
+  }
+  function renderChart(hours) {
+    var svg = document.getElementById("chart"), W = 332, H = 120, L = 22, B = 14, T = 4;
+    var d = series(hours), pts = d.pts, n = pts.length, ymax = 40;
+    var x = function (i) { return L + (W - L - 2) * i / (n - 1); };
+    var y = function (v) { return H - B - (H - B - T) * v / ymax; };
+    var out = "";
+    // away band
+    var a0 = -1, a1 = -1;
+    pts.forEach(function (p, i) { if (p.away) { if (a0 < 0) a0 = i; a1 = i; } });
+    if (a0 >= 0) out += '<rect x="' + x(a0) + '" y="' + T + '" width="' + (x(a1) - x(a0)) + '" height="' + (H - B - T) + '" fill="rgba(128,128,128,.16)"/>';
+    // grid
+    [0, 10, 20, 30, 40].forEach(function (v) {
+      out += '<line x1="' + L + '" x2="' + (W - 2) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="var(--line)" stroke-width=".6"/>' +
+             '<text x="' + (L - 4) + '" y="' + (y(v) + 3) + '" font-size="8" fill="var(--muted)" text-anchor="end">' + v + '</text>';
+    });
+    // stacked areas
+    var keys = ["wired", "app", "comp", "swap"], cols = ["var(--c-wired)", "var(--c-app)", "var(--c-comp)", "var(--c-swap)"];
+    var base = pts.map(function () { return 0; });
+    keys.forEach(function (k, ki) {
+      var top = pts.map(function (p, i) { return base[i] + p[k]; });
+      var poly = top.map(function (v, i) { return x(i).toFixed(1) + "," + y(v).toFixed(1); }).join(" ") + " " +
+                 base.map(function (v, i) { return x(i).toFixed(1) + "," + y(v).toFixed(1); }).reverse().join(" ");
+      out += '<polygon points="' + poly + '" fill="' + cols[ki] + '" fill-opacity=".8"/>';
+      base = top;
+    });
+    // RAM line + incident
+    out += '<line x1="' + L + '" x2="' + (W - 2) + '" y1="' + y(36) + '" y2="' + y(36) + '" stroke="var(--text)" stroke-opacity=".6" stroke-dasharray="4 3"/>';
+    out += '<text x="' + (W - 4) + '" y="' + (y(36) - 3) + '" font-size="8" fill="var(--muted)" text-anchor="end">RAM 36</text>';
+    out += '<line x1="' + x(d.spike) + '" x2="' + x(d.spike) + '" y1="' + T + '" y2="' + (H - B) + '" stroke="var(--c-swap)" stroke-width="1.4"/>';
+    // time labels
+    var now = 18 * 60 + 28;
+    [0, 0.5, 1].forEach(function (f) {
+      var mins = Math.round(now - hours * 60 * (1 - f)), hh = ((Math.floor(mins / 60) % 24) + 24) % 24, mm = ((mins % 60) + 60) % 60;
+      out += '<text x="' + (L + (W - L - 2) * f) + '" y="' + (H - 3) + '" font-size="8" fill="var(--muted)" text-anchor="' + (f === 0 ? "start" : f === 1 ? "end" : "middle") + '">' +
+             (hh < 10 ? "0" : "") + hh + ":" + (mm < 10 ? "0" : "") + mm + '</text>';
+    });
+    svg.innerHTML = out;
+  }
+  document.querySelectorAll(".seg button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      document.querySelectorAll(".seg button").forEach(function (o) { o.setAttribute("aria-pressed", o === b ? "true" : "false"); });
+      renderChart(+b.getAttribute("data-r"));
+    });
+  });
+  renderChart(6);
+
+  // ---------------------------------------------------------------- memory-map background
+  // Each cell is a memory page. A slow field decides which pages are in use; scroll depth
+  // raises the pressure (more pages in use, more of them compressed or swapped). The cursor
+  // allocates pages around it, a click is a spike. A sampler line sweeps across like the
+  // daemon taking a measurement, and its readout reports this page's own "free memory".
+  var canvas = document.getElementById("memmap");
+  var ctx = canvas.getContext("2d");
+  var W = 0, H = 0, DPR = 1, CELL = 18, GAP = 4, cols = 0, rows = 0;
+  var heat = new Float32Array(0), wired = new Uint8Array(0);
+  var scrollPos = 0, mouse = { x: -999, y: -999, active: false };
+  var targetPressure = null, pressure = 0.3, sampleNo = 1, lastSweep = 0, freeGB = 12.4;
+
+  function isDark() {
+    var t = document.documentElement.getAttribute("data-theme");
+    if (t === "dark") return true;
+    if (t === "light") return false;
+    return matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth; H = window.innerHeight;
+    CELL = W < 600 ? 14 : 18; GAP = W < 600 ? 3 : 4;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    cols = Math.ceil(W / CELL) + 1; rows = Math.ceil(H / CELL) + 1;
+    heat = new Float32Array(cols * rows);
+    wired = new Uint8Array(cols * rows);
+    var r = rng(4242);
+    for (var i = 0; i < wired.length; i++) wired[i] = r() < 0.07 ? 1 : 0;
+    draw(lastT);
+  }
+  function field(cx, cy, t) {
+    return 0.5 + 0.22 * Math.sin(cx * 0.13 + t * 0.00019) + 0.16 * Math.sin(cy * 0.09 - t * 0.00014 + cx * 0.031)
+               + 0.12 * Math.sin((cx + cy) * 0.057 + t * 0.00027);
+  }
+  function allocate(px, py, radius, amount) {
+    var c0 = Math.floor(px / CELL), r0 = Math.floor(py / CELL);
+    for (var dy = -radius; dy <= radius; dy++) for (var dx = -radius; dx <= radius; dx++) {
+      var c = c0 + dx, rr = r0 + dy;
+      if (c < 0 || rr < 0 || c >= cols || rr >= rows) continue;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > radius) continue;
+      var k = rr * cols + c;
+      heat[k] = Math.min(1, heat[k] + amount * (1 - d / radius));
+    }
+  }
+
+  var lastT = 0, lastFrame = 0;
+  function draw(t) {
+    lastT = t;
+    ctx.clearRect(0, 0, W, H);
+    var dark = isDark();
+    var maxScroll = Math.max(1, document.documentElement.scrollHeight - H);
+    var f = Math.min(1, scrollPos / maxScroll);
+    var goal = targetPressure !== null ? targetPressure : 0.28 + 0.55 * f;
+    pressure += (goal - pressure) * 0.06;
+    var thr = 1 - pressure;
+    var base = dark ? 1 : 0.75;
+    var C = dark
+      ? { free: "120,140,170", wired: "150,150,160", app: "91,159,224", comp: "232,180,80", swap: "239,107,86", sweep: "127,216,148" }
+      : { free: "86,101,122", wired: "120,120,128", app: "59,130,196", comp: "214,150,40", swap: "208,80,60", sweep: "47,154,92" };
+    var sweepX = reduced ? -100 : ((t / 9000) % 1) * (W + 200) - 100;
+    if (!reduced && t - lastSweep > 9000) { lastSweep = t; sampleNo++; }
+    var s = CELL - GAP, used = 0, total = cols * rows;
+    var colL = Math.max(0, (W - 980) / 2), colR = Math.min(W, colL + 980);
+
+    for (var r = 0; r < rows; r++) {
+      for (var c = 0; c < cols; c++) {
+        var k = r * cols + c, px = c * CELL, py = r * CELL;
+        var o = field(c, r, t) + heat[k];
+        var col, a;
+        if (wired[k]) { col = C.wired; a = 0.22; used++; }
+        else if (o > thr) {
+          used++;
+          var depth = (o - thr) / Math.max(0.15, pressure);
+          if (depth < 0.5 || pressure < 0.45) { col = C.app; a = 0.18 + 0.12 * Math.min(1, depth); }
+          else if (depth < 0.85 || pressure < 0.7) { col = C.comp; a = 0.24; }
+          else { col = C.swap; a = 0.28; }
+        } else { col = C.free; a = 0.05; }
+        var dxs = Math.abs(px + s / 2 - sweepX);
+        if (dxs < CELL * 1.5) a += 0.22 * (1 - dxs / (CELL * 1.5));
+        // keep text readable: fade pages behind the content column
+        var mid = px + s / 2, edge = Math.min(Math.abs(mid - colL), Math.abs(mid - colR));
+        var inside = mid > colL && mid < colR;
+        var fade = inside ? Math.max(0.35, 1 - Math.min(1, edge / 160) * 0.65) : 1;
+        ctx.fillStyle = "rgba(" + col + "," + (a * base * fade * 0.62).toFixed(3) + ")";
+        ctx.fillRect(px + GAP / 2, py + GAP / 2, s, s);
+        if (heat[k] > 0.002) heat[k] *= 0.965;
+      }
+    }
+    // the sampler line and its readout
+    freeGB = 36 * (1 - used / total);
+    if (!reduced && sweepX > -10 && sweepX < W + 10) {
+      ctx.fillStyle = "rgba(" + C.sweep + "," + (dark ? 0.35 : 0.3) + ")";
+      ctx.fillRect(sweepX, 0, 1, H);
+    }
+    if (W < 700) return;
+    ctx.font = "11px ui-monospace, SF Mono, Menlo, monospace";
+    ctx.fillStyle = "rgba(" + (dark ? "200,210,225" : "60,70,85") + ",.55)";
+    var label = "sample #" + sampleNo + " · " + freeGB.toFixed(1) + "G free · pressure " +
+                (pressure > 0.85 ? "critical" : pressure > 0.62 ? "warning" : "normal");
+    ctx.fillText(label, 16, H - 14);
+  }
+
+  // live readout in the hero pill
+  var tickEl = document.getElementById("tick");
+  function tick() {
+    if (STATES[cur].s === "off") { tickEl.textContent = "logging is off — click the chip"; return; }
+    var swap = 2.8 + Math.max(0, pressure - 0.55) * 3.2;
+    tickEl.textContent = "sample #" + sampleNo + " · " + freeGB.toFixed(1) + "G free · swap " + Math.min(4, swap).toFixed(1) + "/4G";
+  }
+
+  window.addEventListener("scroll", function () { scrollPos = window.scrollY; if (reduced) { draw(lastT); tick(); } }, { passive: true });
+  window.addEventListener("resize", resize);
+  window.addEventListener("pointermove", function (e) {
+    mouse.x = e.clientX; mouse.y = e.clientY;
+    allocate(e.clientX, e.clientY, 4, 0.05);
+    if (reduced) draw(lastT);
+  }, { passive: true });
+  window.addEventListener("pointerdown", function (e) {
+    allocate(e.clientX, e.clientY, 9, 0.9);
+    if (reduced) draw(lastT);
+  }, { passive: true });
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", function () { draw(lastT); });
+  new MutationObserver(function () { draw(lastT); })
+    .observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+
+  applyState();
+  resize();
+  tick();
+  if (!reduced) {
+    setInterval(tick, 1000);
+    (function loop(t) {
+      if (t - lastFrame > 33) { lastFrame = t; draw(t); }
+      requestAnimationFrame(loop);
+    })(0);
+  }
+})();
+</script>
+</html>
