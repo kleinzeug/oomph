@@ -39,6 +39,12 @@ DISK_COOLDOWN = 6 * 3600
 INCIDENT_CLOSE_AFTER = 180
 INCIDENT_LOOKBACK = 15 * 60
 KERNEL_LINES_PER_MIN = 60
+JETSAM_POLL = 60          # s between `log show` queries for launchd's jetsam exits
+JETSAM_POLL_HOT = 10      # ... while memory is under pressure
+STALL_TRIGGER_S = 60      # the daemon not running this long while the Mac is awake = starved
+UNOWNED_SUSTAIN_S = 60    # unowned memory must stay above the limit this long to count
+FLAP_WINDOW = 60          # pressure changes closer than this are batched into one event
+FLAP_REPORT_EVERY = 15 * 60
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -212,9 +218,6 @@ def collect_procs():
 
 
 def summarize_procs(procs):
-    by_fp = sorted(procs.values(), key=lambda p: p["fp"], reverse=True)
-    top = [{"pid": p["pid"], "ppid": p["ppid"], "name": p["name"], "uid": p["uid"],
-            "mb": round(p["fp"] / MB), "rss_mb": round(p["rss"] / MB)} for p in by_fp[:TOP_N]]
     groups = {}
     for p in procs.values():
         g = groups.setdefault(group_key(p["path"], p["name"]), [0, 0])
@@ -230,7 +233,7 @@ def summarize_procs(procs):
     def is_claude(p):
         return p["name"] == "claude"
 
-    sessions = []
+    sessions, session_of = [], {}
     for p in procs.values():
         if not is_claude(p):
             continue
@@ -247,6 +250,8 @@ def summarize_procs(procs):
             cur = stack.pop()
             members.append(cur)
             stack.extend(children.get(cur, []))
+        for m in members:
+            session_of[m] = p["pid"]
         desc = [procs[m] for m in members if m != p["pid"] and m in procs]
         big = max(desc, key=lambda d: d["fp"]) if desc else None
         sessions.append({
@@ -256,7 +261,42 @@ def summarize_procs(procs):
             "biggest": {"name": big["name"], "pid": big["pid"], "mb": round(big["fp"] / MB)} if big else None,
         })
     sessions.sort(key=lambda s: s["mb"], reverse=True)
+
+    # g: app group, pn: parent's name, s: Claude session it runs under (for the report's tree)
+    by_fp = sorted(procs.values(), key=lambda p: p["fp"], reverse=True)
+    top = []
+    for p in by_fp[:TOP_N]:
+        e = {"pid": p["pid"], "ppid": p["ppid"], "name": p["name"], "uid": p["uid"],
+             "mb": round(p["fp"] / MB), "rss_mb": round(p["rss"] / MB), "g": group_key(p["path"], p["name"])}
+        if p["ppid"] in procs:
+            e["pn"] = procs[p["ppid"]]["name"]
+        if p["pid"] in session_of:
+            e["s"] = session_of[p["pid"]]
+        top.append(e)
     return top, grp, sessions
+
+
+def ownership(sysm, procs):
+    """What all processes' footprints add up to, and how much memory none of them owns.
+    A footprint counts its compressed and swapped pages at their uncompressed size, so
+    app memory + the compressor's logical size should roughly equal the sum; a large
+    remainder is memory held outside every process (last seen: a WebKit GPU-process leak
+    that survived its processes and froze the Mac)."""
+    procs_gb = sum(p["fp"] for p in procs.values()) / GB
+    return {"procs_gb": round(procs_gb, 1),
+            "unowned_gb": round(max(0.0, sysm["app_gb"] + sysm["compressor_logical_gb"] - procs_gb), 1)}
+
+
+def uptime_s():
+    """Seconds the Mac has been awake since boot (stops while asleep, unlike time.time())."""
+    return time.clock_gettime(time.CLOCK_UPTIME_RAW)
+
+
+def log_time(j, default):
+    try:
+        return datetime.datetime.strptime(j["timestamp"], "%Y-%m-%d %H:%M:%S.%f%z").timestamp()
+    except Exception:
+        return default
 
 
 # ------------------------------------------------------------------ helpers
@@ -292,6 +332,12 @@ class Daemon:
         self.prev_big = {}
         self.prev_t = None
         self.prev_pressure = None
+        self.prev_up = None
+        self.seen_exits = {}
+        self.flap = None
+        self.last_pr_event = 0
+        self.unowned_since = None
+        self.unowned_flagged = False
         self.swap_hist = []
         self.incident = None
         self.last_notify = 0
@@ -334,6 +380,32 @@ class Daemon:
                 self.event("daemon_error", where="stream", error=str(e))
             time.sleep(5)
 
+    def poll_loop(self):
+        since = time.time()
+        while not self.stopping:
+            time.sleep(JETSAM_POLL_HOT if self.hot else JETSAM_POLL)
+            try:
+                since = self.poll_jetsam(since)
+            except Exception as e:  # pragma: no cover
+                self.event("daemon_error", where="jetsam_poll", error=repr(e))
+
+    def poll_jetsam(self, since):
+        """Count launchd's jetsam exits since `since` with `log show`; returns the next cursor.
+        Windows overlap by a few seconds; handle_log drops lines it has already counted."""
+        now = time.time()
+        start = datetime.datetime.fromtimestamp(since - 3).strftime("%Y-%m-%d %H:%M:%S")
+        out = run(["/usr/bin/log", "show", "--style", "ndjson", "--start", start,
+                   "--predicate", oomph.JETSAM_EXIT_PREDICATE], timeout=120)
+        if '"finished"' not in out:
+            return since  # timed out or failed: retry the same window next time
+        for line in out.splitlines():
+            if line.startswith("{") and "eventMessage" in line:
+                try:
+                    self.handle_log(json.loads(line))
+                except ValueError:
+                    pass
+        return now
+
     def handle_log(self, j):
         msg = (j.get("eventMessage") or "").strip()
         proc = os.path.basename(j.get("processImagePath") or "")
@@ -343,13 +415,21 @@ class Daemon:
         with self.lock:
             jet = self.jet
             if m:
+                key = (j.get("machTimestamp") or j.get("timestamp"), msg)
+                if key in self.seen_exits:
+                    return
+                if len(self.seen_exits) > 20000:
+                    self.seen_exits = {k: v for k, v in self.seen_exits.items() if now - v < 600}
+                self.seen_exits[key] = now
+                ts = log_time(j, now)
                 jet["kills"] += 1
                 jet["names"][m.group(1)] = jet["names"].get(m.group(1), 0) + 1
-                self.kill_times = [x for x in self.kill_times if now - x <= 60] + [now]
-                if len(self.kill_times) >= self.STORM_KILLS_PER_MIN and not self.storm:
+                self.kill_times = sorted([x for x in self.kill_times if ts - x <= 60] + [ts])
+                recent = [x for x in self.kill_times if ts - x <= 60]
+                if len(recent) >= self.STORM_KILLS_PER_MIN and not self.storm:
                     self.storm = True
                     self.pending_triggers.append({"kind": "jetsam_storm", "t": now,
-                        "msg": "macOS is killing processes for memory (%d jetsam kills in 60 s)" % len(self.kill_times)})
+                        "msg": "macOS is killing processes for memory (%d jetsam kills in 60 s)" % len(recent)})
                     self.wake.set()
                 return
             if r:
@@ -381,7 +461,7 @@ class Daemon:
         with self.lock:
             jet = self.jet
             self.jet = {"kills": 0, "names": {}, "reasons": {}}
-            if not self.kill_times or time.time() - self.kill_times[-1] > 120:
+            if not self.kill_times or time.time() - max(self.kill_times) > 120:
                 self.storm = False
             self.report_trig = False
         if jet["kills"] or jet["reasons"]:
@@ -440,7 +520,7 @@ class Daemon:
             events = oomph.load_events(inc["start"] - INCIDENT_LOOKBACK, t)
             inc["summary"] = oomph.summarize(samples, events)
             write_atomic(os.path.join(d, "incident.json"), json.dumps(inc, indent=1))
-            html = oomph.render_html(samples, events, "Memory incident " + inc["id"], inc)
+            html = oomph.incident_html(inc)
             write_atomic(os.path.join(d, "report.html"), html)
         except Exception as e:
             write_atomic(os.path.join(d, "incident.json"), json.dumps(inc, indent=1))
@@ -488,16 +568,30 @@ class Daemon:
         # a pid that is still present with the same start time is not gone
         self.prev_big = big
 
-        gap = None
+        up = uptime_s()
+        gap = stall = None
         if self.prev_t and t - self.prev_t > 3 * (HOT_INTERVAL if self.hot else INTERVAL) + 5:
             gap = round(t - self.prev_t)
-            self.event("sleep_gap", seconds=gap)
-        self.prev_t = t
+            asleep = max(0.0, (t - self.prev_t) - (up - self.prev_up)) if self.prev_up is not None else gap
+            if asleep >= gap / 2:
+                self.event("sleep_gap", seconds=gap, asleep_s=round(asleep))
+            else:
+                # awake, yet the daemon didn't get to run: the system is starved
+                stall = gap
+                self.event("stall", seconds=gap, pressure=sysm["pressure"], swap_used_gb=sysm["swap_used_gb"])
+                if gap >= STALL_TRIGGER_S:
+                    with self.lock:
+                        self.pending_triggers.append({"kind": "stall", "t": t,
+                            "msg": "oomph couldn't run for %d s while the Mac was awake — the system is starved for memory" % gap})
+        self.prev_t, self.prev_up = t, up
 
         s = {"t": round(t, 1), "iso": now_iso(t), "hot": self.hot}
         if gap:
             s["gap"] = gap
+        if stall:
+            s["stall"] = stall
         s.update(sysm)
+        s.update(ownership(sysm, procs))
         s["jetsam_kills"] = jetsam_kills
         s["away"] = {k: away[k] for k in ("idle_s", "display_on", "locked", "sleep_preventers")}
         s["top"] = top
@@ -528,10 +622,23 @@ class Daemon:
         t = s["t"]
         pr = s["pressure"]
         if self.prev_pressure is not None and pr != self.prev_pressure:
-            self.event("pressure_change", old=self.prev_pressure, new=pr,
-                       swap_used_gb=s["swap_used_gb"], disk_free_gb=s["disk_free_gb"],
-                       idle_s=s["away"]["idle_s"])
+            if self.flap is None and t - self.last_pr_event > FLAP_WINDOW:
+                self.event("pressure_change", old=self.prev_pressure, new=pr,
+                           swap_used_gb=s["swap_used_gb"], disk_free_gb=s["disk_free_gb"],
+                           idle_s=s["away"]["idle_s"])
+                self.last_pr_event = t
+            else:  # flapping: count it, report once it settles (or every 15 min)
+                f = self.flap = self.flap or {"since": t, "flips": 0, "levels": {self.prev_pressure}}
+                f["flips"] += 1
+                f["levels"].add(pr)
+                f["last"] = t
         self.prev_pressure = pr
+        if self.flap and (t - self.flap["last"] > FLAP_WINDOW or t - self.flap["since"] >= FLAP_REPORT_EVERY):
+            f, self.flap = self.flap, None
+            self.event("pressure_flapping", since=now_iso(f["since"]), flips=f["flips"],
+                       levels=[oomph.PRESSURE.get(x, x) for x in sorted(f["levels"])],
+                       now=oomph.PRESSURE.get(pr, pr), swap_used_gb=s["swap_used_gb"])
+            self.last_pr_event = t
 
         self.swap_hist = [(tt, v) for tt, v in self.swap_hist if t - tt <= 60] + [(t, s["swap_used_gb"])]
         swap_jump = s["swap_used_gb"] - min(v for _, v in self.swap_hist) > 0.5
@@ -540,6 +647,21 @@ class Daemon:
             trig = self.pending_triggers
             self.pending_triggers = []
         reasons = [{"kind": x["kind"], "desc": x["msg"][:120], "t": x["t"]} for x in trig]
+        u, lim = s.get("unowned_gb"), oomph.unowned_limit_gb(s["ram_gb"])
+        if u is not None and u >= lim:
+            self.unowned_since = self.unowned_since or t
+            if t - self.unowned_since >= UNOWNED_SUSTAIN_S:
+                if not self.unowned_flagged:
+                    self.unowned_flagged = True
+                    self.event("unowned_memory", gb=u, procs_gb=s.get("procs_gb"),
+                               compressor_logical_gb=s["compressor_logical_gb"])
+                reasons.append({"kind": "unowned", "t": t, "desc": "%.0f GB of memory belongs to no process — likely a GPU "
+                                "or driver leak; save your work and restart before the Mac freezes" % u})
+        else:
+            self.unowned_since = None
+            if self.unowned_flagged and (u is None or u < 0.75 * lim):
+                self.unowned_flagged = False
+                self.event("unowned_memory_cleared", gb=u)
         if pr >= 4:
             reasons.append({"kind": "pressure", "desc": "Memory pressure CRITICAL (swap %.1f GB, disk %.0f GB free)"
                             % (s["swap_used_gb"], s["disk_free_gb"]), "t": t})
@@ -550,7 +672,7 @@ class Daemon:
                 for r in reasons:
                     if r["kind"] not in known and len(self.incident["reasons"]) < 20:
                         self.incident["reasons"].append(r)
-                        if r["kind"] in ("dialog", "lowmem", "jetsam_storm", "jetsam_report") and time.time() - self.last_notify > NOTIFY_COOLDOWN:
+                        if r["kind"] in ("dialog", "lowmem", "jetsam_storm", "jetsam_report", "unowned", "stall") and time.time() - self.last_notify > NOTIFY_COOLDOWN:
                             self.last_notify = time.time()
                             self.notify("Memory incident", r["desc"])
             else:
@@ -579,6 +701,7 @@ class Daemon:
             except Exception:
                 pass
         threading.Thread(target=self.stream_loop, daemon=True).start()
+        threading.Thread(target=self.poll_loop, daemon=True).start()
         while not self.stopping:
             t0 = time.time()
             try:

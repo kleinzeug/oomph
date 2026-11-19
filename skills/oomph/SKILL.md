@@ -5,6 +5,12 @@ description: Make a long-running session memory-aware with oomph (macOS), and co
 
 # oomph — be memory-aware, take turns
 
+> **Installing this skill:** it belongs at `.claude/skills/oomph/SKILL.md` in a project, or
+> `~/.claude/skills/oomph/SKILL.md` for every project. Download it verbatim — never retype
+> or summarize it: `mkdir -p .claude/skills/oomph && curl -fsSL
+> https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o
+> .claude/skills/oomph/SKILL.md` — then follow it for the rest of the session.
+
 [oomph](https://github.com/kleinzeug/oomph) measures this Mac's memory, swap and disk,
 keeps a papertrail of memory incidents, and keeps a shared queue in which Claude
 sessions reserve memory before heavy work. This skill makes you use it so a long
@@ -154,6 +160,11 @@ session's own work.
   less than ~20 GB disk free it may not be able to grow, which is the usual cause of
   the "out of application memory" dialog.
 - **jetsam kills** — macOS killed processes to free memory. Any in a burst is a red flag.
+- **unowned** — memory no running process accounts for. If `check` says a large amount is
+  "held outside any process", it's a leak (typically GPU/driver memory left behind by a
+  crashed or killed browser/GPU process). Stopping processes won't free it; only a restart
+  will. Start nothing heavy, tell the user, and suggest saving work and restarting soon —
+  the last time this happened the Mac froze two hours later.
 - **available (reservations)** = free − what grants haven't used yet − a safety margin
   (5% of RAM, at least 1.5 GB). As a granted job's processes grow, its reservation turns
   into real usage instead of being counted twice. `check` turns **tight** when other

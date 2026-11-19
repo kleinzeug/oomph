@@ -28,19 +28,23 @@ import gzip
 import html as _html
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
 
-# What the daemon streams from the unified log. On macOS 27 memory kills show up as
+# What the daemon reads from the unified log. On macOS 27 memory kills show up as
 # launchd exits with OS_REASON_JETSAM and as ReportSystemMemory batch lines
 # "Process X [pid] killed by jetsam reason low-swap"; idle-exit kills are excluded.
+# `log stream` never delivers launchd's lines (`log show` does), so the daemon polls
+# JETSAM_EXIT_PREDICATE with `log show` and streams the rest.
+JETSAM_EXIT_PREDICATE = '(process == "launchd" AND eventMessage CONTAINS "OS_REASON_JETSAM")'
 LOG_PREDICATE = (
-    '(process == "launchd" AND eventMessage CONTAINS "OS_REASON_JETSAM")'
+    JETSAM_EXIT_PREDICATE +
     ' OR (process == "ReportSystemMemory" AND eventMessage CONTAINS "killed by jetsam")'
     ' OR ((process == "loginwindow" OR process == "UserNotificationCenter")'
     ' AND eventMessage CONTAINS[c] "application memory")'
@@ -48,6 +52,28 @@ LOG_PREDICATE = (
 
 PRESSURE = {0: "?", 1: "normal", 2: "WARN", 4: "CRITICAL"}
 AWAY_IDLE_S = 300
+
+
+def unowned_limit_gb(ram_gb):
+    """Memory no process owns, above which something outside the process list (a GPU or
+    driver leak, typically) holds it. Normally a few GB; only a restart frees a real leak."""
+    return max(16.0, 0.4 * (ram_gb or 0))
+
+
+def unowned_gb(s):
+    """App memory plus the uncompressed size of everything in the compressor, minus what all
+    processes' footprints account for. Older samples lack procs_gb: fall back to the top
+    groups (an overestimate by a few GB)."""
+    if "compressor_logical_gb" not in s:
+        return None
+    if "unowned_gb" in s:
+        return s["unowned_gb"]
+    owned = s.get("procs_gb")
+    if owned is None:
+        if not s.get("groups"):
+            return None
+        owned = sum(g["mb"] for g in s["groups"]) / 1024
+    return round(max(0.0, s.get("app_gb", 0) + s["compressor_logical_gb"] - owned), 1)
 
 
 # ------------------------------------------------------------------ loading
@@ -109,18 +135,23 @@ def is_away(s):
 
 # ---------------------------------------------------------------- summarize
 def _risers(samples, key, limit=10):
-    first, peak, peak_t, last = {}, {}, {}, {}
+    first, peak, peak_t, last, info = {}, {}, {}, {}, {}
     for s in samples:
         for p in s.get(key) or []:
             k = p["name"] if key == "groups" else "%s [%s]" % (p["name"], p["pid"])
             first.setdefault(k, p["mb"])
             last[k] = p["mb"]
+            info[k] = p
             if p["mb"] > peak.get(k, -1):
                 peak[k], peak_t[k] = p["mb"], s["t"]
     rows = [{"name": k, "first_mb": first[k], "peak_mb": peak[k], "last_mb": last[k],
              "rise_mb": peak[k] - first[k], "peak_iso": _hm(peak_t[k])} for k in peak]
+    if key != "groups":
+        for r in rows:
+            p = info[r["name"]]
+            r.update(pid=p["pid"], proc=p["name"], ppid=p.get("ppid"), uid=p.get("uid"))
     rows.sort(key=lambda r: (r["rise_mb"], r["peak_mb"]), reverse=True)
-    return rows[:limit]
+    return rows[:limit] if limit else rows
 
 
 def _hm(t):
@@ -143,6 +174,7 @@ def summarize(samples, events):
             for k, n in (e.get("top") or {}).items():
                 killed[k] = killed.get(k, 0) + n
     away = sum(1 for s in samples if is_away(s))
+    unowned = [u for u in (unowned_gb(s) for s in samples) if u is not None]
     return {
         "samples": len(samples),
         "from": samples[0]["iso"], "to": samples[-1]["iso"],
@@ -154,6 +186,9 @@ def summarize(samples, events):
         "max_app_plus_compressed_gb": round(max(s.get("app_gb", 0) + s.get("compressed_gb", 0) for s in samples), 1),
         "ram_gb": samples[-1].get("ram_gb"),
         "jetsam_kills": kills,
+        "max_unowned_gb": max(unowned) if unowned else None,
+        "max_stall_s": max([s.get("stall", 0) for s in samples] +
+                           [e.get("seconds", 0) for e in events if e.get("kind") == "stall"]),
         "jetsam_reasons": reasons,
         "most_killed": dict(sorted(killed.items(), key=lambda kv: -kv[1])[:10]),
         "away_fraction": round(away / len(samples), 2),
@@ -175,19 +210,49 @@ def summarize(samples, events):
 CSS = """
 :root{--bg:#fbfbfa;--fg:#1d1d1f;--muted:#6e6e73;--grid:#e3e3e0;--card:#fff;--line:#d9d9d6;
 --c-wired:#8e8e93;--c-app:#3b82c4;--c-comp:#e0a030;--c-swap:#d0503c;--c-ram:#1d1d1f;--away:rgba(110,110,115,.12);
---k1:#3b82c4;--k2:#d0503c;--k3:#2f9e6e;--k4:#9b59b6;--k5:#e0a030;--bad:#d0503c}
+--k1:#3b82c4;--k2:#d0503c;--k3:#2f9e6e;--k4:#9b59b6;--k5:#e0a030;--k6:#a1a1a6;--bad:#d0503c;--crit:rgba(208,80,60,.10);
+--hl:rgba(59,130,196,.22);--hov:rgba(59,130,196,.09);--seg:#ececea;--seg-on:#fff;--input:#fff}
 @media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161618;--fg:#ececee;--muted:#9a9aa0;--grid:#2c2c30;--card:#1e1e21;--line:#34343a;
 --c-wired:#6e6e74;--c-app:#5b9fe0;--c-comp:#e8b450;--c-swap:#ef6b56;--c-ram:#ececee;--away:rgba(160,160,170,.12);
---k1:#5b9fe0;--k2:#ef6b56;--k3:#45c08b;--k4:#b57edc;--k5:#e8b450;--bad:#ef6b56}}
+--k1:#5b9fe0;--k2:#ef6b56;--k3:#45c08b;--k4:#b57edc;--k5:#e8b450;--k6:#6e6e74;--bad:#ef6b56;--crit:rgba(239,107,86,.13);
+--hl:rgba(91,159,224,.28);--hov:rgba(91,159,224,.11);--seg:#2a2a2e;--seg-on:#3a3a40;--input:#1a1a1d}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,BlinkMacSystemFont,"SF Pro Text",system-ui,sans-serif}
 main{max-width:1040px;margin:0 auto;padding:24px 16px 48px}h1{font-size:22px;margin:0 0 4px}h2{font-size:15px;margin:28px 0 8px}
 .sub{color:var(--muted);margin:0 0 16px}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:10px 0}
-.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.kpi .v{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}.kpi .l{color:var(--muted);font-size:12px}
+.kpis{display:grid;grid-auto-flow:column;grid-auto-columns:minmax(0,1fr);gap:8px}.kpis .card{margin:0;padding:10px 12px;min-width:0}
+.kpi .v{font-size:18px;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.kpi .l{color:var(--muted);font-size:11.5px;line-height:1.3}
+@media (max-width:760px){.kpis{grid-auto-flow:row;grid-template-columns:repeat(2,minmax(0,1fr))}.kpis .kpi:last-child:nth-child(odd){grid-column:span 2}}
+.hrow.top{margin:0 0 2px}.hrow h1{margin:0;flex:1 1 auto}.seg.big button{font-size:13px;padding:3px 14px}
 .bad{color:var(--bad)}table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:4px 8px;border-bottom:1px solid var(--grid);vertical-align:top}
-th{color:var(--muted);font-weight:500;font-size:12px}td.n{text-align:right}.scroll{overflow-x:auto}svg{width:100%;height:auto;display:block}
+th{color:var(--muted);font-weight:500;font-size:12px;white-space:nowrap}td.n,th.n{text-align:right}.scroll{overflow-x:auto}svg{width:100%;height:auto;display:block}
+th.pid,td.pid{width:96px;min-width:96px;max-width:96px;white-space:nowrap;text-align:right;padding-right:14px}
+td.pid .more{color:var(--muted);font-size:11px}
 .legend{display:flex;flex-wrap:wrap;gap:12px;font-size:12px;color:var(--muted);margin-top:6px}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
 code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.hrow{display:flex;align-items:baseline;flex-wrap:wrap;gap:6px 12px;margin:28px 0 8px}.hrow h2{margin:0;flex:1 1 auto}
+.ctl{display:flex;align-items:baseline;flex-wrap:wrap;justify-content:flex-end;gap:6px 10px;font-size:12px;color:var(--muted)}
+.seg{display:inline-flex;background:var(--seg);border-radius:999px;padding:2px}
+.seg button{font:inherit;font-size:12px;border:0;background:none;color:var(--muted);padding:2px 12px;border-radius:999px;cursor:pointer}
+.seg button.on{background:var(--seg-on);color:var(--fg);box-shadow:0 1px 2px rgba(0,0,0,.12)}
+tr[data-k]{cursor:pointer}tr.hov>td{background:var(--hov)}tr.hl>td{background:var(--hl)}
+.caret{display:inline-block;width:14px;color:var(--muted);cursor:pointer;user-select:none}
+.node{color:var(--muted)}.agg{color:var(--muted);font-style:italic}
+.morebar{margin-top:8px;font-size:12px}.linkbtn,.morebar a,.morebar button{color:var(--k1);background:none;border:0;padding:0;font:inherit;cursor:pointer;text-decoration:none}
+.cnt{color:var(--muted);font-weight:400;font-size:12px;margin-left:6px}
+.search{position:relative;display:inline-block}
+.search input{font:inherit;font-size:12px;width:170px;padding:3px 22px 3px 8px;border:1px solid var(--line);border-radius:999px;background:var(--input);color:var(--fg)}
+.search button{position:absolute;right:4px;top:50%;transform:translateY(-50%);border:0;background:var(--muted);color:var(--card);width:14px;height:14px;border-radius:50%;font-size:10px;line-height:14px;padding:0;cursor:pointer;display:none}
+.search.has button{display:block}
+input[type=datetime-local]{font:inherit;font-size:12px;padding:2px 6px;border:1px solid var(--line);border-radius:6px;background:var(--input);color:var(--fg)}
+input[type=datetime-local]:disabled{opacity:.45}
+.toggle{display:inline-flex;align-items:center;gap:6px;cursor:pointer}.toggle input{display:none}
+.toggle .tr{width:26px;height:15px;border-radius:999px;background:var(--line);position:relative;transition:background .15s;align-self:center}
+.toggle .tr:after{content:"";position:absolute;left:2px;top:2px;width:11px;height:11px;border-radius:50%;background:#fff;transition:left .15s;box-shadow:0 1px 1px rgba(0,0,0,.2)}
+.toggle input:checked+.tr{background:var(--k3)}.toggle input:checked+.tr:after{left:13px}
+td.kind{white-space:nowrap}td.time{white-space:nowrap;color:var(--muted)}
 """
+
+BAD_KINDS = ("incident_open", "stall", "unowned_memory", "jetsam", "disk_low", "daemon_error", "log")
 
 
 def _e(x):
@@ -198,11 +263,30 @@ def _scale(v, lo, hi, a, b):
     return a if hi == lo else a + (v - lo) * (b - a) / (hi - lo)
 
 
-def _svg_chart(samples, series, stacked, events=(), ymax=None, unit="GB", refline=None, height=220, bars=None):
+NO_DATA_S = 300
+_chart_n = 0
+
+
+def _critical_spans(samples, gap=120):
+    """Stretches of CRITICAL pressure; flips back within `gap` seconds are bridged so a
+    flapping hour reads as one band."""
+    spans = []
+    for s in samples:
+        if s.get("pressure", 0) >= 4:
+            if spans and s["t"] - spans[-1][1] <= gap:
+                spans[-1][1] = s["t"]
+            else:
+                spans.append([s["t"], s["t"]])
+    return spans
+
+
+def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB", refline=None,
+               height=220, bars=None, t0=None, t1=None):
     W, H, L, R, T, B = 960, height, 48, 10, 10, 26
     if not samples:
         return "<p class=sub>No samples.</p>"
-    t0, t1 = samples[0]["t"], samples[-1]["t"]
+    t0 = samples[0]["t"] if t0 is None else min(t0, samples[0]["t"])
+    t1 = samples[-1]["t"] if t1 is None else max(t1, samples[-1]["t"])
     if t1 == t0:
         t1 = t0 + 1
     xs = [_scale(s["t"], t0, t1, L, W - R) for s in samples]
@@ -218,8 +302,32 @@ def _svg_chart(samples, series, stacked, events=(), ymax=None, unit="GB", reflin
         top_max = max((max(v) for v in vals), default=1)
     ymax = ymax or max(top_max, refline or 0) * 1.08 or 1
     y = lambda v: _scale(v, 0, ymax, H - B, T)  # noqa: E731
-    out = ['<svg viewBox="0 0 %d %d" role="img">' % (W, H)]
-    # away shading
+    X = lambda t: _scale(t, t0, t1, L, W - R)  # noqa: E731
+    # runs of samples without a hole (asleep, frozen, logger down) longer than NO_DATA_S
+    segs, a = [], 0
+    for i in range(1, len(samples) + 1):
+        if i == len(samples) or samples[i]["t"] - samples[i - 1]["t"] > NO_DATA_S:
+            segs.append((a, i))
+            a = i
+    global _chart_n
+    _chart_n += 1
+    pat = "nd%d" % _chart_n
+    out = ['<svg viewBox="0 0 %d %d" role="img"><defs><pattern id="%s" width="6" height="6" patternUnits="userSpaceOnUse" '
+           'patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="6" stroke="var(--grid)" stroke-width="2"/></pattern></defs>'
+           % (W, H, pat)]
+    holes = [(samples[e1 - 1]["t"], samples[b0]["t"]) for (_, e1), (b0, _) in zip(segs, segs[1:])]
+    if samples[0]["t"] - t0 > NO_DATA_S:
+        holes.insert(0, (t0, samples[0]["t"]))
+    if t1 - samples[-1]["t"] > NO_DATA_S:
+        holes.append((samples[-1]["t"], t1))
+    for ha, hb in holes:
+        xa, xb = X(ha), X(hb)
+        out.append('<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="url(#%s)"><title>no data %s–%s</title></rect>'
+                   % (xa, T, xb - xa, H - B - T, pat, _hm(ha), _hm(hb)))
+        if xb - xa > 70:
+            out.append('<text x="%.1f" y="%d" font-size="11" fill="var(--muted)" text-anchor="middle">no data</text>'
+                       % ((xa + xb) / 2, T + 16))
+    # background layer: away shading, critical-pressure bands, incident marks, grid
     i = 0
     while i < len(samples):
         if is_away(samples[i]):
@@ -231,7 +339,11 @@ def _svg_chart(samples, series, stacked, events=(), ymax=None, unit="GB", reflin
             i = j + 1
         else:
             i += 1
-    # grid
+    for a, b in bands:
+        if b >= t0 and a <= t1:
+            xa, xb = X(max(a, t0)), X(min(b, t1))
+            out.append('<rect x="%.1f" y="%d" width="%.1f" height="%d" fill="var(--crit)"><title>CRITICAL pressure %s–%s</title></rect>'
+                       % (xa, T, max(xb - xa, 2), H - B - T, _hm(a), _hm(b)))
     step = _nice_step(ymax)
     v = 0
     while v <= ymax:
@@ -239,24 +351,31 @@ def _svg_chart(samples, series, stacked, events=(), ymax=None, unit="GB", reflin
         out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--grid)"/>' % (L, W - R, yy, yy))
         out.append('<text x="%d" y="%.1f" font-size="11" fill="var(--muted)" text-anchor="end">%s</text>' % (L - 6, yy + 4, _fmt(v)))
         v += step
-    # x labels
+    for m in marks:
+        if t0 <= m["t"] <= t1:
+            xx = X(m["t"])
+            out.append('<line x1="%.1f" x2="%.1f" y1="%d" y2="%d" stroke="var(--bad)" stroke-width="1" stroke-dasharray="3 3" opacity=".7"><title>%s</title></line>'
+                       % (xx, xx, T, H - B, _e(m["label"])))
     n = 6
     for k in range(n + 1):
         tt = t0 + (t1 - t0) * k / n
-        xx = _scale(tt, t0, t1, L, W - R)
-        out.append('<text x="%.1f" y="%d" font-size="11" fill="var(--muted)" text-anchor="middle">%s</text>'
-                   % (xx, H - 8, datetime.datetime.fromtimestamp(tt).strftime("%H:%M:%S" if t1 - t0 < 900 else ("%H:%M" if t1 - t0 < 86400 else "%a %H:%M"))))
+        out.append('<text x="%.1f" y="%d" font-size="11" fill="var(--muted)" text-anchor="%s">%s</text>'
+                   % (X(tt), H - 8, "start" if k == 0 else ("end" if k == n else "middle"), datetime.datetime.fromtimestamp(tt).strftime("%H:%M:%S" if t1 - t0 < 900 else ("%H:%M" if t1 - t0 < 86400 else "%a %H:%M"))))
+    # data layer
     if stacked:
         prev = [H - B] * len(samples)
         for (label, _, color), tp in zip(series, tops):
-            pts = " ".join("%.1f,%.1f" % (x, y(v)) for x, v in zip(xs, tp))
-            back = " ".join("%.1f,%.1f" % (x, p) for x, p in reversed(list(zip(xs, prev))))
-            out.append('<polygon points="%s %s" fill="%s" fill-opacity=".75" stroke="%s" stroke-width="1"/>' % (pts, back, color, color))
+            for a, b in segs:
+                pts = " ".join("%.1f,%.1f" % (x, y(v)) for x, v in zip(xs[a:b], tp[a:b]))
+                back = " ".join("%.1f,%.1f" % (x, p) for x, p in reversed(list(zip(xs[a:b], prev[a:b]))))
+                out.append('<polygon points="%s %s" fill="%s" fill-opacity=".75" stroke="%s" stroke-width="1"><title>%s</title></polygon>'
+                           % (pts, back, color, color, _e(label)))
             prev = [y(v) for v in tp]
     else:
         for (label, _, color), v in zip(series, vals):
-            pts = " ".join("%.1f,%.1f" % (x, y(vv)) for x, vv in zip(xs, v))
-            out.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.8"/>' % (pts, color))
+            for a, b in segs:
+                pts = " ".join("%.1f,%.1f" % (x, y(vv)) for x, vv in zip(xs[a:b], v[a:b]))
+                out.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.8"/>' % (pts, color))
     if bars:
         f, color = bars
         bmax = max((f(s) or 0) for s in samples) or 1
@@ -268,14 +387,13 @@ def _svg_chart(samples, series, stacked, events=(), ymax=None, unit="GB", reflin
     if refline:
         out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--c-ram)" stroke-dasharray="5 4"/>' % (L, W - R, y(refline), y(refline)))
         out.append('<text x="%d" y="%.1f" font-size="11" fill="var(--fg)" text-anchor="end">RAM %s %s</text>' % (W - R - 4, y(refline) - 4, _fmt(refline), unit))
-    for e in events:
-        if t0 <= e["t"] <= t1:
-            xx = _scale(e["t"], t0, t1, L, W - R)
-            out.append('<line x1="%.1f" x2="%.1f" y1="%d" y2="%d" stroke="var(--bad)" stroke-width="1.5"><title>%s</title></line>'
-                       % (xx, xx, T, H - B, _e(e.get("iso", "") + " " + e.get("kind", ""))))
     out.append("</svg>")
     leg = "".join('<span><i class=sw style="background:%s"></i>%s</span>' % (c, _e(l)) for l, _, c in series)
     leg += '<span><i class=sw style="background:var(--away)"></i>away (idle ≥5 min / locked / display off)</span>'
+    if any(b >= t0 and a <= t1 for a, b in bands):
+        leg += '<span><i class=sw style="background:var(--crit);outline:1px solid var(--bad)"></i>critical pressure</span>'
+    if any(t0 <= m["t"] <= t1 for m in marks):
+        leg += '<span><i class=sw style="background:none;border-left:1px dashed var(--bad);border-radius:0"></i>incident start / end</span>'
     return "".join(out) + '<div class=legend>%s</div>' % leg
 
 
@@ -290,26 +408,148 @@ def _fmt(v):
     return ("%.1f" % v).rstrip("0").rstrip(".") if isinstance(v, float) else str(v)
 
 
-def _table(rows, cols):
+def _table(rows, cols, attrs=None):
+    """cols: (title, value_fn, numeric[, css_class]); attrs(row) -> extra <tr> attributes."""
     if not rows:
         return "<p class=sub>none</p>"
-    h = "".join("<th>%s</th>" % _e(c[0]) for c in cols)
+
+    def cls(c):
+        return " ".join(x for x in (("n" if c[2] else ""), (c[3] if len(c) > 3 else "")) if x)
+    h = "".join('<th class="%s">%s</th>' % (cls(c), _e(c[0])) for c in cols)
     body = ""
     for r in rows:
-        body += "<tr>" + "".join('<td class="%s">%s</td>' % ("n" if c[2] else "", _e(c[1](r))) for c in cols) + "</tr>"
+        a = attrs(r) if attrs else ""
+        body += "<tr%s>" % a + "".join('<td class="%s">%s</td>' % (cls(c), _e(c[1](r))) for c in cols) + "</tr>"
     return '<div class=scroll><table><tr>%s</tr>%s</table></div>' % (h, body)
 
 
-def render_html(samples, events, title, incident=None):
+def _row_attrs(key, pids=(), app=None):
+    a = ' data-k="%s" data-pids="%s"' % (_e(key), " ".join(str(p) for p in pids if p))
+    if app:
+        a += ' data-app="%s"' % _e(app)
+    return a
+
+
+def _guess_group(name, groups):
+    """The app group a process belongs to, for samples recorded before processes carried it."""
+    if name in groups:
+        return name
+    for g in groups:
+        if name.startswith(g + " "):
+            return g
+    return None
+
+
+VIEW_SPANS = (("24h", 86400), ("6h", 6 * 3600), ("1h", 3600))
+
+
+def _dur_label(sec):
+    if sec >= 2 * 86400:
+        return "%dd" % round(sec / 86400)
+    if sec >= 3600:
+        return "%dh" % round(sec / 3600)
+    return "%dm" % max(1, round(sec / 60))
+
+
+def report_views(since, until):
+    """The report's time views (key, label, from, to): the whole window when it isn't one of
+    24h / 6h / 1h, then each of those that fits, all ending at `until`."""
+    full = until - since
+    views = [(k, k, until - sec, until) for k, sec in VIEW_SPANS if sec <= full + 60]
+    if not any(abs(full - sec) <= 60 for _, sec in VIEW_SPANS):
+        views.insert(0 if full > 86400 else len(views), ("all", _dur_label(full), since, until))
+    return views
+
+
+def _downsample(samples, n=1200):
+    """At most ~n samples for drawing: per time bucket keep the one using the most memory
+    (spikes survive) and add up the bucket's jetsam kills."""
+    if len(samples) <= n:
+        return samples
+    t0, t1 = samples[0]["t"], samples[-1]["t"]
+    w = (t1 - t0) / n or 1
+
+    def load(s):
+        return s.get("app_gb", 0) + s.get("compressed_gb", 0) + s.get("swap_used_gb", 0)
+    out, cur, key, kills = [], None, None, 0
+    for s in samples:
+        b = int((s["t"] - t0) / w)
+        if b != key:
+            if cur is not None:
+                out.append(dict(cur, jetsam_kills=kills))
+            key, cur, kills = b, s, 0
+        elif load(s) > load(cur):
+            cur = s
+        kills += s.get("jetsam_kills", 0)
+    out.append(dict(cur, jetsam_kills=kills))
+    return out
+
+
+def _report_meta(samples):
+    """pid -> name/parent/owner/app/session over the whole report, owner names, session projects."""
+    meta, sessions = {}, {}
+    for s in samples:
+        names = {g["name"] for g in s.get("groups") or []}
+        for p in s.get("top") or []:
+            meta[p["pid"]] = {"n": p["name"], "pp": p.get("ppid"), "u": p.get("uid"),
+                              "g": p.get("g") or _guess_group(p["name"], names), "s": p.get("s"), "pn": p.get("pn")}
+        for c in s.get("claude") or []:
+            sessions[c["pid"]] = c.get("cwd") or ""
+            meta.setdefault(c["pid"], {"n": "claude"})
+            b = c.get("biggest")
+            if b:
+                meta.setdefault(b["pid"], {"n": b["name"]})
+                meta[b["pid"]].setdefault("s", c["pid"])
+    users = {}
+    for m in meta.values():
+        u = m.get("u")
+        if u is not None and u not in users:
+            try:
+                users[u] = pwd.getpwuid(u).pw_name
+            except (KeyError, TypeError):
+                users[u] = "uid %s" % u
+    return meta, users, sessions
+
+
+def _risers_data(samples, meta):
+    app_pids = {}
+    for s in samples:
+        for p in s.get("top") or []:
+            g = (meta.get(p["pid"]) or {}).get("g")
+            if g:
+                d = app_pids.setdefault(g, {})
+                d[p["pid"]] = max(d.get(p["pid"], 0), p["mb"])
+    procs = [{"pid": r["pid"], "name": r["proc"], "first": r["first_mb"], "peak": r["peak_mb"],
+              "rise": r["rise_mb"], "at": r["peak_iso"], "ppid": r.get("ppid"), "uid": r.get("uid")}
+             for r in _risers(samples, "top", limit=None)]
+    apps = []
+    for r in _risers(samples, "groups", limit=None):
+        pids = sorted(app_pids.get(r["name"], {}).items(), key=lambda kv: -kv[1])
+        apps.append({"name": r["name"], "first": r["first_mb"], "peak": r["peak_mb"], "rise": r["rise_mb"],
+                     "at": r["peak_iso"], "pids": [[p, mb] for p, mb in pids]})
+    return procs, apps
+
+
+def _when(t):
+    return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
+
+
+def _view_html(samples, events, meta, key, t0, t1):
+    """One time view: (sub line + KPIs + charts, sessions + top processes + kills)."""
+    cls = "v v-%s" % key
+    sub = '<p class="sub %s">%s → %s · %d samples</p>' % (cls, _when(t0), _when(t1), len(samples))
+    if not samples:
+        return (sub + '<div class="card %s"><p class=sub>No samples in this window.</p></div>' % cls, "")
     summ = summarize(samples, events)
-    marks = [e for e in events if e.get("kind") in ("incident_open", "pressure_change") and
-             (e.get("kind") == "incident_open" or e.get("new", 0) >= 4)]
+    marks = [{"t": e["t"], "label": "%s %s %s" % (e.get("iso", "")[11:19], e["kind"].replace("_", " "), e.get("id", ""))}
+             for e in events if e.get("kind") in ("incident_open", "incident_close")]
+    bands = _critical_spans(samples)
+    draw = _downsample(samples)
     mem_series = [("wired", lambda s: s.get("wired_gb"), "var(--c-wired)"),
                   ("app memory", lambda s: s.get("app_gb"), "var(--c-app)"),
                   ("compressed", lambda s: s.get("compressed_gb"), "var(--c-comp)"),
                   ("swap used", lambda s: s.get("swap_used_gb"), "var(--c-swap)")]
-    ram = samples[-1].get("ram_gb") if samples else None
-    # top-5 app groups by peak
+    ram = samples[-1].get("ram_gb")
     peaks = {}
     for s in samples:
         for g in s.get("groups") or []:
@@ -319,65 +559,395 @@ def render_html(samples, events, title, incident=None):
 
     def gval(name):
         return lambda s: next((g["mb"] / 1024 for g in s.get("groups") or [] if g["name"] == name), 0)
+
+    def rest(s):
+        return sum(g["mb"] for g in s.get("groups") or [] if g["name"] not in top5) / 1024
     grp_series = [(n, gval(n), c) for n, c in zip(top5, colors)]
+    if len(peaks) > len(top5):
+        grp_series.append(("other recorded apps", rest, "var(--k6)"))
     disk_series = [("free disk GB", lambda s: s.get("disk_free_gb"), "var(--k3)"),
                    ("swap total GB", lambda s: s.get("swap_total_gb"), "var(--c-swap)")]
-
-    k = []
-    if summ.get("samples"):
-        o = summ.get("onset") or {}
-        k = [("Peak pressure", summ["peak_pressure"], summ["peak_pressure"] in ("WARN", "CRITICAL")),
-             ("Max swap used", "%.1f GB" % summ["max_swap_used_gb"], False),
-             ("Min free disk", "%.0f GB" % summ["min_disk_free_gb"], summ["min_disk_free_gb"] < 20),
-             ("Jetsam kills", summ["jetsam_kills"], summ["jetsam_kills"] > 0),
-             ("Away during window", "%d%%" % round(100 * summ["away_fraction"]), False),
-             ("Idle at onset", ("%d min" % (o["idle_s"] // 60)) if o.get("idle_s") is not None else "–", False)]
+    o = summ.get("onset") or {}
+    k = [("Peak pressure", summ["peak_pressure"], summ["peak_pressure"] in ("WARN", "CRITICAL")),
+         ("Max swap used", "%.1f GB" % summ["max_swap_used_gb"], False),
+         ("Min free disk", "%.0f GB" % summ["min_disk_free_gb"], summ["min_disk_free_gb"] < 20),
+         ("Jetsam kills", summ["jetsam_kills"], summ["jetsam_kills"] > 0),
+         ("Max unowned memory", "%.0f GB" % summ["max_unowned_gb"] if summ.get("max_unowned_gb") is not None else "–",
+          (summ.get("max_unowned_gb") or 0) >= unowned_limit_gb(summ.get("ram_gb"))),
+         ("Away during window", "%d%%" % round(100 * summ["away_fraction"]), False),
+         ("Idle at onset", ("%d min" % (o["idle_s"] // 60)) if o.get("idle_s") is not None else "–", False)]
+    if summ.get("max_stall_s"):
+        k.append(("Longest stall (awake)", "%d s" % summ["max_stall_s"], summ["max_stall_s"] >= 60))
     kpis = "".join('<div class="card kpi"><div class="v %s">%s</div><div class=l>%s</div></div>'
                    % ("bad" if bad else "", _e(v), _e(l)) for l, v, bad in k)
+    rng = dict(t0=t0, t1=t1)
+    head = "".join([
+        sub,
+        '<div class="kpis %s">%s</div>' % (cls, kpis),
+        '<div class="%s"><h2>System memory (stacked) vs. RAM</h2><div class=card>%s</div>' % (cls, _svg_chart(
+            draw, mem_series, True, marks, bands, refline=ram, bars=(lambda s: s.get("jetsam_kills"), "var(--bad)"), **rng)),
+        "<h2>Top 5 apps / process groups (GB, stacked)</h2><div class=card>%s</div>" % _svg_chart(
+            draw, grp_series, True, marks, bands, **rng),
+        "<h2>Free disk and swap size (GB)</h2><div class=card>%s</div></div>" % _svg_chart(
+            draw, disk_series, False, marks, bands, height=160, **rng),
+    ])
+
+    def sess_pids(c):
+        return [c["pid"]] + [p for p, m in meta.items() if m.get("s") == c["pid"]] + \
+               ([c["biggest"]["pid"]] if c.get("biggest") else [])
+    tail = "".join([
+        '<div class="%s"><h2>Claude sessions at peak (%s)</h2><div class=card>%s</div>' % (
+            cls, _e(summ.get("peak_at", "")[11:19]), _table(summ.get("claude_at_peak") or [], [
+                ("pid", lambda r: r["pid"], True, "pid"), ("project", lambda r: r.get("cwd") or "?", False),
+                ("total MB", lambda r: r["mb"], True), ("procs", lambda r: r["n"], True),
+                ("biggest child", lambda r: ("%s [%s] (%s MB)" % (r["biggest"]["name"], r["biggest"]["pid"], r["biggest"]["mb"]))
+                 if r.get("biggest") else "", False)],
+                attrs=lambda r: _row_attrs("s:%s" % r["pid"], sess_pids(r)))),
+        "<h2>Top processes at peak</h2><div class=card>%s</div>" % _table(summ.get("top_at_peak", []), [
+            ("pid", lambda r: r["pid"], True, "pid"), ("name", lambda r: r["name"], False), ("MB", lambda r: r["mb"], True)],
+            attrs=lambda r: _row_attrs("p:%s" % r["pid"], [r["pid"]], (meta.get(r["pid"]) or {}).get("g"))),
+        "<h2>Most-killed by jetsam</h2><div class=card>%s<p class=sub>reasons: %s</p></div></div>" % (
+            _table([{"n": k2, "c": v2} for k2, v2 in (summ.get("most_killed") or {}).items()],
+                   [("service", lambda r: r["n"], False), ("kills", lambda r: r["c"], True)]),
+            _e(", ".join("%s × %d" % kv for kv in (summ.get("jetsam_reasons") or {}).items()) or "–")),
+    ])
+    return head, tail
+
+
+def render_html(samples, events, title, incident=None, views=None):
+    """A self-contained report. `views` are the (key, label, from, to) windows the page can
+    switch between (default: 24h / 6h / 1h ending at the last sample); the first is shown."""
+    if views is None:
+        views = report_views(samples[0]["t"], samples[-1]["t"]) if samples else [("all", "–", 0, 0)]
+    meta, users, sessions = _report_meta(samples)
+    heads, tails, vdata = [], [], {}
+    for key, label, a, b in views:
+        vs = [s for s in samples if a <= s["t"] <= b]
+        ve = [e for e in events if a <= e["t"] <= b]
+        h, t = _view_html(vs, ve, meta, key, a, b)
+        heads.append(h)
+        tails.append(t)
+        procs, apps = _risers_data(vs, meta)
+        vdata[key] = {"procs": procs, "apps": apps, "range": [a, b]}
+    evs = [{"t": e["t"], "iso": e.get("iso", ""), "kind": e.get("kind", ""), "d": _event_detail(e),
+            "bad": e.get("kind") in BAD_KINDS}
+           for e in reversed(collapse_pressure_events([e for e in events if e.get("kind") != "notified"]))]
+    data = {"meta": meta, "users": users, "sessions": sessions, "events": evs, "views": vdata}
+    first = views[0][0]
+    view_css = "".join('body:not([data-view="%s"]) .v-%s{display:none!important}' % (k, k) for k, *_ in views)
+    pill = ""
+    if len(views) > 1:
+        pill = '<div class="seg big" data-for=view>%s</div>' % "".join(
+            '<button data-view="%s"%s>%s</button>' % (k, " class=on" if k == first else "", _e(lab)) for k, lab, *_ in views)
     reasons_html = ""
     if incident:
         reasons_html = "<h2>Triggers</h2>" + _table(incident.get("reasons", []), [
             ("time", lambda r: _hm(r["t"]), False), ("kind", lambda r: r["kind"], False), ("detail", lambda r: r["desc"], False)])
-    cl = summ.get("claude_at_peak") or []
-    ev_rows = [e for e in events if e.get("kind") not in ("notified",)][-200:]
+
+    def seg(target):
+        return ('<div class=seg data-for="%s"><button class=on data-mode=list>List</button>'
+                '<button data-mode=tree>Tree</button></div>' % target)
+    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
-        "<title>%s</title><style>%s</style></head><body><main>" % (_e(title), CSS),
-        "<h1>%s</h1><p class=sub>%s → %s · %d samples · generated %s by oomph %s</p>" % (
-            _e(title), _e(summ.get("from", "")), _e(summ.get("to", "")), summ.get("samples", 0),
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), VERSION),
-        '<div class=kpis>%s</div>' % kpis,
+        "<title>%s</title><style>%s%s</style></head><body data-view=\"%s\"><main>" % (_e(title), CSS, view_css, first),
+        '<div class="hrow top"><h1>%s</h1><div class=ctl>%s</div></div>' % (_e(title), pill),
+        "".join(heads[:1]) + "".join(heads[1:]),
         reasons_html,
-        "<h2>System memory (stacked) vs. RAM</h2><div class=card>%s</div>" % _svg_chart(
-            samples, mem_series, True, marks, refline=ram,
-            bars=(lambda s: s.get("jetsam_kills"), "var(--bad)")),
-        "<h2>Top 5 apps / process groups (GB)</h2><div class=card>%s</div>" % _svg_chart(samples, grp_series, False, marks),
-        "<h2>Free disk and swap size (GB)</h2><div class=card>%s</div>" % _svg_chart(samples, disk_series, False, marks, height=160),
-        "<h2>Biggest risers — apps</h2><div class=card>%s</div>" % _table(summ.get("group_risers", []), [
-            ("app / group", lambda r: r["name"], False), ("first MB", lambda r: r["first_mb"], True),
-            ("peak MB", lambda r: r["peak_mb"], True), ("rise MB", lambda r: r["rise_mb"], True), ("peak at", lambda r: r["peak_iso"], False)]),
-        "<h2>Biggest risers — processes</h2><div class=card>%s</div>" % _table(summ.get("process_risers", []), [
-            ("process", lambda r: r["name"], False), ("first MB", lambda r: r["first_mb"], True),
-            ("peak MB", lambda r: r["peak_mb"], True), ("rise MB", lambda r: r["rise_mb"], True), ("peak at", lambda r: r["peak_iso"], False)]),
-        "<h2>Claude sessions at peak (%s)</h2><div class=card>%s</div>" % (_e(summ.get("peak_at", "")), _table(cl, [
-            ("pid", lambda r: r["pid"], True), ("project", lambda r: r.get("cwd") or "?", False),
-            ("total MB", lambda r: r["mb"], True), ("procs", lambda r: r["n"], True),
-            ("biggest child", lambda r: ("%s (%s MB)" % (r["biggest"]["name"], r["biggest"]["mb"])) if r.get("biggest") else "", False)])),
-        "<h2>Top processes at peak</h2><div class=card>%s</div>" % _table(summ.get("top_at_peak", []), [
-            ("pid", lambda r: r["pid"], True), ("name", lambda r: r["name"], False), ("MB", lambda r: r["mb"], True)]),
-        "<h2>Most-killed by jetsam</h2><div class=card>%s<p class=sub>reasons: %s</p></div>" % (
-            _table([{"n": k2, "c": v2} for k2, v2 in (summ.get("most_killed") or {}).items()],
-                   [("service", lambda r: r["n"], False), ("kills", lambda r: r["c"], True)]),
-            _e(", ".join("%s × %d" % kv for kv in (summ.get("jetsam_reasons") or {}).items()) or "–")),
-        "<h2>Events</h2><div class=card>%s</div>" % _table(ev_rows, [
-            ("time", lambda e: e.get("iso", "")[11:19], False), ("kind", lambda e: e.get("kind"), False),
-            ("detail", lambda e: _event_detail(e), False)]),
+        '<div class=hrow><h2>Biggest risers — apps</h2><div class=ctl>%s</div></div>'
+        '<div class=card><div id=r-apps></div></div>' % seg("r-apps"),
+        '<div class=hrow><h2>Biggest risers — processes</h2><div class=ctl>%s</div></div>'
+        '<div class=card><div id=r-procs></div></div>' % seg("r-procs"),
+        "".join(tails),
+        '<div class=hrow><h2>Events<span class=cnt id=ev-cnt></span></h2><div class=ctl>'
+        '<label class=toggle title="Filter by time"><input type=checkbox id=ev-time><span class=tr></span>time</label>'
+        '<input type=datetime-local step=1 id=ev-from disabled aria-label="from"> – '
+        '<input type=datetime-local step=1 id=ev-to disabled aria-label="to">'
+        '<span class=search id=ev-search><input type=text id=ev-q placeholder="Filter events" aria-label="Filter events">'
+        '<button id=ev-x type=button aria-label="Clear filter">✕</button></span></div></div>'
+        '<div class=card><div id=ev></div></div>',
+        '<script type="application/json" id=oomph-data>%s</script><script>%s</script>' % (blob, REPORT_JS),
+        '<p class=sub style="margin-top:24px">generated %s by oomph %s</p>' % (
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), VERSION),
         "</main></body></html>",
     ]
     return "".join(parts)
 
 
+def incident_html(inc):
+    """An incident's report: the incident itself (from 15 min before it opened), plus the
+    24h / 6h / 1h before it settled (its last trigger, plus the time it takes to close)."""
+    start = inc["start"]
+    end = inc.get("end") or time.time()
+    anchor = end if inc.get("open") else min(end, inc.get("last_trigger", end) + 180)
+    lo = min(start - 900, anchor - 86400)
+    samples, events = load_samples(lo, end), load_events(lo, end)
+    views = [("incident", "Incident", start - 900, end)] + [(k, k, anchor - sec, anchor) for k, sec in VIEW_SPANS]
+    title = "Memory incident %s%s" % (inc["id"], " (open)" if inc.get("open") else "")
+    return render_html(samples, events, title, inc, views)
+
+
+REPORT_JS = r"""
+(function(){
+const D = JSON.parse(document.getElementById('oomph-data').textContent);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const N = 10, PAGE = 50;
+const meta = D.meta || {}, users = D.users || {}, sessions = D.sessions || {};
+const base = p => (p || '').split('/').filter(Boolean).pop() || p;
+const owner = u => u == null ? 'unknown owner' : (users[u] || ('uid ' + u));
+const label = (pid, name) => sessions[pid] != null ? 'claude · ' + base(sessions[pid]) : name;
+let view = document.body.dataset.view;
+const V = () => (D.views || {})[view] || {procs: [], apps: [], range: null};
+const onView = [];
+let procByPid = new Map(), pidApp = {};
+function refreshMaps(){
+  procByPid = new Map(V().procs.map(r => [r.pid, r]));
+  pidApp = {}; V().apps.forEach(a => a.pids.forEach(p => pidApp[p[0]] = a.name));
+}
+refreshMaps();
+const viewSeg = document.querySelector('.seg[data-for=view]');
+if (viewSeg) viewSeg.addEventListener('click', e => {
+  const b = e.target.closest('button[data-view]'); if (!b || b.dataset.view === view) return;
+  view = document.body.dataset.view = b.dataset.view;
+  viewSeg.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+  refreshMaps(); onView.forEach(f => f()); paint();
+});
+
+/* ---------- highlighting: click toggles, hover previews ---------- */
+const sel = new Set(); let hover = null;
+function keyOf(tr){ return {pids: (tr.dataset.pids || '').split(' ').filter(Boolean), app: tr.dataset.app || null, k: tr.dataset.k}; }
+function sets(keys){
+  const P = new Set(), A = new Set();
+  for (const k of keys) {
+    const tr = document.querySelector('tr[data-k="' + CSS.escape(k) + '"]');
+    if (!tr) continue;
+    const o = keyOf(tr);
+    o.pids.forEach(p => P.add(p));
+    if (k.startsWith('a:')) A.add(k.slice(2));
+  }
+  return [P, A];
+}
+function paint(){
+  const [SP, SA] = sets(sel), [HP, HA] = hover ? sets([hover]) : [new Set(), new Set()];
+  document.querySelectorAll('tr[data-k]').forEach(tr => {
+    const o = keyOf(tr);
+    const m = (P, A) => o.pids.some(p => P.has(p)) || (!!o.app && A.has(o.app)) ;
+    tr.classList.toggle('hl', sel.has(o.k) || m(SP, SA));
+    tr.classList.toggle('hov', !!hover && (hover === o.k || m(HP, HA)));
+  });
+}
+document.addEventListener('click', e => {
+  if (e.target.closest('.caret')) return;
+  const tr = e.target.closest('tr[data-k]'); if (!tr) return;
+  const k = tr.dataset.k; sel.has(k) ? sel.delete(k) : sel.add(k); paint();
+});
+document.addEventListener('mouseover', e => {
+  const tr = e.target.closest('tr[data-k]'); const k = tr ? tr.dataset.k : null;
+  if (k !== hover) { hover = k; paint(); }
+});
+
+/* ---------- risers: list or tree, top 10 or all ---------- */
+function attrs(key, pids, app){
+  return ' data-k="' + esc(key) + '" data-pids="' + esc((pids || []).join(' ')) + '"' + (app ? ' data-app="' + esc(app) + '"' : '');
+}
+function pidCell(pids){
+  if (!pids || !pids.length) return '<td class=pid></td>';
+  const more = pids.length > 1 ? ' <span class=more>+' + (pids.length - 1) + '</span>' : '';
+  return '<td class=pid title="' + esc(pids.join(', ')) + '">' + esc(pids[0]) + more + '</td>';
+}
+function nums(r, agg){
+  if (r) return '<td class=n>' + esc(r.first ?? '') + '</td><td class=n>' + esc(r.peak ?? '') + '</td><td class=n>' + esc(r.rise ?? '') + '</td><td>' + esc(r.at ?? '') + '</td>';
+  if (agg) return '<td class=n></td><td class=n></td><td class="n agg" title="sum of the rises below">Σ ' + esc(agg) + '</td><td></td>';
+  return '<td></td><td></td><td></td><td></td>';
+}
+const HEAD = (first) => '<tr><th class="pid">pid</th><th>' + first + '</th><th class=n>first MB</th><th class=n>peak MB</th><th class=n>rise MB</th><th>peak at</th></tr>';
+const appPids = a => a.pids.map(p => String(p[0]));
+
+function node(key, o){ return Object.assign({key: key, kids: new Map()}, o || {}); }
+function put(root, steps){ let cur = root; for (const st of steps) { if (!cur.kids.has(st.key)) cur.kids.set(st.key, node(st.key, st)); cur = cur.kids.get(st.key); } return cur; }
+// agg: what the direct children add up to (a child with its own row counts once, not again via its kids)
+function finish(n){ let s = 0, mx = -1e9; for (const c of n.kids.values()) { finish(c); s += c.own; mx = Math.max(mx, c.max); }
+  const own = n.row && n.row.rise != null ? n.row.rise : null;
+  n.agg = n.kids.size ? s : null; n.own = own != null ? own : s; n.max = Math.max(mx, own == null ? -1e9 : own); }
+
+function procTree(rows){
+  const root = node('root'), byPid = new Map(rows.map(r => [r.pid, r]));
+  for (const r of rows) {
+    const m = meta[r.pid] || {}, chain = [], seen = new Set([r.pid]);
+    const pp = r.ppid != null ? r.ppid : m.pp;
+    let p = pp, guard = 0;
+    while (p && p > 1 && !seen.has(p) && guard++ < 16) {
+      seen.add(p);
+      const pm = meta[p];
+      chain.unshift({pid: p, name: pm ? pm.n : ((p === pp && m.pn) || 'pid ' + p)});
+      if (!pm || pm.pp == null) break;
+      p = pm.pp;
+    }
+    if (m.s && m.s !== r.pid && !chain.some(c => c.pid === m.s)) chain.unshift({pid: m.s, name: 'claude'});
+    const uid = r.uid != null ? r.uid : m.u;
+    const steps = [{key: 'u:' + uid, label: owner(uid), owner: true}]
+      .concat(chain.map(c => ({key: 'p:' + c.pid, pid: c.pid, label: label(c.pid, c.name), pids: [String(c.pid)], app: (meta[c.pid] || {}).g})))
+      .concat([{key: 'p:' + r.pid, pid: r.pid, label: label(r.pid, r.name), pids: [String(r.pid)], app: m.g || pidApp[r.pid]}]);
+    put(root, steps).row = r;
+  }
+  (function walk(n){ if (!n.row && n.pid && byPid.has(n.pid)) n.row = byPid.get(n.pid); n.kids.forEach(walk); })(root);
+  finish(root); return root;
+}
+function appTree(rows){
+  const root = node('root');
+  for (const a of rows) {
+    const uids = a.pids.map(p => (meta[p[0]] || {}).u).filter(u => u != null);
+    const uid = uids.length ? uids.sort((x, y) => uids.filter(v => v === y).length - uids.filter(v => v === x).length)[0] : null;
+    const an = put(root, [{key: 'u:' + uid, label: owner(uid), owner: true},
+                         {key: 'a:' + a.name, label: a.name, pids: appPids(a), app: a.name}]);
+    an.row = a;
+    for (const [pid, mb] of a.pids) {
+      const pr = procByPid.get(pid);
+      const c = put(an, [{key: 'p:' + pid, pid: pid, label: label(pid, (meta[pid] || {}).n || ('pid ' + pid)), pids: [String(pid)], app: a.name}]);
+      c.row = pr || {peak: mb};
+    }
+  }
+  finish(root); return root;
+}
+const KIDS = 10;
+function treeRows(root, collapsed, opened, showAll){
+  const out = [];
+  (function walk(n, depth){
+    const all = [...n.kids.values()].sort((a, b) => b.max - a.max);
+    const kids = showAll.has(n.key) ? all : all.slice(0, KIDS);
+    for (const c of kids) {
+      // apps start folded (their processes can number in the hundreds); everything else open
+      const has = c.kids.size > 0, closed = c.key.startsWith('a:') ? !opened.has(c.key) : collapsed.has(c.key);
+      const caret = has ? '<span class=caret data-key="' + esc(c.key) + '">' + (closed ? '▸' : '▾') + '</span>' : '<span class=caret></span>';
+      const name = '<td style="padding-left:' + (8 + depth * 16) + 'px">' + caret + (c.owner ? '<span class=node>' + esc(c.label) + '</span>' : esc(c.label)) + '</td>';
+      const a = c.pids ? attrs(c.key, c.pids, c.app) : '';
+      out.push('<tr' + a + '>' + (c.pid ? pidCell([c.pid]) : (c.pids ? pidCell(c.pids) : '<td class=pid></td>')) + name + nums(c.row, c.agg) + '</tr>');
+      if (has && !closed) walk(c, depth + 1);
+    }
+    if (all.length > kids.length)
+      out.push('<tr><td class=pid></td><td colspan=5 style="padding-left:' + (22 + depth * 16) + 'px"><button type=button class=linkbtn data-all="' +
+               esc(n.key) + '">… ' + (all.length - kids.length) + ' more</button></td></tr>');
+  })(root, 0);
+  return out.join('');
+}
+function riser(id, kind){
+  const el = document.getElementById(id); if (!el) return;
+  onView.push(() => { st.all = false; st.showAll.clear(); render(); });
+  const st = {mode: 'list', all: false, collapsed: new Set(), opened: new Set(), showAll: new Set()};
+  const segEl = document.querySelector('.seg[data-for="' + id + '"]');
+  function render(){
+    const rows = V()[kind];
+    if (!rows.length) { el.innerHTML = '<p class=sub>none</p>'; return; }
+    const vis = st.all ? rows : rows.slice(0, N);
+    let body;
+    if (st.mode === 'tree') body = treeRows(kind === 'apps' ? appTree(vis) : procTree(vis), st.collapsed, st.opened, st.showAll);
+    else body = vis.map(r => kind === 'apps'
+      ? '<tr' + attrs('a:' + r.name, appPids(r), r.name) + '>' + pidCell(appPids(r)) + '<td>' + esc(r.name) + '</td>' + nums(r) + '</tr>'
+      : '<tr' + attrs('p:' + r.pid, [String(r.pid)], (meta[r.pid] || {}).g || pidApp[r.pid]) + '>' + pidCell([r.pid]) + '<td>' + esc(label(r.pid, r.name)) + '</td>' + nums(r) + '</tr>').join('');
+    let more = '';
+    if (rows.length > N) more = '<div class=morebar><button type=button data-more>' + (st.all ? 'fewer' : 'more — all ' + rows.length + ' entries') + '</button></div>';
+    el.innerHTML = '<div class=scroll><table>' + HEAD(kind === 'apps' ? 'app / group' : 'process') + body + '</table></div>' + more;
+    paint();
+  }
+  el.addEventListener('click', e => {
+    const c = e.target.closest('.caret[data-key]');
+    if (c) { const k = c.dataset.key, set = k.startsWith('a:') ? st.opened : st.collapsed;
+             set.has(k) ? set.delete(k) : set.add(k); render(); return; }
+    const m = e.target.closest('[data-all]');
+    if (m) { st.showAll.add(m.dataset.all); render(); return; }
+    if (e.target.closest('[data-more]')) { st.all = !st.all; render(); }
+  });
+  if (segEl) segEl.addEventListener('click', e => {
+    const b = e.target.closest('button[data-mode]'); if (!b) return;
+    st.mode = b.dataset.mode;
+    segEl.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === b));
+    render();
+  });
+  render();
+}
+riser('r-apps', 'apps');
+riser('r-procs', 'procs');
+
+/* ---------- events: newest first, live text + time filter, paged ---------- */
+(function(){
+  const el = document.getElementById('ev'); if (!el) return;
+  const evs = D.events || [], q = document.getElementById('ev-q'), x = document.getElementById('ev-x'),
+        box = document.getElementById('ev-search'), on = document.getElementById('ev-time'),
+        from = document.getElementById('ev-from'), to = document.getElementById('ev-to'), cnt = document.getElementById('ev-cnt');
+  const pad = n => String(n).padStart(2, '0');
+  const local = t => { const d = new Date(t * 1000); return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds()); };
+  let shown = PAGE, multiDay = false, inView = evs;
+  function setRange(){
+    const r = V().range || [evs.length ? evs[evs.length - 1].t : 0, evs.length ? evs[0].t : 0];
+    from.value = local(Math.floor(r[0])); to.value = local(Math.ceil(r[1]));
+    multiDay = local(r[0]).slice(0, 10) !== local(r[1]).slice(0, 10);
+    inView = evs.filter(e => e.t >= r[0] && e.t <= r[1]);
+  }
+  setRange();
+  onView.push(() => { setRange(); shown = PAGE; render(); });
+  function filtered(){
+    const terms = q.value.toLowerCase().split(/\s+/).filter(Boolean);
+    const a = on.checked && from.value ? new Date(from.value).getTime() / 1000 : -Infinity;
+    const b = on.checked && to.value ? new Date(to.value).getTime() / 1000 : Infinity;
+    return inView.filter(e => e.t >= a && e.t <= b &&
+      terms.every(w => (e.iso + ' ' + e.kind + ' ' + e.d).toLowerCase().includes(w)));
+  }
+  function render(){
+    const f = filtered(), vis = f.slice(0, shown);
+    cnt.textContent = f.length === inView.length ? inView.length + ' total' : f.length + ' of ' + inView.length;
+    box.classList.toggle('has', !!q.value);
+    if (!f.length) { el.innerHTML = '<p class=sub>' + (inView.length ? 'No events match the filter.' : 'none') + '</p>'; return; }
+    const rows = vis.map(e => '<tr><td class=time>' + esc(multiDay ? e.iso.slice(5, 10) + ' ' + e.iso.slice(11, 19) : e.iso.slice(11, 19)) +
+      '</td><td class="kind' + (e.bad ? ' bad' : '') + '">' + esc(e.kind) + '</td><td>' + esc(e.d) + '</td></tr>').join('');
+    const left = f.length - vis.length;
+    el.innerHTML = '<div class=scroll><table><tr><th>time</th><th>kind</th><th>detail</th></tr>' + rows + '</table></div>' +
+      (left > 0 ? '<div class=morebar><button type=button data-more>more — next ' + Math.min(PAGE, left) + ' of ' + left + ' older</button></div>' : '');
+  }
+  const reset = () => { shown = PAGE; render(); };
+  q.addEventListener('input', reset);
+  x.addEventListener('click', () => { q.value = ''; q.focus(); reset(); });
+  on.addEventListener('change', () => { from.disabled = to.disabled = !on.checked; reset(); });
+  from.addEventListener('input', reset); to.addEventListener('input', reset);
+  el.addEventListener('click', e => { if (e.target.closest('[data-more]')) { shown += PAGE; render(); } });
+  render();
+})();
+})();
+"""
+
+
+FLAP_GAP_S = 120
+
+
+def collapse_pressure_events(events):
+    """Merge runs of pressure_change events less than FLAP_GAP_S apart into one
+    pressure_flapping row (older logs record every flip; the daemon now batches them)."""
+    out, run = [], []
+
+    def flush():
+        if len(run) == 1:
+            out.append(run[0])
+        elif run:
+            levels = sorted({run[0]["old"]} | {e["new"] for e in run})
+            out.append({"t": run[0]["t"], "iso": run[0]["iso"], "kind": "pressure_flapping",
+                        "flips": len(run), "levels": [PRESSURE.get(x, x) for x in levels],
+                        "until": run[-1]["iso"][11:19], "now": PRESSURE.get(run[-1]["new"], run[-1]["new"]),
+                        "swap_used_gb": run[-1].get("swap_used_gb")})
+        run.clear()
+    for e in events:
+        if e.get("kind") == "pressure_change" and "old" in e:
+            if run and e["t"] - run[-1]["t"] > FLAP_GAP_S:
+                flush()
+            run.append(e)
+            continue
+        flush()
+        out.append(e)
+    flush()
+    return out
+
+
 def _event_detail(e):
+    if e.get("kind") == "pressure_change" and "old" in e:
+        e = dict(e, old=PRESSURE.get(e["old"], e["old"]), new=PRESSURE.get(e["new"], e["new"]))
     skip = {"t", "iso", "kind"}
     return ", ".join("%s=%s" % (k, json.dumps(v) if isinstance(v, (dict, list)) else v)
                      for k, v in e.items() if k not in skip)[:300]
@@ -430,6 +1000,10 @@ def cmd_status():
     print("memory     RAM %.0f GB · app %.1f · wired %.1f · compressed %.1f · cached %.1f · free %.1f GB" % (
         c["ram_gb"], c["app_gb"], c["wired_gb"], c["compressed_gb"], c["cached_gb"], c["free_gb"]))
     print("swap       %.1f / %.1f GB used (%d swapfiles)" % (c["swap_used_gb"], c["swap_total_gb"], c["swapfiles"]))
+    u = unowned_gb(c)
+    if u is not None:
+        print("unowned    %.1f GB held outside any process%s" % (
+            u, "  <- LEAK? only a restart frees it" if u >= unowned_limit_gb(c["ram_gb"]) else ""))
     print("disk       %.0f GB free" % c["disk_free_gb"])
     print("you        idle %ss · display %s · %s · sleep held by %s" % (
         a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
@@ -529,12 +1103,10 @@ def cmd_incident(args):
         print("no such incident: %s" % ident)
         return 1
     if "--html" in args:
-        p = os.path.join(inc["dir"], "report.html")
-        if not os.path.exists(p):
-            p = os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-%s.html" % inc["id"])
-            s = load_samples(inc["start"] - 900, inc.get("end", time.time()))
-            e = load_events(inc["start"] - 900, inc.get("end", time.time()))
-            open(p, "w").write(render_html(s, e, "Memory incident %s (open)" % inc["id"], inc))
+        # Render fresh rather than opening the report.html saved at close: that one is a
+        # snapshot in whatever report design the daemon had back then.
+        p = os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-%s.html" % inc["id"])
+        open(p, "w").write(incident_html(inc))
         subprocess.run(["/usr/bin/open", p])
         print(p)
         return 0
@@ -543,7 +1115,7 @@ def cmd_incident(args):
 
 
 def cmd_html(args):
-    since, until = window(args, "6h")
+    since, until = window(args, "24h")
     out = None
     if "-o" in args:
         out = args[args.index("-o") + 1]
@@ -593,8 +1165,10 @@ def live_sample(with_procs=True):
     s.update(d.system_memory())
     s["away"] = {k: v for k, v in d.away_state().items() if k in ("idle_s", "display_on", "locked", "sleep_preventers")}
     if with_procs:
-        top, groups, sessions = d.summarize_procs(d.collect_procs())
+        procs = d.collect_procs()
+        top, groups, sessions = d.summarize_procs(procs)
         s["top"], s["groups"], s["claude"] = top, groups, sessions
+        s.update(d.ownership(s, procs))
     return s
 
 
@@ -646,12 +1220,16 @@ def verdict(s):
         bump(1, "only %.1f GB physical memory free" % free)
     if s.get("jetsam_kills"):
         bump(1, "macOS just killed %d processes for memory" % s["jetsam_kills"])
+    u = s.get("unowned_gb")
+    if u is not None and ram and u >= unowned_limit_gb(ram):
+        bump(1, "%.0f GB of memory is held outside any process (likely a GPU or driver leak) "
+                "and won't come back until the Mac restarts" % u)
     lv = LEVELS[level]
     return {
         "level": lv, "exit_code": level, "reasons": reasons, "advice": ADVICE[lv],
         "free_gb": free, "ram_gb": ram, "pressure": PRESSURE.get(p, p),
         "swap_used_gb": s.get("swap_used_gb"), "swap_total_gb": s.get("swap_total_gb"),
-        "disk_free_gb": disk, "source": s.get("source", "daemon"), "at": s.get("iso"),
+        "disk_free_gb": disk, "unowned_gb": s.get("unowned_gb"), "source": s.get("source", "daemon"), "at": s.get("iso"),
     }
 
 

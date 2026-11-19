@@ -49,6 +49,10 @@ Two practical lessons that shaped the implementation:
 - On current macOS, kernel `memorystatus` messages are **not** in the unified log. The
   useful signals are launchd's `OS_REASON_JETSAM` exits and ReportSystemMemory's
   `killed by jetsam reason …` lines (the latter written as a delayed batch).
+- `log stream` never delivers launchd's lines — `log show` does. Until 1.3 every
+  incident reported 0 kills (the 2026-11-19 freeze had 1,470 in one minute). launchd's
+  exits are now polled with `log show` every 60 s (10 s while hot), with overlapping
+  windows deduplicated by mach timestamp; everything else is still streamed.
 - A naive `log stream` predicate is expensive. Matching message text across *all*
   processes, or including WindowServer / kernel, cost 1–5 % CPU continuously; the final
   predicate costs effectively nothing.
@@ -90,7 +94,7 @@ Two practical lessons that shaped the implementation:
 | Sampling | **Adaptive**: every 30 s; every 5 s ("hot mode") while pressure ≥ warning, swap grew > 512 MB within 60 s, jetsam kills occurred, free disk < 5 GB, or an incident is open | Fine resolution exactly when it matters, near-zero cost otherwise. |
 | Retention | Samples 14 days (previous days gzip-compressed); incidents 90 days; `events.jsonl` rotated at 20 MB | ~50–150 MB on disk in total. |
 | Logs | `/Library/Logs/oomph/`, world-readable | Inspecting the papertrail never needs `sudo`. |
-| Notifications | Only on **critical pressure, a jetsam storm, a memory-shortage kill report, or the dialog**; 15 min cooldown. Plus a **disk guard below 20 GB free**, 6 h cooldown. Delivered into the console user's session via `launchctl asuser … osascript` | You come back to one or two meaningful notifications, not fifty. The disk guard catches the root cause before it bites. |
+| Notifications | Only on **critical pressure, a jetsam storm, a memory-shortage kill report, the dialog, unowned memory or a stall**; 15 min cooldown. Plus a **disk guard below 20 GB free**, 6 h cooldown. Delivered into the console user's session via `launchctl asuser … osascript` | You come back to one or two meaningful notifications, not fifty. The disk guard catches the root cause before it bites. |
 | No auto-remediation | oomph never kills, pauses or throttles anything | It could take down the very session you care about. Papertrail only. |
 | Menu-bar app | Swift (AppKit + SwiftUI + Swift Charts), built with plain `swiftc`, ad-hoc signed | Tiny, no Xcode project, no dependencies. |
 | App autostart | Per-user LaunchAgent `local.oomph.menubar`, toggled from the popup | Reliable for an ad-hoc-signed app. The daemon logs whether or not the app runs. |
@@ -102,11 +106,17 @@ One JSON object per line in `samples-YYYY-MM-DD.jsonl`; `current.json` always ho
 latest one plus daemon status.
 
 - `t` (unix time), `iso`, `hot`, `gap` (seconds since the previous sample when it was
-  more than 3× the interval — sleep/wake or a stall)
+  more than 3× the interval), `stall` (the same, when the Mac was awake throughout:
+  `CLOCK_UPTIME_RAW` stops during sleep, wall time doesn't)
 - **System memory:** pressure level (1 normal / 2 warning / 4 critical),
   `kern.memorystatus_level` (free %), RAM, app memory, wired, compressed (occupied) and
   compressor logical size, file cache, free; swap total/used and swapfile count; free
   space on the data volume; jetsam kills since the previous sample
+- **Ownership:** `procs_gb` (all processes' footprints added up) and `unowned_gb` =
+  app memory + compressor logical size − `procs_gb`. Footprints count compressed and
+  swapped pages at full size, so this is normally a few GB. On 2026-11-19 a WebKit GPU
+  process leak left ~150 GB (compressed ~11:1) behind after its processes were killed;
+  nothing could free it and the Mac froze two hours later.
 - **Away state:** seconds since last keyboard/mouse input, display on/off, screen locked,
   console user, current sleep-preventers (caffeinate, Amphetamine, …)
 - **Top 25 processes** by footprint (pid, ppid, name, footprint, RSS, uid)
@@ -115,19 +125,25 @@ latest one plus daemon status.
 - **Agent sessions** — every outermost process named `claude` together with its whole
   descendant tree: pid, working directory (i.e. the project), total footprint, process
   count, biggest descendant
+- Each top process also carries `g` (its app group), `pn` (its parent's name) and `s`
+  (the Claude session it runs under), so a report can show it in the owner → parent →
+  process tree and connect it to its app without the full process table
 - `gone` — processes ≥ 300 MB that disappeared since the previous sample (normal exits
   included; context only)
 
 ## Events
 
-`events.jsonl` combines what the `log stream` sees with what the daemon derives itself.
+`events.jsonl` combines what the system log shows with what the daemon derives itself.
 
 - **From the log** (predicate in `oomph.LOG_PREDICATE`): launchd `OS_REASON_JETSAM`
   exits, ReportSystemMemory `killed by jetsam reason …`, and "application memory" text
   from loginwindow / UserNotificationCenter. Idle-exit kills are excluded. A low-swap
   storm produces ~1,000 lines per minute, so kills are **aggregated per sample** into a
   single `jetsam` event (count, reasons, most-killed services).
-- **Derived:** `pressure_change`, `sleep_gap`, `disk_low`, `incident_open` /
+- **Derived:** `pressure_change` (the first change after a quiet minute; further flips
+  within a minute of each other are batched into one `pressure_flapping` event with a
+  count, written once it settles or every 15 min — the freeze logged 637 single flips),
+  `sleep_gap` vs. `stall`, `unowned_memory` / `unowned_memory_cleared`, `disk_low`, `incident_open` /
   `incident_close`, `notified`, `daemon_start` / `daemon_stop` / `daemon_error`.
 
 ## Incidents
@@ -137,7 +153,8 @@ latest one plus daemon status.
 - **Opened by** critical memory pressure, ≥ 10 jetsam kills within 60 s ("jetsam
   storm"), a ReportSystemMemory kill with a memory-shortage reason (`low-swap`,
   `vm-pageshortage`, `vm-thrashing`, `vm-compressor-*`, `fc-thrashing`,
-  `zone-map-exhaustion`), or the dialog text. It stays open while a trigger persists
+  `zone-map-exhaustion`), the dialog text, unowned memory above max(16 GB, 40 % of RAM)
+  for a minute, or a stall of ≥ 60 s. It stays open while a trigger persists
   and closes 3 minutes after the last one.
 - **On open:** notification, hot mode, and `log show --last 15m` with the memory
   predicate saved to `syslog.txt`.

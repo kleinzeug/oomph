@@ -6,6 +6,16 @@ import SwiftUI
 
 let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
 let agentLabel = "local.oomph.menubar"
+let skillURL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
+
+/// A prompt to paste into a Claude Code session. It downloads the skill verbatim with curl
+/// (a web fetch would hand the model a summary, not the file) and has the session follow it.
+func skillPrompt(allProjects: Bool) -> String {
+    let dir = allProjects ? "~/.claude/skills/oomph" : ".claude/skills/oomph"
+    let scope = allProjects ? "for all my projects" : "to this project"
+    return "Add the oomph memory skill \(scope): run `mkdir -p \(dir) && curl -fsSL \(skillURL) -o \(dir)/SKILL.md`, "
+        + "then read \(dir)/SKILL.md and follow it for the rest of this session."
+}
 let agentPlist = NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
 
 // MARK: - Model
@@ -240,17 +250,15 @@ final class Store: ObservableObject {
     }
 
     func open(_ inc: Incident) {
-        let report = inc.dir + "/report.html"
-        if FileManager.default.fileExists(atPath: report) {
-            NSWorkspace.shared.open(URL(fileURLWithPath: report))
-        } else {
-            runCLI(["incident", inc.id, "--html"])
-        }
+        // always re-render, so old incidents show in the current report design
+        runCLI(["incident", inc.id, "--html"])
     }
 
     func runCLI(_ args: [String]) {
-        let cli = FileManager.default.fileExists(atPath: "/usr/local/libexec/oomph/oomph.py")
-            ? "/usr/local/libexec/oomph/oomph.py" : (Bundle.main.resourcePath ?? "") + "/oomph.py"
+        // Reports are drawn by the CLI bundled with this app (reading the logs needs no
+        // privileges), so they always match the app's version, even before Update.
+        let bundled = (Bundle.main.resourcePath ?? "") + "/oomph.py"
+        let cli = FileManager.default.fileExists(atPath: bundled) ? bundled : "/usr/local/libexec/oomph/oomph.py"
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         p.arguments = ["-I", "-B", cli] + args
@@ -274,6 +282,7 @@ struct Stat: View {
 struct PopoverView: View {
     @ObservedObject var store: Store
     @State private var error: String?
+    @State private var copied = false
     private let series = ["Wired", "App", "Compressed", "Swap"]
 
     var body: some View {
@@ -516,6 +525,13 @@ struct PopoverView: View {
         .contentShape(Rectangle())
     }
 
+    func copy(_ text: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { copied = false }
+    }
+
     var footer: some View {
         HStack {
             if store.needsUpdate {
@@ -533,11 +549,22 @@ struct PopoverView: View {
                     store.runPrivileged("install.sh") { error = $0 }
                 }.buttonStyle(.borderedProminent).disabled(store.busy)
             }
-            Button("Report") { store.runCLI(["html", "--last", "\(Int(store.range / 3600))h", "--open"]) }
+            Button("Report") { store.runCLI(["html", "--last", "24h", "--open"]) }
                 .help("Open an HTML report for the selected range")
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
                 .toggleStyle(.checkbox).font(.caption)
+            Menu {
+                Section("Claude skill — paste into a session") {
+                    Button("Copy prompt: add to the session's project") { copy(skillPrompt(allProjects: false)) }
+                    Button("Copy prompt: add for all projects") { copy(skillPrompt(allProjects: true)) }
+                }
+                Button("Copy raw SKILL.md link") { copy(skillURL) }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "square.and.arrow.up")
+            }
+            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+            .help(copied ? "Copied — paste it into a Claude Code session" : "Share the oomph skill with a Claude session")
             Button {
                 NSApp.terminate(nil)
             } label: { Image(systemName: "power") }.help("Quit oomph")
@@ -757,6 +784,20 @@ struct Main {
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
             MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark")) }
             return
+        }
+        // One menu-bar icon only: the newest launch wins, so a rebuilt or relaunched app
+        // replaces whatever copy is already running (e.g. the one started at login).
+        let me = ProcessInfo.processInfo.processIdentifier
+        for other in NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            where other.processIdentifier != me {
+            if !other.terminate() { other.forceTerminate() }
+        }
+        // Keep the login item pointing at this executable (it went stale after the OOMph → oomph rename).
+        if let exe = Bundle.main.executablePath,
+           let plist = NSMutableDictionary(contentsOfFile: agentPlist),
+           (plist["ProgramArguments"] as? [String])?.first != exe {
+            plist["ProgramArguments"] = [exe]
+            plist.write(toFile: agentPlist, atomically: true)
         }
         let app = NSApplication.shared
         let delegate = AppDelegate()

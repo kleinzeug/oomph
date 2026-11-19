@@ -65,15 +65,21 @@ Every 30 seconds — every 5 seconds while things are getting tight:
 | Processes | the 25 biggest by physical footprint, and the 15 biggest apps with all their helper processes added up |
 | Agent sessions | every `claude` process with its whole process tree: project directory, total memory, biggest child |
 | Memory kills | jetsam kills from the system log, aggregated per sample with their reasons |
+| Unowned memory | memory no running process accounts for — normally a few GB; a large, lasting amount is a leak outside the processes (e.g. in the GPU driver) that only a restart frees |
 
 An **incident** opens when memory pressure goes critical, when macOS starts killing
 processes for memory (≥ 10 jetsam kills in a minute), when it reports kills for
-`low-swap` or similar reasons, or when the out-of-memory dialog appears. You get one
+`low-swap` or similar reasons, when the out-of-memory dialog appears, when more than
+40 % of RAM (at least 16 GB) belongs to no process for a minute, or when the Mac is
+awake but so starved that oomph itself can't run for a minute. You get one
 notification, and once it is over the incident folder holds:
 
 - `report.html` — a self-contained page with charts and tables: memory vs. RAM with
-  away periods and kills, the top five apps, free disk vs. swap size, the biggest
-  risers, the agent sessions at the peak, the most-killed services;
+  away periods, critical-pressure stretches and kills, the top five apps stacked, free
+  disk vs. swap size (gaps without data are hatched), the biggest risers as a list or a
+  tree by owner, parent process and app, the agent sessions at the peak, the most-killed
+  services, and the events newest-first with a text and time filter. Click any row to
+  highlight that process (or app) in every table;
 - `incident.json` — the same summary as data;
 - `syslog.txt` — the relevant 15 minutes of the system log.
 
@@ -159,7 +165,7 @@ oomph report --last 2h          # timeline, biggest risers, kills and events
 oomph report --since 2026-11-13T18:00 --until 2026-11-13T20:00
 oomph incidents                 # list of incidents
 oomph incident latest --html    # open the latest incident's report
-oomph html --last 24h --open    # HTML report for any time range
+oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
 ```
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
@@ -178,12 +184,17 @@ you. With several sessions on one Mac, they also **take turns**: each reserves t
 a heavy step will need, and ***oomph*** grants the reservations in order, side by side
 while they fit and one after another when they don't.
 
-**Drop-in, for any session** — paste this into Claude Code:
+**Per project** — paste this into a Claude Code session (the popup's share button
+next to *Launch at login* copies it for you, or the all-projects variant with
+`~/.claude/skills/oomph`):
 
 ```
-Use this skill for the rest of the session:
-https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md
+Add the oomph memory skill to this project: run `mkdir -p .claude/skills/oomph && curl -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o .claude/skills/oomph/SKILL.md`, then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.
 ```
+
+The skill is downloaded verbatim with `curl` on purpose: a web fetch hands the model a
+summary of the page, not the file. Commit `.claude/skills/oomph/` and every session in
+that repo has it.
 
 **For every session**, once:
 
@@ -209,7 +220,8 @@ What a session gets:
 | `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
-free, under 20 GB free disk, or right after jetsam kills; **critical** at pressure
+free, under 20 GB free disk, right after jetsam kills, or when a large amount of
+memory belongs to no process; **critical** at pressure
 *critical*, under 5 GB free disk, or full swap on a nearly full disk. All of these
 commands work without the background logger too — they measure live — so the skill is
 useful even before you click Activate. Already installed an older version? The popup
@@ -256,7 +268,7 @@ session B  → granted r8, tests start
 |---|---|
 | `/Library/Logs/oomph/current.json` | the latest sample plus daemon status |
 | `/Library/Logs/oomph/samples-YYYY-MM-DD.jsonl[.gz]` | one sample per line; older days compressed; kept 14 days |
-| `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes, sleep gaps, notifications |
+| `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications |
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
 | `/usr/local/libexec/oomph/` | the installed daemon and CLI |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job |

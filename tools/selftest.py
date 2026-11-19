@@ -70,6 +70,62 @@ inc = json.load(open(os.path.join(inc_dir, "incident.json"))) if iid else {}
 check(inc.get("summary", {}).get("jetsam_kills") == 12, "incident.json summary counts the kills")
 check(os.path.exists(os.path.join(LOG, "current.json")), "current.json written")
 
+# --- jetsam exits via `log show` polling: parsed, deduplicated across overlapping windows
+real_run = oomphd.run
+line = lambda i: json.dumps({"timestamp": "2026-11-19 03:52:57.%06d+0100" % i, "machTimestamp": 1000 + i,
+                             "processImagePath": "/sbin/launchd",
+                             "eventMessage": "[gui/501/com.apple.svc%d [%d]:] exited with exit reason (namespace: 1 "
+                                             "code: 0xd) - OS_REASON_JETSAM, ran for 5ms" % (i % 3, 500 + i)})
+fake_out = "\n".join(line(i) for i in range(15)) + '\n{"count":15,"finished":1}\n'
+oomphd.run = lambda cmd, timeout=10: fake_out
+d2 = oomphd.Daemon()
+cur = d2.poll_jetsam(time.time() - 30)
+cur = d2.poll_jetsam(cur)  # same lines again (overlapping window)
+check(d2.jet["kills"] == 15, "jetsam poll: 15 launchd exits counted once despite overlap (%d)" % d2.jet["kills"])
+check(any(x["kind"] == "jetsam_storm" for x in d2.pending_triggers), "jetsam poll: 15 kills in a minute is a storm")
+oomphd.run = lambda cmd, timeout=10: ""
+check(d2.poll_jetsam(123.0) == 123.0, "jetsam poll: a failed query keeps its window for the retry")
+oomphd.run = real_run
+out = oomphd.run(["/usr/bin/log", "show", "--style", "ndjson", "--last", "20s", "--predicate", oomph.JETSAM_EXIT_PREDICATE], timeout=60)
+check('"finished"' in out, "jetsam poll: the real `log show` query runs")
+
+# --- stall vs. sleep, unowned memory, pressure flapping
+d2.pending_triggers = []
+d2.prev_t, d2.prev_up = time.time() - 120, oomphd.uptime_s() - 118  # 2 min apart, awake throughout
+st = d2.sample()
+check(st.get("stall") and any(x["kind"] == "stall" for x in d2.pending_triggers), "awake 2-min gap reported as a stall")
+d2.prev_t, d2.prev_up = time.time() - 600, oomphd.uptime_s() - 5   # 10 min apart, asleep almost all of it
+st = d2.sample()
+check(not st.get("stall"), "asleep 10-min gap reported as sleep, not a stall")
+check(isinstance(st.get("unowned_gb"), float) and st["unowned_gb"] < oomph.unowned_limit_gb(st["ram_gb"]),
+      "ownership: %.1f GB unowned now (procs %.1f GB), below the %.0f GB limit"
+      % (st.get("unowned_gb") or -1, st.get("procs_gb") or -1, oomph.unowned_limit_gb(st["ram_gb"])))
+evs = []
+d2.event = lambda kind, **kw: evs.append(dict(kw, kind=kind))
+d2.notify = lambda *a: None
+d2.open_incident = lambda t, reasons: setattr(d2, "incident", {"id": "x", "reasons": list(reasons), "last_trigger": t})
+base = dict(st, pressure=1, unowned_gb=2.0, swap_used_gb=0.0, disk_free_gb=60.0)
+t0 = time.time()
+for i, pr in enumerate([1, 2, 4, 2, 4, 2, 4, 2] + [2] * 14):
+    d2.evaluate(dict(base, t=t0 + 5 * i, pressure=pr))
+kinds = [e["kind"] for e in evs]
+flap = [e for e in evs if e["kind"] == "pressure_flapping"]
+check(kinds.count("pressure_change") == 1 and len(flap) == 1 and flap[0]["flips"] == 6,
+      "pressure flapping batched: %s" % [(e["kind"], e.get("flips")) for e in evs])
+d2.incident = None
+leak = dict(base, unowned_gb=140.0, procs_gb=15.0)
+for i in range(15):
+    d2.evaluate(dict(leak, t=t0 + 200 + 5 * i))
+check(d2.incident and any(r["kind"] == "unowned" for r in d2.incident["reasons"]) and
+      any(e["kind"] == "unowned_memory" for e in evs), "140 GB unowned for a minute opens an incident")
+check(oomph.verdict(leak)["level"] == "tight" and "outside any process" in " ".join(oomph.verdict(leak)["reasons"]),
+      "verdict: unowned memory makes it tight")
+old = [{"t": t0 + i * 10, "iso": "2026-11-19T05:11:%02d+01:00" % i, "kind": "pressure_change", "old": 2 + 2 * (i % 2),
+        "new": 4 - 2 * (i % 2)} for i in range(6)]
+col = oomph.collapse_pressure_events(old + [{"t": t0 + 999, "iso": "x", "kind": "sleep_gap"}])
+check([e["kind"] for e in col] == ["pressure_flapping", "sleep_gap"] and col[0]["flips"] == 6,
+      "report: logged flips collapse into one row")
+
 # --- CLI against the generated data
 for args in (["status"], ["report", "--last", "10m"], ["incidents"], ["incident", "latest"],
              ["html", "--last", "1h", "-o", os.path.join(LOG, "adhoc.html")]):
@@ -79,6 +135,16 @@ for args in (["status"], ["report", "--last", "10m"], ["incidents"], ["incident"
     check(rc == 0 and buf.getvalue().strip(), "oomph %s" % " ".join(args))
 html = open(os.path.join(LOG, "adhoc.html")).read()
 check(html.count("<svg") >= 3, "HTML report contains its charts")
+import re  # noqa: E402
+blob = re.search(r'<script type="application/json" id=oomph-data>(.*?)</script>', html, re.S)
+rd = json.loads(blob.group(1).replace("<\\/", "</")) if blob else {}
+vw = rd.get("views") or {}
+first = next(iter(vw.values()), {})
+check(first.get("procs") and first.get("apps") is not None and isinstance(rd.get("events"), list),
+      "HTML report embeds its table data per view (%s; %d processes, %d apps, %d events)"
+      % ("/".join(vw), len(first.get("procs") or []), len(first.get("apps") or []), len(rd.get("events") or [])))
+views = oomph.report_views(0, 86400)
+check([v[0] for v in views] == ["24h", "6h", "1h"], "a 24h report switches between 24h / 6h / 1h")
 
 # --- agent protocol: check / verdict / session / MCP
 v = oomph.verdict(oomph.sample(with_procs=False))

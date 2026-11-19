@@ -314,7 +314,7 @@
     background: var(--chrome); color: var(--chrome-text); border-radius: 14px;
     padding: 18px 20px; box-shadow: var(--shadow);
   }
-  .prompt .lbl { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; opacity: .6; }
+  .prompt .lbl { font-size: 12px; letter-spacing: .1em; text-transform: uppercase; opacity: .6; padding-right: 72px; }
   .prompt pre { margin: 8px 0 0; font-size: 14px; line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
   .prompt pre .u { color: var(--green); }
   .copy {
@@ -571,10 +571,11 @@
     <h2>Make any Claude session oom-aware.</h2>
     <p class="sub">Coding agents are exactly the workload that tips a Mac over: a build here, a container there, three sub-agents running test suites in parallel. <span class="wm">oomph</span> ships a Claude skill that teaches a session to check memory before heavy work, to back off when it's tight and to tell you — and, with several sessions on one Mac, to take turns.</p>
     <div class="prompt">
-      <div class="lbl">Paste into any Claude Code session</div>
-      <button class="copy" type="button" data-copy="Use this skill for the rest of the session:&#10;https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md">Copy</button>
-      <pre class="mono">Use this skill for the rest of the session:
-<span class="u">https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md</span></pre>
+      <div class="lbl">Paste into a Claude Code session — adds the skill to that project</div>
+      <button class="copy" type="button" data-copy="Add the oomph memory skill to this project: run `mkdir -p .claude/skills/oomph &amp;&amp; curl -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o .claude/skills/oomph/SKILL.md`, then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.">Copy</button>
+      <pre class="mono">Add the oomph memory skill to this project: run
+mkdir -p .claude/skills/oomph &amp;&amp; curl -fsSL <span class="u">https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md</span> -o .claude/skills/oomph/SKILL.md
+then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.</pre>
     </div>
     <div class="two">
       <div class="card">
