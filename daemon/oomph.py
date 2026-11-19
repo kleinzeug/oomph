@@ -6,6 +6,7 @@
   oomph incidents
   oomph incident <id|latest> [--html]
   oomph html [--last 24h | --since ISO [--until ISO]] [-o FILE] [--open]
+  oomph upgrade tools|check|log|build [--json]   upgrade from GitHub (each commit on main is a release)
   oomph ai-report [--provider claude|openai|ollama] [--model M] [--base-url URL] [--last 24h] [--open]
                                      a model investigates the logs and writes an analysis on top of the
                                      report (token in OOMPH_AI_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY)
@@ -37,7 +38,28 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.4.0"
+VERSION = "dev"  # stamped by build-app.sh / install.sh from `git describe` (tools/version.sh)
+COMMIT = ""      # the git commit the stamped copy was built from
+
+
+def _checkout_version():
+    """Running straight from a git checkout: derive the version like tools/version.sh."""
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if not os.path.isdir(os.path.join(root, ".git")):
+        return "0.0.0-nogit", ""
+    try:
+        d = subprocess.run(["git", "-C", root, "describe", "--tags", "--match", "v*", "--always", "--dirty",
+                            "--first-parent"], capture_output=True, text=True, timeout=5).stdout.strip()
+        c = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return "0.0.0-nogit", ""
+    if not d:
+        return "0.0.0-nogit", c
+    return (d[1:] if d.startswith("v") else "0.0.0-g" + d), c
+
+
+if VERSION == "dev":
+    VERSION, COMMIT = _checkout_version()
 LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
 
 # What the daemon reads from the unified log. On macOS 27 memory kills show up as
@@ -2117,6 +2139,11 @@ def main(argv):
         return cmd_reservations(rest)
     if c == "run":
         return cmd_run(rest)
+    if c == "upgrade":
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import oomph_upgrade
+        return oomph_upgrade.cmd_upgrade(rest)
     if c == "ai-report":
         if HERE not in sys.path:
             sys.path.insert(0, HERE)

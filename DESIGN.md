@@ -211,6 +211,18 @@ reservation queue that the sessions use through the skill, the CLI and the MCP s
 | Progress and abort | The harness prints one JSON object per line (`progress`, then `done` or `error`); the app shows the latest as the Report button's tooltip and stops the run with SIGTERM | No IPC beyond a pipe; aborting leaves nothing behind. |
 | Output | The normal 24 h report with the analysis on top and the tool-call log in a fold | The model's claims sit right above the evidence they cite. |
 
+## Upgrades (1.5)
+
+| Decision | Choice | Why |
+|---|---|---|
+| Release model | Every commit on `main` is a release; versions are `git describe --tags --match 'v*' --always --dirty --first-parent` without the `v` (`tools/version.sh`, the scheme Glow uses); `v*` tags mark the milestones | No separate release process to forget; the version says exactly which commit you run. |
+| Where versions live | Source carries `VERSION = "dev"`; `build-app.sh` / `install.sh` stamp the describe version and commit into the bundle, the CLI and the logger; a checkout derives it at runtime | One number everywhere, and the app knows its commit for exact comparisons. |
+| When to check | When the popup opens and the last check is over 24 h old (and on **Check**); tools (`xcode-select`, `xcrun git/swiftc`, SDK, `codesign`) once a day | No background network traffic; never pops Apple's "install developer tools" dialog. |
+| Newer? | By commit ancestry in the clone (`merge-base --is-ancestor`); after a history rewrite, by comparing versions | Exact while history is linear; still sane after a force-push. |
+| Source | `~/Library/Application Support/oomph/src`, full history (fetch `--force --tags --prune-tags`) | The changelog and `git describe` need the history; force-fetch follows rewrites. |
+| Build and swap | The checked-out `build-app.sh` builds into `…/oomph/staging` (`OOMPH_NO_KILL=1`), progress lines `==> …` stream into the drawer; the app moves itself to `…/previous.app`, moves the new one in, relaunches with `--after-upgrade`, which runs the logger Update | Built locally, so no quarantine and no certificate; the running copy is only replaced once the build succeeded; the root part keeps its own password prompt. |
+| Skip | Remembers the skipped commit; the daily check won't offer it, **Check** will | A version you skipped shouldn't nag, but stays reachable. |
+
 ## Out of scope
 
 - Preventing or killing anything, or changing macOS's idle jobs.

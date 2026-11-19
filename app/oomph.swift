@@ -9,6 +9,7 @@ let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/
 let agentLabel = "local.oomph.menubar"
 let popupWidth: CGFloat = 480
 let statColumn: CGFloat = 96
+var renderMode = false  // --render-popup: static renders don't draw scroll-view contents
 let skillURL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
 
 // MARK: - AI analysis settings
@@ -26,6 +27,24 @@ enum AIProvider: String, CaseIterable, Identifiable {
         case .ollama: return "Runs on this Mac — no key needed (optional for a proxied server)"
         }
     }
+}
+
+// MARK: - Upgrades from GitHub
+
+enum UpgradeButton: Equatable { case hidden, check, checking, upgrade, upToDate }
+
+struct UpgradeCheck: Decodable {
+    var current: String
+    var current_commit: String?
+    var available: String
+    var commit: String
+    var newer: Bool
+    var behind: Int?
+}
+
+struct ChangelogEntry: Decodable, Identifiable {
+    var commit, version, date, subject, body, status: String
+    var id: String { commit }
 }
 
 /// Access tokens live in the login keychain, one item per provider.
@@ -143,6 +162,21 @@ final class Store: ObservableObject {
     @Published var aiProgress = ""
     @Published var aiError: String?
     private var aiProcess: Process?
+
+    // upgrades ("Upgrade" replaces this app with a newer version; "Update" installs the bundled logger)
+    @Published var upgradeButton: UpgradeButton = .hidden
+    @Published var upgradeCheckError: String?
+    @Published var changelog: [ChangelogEntry] = []
+    @Published var showChangelog = false
+    @Published var loadingChangelog = false
+    @Published var building = false
+    @Published var buildProgress = ""
+    @Published var buildLines: [String] = []
+    @Published var buildError: String?
+    @Published var buildVersion = ""
+    @Published var alertText: String?
+    private var buildProcess: Process?
+    private var buildCancelled = false
     private var aiStarted = Date()
     private var aiAborted = false
 
@@ -323,6 +357,215 @@ final class Store: ObservableObject {
         try? p.run()
     }
 
+    // MARK: Upgrades
+
+    private let defaults = UserDefaults.standard
+    var upgradeAuto: Bool {
+        get { defaults.object(forKey: "upgradeAuto") as? Bool ?? true }   // on by default
+        set { defaults.set(newValue, forKey: "upgradeAuto"); objectWillChange.send() }
+    }
+    var availableVersion: String { defaults.string(forKey: "upgradeAvailable") ?? "" }
+    var availableCommit: String { defaults.string(forKey: "upgradeAvailableCommit") ?? "" }
+    var lastUpgradeCheck: Double { defaults.double(forKey: "upgradeLastCheck") }
+    var bundleCommit: String { Bundle.main.object(forInfoDictionaryKey: "OOMPHCommit") as? String ?? "" }
+
+    /// A newer version that was found earlier and not skipped (it survives closing the popup).
+    var rememberedUpgrade: Bool {
+        !availableCommit.isEmpty && availableCommit != defaults.string(forKey: "upgradeSkipped")
+            && !bundleCommit.hasPrefix(availableCommit) && availableVersion != bundledVersion
+    }
+
+    /// Every time the popup opens: tools once a day, then the button, then the daily check
+    /// (no background timer — it only runs while you look).
+    func popupOpened() {
+        if upgradeButton == .upToDate { upgradeButton = .check }
+        let now = Date().timeIntervalSince1970
+        if now - defaults.double(forKey: "upgradeToolsChecked") > 86400 {
+            runUpgradeCLI(["tools", "--json"]) { [weak self] data, _ in
+                guard let self else { return }
+                let ok = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["ok"] as? Bool ?? false
+                self.defaults.set(ok, forKey: "upgradeToolsOK")
+                self.defaults.set(now, forKey: "upgradeToolsChecked")
+                self.continueUpgradeSetup()
+            }
+        } else {
+            continueUpgradeSetup()
+        }
+    }
+
+    private func continueUpgradeSetup() {
+        guard defaults.bool(forKey: "upgradeToolsOK") else { upgradeButton = .hidden; return }
+        if upgradeButton == .hidden { upgradeButton = rememberedUpgrade ? .upgrade : .check }
+        if upgradeAuto && Date().timeIntervalSince1970 - lastUpgradeCheck > 86400 && upgradeButton != .checking && !building {
+            checkForUpgrade(manual: false)
+        }
+    }
+
+    func checkForUpgrade(manual: Bool) {
+        upgradeButton = .checking
+        upgradeCheckError = nil
+        runUpgradeCLI(["check", "--json"]) { [weak self] data, status in
+            guard let self else { return }
+            guard status == 0, let r = try? JSONDecoder().decode(UpgradeCheck.self, from: data) else {
+                let e = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
+                self.upgradeCheckError = e ?? "the check failed"
+                self.upgradeButton = self.rememberedUpgrade ? .upgrade : .check
+                return
+            }
+            self.defaults.set(Date().timeIntervalSince1970, forKey: "upgradeLastCheck")
+            if r.newer {
+                self.defaults.set(r.available, forKey: "upgradeAvailable")
+                self.defaults.set(r.commit, forKey: "upgradeAvailableCommit")
+                // the daily check doesn't offer a skipped version again; pressing Check does
+                let skipped = r.commit == self.defaults.string(forKey: "upgradeSkipped")
+                self.upgradeButton = (manual || !skipped) ? .upgrade : .check
+                if manual && skipped { self.defaults.removeObject(forKey: "upgradeSkipped") }
+            } else {
+                self.defaults.removeObject(forKey: "upgradeAvailable")
+                self.defaults.removeObject(forKey: "upgradeAvailableCommit")
+                self.upgradeButton = .upToDate
+            }
+        }
+    }
+
+    func openUpgrade() {
+        showChangelog = true
+        loadingChangelog = true
+        changelog = []
+        runUpgradeCLI(["log", "--json"]) { [weak self] data, status in
+            guard let self else { return }
+            self.loadingChangelog = false
+            if status == 0, let entries = try? JSONDecoder().decode([ChangelogEntry].self, from: data) {
+                self.changelog = entries
+                if let top = entries.first {  // the newest is what will be installed
+                    self.defaults.set(top.version, forKey: "upgradeAvailable")
+                    self.defaults.set(top.commit, forKey: "upgradeAvailableCommit")
+                }
+            } else {
+                let e = ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any])?["error"] as? String
+                self.showChangelog = false
+                self.alertText = "Couldn't load the changelog: " + (e ?? "unknown error")
+            }
+        }
+    }
+
+    func skipThisVersion() {
+        defaults.set(availableCommit, forKey: "upgradeSkipped")
+        showChangelog = false
+        upgradeButton = .check
+    }
+
+    /// Clone/checkout, build-app.sh into a staging folder (progress streamed), then swap.
+    func upgradeNow() {
+        showChangelog = false
+        building = true
+        buildError = nil
+        buildLines = []
+        buildCancelled = false
+        buildVersion = availableVersion
+        buildProgress = "Starting"
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-I", "-B", cliPath, "upgrade", "build"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = out
+        var buffer = Data()
+        var builtApp: String?
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            buffer.append(d)
+            while let nl = buffer.firstIndex(of: 0x0a) {
+                let line = buffer.subdata(in: buffer.startIndex..<nl)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                let j = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any]
+                let text = String(data: line, encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    guard let j else { self.buildLines.append(text); return }
+                    if let m = j["progress"] as? String { self.buildProgress = m }
+                    if let v = j["version"] as? String { self.buildVersion = v }
+                    if let l = j["line"] as? String { self.buildLines.append(l) }
+                    if let e = j["error"] as? String { self.buildError = e }
+                    if let a = j["done"] as? String { builtApp = a }
+                    if self.buildLines.count > 400 { self.buildLines.removeFirst(self.buildLines.count - 400) }
+                }
+            }
+        }
+        p.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                out.fileHandleForReading.readabilityHandler = nil
+                self.buildProcess = nil
+                if self.buildCancelled { self.building = false; return }
+                if proc.terminationStatus == 0, let app = builtApp {
+                    self.installUpgrade(app)
+                } else {
+                    self.buildError = self.buildError ?? "The build failed (exit \(proc.terminationStatus))."
+                }
+            }
+        }
+        do { try p.run(); buildProcess = p } catch { buildError = "Couldn't start the build: \(error.localizedDescription)" }
+    }
+
+    func cancelBuild() {
+        buildCancelled = true
+        buildProcess?.terminate()
+        building = false
+    }
+
+    func closeBuild() { building = false; buildError = nil }
+
+    /// Swap the freshly built app in for this one and relaunch it; the new copy closes this one
+    /// and goes straight on to the logger update.
+    func installUpgrade(_ staged: String) {
+        buildProgress = "Replacing the app"
+        let fm = FileManager.default
+        let current = Bundle.main.bundleURL
+        let backup = URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support/oomph/previous.app")
+        try? fm.removeItem(at: backup)
+        do {
+            try fm.moveItem(at: current, to: backup)
+            do { try fm.moveItem(at: URL(fileURLWithPath: staged), to: current) } catch {
+                try? fm.moveItem(at: backup, to: current)
+                throw error
+            }
+        } catch {
+            buildError = "Couldn't replace \(current.path): \(error.localizedDescription)"
+            return
+        }
+        buildProgress = "Relaunching"
+        defaults.removeObject(forKey: "upgradeAvailable")
+        defaults.removeObject(forKey: "upgradeAvailableCommit")
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.arguments = ["--after-upgrade"]
+        cfg.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: current, configuration: cfg) { [weak self] _, err in
+            if let err {
+                DispatchQueue.main.async {
+                    self?.buildError = "Upgraded, but the relaunch failed (\(err.localizedDescription)). Quit oomph and open it again."
+                }
+            }
+        }
+    }
+
+    /// Runs `oomph upgrade …` from the bundled CLI off the main thread; hands back stdout.
+    func runUpgradeCLI(_ args: [String], done: @escaping (Data, Int32) -> Void) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-I", "-B", cliPath, "upgrade"] + args
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        DispatchQueue.global().async {
+            do { try p.run() } catch { DispatchQueue.main.async { done(Data(), -1) }; return }
+            let d = out.fileHandleForReading.readDataToEndOfFile()  // read before waiting: no full-pipe stall
+            p.waitUntilExit()
+            DispatchQueue.main.async { done(d, p.terminationStatus) }
+        }
+    }
+
     // MARK: AI settings + report
 
     func aiModel(_ p: AIProvider) -> String { UserDefaults.standard.string(forKey: "aiModel." + p.rawValue) ?? p.defaultModel }
@@ -487,7 +730,16 @@ struct PopoverView: View {
                 }
             }
         }
+        .overlay { if store.showChangelog { changelogSheet.transition(.opacity) } }
+        .overlay(alignment: .bottom) {
+            if store.building || store.buildError != nil { buildDrawer.transition(.move(edge: .bottom)) }
+        }
+        .animation(.easeOut(duration: 0.2), value: store.showChangelog)
+        .animation(.easeOut(duration: 0.25), value: store.building)
         .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false } }
+        .onChange(of: store.alertText) { _, e in
+            if let e { error = e; store.alertText = nil }
+        }
         .onChange(of: store.aiError) { _, e in
             if let e { error = e; store.aiError = nil }
         }
@@ -512,8 +764,10 @@ struct PopoverView: View {
                         .font(.system(size: 14))
                     if let v = store.bundledVersion {
                         Text("v" + v).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                            .lineLimit(1).truncationMode(.middle)
                             .help(store.needsUpdate ? "Installed logger: v\(store.installedVersion ?? "?")" : "")
                     }
+                    upgradeButtonView
                 }
                 Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
@@ -796,6 +1050,173 @@ struct PopoverView: View {
         }
         .padding(.vertical, 3).padding(.horizontal, 4)
         .contentShape(Rectangle())
+    }
+
+    // MARK: Upgrade button, changelog dialog, build drawer
+
+    @ViewBuilder var upgradeButtonView: some View {
+        let cur = store.bundledVersion ?? "?"
+        switch store.upgradeButton {
+        case .hidden:
+            EmptyView()
+        case .checking:
+            ProgressView().controlSize(.small).scaleEffect(0.55).frame(width: 40, height: 14)
+                .help("Checking GitHub for a newer oomph…")
+        case .check:
+            Button("Check") { store.checkForUpgrade(manual: true) }
+                .buttonStyle(.bordered).controlSize(.mini).focusable(false)
+                .help(store.upgradeCheckError.map { "The last check failed: \($0). Click to try again." }
+                      ?? "Check GitHub for a newer oomph (this is \(cur))" + lastChecked)
+                .contextMenu { autoCheckToggle }
+        case .upgrade:
+            Button("Upgrade") { store.openUpgrade() }
+                .buttonStyle(.borderedProminent).controlSize(.mini).focusable(false)
+                .help("oomph \(cur) is installed — \(store.availableVersion) is available. Click to see what's new.")
+                .contextMenu { autoCheckToggle }
+        case .upToDate:
+            Button("Up to date") {}
+                .buttonStyle(.bordered).controlSize(.mini).disabled(true).focusable(false)
+                .help("oomph \(cur) is the newest version on GitHub")
+        }
+    }
+
+    var lastChecked: String {
+        let t = store.lastUpgradeCheck
+        guard t > 0 else { return "" }
+        let f = RelativeDateTimeFormatter()
+        return " — last checked " + f.localizedString(for: Date(timeIntervalSince1970: t), relativeTo: Date())
+    }
+
+    var autoCheckToggle: some View {
+        Toggle("Check once a day when oomph opens", isOn: Binding(get: { store.upgradeAuto }, set: { store.upgradeAuto = $0 }))
+    }
+
+    static let isoIn = ISO8601DateFormatter()
+    static let dayOut: DateFormatter = { let f = DateFormatter(); f.dateFormat = "d MMM yyyy"; return f }()
+
+    var changelogSheet: some View {
+        let cur = store.bundledVersion ?? "?"
+        let newCount = store.changelog.filter { $0.status == "new" }.count
+        return ZStack {
+            Color.black.opacity(0.28).onTapGesture {}
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    Image(systemName: "arrow.down.app").foregroundStyle(Color.accentColor)
+                    Text("Upgrade oomph").font(.system(size: 14, weight: .semibold))
+                    Spacer()
+                    Text("\(cur) → \(store.changelog.first?.version ?? store.availableVersion)")
+                        .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
+                }
+                Text(store.loadingChangelog ? "Fetching the changelog from GitHub…"
+                     : newCount == 1 ? "1 new version since yours. Each commit on main is a release."
+                     : "\(newCount) new versions since yours. Each commit on main is a release.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                SwiftUI.Group {
+                    if renderMode {
+                        changelogList(Array(store.changelog.prefix(4))).frame(maxHeight: .infinity, alignment: .top)
+                    } else {
+                        ScrollView { changelogList(store.changelog) }
+                    }
+                }
+                .frame(maxHeight: .infinity)
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .overlay { if store.loadingChangelog { ProgressView().controlSize(.small) } }
+                HStack {
+                    Button("Cancel") { store.showChangelog = false }.keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Skip This Version") { store.skipThisVersion() }
+                        .help("Don't offer this version again when oomph checks by itself (Check still finds it)")
+                    Button("Upgrade Now") { store.upgradeNow() }
+                        .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
+                        .disabled(store.loadingChangelog || newCount == 0)
+                }
+                .controlSize(.regular)
+            }
+            .padding(14)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+            .shadow(color: .black.opacity(0.3), radius: 16, y: 6)
+            .padding(.horizontal, 14).padding(.vertical, 18)
+        }
+    }
+
+    func changelogList(_ entries: [ChangelogEntry]) -> some View {
+        LazyVStack(alignment: .leading, spacing: 12) {
+            ForEach(entries) { e in changelogEntry(e) }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    func changelogEntry(_ e: ChangelogEntry) -> some View {
+        let day = Self.isoIn.date(from: e.date).map { Self.dayOut.string(from: $0) } ?? String(e.date.prefix(10))
+        let body = (try? AttributedString(markdown: e.body, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(e.body)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                Text(e.version).font(.system(size: 11, weight: .semibold, design: .monospaced))
+                Text(day).font(.system(size: 10)).foregroundStyle(.secondary)
+                Spacer()
+                if e.status == "new" {
+                    Text("new").font(.system(size: 9, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 5).padding(.vertical, 1).background(Color.accentColor, in: Capsule())
+                } else if e.status == "installed" {
+                    Text("installed").font(.system(size: 9, weight: .semibold)).foregroundStyle(.green)
+                        .padding(.horizontal, 5).padding(.vertical, 1).background(Color.green.opacity(0.15), in: Capsule())
+                }
+            }
+            Text(e.subject).font(.system(size: 12, weight: .semibold)).fixedSize(horizontal: false, vertical: true)
+            if !e.body.isEmpty {
+                Text(body).font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(1.5)
+                    .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
+            }
+            Divider().padding(.top, 4)
+        }
+        .opacity(e.status == "new" ? 1 : 0.6)
+    }
+
+    var buildDrawer: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Capsule().fill(Color.primary.opacity(0.2)).frame(width: 36, height: 4).frame(maxWidth: .infinity)
+            HStack(alignment: .firstTextBaseline) {
+                Text(store.buildError == nil ? "Upgrading to \(store.buildVersion.isEmpty ? "the newest version" : store.buildVersion)"
+                     : "The upgrade didn't finish")
+                    .font(.system(size: 13, weight: .semibold))
+                Spacer()
+                if store.buildError == nil {
+                    Button("Cancel") { store.cancelBuild() }.controlSize(.small)
+                } else {
+                    Button("Close") { store.closeBuild() }.controlSize(.small).keyboardShortcut(.cancelAction)
+                }
+            }
+            if let e = store.buildError {
+                Text(e).font(.system(size: 11)).foregroundStyle(.red).fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            } else {
+                ProgressView(value: nil as Double?).progressViewStyle(.linear)
+                Text(store.buildProgress).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 1) {
+                        ForEach(Array(store.buildLines.enumerated()), id: \.offset) { i, l in
+                            Text(l).font(.system(size: 9.5, design: .monospaced)).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading).id(i)
+                        }
+                    }.padding(6)
+                }
+                .frame(height: 110)
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 5))
+                .onChange(of: store.buildLines.count) { _, n in if n > 0 { proxy.scrollTo(n - 1, anchor: .bottom) } }
+            }
+            Text("When it's built, oomph replaces itself, restarts and updates the logger (one password prompt).")
+                .font(.system(size: 10)).foregroundStyle(.tertiary)
+        }
+        .padding(14)
+        .background(.regularMaterial, in: UnevenRoundedRectangle(cornerRadii: .init(topLeading: 12, topTrailing: 12)))
+        .overlay(UnevenRoundedRectangle(cornerRadii: .init(topLeading: 12, topTrailing: 12)).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.25), radius: 12, y: -2)
     }
 
     // MARK: Report + AI pair
@@ -1091,6 +1512,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.loadIncidents()
         updateIcon()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
+
+        // Relaunched by an upgrade: show the popup and go straight on to the logger update.
+        if CommandLine.arguments.contains("--after-upgrade") {
+            store.upgradeButton = .upToDate
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                guard let self else { return }
+                if !self.isShown { self.toggle() }
+                self.store.upgradeButton = .upToDate
+                if self.store.installed && self.store.needsUpdate {
+                    self.store.runPrivileged("install.sh") { [weak self] e in
+                        if let e { self?.store.alertText = "Upgraded to \(self?.store.bundledVersion ?? "the new version"), but the logger update failed: \(e)" }
+                    }
+                }
+            }
+        }
     }
 
     func tick() {
@@ -1105,6 +1541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         // clicking the icon first makes the panel resign key (which closes it); don't reopen on that same click
         if Date().timeIntervalSince(lastClose) < 0.35 { return }
         store.refreshAll()
+        store.popupOpened()
         position()
         panel.makeKeyAndOrderFront(nil)
         // nothing focused on open: a focus ring is drawn above everything, callouts included
@@ -1232,11 +1669,29 @@ enum ChipIcon {
 
 @MainActor
 func renderPopup(to path: String, dark: Bool, ai: String = "") {
+    renderMode = true
     let store = Store()
     store.refreshAll()
     // `--ai callout|on|running` draws the AI states (render only; nothing is saved)
     if ai == "on" || ai == "running" { store.aiOn = true; store.aiProvider = .ollama }
     if ai == "running" { store.aiRunning = true; store.aiProgress = "Tracing WebKit.GPU" }
+    // `--ai upgrade|changelog|build` draws the upgrade states (render only)
+    if ai == "upgrade" { store.upgradeButton = .upgrade }
+    if ai == "changelog" {
+        store.upgradeButton = .upgrade
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-I", "-B", store.cliPath, "upgrade", "log", "--json"]
+        let out = Pipe(); p.standardOutput = out
+        try? p.run()
+        let d = out.fileHandleForReading.readDataToEndOfFile(); p.waitUntilExit()
+        store.changelog = (try? JSONDecoder().decode([ChangelogEntry].self, from: d)) ?? []
+        store.showChangelog = true
+    }
+    if ai == "build" {
+        store.building = true; store.buildVersion = "1.5.0"; store.buildProgress = "Compiling oomph 1.5.0"
+        store.buildLines = ["==> Compiling oomph 1.5.0", "app/oomph.swift:42: note: building for macOS 14"]
+    }
     let view = PopoverView(store: store, showAI: ai == "callout", showTopApps: ai == "top")
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.colorScheme, dark ? .dark : .light)

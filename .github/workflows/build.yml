@@ -20,6 +20,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: the version derives from `git describe` (tools/version.sh)
 
       - name: Toolchain
         run: |
@@ -32,7 +34,8 @@ jobs:
         run: |
           bash -n build-app.sh install.sh uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py tools/selftest.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py tools/selftest.py
+          sh -n tools/version.sh && echo "version: $(tools/version.sh)"
 
       - name: Daemon + CLI self-test
         # Samples this runner into a temp dir, simulates a jetsam storm, and checks
@@ -57,9 +60,11 @@ jobs:
           echo "agent app: $agent"
           [ "$id" = "local.oomph.menubar" ] || { echo "::error::unexpected bundle id $id"; exit 1; }
           [ "$agent" = "true" ] || { echo "::error::LSUIElement not set — would show a Dock icon"; exit 1; }
+          [ "$version" = "$(tools/version.sh)" ] || { echo "::error::bundle version $version != git describe"; exit 1; }
+          grep -q "^VERSION = \"$version\"" "$APP/Contents/Resources/oomph.py" || { echo "::error::bundled CLI not stamped"; exit 1; }
 
           # Activate/Deactivate run these from the bundle.
-          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_ai.py local.oomph.daemon.plist; do
+          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_ai.py oomph_upgrade.py local.oomph.daemon.plist; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }

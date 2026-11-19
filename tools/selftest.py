@@ -303,5 +303,49 @@ check(h.get("anthropic-version") == "2026-10-21" and h.get("x-api-key") == "sk-t
 os.environ.pop("OOMPH_AI_TOKEN")
 srv.shutdown()
 
+# --- upgrades: check / changelog / build against a throwaway repository with tagged releases
+import oomph_upgrade  # noqa: E402
+up = tempfile.mkdtemp(prefix="oomph-upgrade-")
+repo = os.path.join(up, "repo")
+os.makedirs(repo)
+g = lambda *a: subprocess.run(["git", "-C", repo] + list(a), capture_output=True, text=True,  # noqa: E731
+                              env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                                       GIT_COMMITTER_EMAIL="t@t")).stdout.strip()
+g("init", "-q", "-b", "main")
+open(os.path.join(repo, "build-app.sh"), "w").write(
+    '#!/bin/bash\nset -e\necho "==> Compiling"\nmkdir -p "$1/oomph.app/Contents/MacOS"\n'
+    'touch "$1/oomph.app/Contents/MacOS/oomph"\necho "==> Built"\n')
+g("add", "-A"); g("commit", "-q", "-m", "First release"); g("tag", "v1.0.0")
+c1 = g("rev-parse", "HEAD")
+for i in (1, 2):
+    open(os.path.join(repo, "f%d" % i), "w").write(str(i))
+    g("add", "-A"); g("commit", "-q", "-m", "Change %d" % i, "-m", "- detail **%d**\n\nCo-Authored-By: x" % i)
+os.environ.update(OOMPH_REPO=repo, OOMPH_UPGRADE_DIR=os.path.join(up, "support"))
+import importlib  # noqa: E402
+importlib.reload(oomph_upgrade)
+check(oomph_upgrade.parse_version("1.5.0-3-gabc1234-dirty") == (1, 5, 0, 3) and
+      oomph_upgrade.parse_version("2.0.0") > oomph_upgrade.parse_version("1.9.9-12-gabc"), "upgrade: version ordering")
+saved = (oomph.VERSION, oomph.COMMIT)
+oomph.VERSION, oomph.COMMIT = "1.0.0", c1
+r = oomph_upgrade.check()
+check(r["newer"] and r["behind"] == 2 and r["available"].startswith("1.0.0-2-g"),
+      "upgrade check: 2 commits behind, %s available" % r["available"])
+lg = oomph_upgrade.log()
+check([e["status"] for e in lg] == ["new", "new", "installed"] and "Co-Authored-By" not in lg[0]["body"]
+      and lg[-1]["version"] == "1.0.0", "upgrade log: newest first, statuses, versions, trailers dropped")
+oomph.VERSION, oomph.COMMIT = r["available"], r["commit"]
+check(not oomph_upgrade.check()["newer"], "upgrade check: up to date at main's head")
+oomph.VERSION, oomph.COMMIT = "0.9.0", "f" * 40  # a build whose commit main no longer has
+check(oomph_upgrade.check()["newer"], "upgrade check: falls back to comparing versions after a rewrite")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    app, v = oomph_upgrade.build(os.path.join(up, "staging"))
+msgs = [json.loads(x) for x in buf.getvalue().splitlines()]
+check(os.path.isdir(app) and v.startswith("1.0.0-2-g") and any(m.get("progress") == "Compiling" for m in msgs),
+      "upgrade build: runs build-app.sh into staging, streams its steps")
+oomph.VERSION, oomph.COMMIT = saved
+for k in ("OOMPH_REPO", "OOMPH_UPGRADE_DIR"):
+    os.environ.pop(k)
+
 print("\n%s — logs in %s" % ("FAILED (%d)" % len(failures) if failures else "all checks passed", LOG))
 sys.exit(1 if failures else 0)

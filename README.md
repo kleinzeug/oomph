@@ -155,6 +155,33 @@ Re-running it updates an existing installation. **Deactivate** in the popup, or
 delete `oomph.app` (and `~/Library/LaunchAgents/local.oomph.menubar.plist` if you
 turned on launch at login).
 
+## Upgrading
+
+Every commit on `main` is a release. If the Xcode Command Line Tools are installed
+(`xcode-select --install`), the popup shows a small **Check** button next to the version:
+
+- Once a day, when you open the popup, oomph asks GitHub whether `main` has moved on (no
+  background timer — it only checks while you look). **Check** does the same right away;
+  either way the button spins while it asks.
+- If there's something newer, the button turns into **Upgrade** (its tooltip names both
+  versions). If not, it says **Up to date** until you open the popup again.
+- **Upgrade** shows the changelog — every release since yours, from the commit messages —
+  with **Cancel**, **Skip This Version** (the daily check won't offer it again; **Check** still
+  does) and **Upgrade Now**.
+- **Upgrade Now** builds the new version from source on your Mac (a clone with the full
+  history in `~/Library/Application Support/oomph/src`, then its own `build-app.sh`), with
+  the build's progress in a drawer, replaces `~/Applications/oomph.app`, relaunches, and goes
+  straight on to updating the logger (one password prompt). Building locally means no
+  download quarantine and no developer certificate.
+
+*Upgrade* replaces the app; *Update* installs the logger the app carries. Right-click
+**Check** to turn the daily check off. `oomph upgrade check | log | build` is the same from
+the terminal.
+
+**Versions** come from git history, `git describe` style: the `v1.5.0` tag builds `1.5.0`,
+three commits later builds `1.5.0-3-g<sha>`, uncommitted changes add `-dirty`
+(`tools/version.sh`). The build stamps it into the app, the CLI and the logger.
+
 ## The `oomph` command
 
 Everything the app shows is also available in the terminal, without `sudo`:
