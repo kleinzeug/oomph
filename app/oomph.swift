@@ -9,6 +9,8 @@ let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/
 let agentLabel = "local.oomph.menubar"
 let popupWidth: CGFloat = 480
 let statColumn: CGFloat = 96
+var renderHoverX: CGFloat?  // --ai hover:X / hoverlog:X renders the hover tooltip at x = X pt
+var renderBlend: Double?  // --ai blend:0.5 renders the 24h → ∞ morph halfway
 var renderMode = false  // --render-popup: static renders don't draw scroll-view contents
 let skillURL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
 
@@ -116,6 +118,48 @@ struct Sample: Decodable {
     }
 }
 
+struct Gap { let from, to: Double }
+
+/// One line of events.jsonl, reduced to what the chart's hover tooltip shows.
+struct ChartEvent {
+    let t: Double
+    let kind: String
+    let text: String
+    var kills = 0
+    var top: [String: Int] = [:]
+    var seconds = 0.0
+    var alarming: Bool { ["jetsam", "stall", "unowned_memory", "disk_low", "pressure_flapping", "daemon_error"].contains(kind) }
+
+    static func pressureName(_ v: Any?) -> String {
+        switch (v as? NSNumber)?.intValue { case 1: "normal"; case 2: "warning"; case 4: "critical"; default: "\(v ?? "?")" }
+    }
+
+    init?(_ e: [String: Any]) {
+        guard let t = (e["t"] as? NSNumber)?.doubleValue, let kind = e["kind"] as? String else { return nil }
+        func num(_ k: String) -> Double { (e[k] as? NSNumber)?.doubleValue ?? 0 }
+        self.t = t; self.kind = kind
+        switch kind {
+        case "pressure_change": text = "pressure \(ChartEvent.pressureName(e["old"])) → \(ChartEvent.pressureName(e["new"]))"
+        case "pressure_flapping": text = "pressure flapping, \(Int(num("flips"))) flips"
+        case "jetsam":
+            kills = Int(num("kills")); top = (e["top"] as? [String: Int]) ?? [:]
+            text = kills > 0 ? "\(kills) killed by jetsam" : "jetsam report"
+        case "sleep_gap": seconds = num("seconds"); text = "asleep " + MemoryChart.duration(seconds)
+        case "stall": seconds = num("seconds"); text = "system stalled " + MemoryChart.duration(seconds)
+        case "unowned_memory": text = String(format: "%.0f GB unowned memory (leak?)", num("gb"))
+        case "unowned_memory_cleared": text = "unowned memory cleared"
+        case "disk_low": text = String(format: "disk low: %.1f GB free", num("disk_free_gb"))
+        case "daemon_start": text = "logger started" + ((e["version"] as? String).map { " (v\($0))" } ?? "")
+        case "daemon_stop": text = "logger stopped"
+        case "daemon_error": text = "logger error (\(e["where"] as? String ?? "?"))"
+        case "notified": text = "notified: \(e["title"] as? String ?? "")"
+        case "log": text = "system log: " + String((e["msg"] as? String ?? "").prefix(60))
+        case "incident_open", "incident_close": return nil   // shown from the incidents themselves
+        default: text = kind.replacingOccurrences(of: "_", with: " ")
+        }
+    }
+}
+
 struct Point: Identifiable {
     let id: Double
     let date: Date
@@ -147,9 +191,18 @@ enum Pressure: Int { case unknown = 0, normal = 1, warn = 2, critical = 4
 final class Store: ObservableObject {
     @Published var current: Sample?
     @Published var currentAge: Double = .infinity
-    @Published var points: [Point] = []
+    /// All logged history, oldest first, finer near now (see Store.multires): every range draws from it.
+    @Published var history: [Point] = []
+    /// When `history` was loaded: the chart measures ages from here.
+    @Published var historyNow = Date().timeIntervalSince1970
+    /// Stretches without samples (asleep, off, logger stopped), found in the raw samples.
+    @Published var gaps: [Gap] = []
+    /// events.jsonl(.1), oldest first, for the hover tooltip.
+    @Published var events: [ChartEvent] = []
+    private var eventsStamp = ""
     @Published var incidents: [Incident] = []
-    @Published var range: Double = 6 * 3600 { didSet { reloadPoints() } }
+    /// The chart's range in seconds; .infinity = all history on a log time axis.
+    @Published var range: Double = 24 * 3600
     @Published var launchAtLogin = FileManager.default.fileExists(atPath: agentPlist)
     @Published var busy = false
 
@@ -219,19 +272,51 @@ final class Store: ObservableObject {
         loadIncidents()
     }
 
+    var allHistory: Bool { range.isInfinite }
+
+    /// Loads every samples file (14 days are kept), so switching ranges never waits for data.
     func reloadPoints() {
         let now = Date().timeIntervalSince1970
-        let since = now - range
-        var days: [String] = []
         let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        var d = since
-        while d <= now + 1 { days.append(fmt.string(from: Date(timeIntervalSince1970: d))); d += 86400 }
         let today = fmt.string(from: Date())
-        if !days.contains(today) { days.append(today) }
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: logDir)) ?? []
+        var days = Set(files.compactMap { f -> String? in
+            guard f.hasPrefix("samples-"), f.hasSuffix(".jsonl") || f.hasSuffix(".jsonl.gz") else { return nil }
+            return String(f.dropFirst("samples-".count).prefix(10))
+        })
+        days.insert(today)
         var all: [Point] = []
-        for day in Array(Set(days)).sorted() { all += loadDay(day, isToday: day == today) }
-        let pts = all.filter { $0.id >= since }
-        points = downsample(pts, max: 360)
+        for day in days.sorted() { all += loadDay(day, isToday: day == today) }
+        all.sort { $0.id < $1.id }
+        var gaps: [Gap] = []
+        for i in all.indices.dropFirst() where all[i].id - all[i - 1].id > Store.gapSeconds {
+            gaps.append(Gap(from: all[i - 1].id, to: all[i].id))
+        }
+        if let last = all.last, now - last.id > Store.gapSeconds { gaps.append(Gap(from: last.id, to: now)) }
+        history = Store.multires(all, now: now)
+        self.gaps = gaps
+        historyNow = now
+        reloadEvents()
+    }
+
+    private func reloadEvents() {
+        let paths = ["events.jsonl.1", "events.jsonl"].map { "\(logDir)/\($0)" }
+        let stamp = paths.map { p -> String in
+            let a = try? FileManager.default.attributesOfItem(atPath: p)
+            return "\(a?[.size] ?? 0)/\((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
+        }.joined(separator: ",")
+        guard stamp != eventsStamp else { return }
+        eventsStamp = stamp
+        var out: [ChartEvent] = []
+        for p in paths {
+            guard let d = FileManager.default.contents(atPath: p) else { continue }
+            for line in d.split(separator: 0x0A) {
+                if let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any], let e = ChartEvent(o) {
+                    out.append(e)
+                }
+            }
+        }
+        events = out.sorted { $0.t < $1.t }
     }
 
     private func loadDay(_ day: String, isToday: Bool) -> [Point] {
@@ -277,21 +362,32 @@ final class Store: ObservableObject {
         return out
     }
 
-    private func downsample(_ pts: [Point], max n: Int) -> [Point] {
-        guard pts.count > n else { return pts }
-        let step = Double(pts.count) / Double(n)
+    /// Thins the history so its resolution falls with age: buckets max(30 s, age/720) wide, each
+    /// keeping its worst point (spikes survive). Fine enough for any linear range at 720 px and
+    /// for the log axis, small enough (a few thousand points) to remap on every animation frame.
+    /// Longer than this without a sample is a gap (the logger samples every 30 s; the report uses 5 min).
+    static let gapSeconds: Double = 300
+
+    static func multires(_ pts: [Point], now: Double) -> [Point] {
         var out: [Point] = []
-        var i = 0.0
-        while Int(i) < pts.count {
-            let lo = Int(i), hi = min(pts.count, Int(i + step))
-            let slice = pts[lo..<max(hi, lo + 1)]
-            // keep the worst point of each bucket so spikes survive
-            let worst = slice.max { ($0.app + $0.comp + $0.swap) < ($1.app + $1.comp + $1.swap) }!
-            out.append(Point(id: worst.id, date: worst.date, wired: worst.wired, app: worst.app, comp: worst.comp,
-                             swap: worst.swap, away: slice.contains { $0.away }, kills: slice.reduce(0) { $0 + $1.kills }))
-            i += step
+        var j = pts.count - 1
+        while j >= 0 {
+            let width = max(30, (now - pts[j].id) / 720)
+            var i = j
+            // never across a gap: a bucket spanning one would bridge it
+            while i > 0 && pts[i - 1].id > pts[j].id - width && pts[i].id - pts[i - 1].id <= gapSeconds { i -= 1 }
+            out.append(worst(pts[i...j]))
+            j = i - 1
         }
-        return out
+        return out.reversed()
+    }
+
+    /// The worst point of a bucket, so spikes survive downsampling.
+    static func worst(_ slice: ArraySlice<Point>) -> Point {
+        guard slice.count > 1 else { return slice.first! }
+        let w = slice.max { ($0.app + $0.comp + $0.swap) < ($1.app + $1.comp + $1.swap) }!
+        return Point(id: w.id, date: w.date, wired: w.wired, app: w.app, comp: w.comp,
+                     swap: w.swap, away: slice.contains { $0.away }, kills: slice.reduce(0) { $0 + $1.kills })
     }
 
     func loadIncidents() {
@@ -665,6 +761,492 @@ struct Stat: View {
     }
 }
 
+// MARK: - Memory chart
+
+/// The popup's memory chart. One view for every range: x is a blend of a linear axis (the last
+/// 10^lgRange seconds) and a log axis over all history (blend 0 → 1), both animatable, so a range
+/// switch morphs the chart and every point visibly travels to its new place. Each frame
+/// re-buckets the preloaded history into ~360 columns; nothing is reloaded.
+struct MemoryChart: View, Animatable {
+    var points: [Point]          // oldest first, multi-resolution (Store.multires)
+    var gaps: [Gap]
+    var now: Double
+    var incidents: [Incident]
+    var events: [ChartEvent]
+    var ram: Double?
+    var lgRange: Double          // log10 of the linear range, seconds
+    var blend: Double            // 0 = linear, 1 = log
+    /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
+    @State private var hoverX: CGFloat? = renderHoverX
+
+    var animatableData: AnimatablePair<Double, Double> {
+        get { AnimatablePair(lgRange, blend) }
+        set { lgRange = newValue.first; blend = newValue.second }
+    }
+
+    static let series = ["Wired", "App", "Compressed", "Swap"]
+    static let minAge: Double = 300          // ages below this share the right edge of the log axis
+    static let columns = 360
+    // grid levels, coarse first: a week, a day, 6 h, 1 h, 15 min, 5 min, 1 min (local time)
+    static let levels: [Double] = [604800, 86400, 21600, 3600, 900, 300, 60]
+
+    struct Entry: Identifiable { let id: Int; let x: Double; let kind: String; let gb: Double }
+    struct Band: Identifiable { let id: Int; let from: Double; let to: Double }
+    struct GridLine: Identifiable { let id: Double; let x: Double; let alpha: Double }
+    struct Label { let x: Double; let text: String }
+
+    /// Time → x in 0…1 (1 = now) for the current blend.
+    func mapper() -> (Double) -> Double {
+        let r = pow(10, lgRange), m = MemoryChart.minAge, b = blend, now = now
+        let span = log10(max(now - (points.first?.id ?? now), 3600) / m)
+        return { t in
+            let a = max(now - t, 0)
+            return (1 - b) * (1 - a / r) + b * (1 - log10(max(a, m) / m) / span)
+        }
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let f = mapper()
+            let plotW = max(geo.size.width - 30, 50)
+            let (entries, away) = columns(f)
+            let grid = gridLines(f, plotW: plotW)
+            let labels = axisLabels(f, plotW: plotW)
+            Chart {
+                bandMarks(away, style: AnyShapeStyle(Color.gray.opacity(0.15)))
+                gridMarks(grid, color: .primary, scale: 1)
+                areaMarks(entries)
+                gridMarks(grid, color: .white, scale: 0.45)
+                bandMarks(gapBands(f), style: AnyShapeStyle(MemoryChart.hatch))
+                ramMark
+                incidentMarks(f)
+            }
+            .chartXScale(domain: 0...1)
+            .chartXAxis {
+                // ticks here; the labels are drawn centered on them in the overlay (Charts would
+                // left-align them to the tick). The blank label keeps the axis's height.
+                AxisMarks(values: labels.map(\.x)) { _ in
+                    AxisTick(length: 3)
+                    AxisValueLabel { Text(" ").font(.system(size: 10)) }
+                }
+            }
+            .chartForegroundStyleScale(domain: MemoryChart.series, range: [Color.gray, Color.blue, Color.orange, Color.red])
+            .chartLegend(position: .bottom, spacing: 4)
+            .transaction { $0.animation = nil }  // this view animates itself, frame by frame
+            .chartOverlay { proxy in
+                ZStack(alignment: .topLeading) {
+                    axisLabelLayer(proxy, labels: labels)
+                    hoverLayer(proxy, mapper: f)
+                }
+            }
+        }
+    }
+
+    func axisLabelLayer(_ proxy: ChartProxy, labels: [Label]) -> some View {
+        GeometryReader { g in
+            let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
+            ForEach(Array(labels.enumerated()), id: \.offset) { _, l in
+                if let x = proxy.position(forX: l.x) {
+                    Text(l.text).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize()
+                        .position(x: plot.minX + x, y: plot.maxY + 11)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    // MARK: hover
+
+    /// A vertical line following the pointer and a live tooltip for the time under it.
+    func hoverLayer(_ proxy: ChartProxy, mapper f: @escaping (Double) -> Double) -> some View {
+        GeometryReader { g in
+            let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
+            ZStack(alignment: .topLeading) {
+                Rectangle().fill(Color.clear).contentShape(Rectangle())
+                    .onContinuousHover { phase in
+                        switch phase {
+                        case .active(let p): hoverX = p.x
+                        case .ended: hoverX = nil
+                        }
+                    }
+                if let x = hoverX, x >= plot.minX, x <= plot.maxX,
+                   let u = proxy.value(atX: x - plot.minX, as: Double.self) {
+                    let info = hoverInfo(u: u, du: 1 / Double(plot.width), mapper: f)
+                    Rectangle().fill(Color.primary.opacity(0.55))
+                        .frame(width: 1, height: plot.height)
+                        .offset(x: x - 0.5, y: plot.minY)
+                        .allowsHitTesting(false)
+                    HoverCard(info: info)
+                        .frame(width: MemoryChart.cardWidth, alignment: .leading)
+                        .offset(x: x < plot.midX ? x + 10 : x - 10 - MemoryChart.cardWidth, y: plot.minY + 2)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+    }
+
+    static let cardWidth: CGFloat = 230
+
+    struct Reading { let name: String; let lo: Double; let hi: Double }
+    struct HoverInfo {
+        var when = ""
+        var ago = ""
+        var samples = 0
+        var peak = 0.0                      // the highest stacked total among the readings
+        var readings: [Reading] = []
+        var away = false
+        var noData: String?
+        var incidents: [String] = []
+        var events: [(String, Bool)] = []   // text, alarming
+        var moreEvents = 0
+    }
+
+    /// Time for x (the mapper is monotonic, so bisection inverts it).
+    func time(at u: Double, _ f: (Double) -> Double) -> Double {
+        var lo = (points.first?.id ?? now) - 1, hi = now
+        if u >= f(hi) { return hi }
+        if u <= f(lo) { return lo }
+        for _ in 0..<50 {
+            let mid = (lo + hi) / 2
+            if f(mid) < u { lo = mid } else { hi = mid }
+        }
+        return (lo + hi) / 2
+    }
+
+    /// Everything under one horizontal pixel, aggregated: on the log axis one pixel can hold hours.
+    func hoverInfo(u: Double, du: Double, mapper f: (Double) -> Double) -> HoverInfo {
+        var info = HoverInfo()
+        let t0 = time(at: max(u - du / 2, 0), f), t1 = time(at: min(u + du / 2, 1), f)
+        let tc = (t0 + t1) / 2
+        // the time under the pointer
+        let day = MemoryChart.dayFmt, clock = MemoryChart.timeFmt
+        let d0 = Date(timeIntervalSince1970: t0), d1 = Date(timeIntervalSince1970: t1)
+        if t1 - t0 < 90 {
+            info.when = day.string(from: Date(timeIntervalSince1970: tc)) + " " + clock.string(from: Date(timeIntervalSince1970: tc))
+        } else if Calendar.current.isDate(d0, inSameDayAs: d1) {
+            info.when = "\(day.string(from: d0)) \(clock.string(from: d0))–\(clock.string(from: d1))"
+        } else {
+            info.when = "\(day.string(from: d0)) \(clock.string(from: d0)) – \(day.string(from: d1)) \(clock.string(from: d1))"
+        }
+        info.ago = now - tc < 90 ? "now" : MemoryChart.duration(now - tc) + " ago"
+        // samples in the pixel; on a fine axis the nearest one, unless the pointer is in a gap
+        let gapHere = gaps.first { $0.from < tc && $0.to > tc }
+        var pts = slice(points, from: t0, to: t1, key: \.id)
+        if pts.isEmpty && gapHere == nil, let near = nearest(tc), abs(near.id - tc) <= 60 { pts = [near] }
+        info.samples = pts.count
+        if !pts.isEmpty {
+            let cols: [(String, KeyPath<Point, Double>)] = [("App", \.app), ("Compressed", \.comp), ("Wired", \.wired), ("Swap", \.swap)]
+            info.readings = cols.map { (name, k) in
+                Reading(name: name, lo: pts.map { $0[keyPath: k] }.min()!, hi: pts.map { $0[keyPath: k] }.max()!)
+            }
+            info.away = pts.contains { $0.away }
+            info.peak = pts.map { $0.wired + $0.app + $0.comp + $0.swap }.max() ?? 0
+        }
+        let overlapping = gaps.filter { $0.from < t1 && $0.to > t0 }
+        if overlapping.count == 1, let g = overlapping.first {
+            info.noData = "no data \(clock.string(from: Date(timeIntervalSince1970: g.from)))–\(clock.string(from: Date(timeIntervalSince1970: g.to))) (\(MemoryChart.duration(g.to - g.from)))"
+        } else if overlapping.count > 1 {
+            info.noData = "\(overlapping.count) stretches without data, \(MemoryChart.duration(overlapping.reduce(0) { $0 + $1.to - $1.from })) in all"
+        }
+        // incidents and events: catch the ones within a few pixels, they are thin lines
+        let e0 = time(at: max(u - 3 * du, 0), f), e1 = time(at: min(u + 3 * du, 1), f)
+        info.incidents = incidents.filter { $0.start <= e1 && ($0.end ?? now) >= e0 }.map { inc in
+            "incident " + clock.string(from: Date(timeIntervalSince1970: inc.start))
+                + (inc.reasons.first.map { ": " + $0.desc } ?? "")
+        }
+        let evs = slice(events, from: e0, to: e1, key: \.t)
+        var lines: [(String, Bool)] = []
+        var order: [String] = []
+        var byKind: [String: [ChartEvent]] = [:]
+        for e in evs { if byKind[e.kind] == nil { order.append(e.kind) }; byKind[e.kind, default: []].append(e) }
+        for k in order {
+            let es = byKind[k]!
+            if es.count == 1 { lines.append((es[0].text, es[0].alarming)); continue }
+            switch k {
+            case "jetsam":
+                let kills = es.reduce(0) { $0 + $1.kills }
+                var top: [String: Int] = [:]
+                for e in es { top.merge(e.top, uniquingKeysWith: +) }
+                let names = top.sorted { $0.value > $1.value }.prefix(2).map { "\($0.key) ×\($0.value)" }.joined(separator: ", ")
+                lines.append((kills > 0 ? "\(kills) killed by jetsam" + (names.isEmpty ? "" : " · " + names)
+                                        : "\(es.count) jetsam reports", true))
+            case "pressure_change":
+                lines.append(("pressure changed \(es.count)× · last: " + es.last!.text.replacingOccurrences(of: "pressure ", with: ""), false))
+            case "sleep_gap", "stall":
+                lines.append(((k == "stall" ? "system stalled" : "asleep") + " \(es.count)×, "
+                              + MemoryChart.duration(es.reduce(0) { $0 + $1.seconds }) + " in all", es[0].alarming))
+            default:
+                lines.append((es.last!.text + " ×\(es.count)", es[0].alarming))
+            }
+        }
+        info.events = Array(lines.prefix(6))
+        info.moreEvents = max(lines.count - 6, 0)
+        return info
+    }
+
+    /// The elements of a sorted array with key in from...to.
+    func slice<T>(_ a: [T], from: Double, to: Double, key: KeyPath<T, Double>) -> [T] {
+        func lower(_ v: Double) -> Int {
+            var lo = 0, hi = a.count
+            while lo < hi { let m = (lo + hi) / 2; if a[m][keyPath: key] < v { lo = m + 1 } else { hi = m } }
+            return lo
+        }
+        let i = lower(from), j = lower(to.nextUp)
+        return i < j ? Array(a[i..<j]) : []
+    }
+
+    func nearest(_ t: Double) -> Point? {
+        let after = slice(points, from: t, to: .infinity, key: \.id).first
+        let before = slice(points, from: -.infinity, to: t, key: \.id).last
+        switch (before, after) {
+        case let (b?, a?): return t - b.id <= a.id - t ? b : a
+        default: return before ?? after
+        }
+    }
+
+    static func duration(_ s: Double) -> String {
+        let s = Int(s.rounded())
+        if s < 90 { return "\(s) s" }
+        if s < 3600 { return "\(s / 60) min" }
+        if s < 86400 { return s % 3600 / 60 == 0 || s >= 36000 ? "\(s / 3600) h" : "\(s / 3600) h \(s % 3600 / 60) min" }
+        let d = s / 86400, h = s % 86400 / 3600
+        return h == 0 ? "\(d) d" : "\(d) d \(h) h"
+    }
+
+    struct HoverCard: View {
+        let info: HoverInfo
+        static let colors: [String: Color] = ["App": .blue, "Compressed": .orange, "Wired": .gray, "Swap": .red]
+
+        func gb(_ r: Reading) -> String {
+            let lo = String(format: "%.1f", r.lo), hi = String(format: "%.1f", r.hi)
+            return lo == hi ? hi + " GB" : "\(lo)–\(hi) GB"
+        }
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(info.when).font(.system(size: 11, weight: .semibold)).lineLimit(1)
+                    Spacer(minLength: 4)
+                    Text(info.ago).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                if info.samples > 1 {
+                    Text("\(info.samples) readings in this pixel · range shown")
+                        .font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
+                ForEach(info.readings, id: \.name) { r in
+                    HStack(spacing: 5) {
+                        Circle().fill(HoverCard.colors[r.name] ?? .gray).frame(width: 6, height: 6)
+                        Text(r.name).font(.system(size: 10))
+                        Spacer(minLength: 4)
+                        Text(gb(r)).font(.system(size: 10, design: .monospaced))
+                    }
+                }
+                if !info.readings.isEmpty {
+                    HStack {
+                        Text((info.samples > 1 ? "all four, peak" : "all four") + (info.away ? " · away" : ""))
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                        Spacer()
+                        Text(String(format: "%.1f GB", info.peak)).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                    }
+                }
+                if let n = info.noData {
+                    SwiftUI.Label(n, systemImage: "slash.circle").font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if !info.incidents.isEmpty || !info.events.isEmpty { Divider().padding(.vertical, 1) }
+                ForEach(Array(info.incidents.prefix(2).enumerated()), id: \.offset) { _, t in
+                    Text(t).font(.system(size: 10, weight: .medium)).foregroundStyle(.red).lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                ForEach(Array(info.events.enumerated()), id: \.offset) { _, e in
+                    Text("• " + e.0).font(.system(size: 10)).foregroundStyle(e.1 ? Color.red : Color.primary).lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if info.moreEvents > 0 {
+                    Text("+ \(info.moreEvents) more kinds of events").font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
+            }
+            .padding(8)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+            .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+        }
+    }
+
+    /// The history bucketed into screen columns (worst point each), with the area dropping to
+    /// zero at both edges of every gap instead of bridging it; plus the away spans.
+    func columns(_ f: (Double) -> Double) -> ([Entry], [Band]) {
+        var cols: [(x: Double, p: Point)] = []
+        var gi = gaps.count - 1
+        var bucket: [Point] = [], bucketCol = Int.min, bucketX = 0.0
+        var segBreaks: Set<Int> = []                  // indices in cols that start a new segment (older side)
+        func flush() {
+            if !bucket.isEmpty { cols.append((bucketX, Store.worst(ArraySlice(bucket)))) }
+            bucket = []
+        }
+        var prevT = Double.infinity
+        for p in points.reversed() {
+            let x = f(p.id)
+            // a gap between this point and the newer one?
+            var broke = false
+            while gi >= 0 && gaps[gi].from >= p.id {
+                if gaps[gi].to <= prevT { broke = true }
+                gi -= 1
+            }
+            let col = Int((x * Double(MemoryChart.columns)).rounded(.down))
+            if broke || col != bucketCol {
+                flush()
+                if broke { segBreaks.insert(cols.count) }
+                bucketCol = col; bucketX = x
+            }
+            bucket.append(p)
+            prevT = p.id
+            if x < 0 { break }                        // one point past the left edge, clamped below
+        }
+        flush()
+        // oldest first, clamped into the plot
+        var entries: [Entry] = []
+        var away: [Band] = []
+        var awayStart: Double?
+        var id = 0
+        func add(_ x: Double, _ p: Point?) {
+            let v: [Double] = p.map { [$0.wired, $0.app, $0.comp, $0.swap] } ?? [0, 0, 0, 0]
+            for (k, name) in MemoryChart.series.enumerated() {
+                entries.append(Entry(id: id, x: x, kind: name, gb: v[k])); id += 1
+            }
+        }
+        let n = cols.count
+        for i in stride(from: n - 1, through: 0, by: -1) {
+            let x = min(max(cols[i].x, 0), 1), p = cols[i].p
+            let startsSeg = i == n - 1 || segBreaks.contains(i + 1)   // older neighbour is across a gap
+            let endsSeg = i == 0 || segBreaks.contains(i)
+            if startsSeg && i != n - 1 { add(x - 1e-6, nil) }
+            add(x, p)
+            if endsSeg && i != 0 { add(x + 1e-6, nil) }
+            if p.away { if awayStart == nil { awayStart = x } }
+            if (!p.away || endsSeg), let s = awayStart {
+                away.append(Band(id: away.count, from: s, to: x)); awayStart = nil
+            }
+        }
+        if let s = awayStart { away.append(Band(id: away.count, from: s, to: 1)) }
+        return (entries, away)
+    }
+
+    func gapBands(_ f: (Double) -> Double) -> [Band] {
+        var out: [Band] = []
+        for g in gaps {
+            let a = max(f(g.from), 0), b = min(f(g.to), 1)
+            if b > a { out.append(Band(id: out.count, from: a, to: b)) }
+        }
+        return out
+    }
+
+    /// Clock-aligned lines at every level, faded by their on-screen spacing: lines closer than a
+    /// few pixels vanish, so the log axis shows its decades of grids without turning solid.
+    func gridLines(_ f: (Double) -> Double, plotW: Double) -> [GridLine] {
+        let tz = Double(TimeZone.current.secondsFromGMT())
+        var alpha: [Double: (x: Double, a: Double)] = [:]
+        for unit in MemoryChart.levels {
+            let offset = unit == 604800 ? 4 * 86400.0 : 0   // weeks start on Monday (1970-01-01 was a Thursday)
+            var t = ((now + tz - offset) / unit).rounded(.down) * unit - tz + offset
+            var guardN = 0
+            while guardN < 400 {
+                guardN += 1
+                let x = f(t)
+                if x < 0 { break }
+                let spacing = (x - f(t - unit)) * plotW
+                if spacing < 3 { break }                     // only gets denser further left
+                let s = min(max((spacing - 3) / 37, 0), 1)   // 3 px → invisible, 40 px → full
+                let a = 0.2 * s * s * (3 - 2 * s)
+                if a > (alpha[t]?.a ?? 0) { alpha[t] = (x, a) }
+                t -= unit
+            }
+        }
+        return alpha.map { GridLine(id: $0.key, x: $0.value.x, alpha: $0.value.a) }.filter { $0.x <= 0.995 }
+    }
+
+    /// Labels on grid lines, coarsest first, skipping any that would crowd an earlier one.
+    func axisLabels(_ f: (Double) -> Double, plotW: Double) -> [Label] {
+        let tz = Double(TimeZone.current.secondsFromGMT())
+        let minGap = 46 / plotW
+        var out: [Label] = []
+        for unit in MemoryChart.levels {
+            let offset = unit == 604800 ? 4 * 86400.0 : 0
+            var t = ((now + tz - offset) / unit).rounded(.down) * unit - tz + offset
+            var guardN = 0
+            while guardN < 400 {
+                guardN += 1
+                let x = f(t)
+                if x < 0 { break }
+                if (x - f(t - unit)) * plotW < 20 { break }
+                if x >= 0.03 && x <= 0.95 && !out.contains(where: { abs($0.x - x) < minGap }) {
+                    out.append(Label(x: x, text: MemoryChart.label(t, unit: unit)))
+                }
+                t -= unit
+            }
+        }
+        return out.sorted { $0.x < $1.x }
+    }
+
+    static let dayFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d"; return f }()
+    static let timeFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+    static func label(_ t: Double, unit: Double) -> String {
+        let d = Date(timeIntervalSince1970: t)
+        return unit >= 86400 ? dayFmt.string(from: d) : timeFmt.string(from: d)
+    }
+
+    /// Diagonal hatching for "no data", visible on either theme.
+    static let hatch: ImagePaint = {
+        let img = NSImage(size: NSSize(width: 6, height: 6), flipped: false) { r in
+            NSColor.gray.withAlphaComponent(0.45).setStroke()
+            let p = NSBezierPath(); p.lineWidth = 1
+            p.move(to: NSPoint(x: -1, y: -1)); p.line(to: NSPoint(x: 7, y: 7))
+            p.move(to: NSPoint(x: -1, y: 5)); p.line(to: NSPoint(x: 1, y: 7))
+            p.move(to: NSPoint(x: 5, y: -1)); p.line(to: NSPoint(x: 7, y: 1))
+            p.stroke()
+            return true
+        }
+        return ImagePaint(image: Image(nsImage: img))
+    }()
+
+    @ChartContentBuilder func bandMarks(_ bands: [Band], style: AnyShapeStyle) -> some ChartContent {
+        ForEach(bands) { (b: Band) in
+            RectangleMark(xStart: .value("from", b.from), xEnd: .value("to", max(b.to, b.from + 0.002)))
+                .foregroundStyle(style)
+        }
+    }
+
+    @ChartContentBuilder func gridMarks(_ lines: [GridLine], color: Color, scale: Double) -> some ChartContent {
+        ForEach(lines) { (l: GridLine) in
+            RuleMark(x: .value("grid", l.x))
+                .lineStyle(StrokeStyle(lineWidth: 0.5))
+                .foregroundStyle(color.opacity(l.alpha * scale))
+        }
+    }
+
+    @ChartContentBuilder func areaMarks(_ entries: [Entry]) -> some ChartContent {
+        ForEach(entries) { (e: Entry) in
+            AreaMark(x: .value("time", e.x), y: .value("GB", e.gb))
+                .foregroundStyle(by: .value("kind", e.kind))
+        }
+    }
+
+    @ChartContentBuilder var ramMark: some ChartContent {
+        if let ram {
+            RuleMark(y: .value("RAM", ram))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(Color.primary.opacity(0.6))
+        }
+    }
+
+    @ChartContentBuilder func incidentMarks(_ f: (Double) -> Double) -> some ChartContent {
+        let xs: [Double] = incidents.map { f($0.start) }.filter { $0 >= 0 && $0 <= 1 }
+        ForEach(xs, id: \.self) { (x: Double) in
+            RuleMark(x: .value("incident", x)).foregroundStyle(Color.red)
+        }
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: Store
     @State private var error: String?
@@ -688,7 +1270,7 @@ struct PopoverView: View {
             VStack(alignment: .leading, spacing: 10) {
                 if let c = store.current, store.daemonRunning { stats(c) }
                 if let ls = store.current?.leases, !ls.isEmpty, store.daemonRunning { leases(ls) }
-                chart
+                chart.zIndex(1)
                 incidentsList
                 Divider()
                 footer
@@ -767,7 +1349,6 @@ struct PopoverView: View {
                             .lineLimit(1).truncationMode(.middle)
                             .help(store.needsUpdate ? "Installed logger: v\(store.installedVersion ?? "?")" : "")
                     }
-                    upgradeButtonView
                 }
                 Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
@@ -923,89 +1504,44 @@ struct PopoverView: View {
 
     var chart: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Memory, GB").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Picker("", selection: $store.range) {
-                    Text("1h").tag(3600.0); Text("6h").tag(6 * 3600.0); Text("24h").tag(24 * 3600.0)
-                }.pickerStyle(.segmented).frame(width: 140).labelsHidden()
+            HStack(spacing: 8) {
+                // ranges animate into each other (0.5 s): the chart morphs, nothing reloads
+                Picker("", selection: Binding(get: { store.range }, set: { v in
+                    withAnimation(.easeInOut(duration: 0.5)) { store.range = v }
+                })) {
+                    Image(systemName: "infinity").tag(Double.infinity)
+                    Text("24h").tag(24 * 3600.0); Text("6h").tag(6 * 3600.0); Text("1h").tag(3600.0)
+                }.pickerStyle(.segmented).frame(width: 180).labelsHidden()
                 .focusable(false).focusEffectDisabled()
+                if store.needsUpdate {  // the logger is a different version than the one this app ships
+                    if store.busy {
+                        ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 16, height: 16)
+                    } else {
+                        Button { store.runPrivileged("install.sh") { error = $0 } } label: {
+                            Image(systemName: "arrow.clockwise").font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(Color.accentColor).frame(width: 16, height: 16).contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain).focusable(false)
+                        .help("Update the logger: it runs v\(store.installedVersion ?? "?"), this app ships v\(store.bundledVersion ?? "?")")
+                    }
+                }
+                Spacer()
+                Text(store.allHistory ? "Memory, GB · log time" : "Memory, GB")
+                    .font(.caption).foregroundStyle(.secondary)
             }
-            if store.points.isEmpty {
+            if store.history.isEmpty {
                 Text("No samples yet").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 140)
             } else {
-                Chart {
-                    awayMarks
-                    stackMarks
-                    ramMark
-                    incidentMarks
-                }
-                .chartForegroundStyleScale(domain: series, range: [Color.gray, Color.blue, Color.orange, Color.red])
-                .chartLegend(position: .bottom, spacing: 4)
-                .frame(height: 160)
-                Text("Grey bands = away (idle ≥ 5 min, locked or display off) · red lines = incidents")
+                MemoryChart(points: store.history, gaps: store.gaps, now: store.historyNow,
+                            incidents: store.incidents, events: store.events, ram: store.current?.ram_gb,
+                            lgRange: log10(store.allHistory ? 24 * 3600 : store.range),
+                            blend: renderBlend ?? (store.allHistory ? 1 : 0))
+                    .frame(height: 160)
+                    .zIndex(1)  // the hover tooltip may reach over the caption below
+                Text("Grey bands = away (idle, locked or display off) · hatched = no data · red lines = incidents")
                     .font(.system(size: 9)).foregroundStyle(.secondary)
             }
         }
-    }
-
-    // Chart content is split into small, explicitly typed pieces: one big Chart { … }
-    // expression is too much for the type checker of older Swift toolchains.
-    struct Span: Identifiable { let id: Double; let from: Date; let to: Date }
-    struct StackEntry: Identifiable { let id: String; let date: Date; let kind: String; let gb: Double }
-
-    var stackEntries: [StackEntry] {
-        var out: [StackEntry] = []
-        out.reserveCapacity(store.points.count * 4)
-        for p in store.points {
-            let values: [Double] = [p.wired, p.app, p.comp, p.swap]
-            for (i, name) in series.enumerated() {
-                out.append(StackEntry(id: "\(p.id)-\(name)", date: p.date, kind: name, gb: values[i]))
-            }
-        }
-        return out
-    }
-
-    @ChartContentBuilder var awayMarks: some ChartContent {
-        ForEach(awaySpans().map { Span(id: $0.0.timeIntervalSince1970, from: $0.0, to: $0.1) }) { (span: Span) in
-            RectangleMark(xStart: .value("from", span.from), xEnd: .value("to", span.to))
-                .foregroundStyle(Color.gray.opacity(0.15))
-        }
-    }
-
-    @ChartContentBuilder var stackMarks: some ChartContent {
-        ForEach(stackEntries) { (e: StackEntry) in
-            AreaMark(x: .value("time", e.date), y: .value("GB", e.gb))
-                .foregroundStyle(by: .value("kind", e.kind))
-        }
-    }
-
-    @ChartContentBuilder var ramMark: some ChartContent {
-        if let ram = store.current?.ram_gb {
-            RuleMark(y: .value("RAM", ram))
-                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
-                .foregroundStyle(Color.primary.opacity(0.6))
-        }
-    }
-
-    @ChartContentBuilder var incidentMarks: some ChartContent {
-        let since: Double = store.points.first?.id ?? 0
-        ForEach(store.incidents.filter { $0.start >= since }) { (inc: Incident) in
-            RuleMark(x: .value("incident", Date(timeIntervalSince1970: inc.start)))
-                .foregroundStyle(Color.red)
-        }
-    }
-
-    func awaySpans() -> [(Date, Date)] {
-        var out: [(Date, Date)] = []
-        var start: Date?
-        var prev: Date?
-        for p in store.points {
-            if p.away { if start == nil { start = p.date } } else if let s = start { out.append((s, prev ?? s)); start = nil }
-            prev = p.date
-        }
-        if let s = start, let l = prev { out.append((s, l)) }
-        return out
     }
 
     var incidentsList: some View {
@@ -1059,23 +1595,25 @@ struct PopoverView: View {
         switch store.upgradeButton {
         case .hidden:
             EmptyView()
-        case .checking:
-            ProgressView().controlSize(.small).scaleEffect(0.55).frame(width: 40, height: 14)
+        case .checking:  // the Check button, pressed: same size, a spinner instead of the label
+            Button {} label: {
+                Text("Check").hidden().overlay(ProgressView().controlSize(.small).scaleEffect(0.6))
+            }.disabled(true).focusable(false)
                 .help("Checking GitHub for a newer oomph…")
         case .check:
             Button("Check") { store.checkForUpgrade(manual: true) }
-                .buttonStyle(.bordered).controlSize(.mini).focusable(false)
+                .focusable(false)
                 .help(store.upgradeCheckError.map { "The last check failed: \($0). Click to try again." }
                       ?? "Check GitHub for a newer oomph (this is \(cur))" + lastChecked)
                 .contextMenu { autoCheckToggle }
         case .upgrade:
             Button("Upgrade") { store.openUpgrade() }
-                .buttonStyle(.borderedProminent).controlSize(.mini).focusable(false)
+                .buttonStyle(.borderedProminent).focusable(false)
                 .help("oomph \(cur) is installed — \(store.availableVersion) is available. Click to see what's new.")
                 .contextMenu { autoCheckToggle }
         case .upToDate:
             Button("Up to date") {}
-                .buttonStyle(.bordered).controlSize(.mini).disabled(true).focusable(false)
+                .disabled(true).focusable(false)
                 .help("oomph \(cur) is the newest version on GitHub")
         }
     }
@@ -1260,8 +1798,7 @@ struct PopoverView: View {
                 }
                 .font(.system(size: 11, weight: .semibold))
                 .frame(width: 30, height: 20)
-                .background(lit && !running ? AnyShapeStyle(grad.opacity(0.22)) : AnyShapeStyle(showAI ? Color.primary.opacity(0.08) : .clear),
-                            in: UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 5, topTrailing: 5)))
+                .background(lit && !running ? AnyShapeStyle(grad.opacity(0.22)) : AnyShapeStyle(showAI ? Color.primary.opacity(0.08) : .clear))
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -1269,6 +1806,26 @@ struct PopoverView: View {
             .anchorPreference(key: StarAnchorKey.self, value: .bounds) { $0 }
             .help(running ? "Stop the AI report" : lit ? "AI analysis on (\(store.aiSummary)) — click to turn off"
                   : "Add an AI analysis to reports")
+
+            Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14)
+
+            // the oomph skill for Claude sessions: copy a prompt or the raw link
+            Menu {
+                Section("Claude skill — paste into a session") {
+                    Button("Copy prompt: add to the session's project") { copy(skillPrompt(allProjects: false)) }
+                    Button("Copy prompt: add for all projects") { copy(skillPrompt(allProjects: true)) }
+                }
+                Button("Copy raw SKILL.md link") { copy(skillURL) }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "link")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(copied ? Color.green : Color.secondary)
+                    .frame(width: 30, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.button).buttonStyle(.plain).menuIndicator(.hidden).fixedSize()
+            .focusable(false)
+            .help(copied ? "Copied — paste it into a Claude Code session" : "Share the oomph skill with a Claude session")
         }
         .font(.system(size: 12))
         .focusEffectDisabled()
@@ -1401,12 +1958,6 @@ struct PopoverView: View {
 
     var footer: some View {
         HStack {
-            if store.needsUpdate {
-                Button("Update") {
-                    store.runPrivileged("install.sh") { error = $0 }
-                }.buttonStyle(.borderedProminent).disabled(store.busy)
-                .help("Installed logger is v\(store.installedVersion ?? "?"), this app ships v\(store.bundledVersion ?? "?")")
-            }
             if store.installed {
                 Button("Deactivate") {
                     store.runPrivileged("uninstall.sh") { error = $0 }
@@ -1416,21 +1967,11 @@ struct PopoverView: View {
                     store.runPrivileged("install.sh") { error = $0 }
                 }.buttonStyle(.borderedProminent).disabled(store.busy)
             }
+            upgradeButtonView
             reportPair
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
                 .toggleStyle(.checkbox).font(.caption).lineLimit(1).fixedSize()
-            Menu {
-                Section("Claude skill — paste into a session") {
-                    Button("Copy prompt: add to the session's project") { copy(skillPrompt(allProjects: false)) }
-                    Button("Copy prompt: add for all projects") { copy(skillPrompt(allProjects: true)) }
-                }
-                Button("Copy raw SKILL.md link") { copy(skillURL) }
-            } label: {
-                Image(systemName: copied ? "checkmark" : "square.and.arrow.up")
-            }
-            .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
-            .help(copied ? "Copied — paste it into a Claude Code session" : "Share the oomph skill with a Claude session")
             Button {
                 NSApp.terminate(nil)
             } label: { Image(systemName: "power") }.help("Quit oomph")
@@ -1677,6 +2218,15 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
     if ai == "running" { store.aiRunning = true; store.aiProgress = "Tracing WebKit.GPU" }
     // `--ai upgrade|changelog|build` draws the upgrade states (render only)
     if ai == "upgrade" { store.upgradeButton = .upgrade }
+    if ai == "check" { store.upgradeButton = .check }
+    if ai == "checking" { store.upgradeButton = .checking }
+    if ai == "uptodate" { store.upgradeButton = .upToDate }
+    if ai.hasPrefix("hover:") || ai.hasPrefix("hoverlog:") {
+        renderHoverX = Double(ai.split(separator: ":").last ?? "").map { CGFloat($0) }
+        if ai.hasPrefix("hoverlog:") { store.range = .infinity }
+    }
+    if ai.hasPrefix("blend:") { renderBlend = Double(ai.dropFirst(6)) }
+    if ai == "log" { store.range = .infinity }  // the ∞ range: all history on a log time axis
     if ai == "changelog" {
         store.upgradeButton = .upgrade
         let p = Process()

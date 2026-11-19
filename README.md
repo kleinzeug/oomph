@@ -45,8 +45,13 @@ Click it for the popup:
 
 - current pressure, app / compressed / wired memory, swap used and size, free disk,
   how long you have been idle, the biggest app;
-- a chart of the last **1 h / 6 h / 24 h** — wired, app, compressed and swap stacked
-  against your RAM, with the periods you were away shaded and incidents marked in red;
+- a chart of **all history (∞) / 24 h / 6 h / 1 h** — wired, app, compressed and swap
+  stacked against your RAM, with the periods you were away shaded, stretches without data
+  hatched (never bridged) and incidents marked in red. ∞ uses a logarithmic time axis: the
+  last hour stays readable next to two weeks of context. Switching ranges morphs the chart
+  in half a second, so you can follow where each stretch of time goes. Hover for a line
+  that follows the pointer and a tooltip with the readings, gaps, incidents and events
+  under it — on the log axis one pixel can hold hours, so it shows each value's range;
 - the list of incidents — click one to open its report; right-click to copy its path
   or reveal it in Finder;
 - **Activate / Deactivate**, **Report** (HTML report for the selected range),
@@ -158,7 +163,7 @@ turned on launch at login).
 ## Upgrading
 
 Every commit on `main` is a release. If the Xcode Command Line Tools are installed
-(`xcode-select --install`), the popup shows a small **Check** button next to the version:
+(`xcode-select --install`), the popup shows a **Check** button next to Deactivate:
 
 - Once a day, when you open the popup, oomph asks GitHub whether `main` has moved on (no
   background timer — it only checks while you look). **Check** does the same right away;
@@ -232,8 +237,8 @@ you. With several sessions on one Mac, they also **take turns**: each reserves t
 a heavy step will need, and ***oomph*** grants the reservations in order, side by side
 while they fit and one after another when they don't.
 
-**Per project** — paste this into a Claude Code session (the popup's share button
-next to *Launch at login* copies it for you, or the all-projects variant with
+**Per project** — paste this into a Claude Code session (the popup's link button
+(🔗, next to Report and the AI star) copies it for you, or the all-projects variant with
 `~/.claude/skills/oomph`):
 
 ```
@@ -272,8 +277,9 @@ free, under 20 GB free disk, right after jetsam kills, or when a large amount of
 memory belongs to no process; **critical** at pressure
 *critical*, under 5 GB free disk, or full swap on a nearly full disk. All of these
 commands work without the background logger too — they measure live — so the skill is
-useful even before you click Activate. Already installed an older version? The popup
-shows an **Update** button when the app carries a newer logger than the one installed.
+useful even before you click Activate. Already installed an older version? A blue
+refresh icon (↻) appears next to the chart's time range when the app carries a different
+logger than the one installed; clicking it updates the logger.
 
 ### Taking turns: sessions coordinating memory
 
