@@ -120,6 +120,18 @@ struct Sample: Decodable {
 
 struct Gap { let from, to: Double }
 
+/// Just the fields the chart needs: decoding a whole Sample (process groups, sessions…) for two
+/// weeks of history is most of the loading time.
+struct ChartSample: Decodable {
+    var t: Double
+    var app_gb: Double
+    var wired_gb: Double
+    var compressed_gb: Double
+    var swap_used_gb: Double
+    var jetsam_kills: Int?
+    var away: Away?
+}
+
 /// One line of events.jsonl, reduced to what the chart's hover tooltip shows.
 struct ChartEvent {
     let t: Double
@@ -233,7 +245,13 @@ final class Store: ObservableObject {
     private var aiStarted = Date()
     private var aiAborted = false
 
+    // history loading runs on its own queue; the cache and its decoder belong to that queue
+    private let loadQueue = DispatchQueue(label: "local.oomph.history", qos: .userInitiated)
     private var cache: [String: (offset: UInt64, pts: [Point])] = [:]
+    private let loadDecoder = JSONDecoder()
+    private var loading = false, loadAgain = false
+    /// False until the history has been loaded once: the chart shows a spinner meanwhile.
+    @Published var historyLoaded = false
     private let decoder = JSONDecoder()
 
     var daemonRunning: Bool {
@@ -275,7 +293,39 @@ final class Store: ObservableObject {
     var allHistory: Bool { range.isInfinite }
 
     /// Loads every samples file (14 days are kept), so switching ranges never waits for data.
-    func reloadPoints() {
+    /// In the background: the popup opens at once and keeps showing the previous history
+    /// until the new one is ready (or a spinner, the first time). `sync` is for renders.
+    func reloadPoints(sync: Bool = false) {
+        if sync {
+            let r = loadQueue.sync { loadHistory() }
+            apply(r); historyLoaded = true
+            return
+        }
+        if loading { loadAgain = true; return }
+        loading = true
+        loadQueue.async { [weak self] in
+            guard let self else { return }
+            let r = self.loadHistory()
+            DispatchQueue.main.async {
+                self.apply(r)
+                if !self.historyLoaded { withAnimation(.easeIn(duration: 0.33)) { self.historyLoaded = true } }
+                self.loading = false
+                if self.loadAgain { self.loadAgain = false; self.reloadPoints() }
+            }
+        }
+    }
+
+    private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]? }
+
+    private func apply(_ r: Loaded) {
+        history = r.history
+        gaps = r.gaps
+        historyNow = r.now
+        if let e = r.events { events = e }
+    }
+
+    /// On loadQueue only.
+    private func loadHistory() -> Loaded {
         let now = Date().timeIntervalSince1970
         let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
         let today = fmt.string(from: Date())
@@ -293,19 +343,20 @@ final class Store: ObservableObject {
             gaps.append(Gap(from: all[i - 1].id, to: all[i].id))
         }
         if let last = all.last, now - last.id > Store.gapSeconds { gaps.append(Gap(from: last.id, to: now)) }
-        history = Store.multires(all, now: now)
-        self.gaps = gaps
-        historyNow = now
-        reloadEvents()
+        // drop cached files that are gone (a day's plain file once it is gzipped)
+        let present = Set(files.map { "\(logDir)/\($0)" })
+        for k in cache.keys where !present.contains(k) { cache[k] = nil }
+        return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents())
     }
 
-    private func reloadEvents() {
+    /// The events, or nil when the files haven't changed since the last load. On loadQueue only.
+    private func loadEvents() -> [ChartEvent]? {
         let paths = ["events.jsonl.1", "events.jsonl"].map { "\(logDir)/\($0)" }
         let stamp = paths.map { p -> String in
             let a = try? FileManager.default.attributesOfItem(atPath: p)
             return "\(a?[.size] ?? 0)/\((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
         }.joined(separator: ",")
-        guard stamp != eventsStamp else { return }
+        guard stamp != eventsStamp else { return nil }
         eventsStamp = stamp
         var out: [ChartEvent] = []
         for p in paths {
@@ -316,7 +367,7 @@ final class Store: ObservableObject {
                 }
             }
         }
-        events = out.sorted { $0.t < $1.t }
+        return out.sorted { $0.t < $1.t }
     }
 
     private func loadDay(_ day: String, isToday: Bool) -> [Point] {
@@ -355,9 +406,10 @@ final class Store: ObservableObject {
     private func parse(_ data: Data.SubSequence) -> [Point] {
         var out: [Point] = []
         for line in data.split(separator: 0x0A) {
-            guard let s = try? decoder.decode(Sample.self, from: Data(line)) else { continue }
+            guard let s = try? loadDecoder.decode(ChartSample.self, from: Data(line)) else { continue }
+            let away = s.away.map { ($0.idle_s ?? 0) >= 300 || ($0.locked ?? false) || $0.display_on == false } ?? false
             out.append(Point(id: s.t, date: Date(timeIntervalSince1970: s.t), wired: s.wired_gb, app: s.app_gb,
-                             comp: s.compressed_gb, swap: s.swap_used_gb, away: s.isAway, kills: s.jetsam_kills ?? 0))
+                             comp: s.compressed_gb, swap: s.swap_used_gb, away: away, kills: s.jetsam_kills ?? 0))
         }
         return out
     }
@@ -1529,18 +1581,27 @@ struct PopoverView: View {
                 Text(store.allHistory ? "Memory, GB · log time" : "Memory, GB")
                     .font(.caption).foregroundStyle(.secondary)
             }
-            if store.history.isEmpty {
-                Text("No samples yet").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 140)
-            } else {
-                MemoryChart(points: store.history, gaps: store.gaps, now: store.historyNow,
-                            incidents: store.incidents, events: store.events, ram: store.current?.ram_gb,
-                            lgRange: log10(store.allHistory ? 24 * 3600 : store.range),
-                            blend: renderBlend ?? (store.allHistory ? 1 : 0))
-                    .frame(height: 160)
-                    .zIndex(1)  // the hover tooltip may reach over the caption below
-                Text("Grey bands = away (idle, locked or display off) · hatched = no data · red lines = incidents")
-                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            ZStack {
+                if !store.historyLoaded {
+                    VStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Loading history…").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if store.history.isEmpty {
+                    Text("No samples yet").font(.caption).foregroundStyle(.secondary)
+                } else {
+                    MemoryChart(points: store.history, gaps: store.gaps, now: store.historyNow,
+                                incidents: store.incidents, events: store.events, ram: store.current?.ram_gb,
+                                lgRange: log10(store.allHistory ? 24 * 3600 : store.range),
+                                blend: renderBlend ?? (store.allHistory ? 1 : 0))
+                        .transition(.opacity)  // fades in (0.33 s) once the history has loaded
+                }
             }
+            .frame(maxWidth: .infinity)
+            .frame(height: 160)
+            .zIndex(1)  // the hover tooltip may reach over the caption below
+            Text("Grey bands = away (idle, locked or display off) · hatched = no data · red lines = incidents")
+                .font(.system(size: 9)).foregroundStyle(.secondary)
         }
     }
 
@@ -2021,6 +2082,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        store.reloadPoints()  // in the background: the first popup then opens with its chart ready
         item.button?.target = self
         item.button?.action = #selector(toggle)
         item.button?.imageScaling = .scaleNone
@@ -2213,6 +2275,7 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
     renderMode = true
     let store = Store()
     store.refreshAll()
+    if ai != "loading" { store.reloadPoints(sync: true) }  // `--ai loading` draws the spinner
     // `--ai callout|on|running` draws the AI states (render only; nothing is saved)
     if ai == "on" || ai == "running" { store.aiOn = true; store.aiProvider = .ollama }
     if ai == "running" { store.aiRunning = true; store.aiProgress = "Tracing WebKit.GPU" }
