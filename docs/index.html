@@ -796,8 +796,8 @@ open ~/Applications/oomph.app</pre>
   // ---------------------------------------------------------------- memory-map background
   // Each cell is a memory page. A slow field decides which pages are in use; scroll depth
   // raises the pressure (more pages in use, more of them compressed or swapped). The cursor
-  // allocates pages around it, a click is a spike. A sampler line sweeps across like the
-  // daemon taking a measurement, and its readout reports this page's own "free memory".
+  // allocates pages around it, a click is a spike. Every 9 s the readout takes a "sample"
+  // of this page's own free memory, like the daemon would.
   var canvas = document.getElementById("memmap");
   var ctx = canvas.getContext("2d");
   var W = 0, H = 0, DPR = 1, CELL = 18, GAP = 4, cols = 0, rows = 0;
@@ -852,9 +852,8 @@ open ~/Applications/oomph.app</pre>
     var thr = 1 - pressure;
     var base = dark ? 1 : 0.75;
     var C = dark
-      ? { free: "120,140,170", wired: "150,150,160", app: "91,159,224", comp: "232,180,80", swap: "239,107,86", sweep: "127,216,148" }
-      : { free: "86,101,122", wired: "120,120,128", app: "59,130,196", comp: "214,150,40", swap: "208,80,60", sweep: "47,154,92" };
-    var sweepX = reduced ? -100 : ((t / 9000) % 1) * (W + 200) - 100;
+      ? { free: "120,140,170", wired: "150,150,160", app: "91,159,224", comp: "232,180,80", swap: "239,107,86" }
+      : { free: "86,101,122", wired: "120,120,128", app: "59,130,196", comp: "214,150,40", swap: "208,80,60" };
     if (!reduced && t - lastSweep > 9000) { lastSweep = t; sampleNo++; }
     var s = CELL - GAP, used = 0, total = cols * rows;
     var colL = Math.max(0, (W - 980) / 2), colR = Math.min(W, colL + 980);
@@ -872,8 +871,6 @@ open ~/Applications/oomph.app</pre>
           else if (depth < 0.85 || pressure < 0.7) { col = C.comp; a = 0.24; }
           else { col = C.swap; a = 0.28; }
         } else { col = C.free; a = 0.05; }
-        var dxs = Math.abs(px + s / 2 - sweepX);
-        if (dxs < CELL * 1.5) a += 0.22 * (1 - dxs / (CELL * 1.5));
         // keep text readable: fade pages behind the content column
         var mid = px + s / 2, edge = Math.min(Math.abs(mid - colL), Math.abs(mid - colR));
         var inside = mid > colL && mid < colR;
@@ -883,12 +880,8 @@ open ~/Applications/oomph.app</pre>
         if (heat[k] > 0.002) heat[k] *= 0.965;
       }
     }
-    // the sampler line and its readout
+    // the readout
     freeGB = 36 * (1 - used / total);
-    if (!reduced && sweepX > -10 && sweepX < W + 10) {
-      ctx.fillStyle = "rgba(" + C.sweep + "," + (dark ? 0.35 : 0.3) + ")";
-      ctx.fillRect(sweepX, 0, 1, H);
-    }
     if (W < 700) return;
     ctx.font = "11px ui-monospace, SF Mono, Menlo, monospace";
     ctx.fillStyle = "rgba(" + (dark ? "200,210,225" : "60,70,85") + ",.55)";

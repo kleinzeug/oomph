@@ -2,11 +2,54 @@
 // Build: ../build-app.sh
 import AppKit
 import Charts
+import Security
 import SwiftUI
 
 let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
 let agentLabel = "local.oomph.menubar"
+let popupWidth: CGFloat = 480
+let statColumn: CGFloat = 96
 let skillURL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
+
+// MARK: - AI analysis settings
+
+enum AIProvider: String, CaseIterable, Identifiable {
+    case claude, openai, ollama
+    var id: String { rawValue }
+    var title: String { ["claude": "Claude", "openai": "OpenAI Codex", "ollama": "Ollama"][rawValue]! }
+    var defaultModel: String { ["claude": "claude-opus-5-5", "openai": "gpt-5-codex", "ollama": ""][rawValue]! }
+    var needsToken: Bool { self != .ollama }
+    var keyHint: String {
+        switch self {
+        case .claude: return "API key from platform.claude.com → API keys (sk-ant-…)"
+        case .openai: return "API key from platform.openai.com → API keys (sk-…)"
+        case .ollama: return "Runs on this Mac — no key needed (optional for a proxied server)"
+        }
+    }
+}
+
+/// Access tokens live in the login keychain, one item per provider.
+enum Keychain {
+    static let service = "local.oomph.ai"
+    static func base(_ account: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
+    }
+    static func get(_ account: String) -> String? {
+        var q = base(account)
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: AnyObject?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+    static func set(_ value: String, _ account: String) {
+        SecItemDelete(base(account) as CFDictionary)
+        guard !value.isEmpty else { return }
+        var add = base(account)
+        add[kSecValueData as String] = Data(value.utf8)
+        SecItemAdd(add as CFDictionary, nil)
+    }
+}
 
 /// A prompt to paste into a Claude Code session. It downloads the skill verbatim with curl
 /// (a web fetch would hand the model a summary, not the file) and has the session follow it.
@@ -90,6 +133,18 @@ final class Store: ObservableObject {
     @Published var range: Double = 6 * 3600 { didSet { reloadPoints() } }
     @Published var launchAtLogin = FileManager.default.fileExists(atPath: agentPlist)
     @Published var busy = false
+
+    // AI reports
+    @Published var aiOn = UserDefaults.standard.bool(forKey: "aiOn") { didSet { UserDefaults.standard.set(aiOn, forKey: "aiOn") } }
+    @Published var aiProvider = AIProvider(rawValue: UserDefaults.standard.string(forKey: "aiProvider") ?? "") ?? .claude {
+        didSet { UserDefaults.standard.set(aiProvider.rawValue, forKey: "aiProvider") }
+    }
+    @Published var aiRunning = false
+    @Published var aiProgress = ""
+    @Published var aiError: String?
+    private var aiProcess: Process?
+    private var aiStarted = Date()
+    private var aiAborted = false
 
     private var cache: [String: (offset: UInt64, pts: [Point])] = [:]
     private let decoder = JSONDecoder()
@@ -254,15 +309,103 @@ final class Store: ObservableObject {
         runCLI(["incident", inc.id, "--html"])
     }
 
-    func runCLI(_ args: [String]) {
-        // Reports are drawn by the CLI bundled with this app (reading the logs needs no
-        // privileges), so they always match the app's version, even before Update.
+    // Reports are drawn by the CLI bundled with this app (reading the logs needs no
+    // privileges), so they always match the app's version, even before Update.
+    var cliPath: String {
         let bundled = (Bundle.main.resourcePath ?? "") + "/oomph.py"
-        let cli = FileManager.default.fileExists(atPath: bundled) ? bundled : "/usr/local/libexec/oomph/oomph.py"
+        return FileManager.default.fileExists(atPath: bundled) ? bundled : "/usr/local/libexec/oomph/oomph.py"
+    }
+
+    func runCLI(_ args: [String]) {
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        p.arguments = ["-I", "-B", cli] + args
+        p.arguments = ["-I", "-B", cliPath] + args
         try? p.run()
+    }
+
+    // MARK: AI settings + report
+
+    func aiModel(_ p: AIProvider) -> String { UserDefaults.standard.string(forKey: "aiModel." + p.rawValue) ?? p.defaultModel }
+    func setAIModel(_ m: String, _ p: AIProvider) { UserDefaults.standard.set(m, forKey: "aiModel." + p.rawValue) }
+    var ollamaURL: String {
+        get { UserDefaults.standard.string(forKey: "ollamaURL") ?? "http://localhost:11434" }
+        set { UserDefaults.standard.set(newValue, forKey: "ollamaURL") }
+    }
+    func hasToken(_ p: AIProvider) -> Bool { (Keychain.get(p.rawValue) ?? "").isEmpty == false }
+    func aiConfigured(_ p: AIProvider) -> Bool { !p.needsToken || hasToken(p) }
+
+    var aiSummary: String {
+        let m = aiModel(aiProvider)
+        return aiProvider.title + (m.isEmpty ? "" : " · " + m)
+    }
+
+    func runReport() {
+        if aiRunning { return }
+        if aiOn && aiConfigured(aiProvider) { runAIReport() } else { runCLI(["html", "--last", "24h", "--open"]) }
+    }
+
+    func runAIReport() {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        var args = ["-I", "-B", cliPath, "ai-report", "--provider", aiProvider.rawValue, "--last", "24h", "--open"]
+        let model = aiModel(aiProvider)
+        if !model.isEmpty { args += ["--model", model] }
+        if aiProvider == .ollama { args += ["--base-url", ollamaURL] }
+        p.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        env["OOMPH_AI_TOKEN"] = Keychain.get(aiProvider.rawValue) ?? ""  // via the environment, not argv
+        p.environment = env
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        var buffer = Data()
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            buffer.append(d)
+            while let nl = buffer.firstIndex(of: 0x0a) {
+                let line = buffer.subdata(in: buffer.startIndex..<nl)
+                buffer.removeSubrange(buffer.startIndex...nl)
+                guard let j = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    if let m = j["progress"] as? String { self.aiProgress = m }
+                    if let e = j["error"] as? String, !self.aiAborted { self.aiError = "AI report failed: " + e }
+                }
+            }
+        }
+        p.terminationHandler = { [weak self] proc in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                out.fileHandleForReading.readabilityHandler = nil
+                self.aiRunning = false
+                self.aiProcess = nil
+                if proc.terminationStatus != 0 && !self.aiAborted && self.aiError == nil {
+                    self.aiError = "AI report failed (exit \(proc.terminationStatus))."
+                }
+            }
+        }
+        do {
+            aiAborted = false
+            aiError = nil
+            aiStarted = Date()
+            aiProgress = "Starting"
+            try p.run()
+            aiProcess = p
+            aiRunning = true
+        } catch {
+            aiError = "Couldn't start the AI report: \(error.localizedDescription)"
+        }
+    }
+
+    func abortAI() {
+        aiAborted = true
+        aiProcess?.terminate()
+    }
+
+    var aiTooltip: String {
+        let s = Int(Date().timeIntervalSince(aiStarted))
+        return "\(aiProgress) · \(s / 60):" + String(format: "%02d", s % 60) + " · \(aiSummary)"
     }
 }
 
@@ -275,7 +418,7 @@ struct Stat: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(value).font(.system(size: 13, weight: .semibold)).monospacedDigit().foregroundStyle(warn ? .red : .primary)
             Text(label).font(.system(size: 10)).foregroundStyle(.secondary)
-        }.frame(maxWidth: .infinity, alignment: .leading)
+        }.frame(width: statColumn, alignment: .leading)  // the 4th column takes the rest (top app)
     }
 }
 
@@ -283,6 +426,13 @@ struct PopoverView: View {
     @ObservedObject var store: Store
     @State private var error: String?
     @State private var copied = false
+    @State var showAI = false
+    @State var showTopApps = false
+    @State private var draftProvider: AIProvider = .claude
+    @State private var draftToken = ""
+    @State private var draftModel = ""
+    @State private var draftURL = ""
+    @State private var ollamaModels: [String] = []
     private let series = ["Wired", "App", "Compressed", "Swap"]
 
     var body: some View {
@@ -302,7 +452,45 @@ struct PopoverView: View {
             }
             .padding(14)
         }
-        .frame(width: 428)
+        .frame(width: popupWidth)
+        .overlayPreferenceValue(StarAnchorKey.self) { anchor in
+            GeometryReader { geo in
+                if showAI, let anchor {
+                    let r = geo[anchor]
+                    let w: CGFloat = 316
+                    let left = min(max(8, r.midX - w + 28), geo.size.width - w - 8)
+                    aiCallout(arrowX: r.midX - left)
+                        .frame(width: w)
+                        .padding(.leading, left)
+                        .padding(.bottom, geo.size.height - r.minY + 4)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                        .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottomTrailing)))
+                }
+            }
+        }
+        .overlayPreferenceValue(TopAppAnchorKey.self) { anchor in
+            GeometryReader { geo in
+                if showTopApps, let anchor {
+                    let r = geo[anchor]
+                    let w: CGFloat = 320
+                    let left = min(max(8, r.midX - w + 40), geo.size.width - w - 8)
+                    ZStack(alignment: .topLeading) {
+                        // a click anywhere outside the bubble closes it
+                        Color.black.opacity(0.001)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false } }
+                        topAppsCallout(arrowX: r.midX - left)
+                            .frame(width: w)
+                            .padding(.leading, left)
+                            .padding(.top, r.maxY + 2)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topTrailing)))
+                    }
+                }
+            }
+        }
+        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false } }
+        .onChange(of: store.aiError) { _, e in
+            if let e { error = e; store.aiError = nil }
+        }
         .alert("oomph", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK") { error = nil }
         } message: { Text(error ?? "") }
@@ -355,13 +543,13 @@ struct PopoverView: View {
                 Stat(label: "App memory", value: String(format: "%.1f GB", c.app_gb))
                 Stat(label: "Compressed", value: String(format: "%.1f GB", c.compressed_gb))
                 Stat(label: "Wired", value: String(format: "%.1f GB", c.wired_gb))
-                Stat(label: "RAM", value: String(format: "%.0f GB", c.ram_gb))
+                Stat(label: "RAM total", value: String(format: "%.0f GB", c.ram_gb)).frame(maxWidth: .infinity, alignment: .leading)
             }
             HStack {
                 Stat(label: "Swap used / size", value: String(format: "%.1f / %.0f GB", c.swap_used_gb, c.swap_total_gb))
                 Stat(label: "Free disk", value: String(format: "%.0f GB", c.disk_free_gb), warn: c.disk_free_gb < 20)
                 Stat(label: "Idle", value: idle >= 120 ? "\(idle / 60) min" : "\(idle) s")
-                Stat(label: "Top app", value: shortTop(c))
+                topAppTile(c)
             }
         }
     }
@@ -375,7 +563,7 @@ struct PopoverView: View {
                     Circle().fill(l.state == "granted" ? Color.green : Color.orange).frame(width: 6, height: 6)
                     Text(String(format: "%.1fG", l.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                         .frame(width: 40, alignment: .trailing)
-                    Text(l.purpose).font(.system(size: 11)).lineLimit(1)
+                    Text(l.purpose).font(.system(size: 11)).lineLimit(1).help(l.purpose + (l.project.map { " — " + $0 } ?? ""))
                     if let p = l.project { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
                     Spacer()
                     Text(leaseTail(l)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
@@ -389,10 +577,94 @@ struct PopoverView: View {
         return "waiting \(Int(l.waiting_min ?? 0)) min"
     }
 
-    func shortTop(_ c: Sample) -> String {
-        guard let g = c.groups?.first else { return "–" }
-        let n = g.name.count > 9 ? String(g.name.prefix(8)) + "…" : g.name
-        return String(format: "%@ %.1fG", n, Double(g.mb) / 1024)
+    // The biggest app: its size as the figure, its name below (shortened in the middle,
+    // full name as tooltip). Click for the list of top apps.
+    func topAppTile(_ c: Sample) -> some View {
+        let g = c.groups?.first
+        return Button {
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            withAnimation(.easeOut(duration: 0.15)) { showTopApps.toggle(); showAI = false }
+        } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(g.map { String(format: "%.1f GB", Double($0.mb) / 1024) } ?? "–")
+                        .font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                    Text("biggest app").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 3) {
+                    Text("#1 " + friendlyName(g?.name ?? "–")).lineLimit(1).truncationMode(.middle)
+                    Image(systemName: showTopApps ? "chevron.up" : "chevron.down").font(.system(size: 7, weight: .bold))
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .focusEffectDisabled()
+        .help(g.map { "Top app: \($0.name) — \(String(format: "%.1f GB", Double($0.mb) / 1024))\($0.n.map { " in \($0) processes" } ?? "") · click for the top apps" } ?? "")
+        .anchorPreference(key: TopAppAnchorKey.self, value: .bounds) { $0 }
+    }
+
+    /// "com.apple.WebKit.WebContent" -> "WebKit.WebContent": drop a reverse-DNS prefix so short tiles stay readable.
+    func friendlyName(_ n: String) -> String {
+        let parts = n.split(separator: ".")
+        guard parts.count >= 3, ["com", "org", "net", "io", "de", "app"].contains(parts[0].lowercased()) else { return n }
+        return parts.dropFirst(2).joined(separator: ".")
+    }
+
+    func topAppsCallout(arrowX: CGFloat) -> some View {
+        let gs = Array((store.current?.groups ?? []).prefix(12))
+        let maxMB = Double(gs.first?.mb ?? 1)
+        let total = Double(gs.reduce(0) { $0 + $1.mb }) / 1024
+        return VStack(spacing: 0) {
+            CalloutArrow()
+                .fill(.regularMaterial)
+                .overlay(CalloutArrow().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: 16, height: 8)
+                .rotationEffect(.degrees(180))
+                .offset(x: arrowX - 160)  // centre of a 320-wide bubble
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Biggest apps now").font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text(String(format: "%.1f GB in these %d", total, gs.count))
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                ForEach(Array(gs.enumerated()), id: \.offset) { i, g in
+                    HStack(spacing: 8) {
+                        Text("\(i + 1)").font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
+                            .frame(width: 14, alignment: .trailing)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                Text(g.name).font(.system(size: 11.5)).lineLimit(1).truncationMode(.middle)
+                                if let n = g.n, n > 1 {
+                                    Text("\(n)").font(.system(size: 9.5)).foregroundStyle(.secondary).monospacedDigit()
+                                        .padding(.horizontal, 4).background(Color.primary.opacity(0.08), in: Capsule())
+                                        .help("\(n) processes")
+                                }
+                            }
+                            GeometryReader { geo in
+                                Capsule().fill(Color.accentColor.opacity(i == 0 ? 0.75 : 0.45))
+                                    .frame(width: max(2, geo.size.width * Double(g.mb) / maxMB))
+                            }.frame(height: 3)
+                        }
+                        Text(String(format: "%.1f GB", Double(g.mb) / 1024))
+                            .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                            .frame(width: 54, alignment: .trailing)
+                    }
+                    .help(g.name)
+                }
+                if gs.isEmpty { Text("No data yet").font(.system(size: 11)).foregroundStyle(.secondary) }
+                Text("An app counts all its helper processes; sizes are physical footprints like Activity Monitor's Memory column.")
+                    .font(.system(size: 9.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+        }
+        .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
     }
 
     var chart: some View {
@@ -403,6 +675,7 @@ struct PopoverView: View {
                 Picker("", selection: $store.range) {
                     Text("1h").tag(3600.0); Text("6h").tag(6 * 3600.0); Text("24h").tag(24 * 3600.0)
                 }.pickerStyle(.segmented).frame(width: 140).labelsHidden()
+                .focusable(false).focusEffectDisabled()
             }
             if store.points.isEmpty {
                 Text("No samples yet").font(.caption).foregroundStyle(.secondary).frame(maxWidth: .infinity, minHeight: 140)
@@ -525,6 +798,179 @@ struct PopoverView: View {
         .contentShape(Rectangle())
     }
 
+    // MARK: Report + AI pair
+
+    var reportPair: some View {
+        let running = store.aiRunning
+        let lit = store.aiOn && store.aiConfigured(store.aiProvider)
+        let grad = LinearGradient(colors: [Color(red: 0.55, green: 0.36, blue: 0.96), Color(red: 0.23, green: 0.51, blue: 0.96)],
+                                  startPoint: .topLeading, endPoint: .bottomTrailing)
+        return HStack(spacing: 0) {
+            Button { store.runReport() } label: {
+                ZStack {
+                    Text("Report").opacity(running ? 0 : 1)
+                    if running { ProgressView().controlSize(.small).scaleEffect(0.6) }
+                }
+                .frame(minWidth: 46, minHeight: 20)
+                .padding(.horizontal, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .foregroundStyle(running ? .secondary : .primary)
+            .help(running ? store.aiTooltip
+                  : lit ? "AI report of the last 24 h with \(store.aiSummary)" : "Open an HTML report of the last 24 h")
+
+            Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14)
+
+            Button {
+                if running { store.abortAI() }
+                else if lit { withAnimation(.easeOut(duration: 0.15)) { store.aiOn = false } }
+                else { openAICallout() }
+            } label: {
+                SwiftUI.Group {
+                    if running {
+                        Image(systemName: "stop.fill").foregroundStyle(.red)
+                    } else if lit {
+                        Image(systemName: "sparkles").foregroundStyle(grad)
+                    } else {
+                        Image(systemName: "sparkles").foregroundStyle(.secondary)
+                    }
+                }
+                .font(.system(size: 11, weight: .semibold))
+                .frame(width: 30, height: 20)
+                .background(lit && !running ? AnyShapeStyle(grad.opacity(0.22)) : AnyShapeStyle(showAI ? Color.primary.opacity(0.08) : .clear),
+                            in: UnevenRoundedRectangle(cornerRadii: .init(bottomTrailing: 5, topTrailing: 5)))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .focusable(false)
+            .anchorPreference(key: StarAnchorKey.self, value: .bounds) { $0 }
+            .help(running ? "Stop the AI report" : lit ? "AI analysis on (\(store.aiSummary)) — click to turn off"
+                  : "Add an AI analysis to reports")
+        }
+        .font(.system(size: 12))
+        .focusEffectDisabled()
+        .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 5))
+        .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+        .shadow(color: lit && !running ? Color(red: 0.45, green: 0.4, blue: 0.96).opacity(0.35) : .clear, radius: 4)
+    }
+
+    func openAICallout() {
+        draftProvider = store.aiProvider
+        loadDraft(for: draftProvider)
+        withAnimation(.easeOut(duration: 0.15)) { showAI = true; showTopApps = false }
+    }
+
+    func loadDraft(for p: AIProvider) {
+        draftToken = ""
+        draftModel = store.aiModel(p)
+        draftURL = store.ollamaURL
+        if p == .ollama { fetchOllamaModels() }
+    }
+
+    func fetchOllamaModels() {
+        ollamaModels = []
+        guard let url = URL(string: (draftURL.isEmpty ? "http://localhost:11434" : draftURL) + "/api/tags") else { return }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            let names = ((try? JSONSerialization.jsonObject(with: data ?? Data())) as? [String: Any])
+                .flatMap { $0["models"] as? [[String: Any]] }?.compactMap { $0["name"] as? String } ?? []
+            DispatchQueue.main.async {
+                ollamaModels = names
+                if draftModel.isEmpty, let first = names.first { draftModel = first }
+            }
+        }.resume()
+    }
+
+    var canApply: Bool { !draftProvider.needsToken || !draftToken.isEmpty || store.hasToken(draftProvider) }
+
+    func applyAI() {
+        if !draftToken.isEmpty { Keychain.set(draftToken.trimmingCharacters(in: .whitespacesAndNewlines), draftProvider.rawValue) }
+        store.setAIModel(draftModel.trimmingCharacters(in: .whitespaces), draftProvider)
+        if draftProvider == .ollama { store.ollamaURL = draftURL.isEmpty ? "http://localhost:11434" : draftURL }
+        store.aiProvider = draftProvider
+        withAnimation(.easeOut(duration: 0.15)) {
+            store.aiOn = store.aiConfigured(draftProvider)
+            showAI = false
+        }
+    }
+
+    func aiCallout(arrowX: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 6) {
+                    Image(systemName: "sparkles").foregroundStyle(.purple)
+                    Text("AI analysis in reports").font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                }
+                Picker("", selection: $draftProvider) {
+                    ForEach(AIProvider.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented).labelsHidden()
+                .onChange(of: draftProvider) { _, p in loadDraft(for: p) }
+
+                if draftProvider.needsToken {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            SecureField(store.hasToken(draftProvider) ? "Key saved — paste to replace" : "Paste access token",
+                                        text: $draftToken)
+                                .textFieldStyle(.roundedBorder)
+                            Button("Paste") { draftToken = NSPasteboard.general.string(forType: .string) ?? "" }
+                        }
+                        Text(draftProvider.keyHint).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            TextField("http://localhost:11434", text: $draftURL).textFieldStyle(.roundedBorder)
+                                .onSubmit { fetchOllamaModels() }
+                            Button { fetchOllamaModels() } label: { Image(systemName: "arrow.clockwise") }
+                                .help("Look for local models")
+                        }
+                        Text(ollamaModels.isEmpty ? "No Ollama models found at this address yet — is `ollama serve` running?"
+                             : "\(ollamaModels.count) local model\(ollamaModels.count == 1 ? "" : "s") found")
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+
+                HStack(spacing: 6) {
+                    Text("Model").font(.system(size: 11)).foregroundStyle(.secondary)
+                    if draftProvider == .ollama && !ollamaModels.isEmpty {
+                        Picker("", selection: $draftModel) { ForEach(ollamaModels, id: \.self) { Text($0).tag($0) } }
+                            .labelsHidden()
+                    } else {
+                        TextField(draftProvider.defaultModel, text: $draftModel).textFieldStyle(.roundedBorder)
+                    }
+                }
+
+                Text(draftProvider == .ollama
+                     ? "Reports are analysed on this Mac; nothing leaves it."
+                     : "AI reports send memory figures, process names and project paths from oomph's logs to \(draftProvider == .claude ? "Anthropic" : "OpenAI"). The key stays in your keychain.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+
+                HStack {
+                    Button("Cancel") { withAnimation(.easeOut(duration: 0.15)) { showAI = false } }
+                        .keyboardShortcut(.cancelAction)
+                    Spacer()
+                    Button("Apply") { applyAI() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(!canApply)
+                }
+            }
+            .padding(12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+
+            CalloutArrow()
+                .fill(.regularMaterial)
+                .overlay(CalloutArrow().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: 16, height: 8)
+                .offset(x: arrowX - 158)  // centre of a 316-wide bubble is 158
+        }
+        .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
+        .controlSize(.small)
+    }
+
     func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -549,11 +995,10 @@ struct PopoverView: View {
                     store.runPrivileged("install.sh") { error = $0 }
                 }.buttonStyle(.borderedProminent).disabled(store.busy)
             }
-            Button("Report") { store.runCLI(["html", "--last", "24h", "--open"]) }
-                .help("Open an HTML report for the selected range")
+            reportPair
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
-                .toggleStyle(.checkbox).font(.caption)
+                .toggleStyle(.checkbox).font(.caption).lineLimit(1).fixedSize()
             Menu {
                 Section("Claude skill — paste into a session") {
                     Button("Copy prompt: add to the session's project") { copy(skillPrompt(allProjects: false)) }
@@ -570,6 +1015,27 @@ struct PopoverView: View {
             } label: { Image(systemName: "power") }.help("Quit oomph")
         }
         .controlSize(.small)
+    }
+}
+
+struct TopAppAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
+}
+
+struct StarAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
+}
+
+/// The little triangle under the AI callout, pointing down at the ✦ button.
+struct CalloutArrow: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.midX, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.maxX, y: r.minY))
+        return p
     }
 }
 
@@ -597,7 +1063,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.button?.action = #selector(toggle)
         item.button?.imageScaling = .scaleNone
 
-        panel = PopupPanel(contentRect: NSRect(x: 0, y: 0, width: 428, height: 400),
+        panel = PopupPanel(contentRect: NSRect(x: 0, y: 0, width: popupWidth, height: 400),
                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
         panel.level = .popUpMenu
         panel.isOpaque = false
@@ -641,6 +1107,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.refreshAll()
         position()
         panel.makeKeyAndOrderFront(nil)
+        // nothing focused on open: a focus ring is drawn above everything, callouts included
+        DispatchQueue.main.async { self.panel.makeFirstResponder(nil) }
         DispatchQueue.main.async { self.position() }  // SwiftUI may settle its size one pass later
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             self?.close()
@@ -763,10 +1231,13 @@ enum ChipIcon {
 }
 
 @MainActor
-func renderPopup(to path: String, dark: Bool) {
+func renderPopup(to path: String, dark: Bool, ai: String = "") {
     let store = Store()
     store.refreshAll()
-    let view = PopoverView(store: store)
+    // `--ai callout|on|running` draws the AI states (render only; nothing is saved)
+    if ai == "on" || ai == "running" { store.aiOn = true; store.aiProvider = .ollama }
+    if ai == "running" { store.aiRunning = true; store.aiProgress = "Tracing WebKit.GPU" }
+    let view = PopoverView(store: store, showAI: ai == "callout", showTopApps: ai == "top")
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.colorScheme, dark ? .dark : .light)
     let r = ImageRenderer(content: view)
@@ -782,7 +1253,8 @@ struct Main {
         // Development aid: `oomph --render-popup out.png [--dark]` draws the popup into a PNG and exits.
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
-            MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark")) }
+            let ai = args.firstIndex(of: "--ai").map { args.count > $0 + 1 ? args[$0 + 1] : "" } ?? ""
+            MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark"), ai: ai) }
             return
         }
         // One menu-bar icon only: the newest launch wins, so a rebuilt or relaunched app

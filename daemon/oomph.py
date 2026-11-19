@@ -5,7 +5,10 @@
   oomph report [--last 2h | --since ISO [--until ISO]]
   oomph incidents
   oomph incident <id|latest> [--html]
-  oomph html [--last 6h | --since ISO [--until ISO]] [-o FILE] [--open]
+  oomph html [--last 24h | --since ISO [--until ISO]] [-o FILE] [--open]
+  oomph ai-report [--provider claude|openai|ollama] [--model M] [--base-url URL] [--last 24h] [--open]
+                                     a model investigates the logs and writes an analysis on top of the
+                                     report (token in OOMPH_AI_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY)
 
 for agents and scripts (work without the daemon too — they measure live):
   oomph check [--json]              verdict ok / tight / critical + advice; exit 0 / 1 / 2
@@ -34,7 +37,7 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
 
 # What the daemon reads from the unified log. On macOS 27 memory kills show up as
@@ -614,7 +617,7 @@ def _view_html(samples, events, meta, key, t0, t1):
     return head, tail
 
 
-def render_html(samples, events, title, incident=None, views=None):
+def render_html(samples, events, title, incident=None, views=None, extra_css="", intro_html=""):
     """A self-contained report. `views` are the (key, label, from, to) windows the page can
     switch between (default: 24h / 6h / 1h ending at the last sample); the first is shown."""
     if views is None:
@@ -650,8 +653,9 @@ def render_html(samples, events, title, incident=None, views=None):
     blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
-        "<title>%s</title><style>%s%s</style></head><body data-view=\"%s\"><main>" % (_e(title), CSS, view_css, first),
+        "<title>%s</title><style>%s%s%s</style></head><body data-view=\"%s\"><main>" % (_e(title), CSS, view_css, extra_css, first),
         '<div class="hrow top"><h1>%s</h1><div class=ctl>%s</div></div>' % (_e(title), pill),
+        intro_html,
         "".join(heads[:1]) + "".join(heads[1:]),
         reasons_html,
         '<div class=hrow><h2>Biggest risers — apps</h2><div class=ctl>%s</div></div>'
@@ -2113,6 +2117,11 @@ def main(argv):
         return cmd_reservations(rest)
     if c == "run":
         return cmd_run(rest)
+    if c == "ai-report":
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import oomph_ai
+        return oomph_ai.cmd_ai_report(rest)
     if c == "hook":
         return cmd_hook(rest)
     if c == "mcp":

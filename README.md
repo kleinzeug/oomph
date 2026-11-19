@@ -173,6 +173,27 @@ For scripts and agents there are also `oomph check`, `oomph session`, `oomph wai
 `oomph status --json`, `oomph hook` and `oomph mcp` — see
 [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
 
+### AI analysis
+
+Turn on the **✦** next to **Report** in the popup, pick **Claude**, **OpenAI Codex** or a
+local **Ollama**, and paste an access token (Ollama needs none). From then on **Report**
+asks the model to investigate the last 24 hours before writing the page: it reads the
+timeline, follows the processes that rose, their parents and Claude sessions, the events
+and the incidents' system-log excerpts through read-only tools, and puts its analysis —
+verdict, timeline, root cause, evidence, who was involved, risk now, recommendations —
+above the usual charts, with the list of tool calls it made. While it works, Report
+shows a spinner whose tooltip says what it is looking at, and ✦ turns into a stop
+button. Click ✦ again to go back to plain reports.
+
+```sh
+OOMPH_AI_TOKEN=sk-ant-… oomph ai-report --open                     # Claude (claude-opus-5-5)
+oomph ai-report --provider ollama --model qwen3 --open             # local, nothing leaves the Mac
+oomph ai-report --provider openai --model gpt-5-codex --last 6h --open
+```
+
+The harness is `daemon/oomph_ai.py`, standard library only like the rest. Tokens are kept
+in the login keychain and passed to it through the environment, never on a command line.
+
 ## Making Claude sessions oom-aware
 
 Long-running coding agents are exactly the kind of workload that tips a Mac into
@@ -281,7 +302,9 @@ memory and no measurable CPU.
 
 The logs contain process names and working directories — never command-line arguments
 or file contents — and are readable by every user on the Mac. Nothing leaves your
-machine: no network access, no telemetry.
+machine: no network access, no telemetry — except when you turn on the AI analysis with
+Claude or OpenAI, which sends figures, process names and project paths from the logs to
+that provider for each AI report (Ollama keeps it local).
 
 ## Layout
 

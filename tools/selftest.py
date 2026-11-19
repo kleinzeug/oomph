@@ -233,5 +233,75 @@ check("available_gb" in res6, "MCP reservations")
 res7 = json.loads(resp.get(7, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
 check(len(res7.get("released", [])) == 1, "MCP release_memory all")
 
+# --- AI report harness against a local mock of the Claude, OpenAI and Ollama APIs
+import http.server  # noqa: E402
+import threading  # noqa: E402
+sys.path.insert(0, os.path.join(ROOT, "daemon"))
+import oomph_ai  # noqa: E402
+seen = []
+REPORT_MD = "## Verdict\nAll fine.\n## Timeline\n- 10:00 **quiet**\n## Evidence\n| a | b |\n|---|---|\n| 1 | 2 |"
+
+
+class Mock(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def reply(self, obj):
+        b = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        self.reply({"models": [{"name": "mock-model"}]})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["content-length"])))
+        seen.append((self.path, dict(self.headers), body))
+        if self.path == "/v1/messages":
+            first = len(body["messages"]) == 1
+            self.reply({"stop_reason": "tool_use" if first else "end_turn", "content":
+                        [{"type": "thinking", "thinking": "", "signature": "x"},
+                         {"type": "tool_use", "id": "t1", "name": "overview", "input": {"since": "-1h"}}] if first
+                        else [{"type": "text", "text": REPORT_MD}]})
+        elif self.path == "/v1/responses":
+            first = "previous_response_id" not in body
+            self.reply({"id": "r1" if first else "r2", "output":
+                        [{"type": "function_call", "call_id": "c1", "name": "timeline", "arguments": '{"step_minutes": 30}'}]
+                        if first else [{"type": "message", "content": [{"type": "output_text", "text": REPORT_MD}]}]})
+        else:  # /api/chat
+            first = len(body["messages"]) == 2
+            self.reply({"message": {"role": "assistant", "content": "" if first else REPORT_MD, "tool_calls":
+                        [{"function": {"name": "events", "arguments": {"kind": "stall"}}}] if first else []}})
+
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Mock)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d" % srv.server_address[1]
+for pk, url in (("claude", base), ("openai", base + "/v1"), ("ollama", base)):
+    seen.clear()
+    out = os.path.join(LOG, "ai-%s.html" % pk)
+    buf = io.StringIO()
+    os.environ["OOMPH_AI_TOKEN"] = "sk-test"
+    with redirect_stdout(buf):
+        rc = oomph_ai.cmd_ai_report(["--provider", pk, "--base-url", url, "--last", "1h", "-o", out])
+    lines = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
+    page = open(out).read() if os.path.exists(out) else ""
+    check(rc == 0 and lines[-1].get("done") and "AI analysis" in page and "<table>" in page and len(seen) == 2,
+          "AI report via mock %s: %d requests, %d progress lines, tool %s" % (
+              pk, len(seen), sum("progress" in x for x in lines), lines[-1].get("tool_calls") if lines else "?"))
+claude_req = None
+seen.clear()
+with redirect_stdout(io.StringIO()):
+    oomph_ai.cmd_ai_report(["--provider", "claude", "--base-url", base, "--last", "1h", "-o", os.path.join(LOG, "x.html")])
+h, b2 = {k.lower(): v for k, v in seen[1][1].items()}, seen[1][2]
+check(h.get("anthropic-version") == "2026-10-21" and h.get("x-api-key") == "sk-test"
+      and b2["messages"][1]["content"][0]["type"] == "thinking" and b2["messages"][2]["content"][0]["type"] == "tool_result"
+      and b2["output_config"]["effort"] == "high", "Claude request: headers, thinking passed back, tool_result")
+os.environ.pop("OOMPH_AI_TOKEN")
+srv.shutdown()
+
 print("\n%s — logs in %s" % ("FAILED (%d)" % len(failures) if failures else "all checks passed", LOG))
 sys.exit(1 if failures else 0)

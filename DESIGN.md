@@ -201,6 +201,16 @@ reservation queue that the sessions use through the skill, the CLI and the MCP s
 | Visibility | `oomph check` folds in others' reservations (tight when they exceed what's free); the daemon copies live reservations into every sample; the popup lists them | Uncoordinated checks still see planned work, and incidents show what was reserved at the time. |
 | Enforcement | None — advisory, like the rest of oomph | Killing or pausing an agent's work would be worse than the problem. The skill tells sessions never to start reserved-for work early and never to release others' entries. |
 
+## AI analysis (1.4)
+
+| Decision | Choice | Why |
+|---|---|---|
+| Who investigates | The model, through ten read-only tools over the logs (`overview`, `timeline`, `top_at`, `process_history`, `events`, `incidents`, `incident`, `syslog`, `current_status`, `claude_sessions`), up to 12 rounds, then a forced write-up | A fixed prompt with a data dump can't follow a lead; tools let it zoom from "critical at 03:53" to the process, its parent and its session. Results are capped at 14 k characters so a broad query can't flood the context. |
+| Providers | Claude (Messages API, `claude-opus-5-5`, adaptive thinking at effort high, server-side refusal fallback), OpenAI (Responses API), Ollama (`/api/chat`; models without tool support get one pass over the briefing) | What the user asked for; all over plain HTTPS with the standard library. The Claude turn sends the whole previous assistant content back unchanged. |
+| Credentials | Login keychain, one item per provider; handed to the harness in `OOMPH_AI_TOKEN` | Never in a file, a preference or `ps` output. |
+| Progress and abort | The harness prints one JSON object per line (`progress`, then `done` or `error`); the app shows the latest as the Report button's tooltip and stops the run with SIGTERM | No IPC beyond a pipe; aborting leaves nothing behind. |
+| Output | The normal 24 h report with the analysis on top and the tool-call log in a fold | The model's claims sit right above the evidence they cite. |
+
 ## Out of scope
 
 - Preventing or killing anything, or changing macOS's idle jobs.

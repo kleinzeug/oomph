@@ -23,7 +23,7 @@ if [ -d /Library/Logs/memwatch ] && [ ! -d /Library/Logs/oomph ]; then
 fi
 launchctl bootout system/local.oomph.daemon 2>/dev/null || true
 install -d -o root -g wheel -m 755 "$LIB" /usr/local/bin /Library/Logs/oomph
-install -o root -g wheel -m 755 "$SRC/oomphd.py" "$SRC/oomph.py" "$LIB/"
+install -o root -g wheel -m 755 "$SRC/oomphd.py" "$SRC/oomph.py" "$SRC/oomph_ai.py" "$LIB/"
 install -o root -g wheel -m 644 "$SRC/local.oomph.daemon.plist" "$PLIST"
 if [ -f "$HERE/skills/oomph/SKILL.md" ]; then
   install -d -o root -g wheel -m 755 "$LIB/skills/oomph"
