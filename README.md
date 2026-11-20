@@ -4,9 +4,15 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platform: macOS 14+](https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey.svg)
 
-***oomph*** is a menu-bar memory monitor for macOS that keeps a papertrail of what
-happened to your RAM, swap and disk while you were away — so the next
-*"Your system has run out of application memory"* dialog comes with an explanation.
+***oomph*** does two things for a Mac that runs heavy work:
+
+- **It watches memory for you.** A menu-bar monitor keeps a papertrail of what happened
+  to your RAM, swap and disk while you were away — so the next *"Your system has run out
+  of application memory"* dialog comes with an explanation.
+- **It lets agents share RAM.** Claude sessions and other agents reserve the memory a
+  heavy step needs before they start it — a Gradle build, a Playwright run, a model
+  download — and take turns through one shared ledger instead of crashing each other.
+  You see every reservation over time, right under the memory chart.
 
 A [Kleinzeug](https://github.com/kleinzeug) tool — small tools, properly made.
 Home: [kleinzeug.github.io/oomph](https://kleinzeug.github.io/oomph/) · Source: [github.com/kleinzeug/oomph](https://github.com/kleinzeug/oomph)
@@ -18,11 +24,12 @@ swap, disk space and per-process footprints around the clock, watches the system
 for memory kills, and turns every incident into a report with charts of the minutes
 leading up to it.
 
-Running long Claude Code sessions? Paste the
+Running several Claude Code sessions or other agents at once? Paste the
 [oomph skill](https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md)
-link into one and it becomes memory-aware — and when several sessions run at once,
-they reserve memory through ***oomph*** and take turns with heavy work instead of
-competing for RAM. See [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
+link into each (or run `oomph setup-claude` once) and they become memory-aware: they
+reserve RAM before heavy work, shrink or release it when the heavy part is over, and
+wait their turn when another agent needs the room. See
+[Taking turns](#taking-turns-sessions-coordinating-memory).
 
 The name: **oom** (out of memory) + *oomph* — and the trailing **ph** is the
 author's initials.

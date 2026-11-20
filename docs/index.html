@@ -3,13 +3,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>oomph — walk away, come back to answers</title>
-<meta name="description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — so the next “out of application memory” dialog comes with an explanation. Open source, free.">
+<meta name="description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — so the next “out of application memory” dialog comes with an explanation — and lets Claude sessions and other agents reserve RAM in a shared ledger and take turns. Open source, free.">
 <link rel="canonical" href="https://kleinzeug.github.io/oomph/">
 
 <meta property="og:type" content="website">
 <meta property="og:site_name" content="oomph">
 <meta property="og:title" content="oomph — walk away, come back to answers">
-<meta property="og:description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — so the next “out of application memory” dialog comes with an explanation.">
+<meta property="og:description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — and lets coding agents reserve RAM and take turns instead of crashing each other.">
 <meta property="og:url" content="https://kleinzeug.github.io/oomph/">
 <meta property="og:image" content="https://kleinzeug.github.io/oomph/social-preview.jpg">
 <meta property="og:image:width" content="1280">
@@ -17,7 +17,7 @@
 <meta property="og:image:alt" content="The oomph chip icon showing 4.2G free, the tagline “Walk away. Come back to answers.” over a memory map that fills up from left to right.">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="oomph — walk away, come back to answers">
-<meta name="twitter:description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away.">
+<meta name="twitter:description" content="A tiny macOS menu-bar memory monitor that keeps a papertrail while you're away — and lets agents take turns with RAM.">
 <meta name="twitter:image" content="https://kleinzeug.github.io/oomph/social-preview.jpg">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 28 18'%3E%3Cg fill='%23272c36'%3E%3Crect x='6.15' y='0.5' width='2.2' height='2'/%3E%3Crect x='10.65' y='0.5' width='2.2' height='2'/%3E%3Crect x='15.15' y='0.5' width='2.2' height='2'/%3E%3Crect x='19.65' y='0.5' width='2.2' height='2'/%3E%3Crect x='6.15' y='15.5' width='2.2' height='2'/%3E%3Crect x='10.65' y='15.5' width='2.2' height='2'/%3E%3Crect x='15.15' y='15.5' width='2.2' height='2'/%3E%3Crect x='19.65' y='15.5' width='2.2' height='2'/%3E%3C/g%3E%3Crect x='3.3' y='3.3' width='21.4' height='11.4' rx='1.2' fill='%238fdb99' stroke='%23272c36' stroke-width='1.6'/%3E%3C/svg%3E">
 <style>
@@ -39,6 +39,8 @@
     --chrome-text: #eceff3;
     --shadow: 0 18px 50px -18px rgba(23, 27, 34, .35);
     --c-wired: #8e8e93; --c-app: #3b82c4; --c-comp: #e0a030; --c-swap: #d0503c;
+    /* agent reservations: deliberately not the memory chart's grey/blue/orange/red */
+    --r1: #30B0C7; --r2: #AF52DE; --r3: #FF2D55; --r4: #5856D6; --r5: #D69E00; --r6: #A2845E; --r7: #34C759;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
@@ -54,6 +56,7 @@
       --chrome-text: #eceff3;
       --shadow: 0 18px 50px -18px rgba(0, 0, 0, .7);
       --c-wired: #6e6e74; --c-app: #5b9fe0; --c-comp: #e8b450; --c-swap: #ef6b56;
+      --r1: #40C8E0; --r2: #BF5AF2; --r3: #FF375F; --r4: #6D6BF0; --r5: #FFC21A; --r6: #AC8E68; --r7: #30D158;
     }
   }
   :root[data-theme="dark"] {
@@ -61,6 +64,7 @@
     --signal: #7fd894; --accent: #4b8bff; --muted: #7c8ea5; --line: #1c2632;
     --chrome: #272c36; --chrome-text: #eceff3; --shadow: 0 18px 50px -18px rgba(0, 0, 0, .7);
     --c-wired: #6e6e74; --c-app: #5b9fe0; --c-comp: #e8b450; --c-swap: #ef6b56;
+    --r1: #40C8E0; --r2: #BF5AF2; --r3: #FF375F; --r4: #6D6BF0; --r5: #FFC21A; --r6: #AC8E68; --r7: #30D158;
   }
 
   * { box-sizing: border-box; }
@@ -186,6 +190,18 @@
     margin: 22px 0 0; max-width: 34em;
     font-size: 19px; color: var(--muted); text-wrap: pretty;
   }
+  /* the two jobs, side by side under the lede */
+  .pillars { list-style: none; padding: 0; margin: 16px 0 0; display: grid; gap: 12px; max-width: 36em; }
+  .pillars li {
+    position: relative; padding-left: 24px;
+    font-size: 16px; color: var(--muted); text-wrap: pretty;
+  }
+  .pillars li::before {
+    content: ""; position: absolute; left: 0; top: .5em; width: 12px; height: 8px; border-radius: 1.5px;
+    background: var(--p, var(--green)); box-shadow: 0 0 0 1.4px var(--ink) inset;
+  }
+  .pillars li b { color: var(--text); }
+  .pillars a { color: inherit; text-decoration-color: color-mix(in srgb, currentColor 40%, transparent); text-underline-offset: 2px; }
   .statpill {
     display: inline-flex; align-items: center; gap: 10px;
     margin-top: 28px; max-width: 100%;
@@ -308,6 +324,60 @@
   .chips .c span { color: var(--muted); font-size: 13.5px; }
 
   .card code { white-space: nowrap; }
+
+  /* agents: the shared ledger */
+  .duo {
+    display: grid; grid-template-columns: 1fr minmax(0, 460px); gap: 40px;
+    align-items: start; margin-top: 32px;
+  }
+  @media (max-width: 860px) { .duo { grid-template-columns: 1fr; } }
+  .proto { list-style: none; padding: 0; margin: 0; display: grid; gap: 16px; counter-reset: p; }
+  .proto li { position: relative; padding-left: 46px; font-size: 15px; color: var(--muted); text-wrap: pretty; }
+  .proto li::before {
+    counter-increment: p; content: "0x0" counter(p); position: absolute; left: 0; top: 3px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11px; letter-spacing: .08em; color: var(--muted);
+  }
+  .proto li b { color: var(--text); }
+  .proto code, .note code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: .86em; background: var(--surface-2); overflow-wrap: anywhere;
+    border: 1px solid var(--line); border-radius: 5px; padding: 0 5px;
+  }
+  .note { margin-top: 22px; font-size: 14px; color: var(--muted); border-left: 3px solid var(--line); padding: 2px 0 2px 14px; text-wrap: pretty; }
+  .popup.ledger { justify-self: stretch; max-width: 460px; margin-top: 0; }
+  @media (max-width: 860px) { .popup.ledger { justify-self: start; } }
+  .popup.ledger .head .st { display: block; }
+  .popup .pill.agents { background: color-mix(in srgb, var(--r1) 30%, transparent); white-space: nowrap; }
+  svg.rchart { width: 100%; max-width: 100%; height: auto; display: block; margin-top: 8px; }
+  .rchart .rv { fill-opacity: .8; }
+  .rchart .rq { stroke-width: .8; stroke-opacity: .75; }
+  .rchart .rl { fill: #fff; font-size: 9px; font-weight: 600; }
+  .rchart .rl.ttl { font-weight: 500; fill-opacity: .8; }
+  .rchart .ra { fill: var(--muted); font-size: 8px; }
+  .rchart .rg { stroke: var(--muted); stroke-opacity: .45; stroke-width: .6; stroke-dasharray: 2 3; }
+  .rchart .rb, .rchart .rt { stroke: var(--line); stroke-width: 1; }
+  .rsv { margin-top: 10px; }
+  .rsv .k { color: var(--muted); font-size: 11px; margin: 0 0 2px; }
+  .rsv .k + .rrow { margin-top: 0; }
+  .rsv .k.later { margin-top: 8px; }
+  .rrow {
+    display: flex; align-items: center; gap: 7px; min-width: 0;
+    padding: 3px 4px; border-radius: 6px; font-size: 11px; line-height: 1.35;
+  }
+  .rrow:hover { background: var(--surface-2); }
+  .rrow .sw { width: 9px; height: 9px; border-radius: 2px; flex: none; background: var(--c); opacity: .85; }
+  .rrow .sw.q {
+    background: repeating-linear-gradient(135deg, var(--c) 0 1.5px, color-mix(in srgb, var(--c) 22%, transparent) 1.5px 3.5px);
+    box-shadow: 0 0 0 .8px var(--c) inset;
+  }
+  .rrow .gb { width: 3.1em; flex: none; font-weight: 650; text-align: right; }
+  .rrow .what { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .rrow .proj { flex: 1 1 0; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .rrow .tail { flex: none; margin-left: auto; white-space: nowrap; color: var(--muted); font-size: 10.5px; }
+  .rrow .tail.wait { color: color-mix(in srgb, var(--c) 70%, var(--text)); }
+  .rrow.done { opacity: .72; }
+  @media (max-width: 420px) { .rrow .proj { display: none; } }
+
   /* claude section */
   .prompt {
     margin-top: 30px; position: relative;
@@ -324,21 +394,7 @@
   }
   .copy:hover { background: rgba(255,255,255,.16); }
   .turns { margin-top: 14px; }
-  .lanes { margin-top: 18px; display: grid; gap: 8px; }
-  .lane { display: grid; grid-template-columns: 78px minmax(0, 1fr); align-items: center; gap: 10px; }
-  .lane .who { font: 12px ui-monospace, "SF Mono", Menlo, monospace; color: var(--muted); white-space: nowrap; }
-  .track { position: relative; height: 26px; background: var(--surface-2); border-radius: 7px; overflow: hidden; }
-  .track i {
-    position: absolute; top: 3px; bottom: 3px; border-radius: 5px; padding: 0 8px;
-    display: flex; align-items: center; white-space: nowrap; overflow: hidden;
-    font: 600 11.5px ui-monospace, "SF Mono", Menlo, monospace; font-style: normal; color: #1c222c;
-  }
-  .track .run { background: var(--green); }
-  .track .wait {
-    color: var(--text); border: 1px dashed var(--yellow);
-    background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--yellow) 35%, transparent) 0 5px, transparent 5px 10px);
-  }
-  .lanes .axis { font-size: 12px; color: var(--muted); padding-left: 88px; }
+  .card p a, .note a { color: var(--text); text-underline-offset: 2px; }
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
   @media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
   .two > * { min-width: 0; }
@@ -377,7 +433,7 @@
   footer p { max-width: 46em; text-wrap: pretty; }
 
   /* never let a long mono line widen the page on phones */
-  .hero-grid > *, .pain > *, .grid > *, .chain > *, .chips > *, .numbers > * { min-width: 0; }
+  .hero-grid > *, .pain > *, .grid > *, .chain > *, .chips > *, .numbers > *, .duo > * { min-width: 0; }
   .mono, pre.cmd { overflow-wrap: anywhere; }
   pre.cmd { white-space: pre-wrap; }
   .statpill { max-width: 100%; }
@@ -417,7 +473,11 @@
     <div class="hero-grid">
       <div>
         <h1>Walk away<span class="dot">.</span><br>Come back to answers<span class="dot">.</span></h1>
-        <p class="lede"><span class="wm">oomph</span> is a tiny macOS menu-bar memory monitor that keeps a <strong>papertrail while you're away</strong> — so the next <em>“Your system has run out of application memory”</em> comes with an explanation: what filled RAM, swap and disk, and when.</p>
+        <p class="lede"><span class="wm">oomph</span> is a tiny macOS menu-bar memory monitor with two jobs:</p>
+        <ul class="pillars">
+          <li><b>A papertrail for you.</b> Memory, swap and disk, recorded while you're away — so the next <em>“Your system has run out of application memory”</em> comes with an explanation: what filled it, and when.</li>
+          <li style="--p: var(--r1)"><b>A RAM ledger for your agents.</b> Claude sessions and other agents <a href="#turns">reserve memory before heavy work</a> and take turns — instead of crashing each other.</li>
+        </ul>
         <div class="statpill mono" aria-label="live sampler readout">
           <span class="led" id="led"></span>
           <span id="tick">sample #1 · 12.4G free · swap 2.8/4G</span>
@@ -428,7 +488,7 @@
             <span class="sub mono">github.com/kleinzeug/oomph</span>
           </a>
           <a class="btn ghost" href="#why">Why Macs run out of memory<span class="sub">when you walk away</span></a>
-          <a class="btn ghost" href="#claude">Make Claude oom-aware<span class="sub">one skill link</span></a>
+          <a class="btn ghost" href="#turns">Let agents take turns<span class="sub">a shared RAM ledger</span></a>
         </div>
         <p class="hint">The page behind this text is a memory map. Scroll down to raise the pressure; move or click to allocate.</p>
       </div>
@@ -498,9 +558,77 @@
   </div>
 </section>
 
+<section id="turns">
+  <div class="wrap">
+    <span class="tc">0x02 · For agents: a shared RAM ledger</span>
+    <h2>Several agents? They take turns.</h2>
+    <p class="sub">Two Claude sessions that each see “8 GB free” and each start a 6 GB build at the same moment are how a Mac runs out. With <span class="wm">oomph</span>, agents write heavy work into a shared ledger first and wait their turn — and the menu bar shows that ledger as blocks under the memory chart.</p>
+    <div class="duo">
+      <div>
+        <ol class="proto">
+          <li><b>Reserve before heavy work.</b> The agent announces its estimated peak: <code>reserve_memory</code> over MCP, <code>oomph reserve 6G --for "gradle build"</code> in a shell, or wrapped around the command: <code>oomph run --reserve 6G -- ./gradlew build</code>.</li>
+          <li><b>Wait for a turn.</b> Requests queue first-come-first-served and are granted when they fit into free memory next to what the others reserved. A small request can't overtake a big one; a queued agent keeps doing light work.</li>
+          <li><b>Amend as it learns.</b> Shrinking takes effect at once. Growing is granted only when the extra fits right now and nobody is waiting — otherwise it's refused, with the advice to reserve the extra separately. <code>oomph amend r12 --gb 3G</code> · <code>update_reservation</code></li>
+          <li><b>Release when done.</b> <code>oomph release r12</code> or <code>release_memory</code>. A reservation also lapses when its session exits or stops extending it, so nothing gets stuck.</li>
+          <li><b>Remember the real peak.</b> Each finished reservation keeps the memory its job really used, for 14 days — <code>oomph reservations --history</code>, <code>reservation_history</code> — so the next estimate is better.</li>
+        </ol>
+        <p class="note"><b>Advisory, like everything else:</b> <span class="wm">oomph</span> never stops or kills anything. Taking turns is what the agents agree on — through <a href="#claude">the skill</a>, the MCP tools or the CLI.</p>
+      </div>
+
+      <div class="popup ledger" role="group" aria-label="Mock-up of the reservations in the oomph popup">
+        <div class="head">
+          <svg viewBox="0 0 28 18" width="28" height="18" aria-hidden="true" style="color:var(--text)"><use href="#feet"/><rect x="3.3" y="3.3" width="21.4" height="11.4" rx="1.2" fill="none" stroke="currentColor" stroke-width="1.6"/></svg>
+          <div><b>Agents</b><span class="st">shared ledger · 3 sessions</span></div>
+          <span class="pill agents">2 granted · 1 queued</span>
+        </div>
+        <div class="charthead" style="margin-top:12px"><span>Reserved, GB</span><span>last 3 h</span></div>
+        <svg class="rchart" viewBox="0 0 420 136" role="img" aria-label="Reservation timeline from 09:40 to now. gradle assembleDebug holds 6 GB from 09:48, amended down to 3 GB at 11:38, still active with 22 minutes left. pytest -n 8 held 2 GB from 09:54 to 10:30. model download + quantize asked for 8 GB at 10:10, was queued until 10:30, then ran until 11:34. playwright e2e holds 4 GB since 11:44, 27 minutes left. docker compose up has been queued for 3 GB for 5 minutes.">
+          <defs>
+          <pattern id="rhatch-3" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" style="fill:var(--r3)" fill-opacity=".2"/><rect width="1.6" height="4" style="fill:var(--r3)" fill-opacity=".85"/></pattern>
+          <pattern id="rhatch-5" patternUnits="userSpaceOnUse" width="4" height="4" patternTransform="rotate(45)"><rect width="4" height="4" style="fill:var(--r5)" fill-opacity=".2"/><rect width="1.6" height="4" style="fill:var(--r5)" fill-opacity=".85"/></pattern>
+          </defs>
+          <line class="rg" x1="2" x2="392" y1="8.0" y2="8.0"/>
+          <text class="ra" x="396" y="11.0">16 GB</text>
+          <line class="rb" x1="2" x2="392" y1="120.5" y2="120.5"/>
+          <text class="ra" x="45.3" y="132" text-anchor="middle">10:00</text>
+          <line class="rt" x1="45.3" x2="45.3" y1="121" y2="123"/>
+          <text class="ra" x="175.3" y="132" text-anchor="middle">11:00</text>
+          <line class="rt" x1="175.3" x2="175.3" y1="121" y2="123"/>
+          <text class="ra" x="305.3" y="132" text-anchor="middle">12:00</text>
+          <line class="rt" x1="305.3" x2="305.3" y1="121" y2="123"/>
+          <text class="ra" x="392.0" y="132" text-anchor="end">now</text>
+          <line class="rt" x1="392.0" x2="392.0" y1="121" y2="123"/>
+          <path class="rv" style="fill:var(--r1)" d="M19.3 118.0Q19.3 120.0 21.3 120.0L390.0 120.0Q392.0 120.0 392.0 118.0L392.0 102.0Q392.0 100.0 390.0 100.0L259.7 100.0Q257.7 100.0 257.7 98.0L257.7 81.0Q257.7 79.0 255.7 79.0L21.3 79.0Q19.3 79.0 19.3 81.0Z"/>
+          <path class="rv" style="fill:var(--r2)" d="M32.3 76.0Q32.3 78.0 34.3 78.0L108.3 78.0Q110.3 78.0 110.3 76.0L110.3 67.0Q110.3 65.0 108.3 65.0L34.3 65.0Q32.3 65.0 32.3 67.0Z"/>
+          <path class="rq" fill="url(#rhatch-3)" style="stroke:var(--r3)" d="M67.0 62.0Q67.0 64.0 69.0 64.0L108.3 64.0Q110.3 64.0 110.3 62.0L110.3 11.0Q110.3 9.0 108.3 9.0L69.0 9.0Q67.0 9.0 67.0 11.0Z"/>
+          <path class="rv" style="fill:var(--r3)" d="M110.3 76.0Q110.3 78.0 112.3 78.0L247.0 78.0Q249.0 78.0 249.0 76.0L249.0 25.0Q249.0 23.0 247.0 23.0L112.3 23.0Q110.3 23.0 110.3 25.0Z"/>
+          <path class="rv" style="fill:var(--r4)" d="M270.7 97.0Q270.7 99.0 272.7 99.0L390.0 99.0Q392.0 99.0 392.0 97.0L392.0 74.0Q392.0 72.0 390.0 72.0L272.7 72.0Q270.7 72.0 270.7 74.0Z"/>
+          <path class="rq" fill="url(#rhatch-5)" style="stroke:var(--r5)" d="M381.2 69.0Q381.2 71.0 383.2 71.0L390.0 71.0Q392.0 71.0 392.0 69.0L392.0 53.0Q392.0 51.0 390.0 51.0L383.2 51.0Q381.2 51.0 381.2 53.0Z"/>
+          <text class="rl" x="23.3" y="102.5">gradle assembleDebug</text>
+          <text class="rl" x="261.7" y="113.0">amended to 3 GB</text>
+          <text class="rl ttl" x="388.0" y="113.0" text-anchor="end">22m</text>
+          <text class="rl" x="36.3" y="74.5">pytest -n 8</text>
+          <text class="rl" x="114.3" y="53.5">model download + quantize</text>
+          <text class="rl" x="274.7" y="88.5">playwright e2e</text>
+          <text class="rl ttl" x="388.0" y="88.5" text-anchor="end">27m</text>
+        </svg>
+        <div class="rsv mono">
+          <div class="k">Reserved by agents</div>
+          <div class="rrow" style="--c: var(--r1)"><span class="sw"></span><span class="gb">3.0G</span><span class="what">gradle assembleDebug</span><span class="proj">android-app</span><span class="tail">using 2.6G · 22m left</span></div>
+          <div class="rrow" style="--c: var(--r4)"><span class="sw"></span><span class="gb">4.0G</span><span class="what">playwright e2e</span><span class="proj">webshop</span><span class="tail">using 3.4G · 27m left</span></div>
+          <div class="rrow" style="--c: var(--r5)"><span class="sw q"></span><span class="gb">3.0G</span><span class="what">docker compose up</span><span class="proj">infra</span><span class="tail wait">queued #1 · 5 min</span></div>
+          <div class="k later">Finished · peak used</div>
+          <div class="rrow done" style="--c: var(--r3)"><span class="sw"></span><span class="gb">8.0G</span><span class="what">model download + quantize</span><span class="proj">llm-lab</span><span class="tail">peak 7.1G · 64 min</span></div>
+          <div class="rrow done" style="--c: var(--r2)"><span class="sw"></span><span class="gb">2.0G</span><span class="what">pytest -n 8</span><span class="proj">api</span><span class="tail">peak 1.6G · 36 min</span></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
 <section>
   <div class="wrap">
-    <span class="tc">0x02 · What it records</span>
+    <span class="tc">0x03 · What it records</span>
     <h2>A sampler, a log watcher, a report.</h2>
     <p class="sub">A small root daemon takes a measurement every 30 seconds — every 5 while memory gets tight — and keeps listening to the system log for memory kills. The menu-bar app and the <code>oomph</code> command just read what it wrote.</p>
     <div class="grid">
@@ -522,7 +650,7 @@
       </div>
       <div class="card">
         <h3>Agent sessions, grouped</h3>
-        <p>Long-running coding-agent sessions are recorded with their whole process tree and project directory — so “which project blew up?” has an answer.</p>
+        <p>Long-running coding-agent sessions are recorded with their whole process tree and project directory, next to the memory they reserved and really used — so “which project blew up?” has an answer.</p>
       </div>
       <div class="card">
         <h3>Incidents, written up</h3>
@@ -534,7 +662,7 @@
 
 <section id="why">
   <div class="wrap">
-    <span class="tc">0x03 · Why it happens when you walk away</span>
+    <span class="tc">0x04 · Why it happens when you walk away</span>
     <h2>It's usually your disk, not your RAM.</h2>
     <p class="sub">macOS swap isn't a fixed partition. It grows in 1 GB files on your startup disk — and macOS stops adding them when free space runs low. Here is the chain <span class="wm">oomph</span> caught on the machine it was written for:</p>
     <ol class="chain">
@@ -553,7 +681,7 @@
 
 <section>
   <div class="wrap">
-    <span class="tc">0x04 · The icon</span>
+    <span class="tc">0x05 · The icon</span>
     <h2>One glance at the menu bar.</h2>
     <p class="sub">The chip shows free physical memory — Physical Memory minus Memory Used, exactly as Activity Monitor computes it — abbreviated to fit. The digits are cut out of the chip, so the menu bar shows through them.</p>
     <div class="chips">
@@ -567,9 +695,9 @@
 
 <section id="claude">
   <div class="wrap">
-    <span class="tc">0x05 · For long-running agents</span>
+    <span class="tc">0x06 · For long-running agents</span>
     <h2>Make any Claude session oom-aware.</h2>
-    <p class="sub">Coding agents are exactly the workload that tips a Mac over: a build here, a container there, three sub-agents running test suites in parallel. <span class="wm">oomph</span> ships a Claude skill that teaches a session to check memory before heavy work, to back off when it's tight and to tell you — and, with several sessions on one Mac, to take turns.</p>
+    <p class="sub">Coding agents are exactly the workload that tips a Mac over: a build here, a container there, three sub-agents running test suites in parallel. <span class="wm">oomph</span> ships a Claude skill that teaches a session to check memory before heavy work, to back off when it's tight and to tell you — and, with several sessions on one Mac, to <a href="#turns" style="color:inherit">take turns</a>.</p>
     <div class="prompt">
       <div class="lbl">Paste into a Claude Code session — adds the skill to that project</div>
       <button class="copy" type="button" data-copy="Add the oomph memory skill to this project: run `mkdir -p .claude/skills/oomph &amp;&amp; curl -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o .claude/skills/oomph/SKILL.md`, then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.">Copy</button>
@@ -589,26 +717,20 @@ then read .claude/skills/oomph/SKILL.md and follow it for the rest of this sessi
       </div>
       <div class="card">
         <h3>For every session, once</h3>
-        <p><code>oomph setup-claude</code> installs the skill and registers the <span class="wm">oomph</span> MCP server — <code>memory_check</code>, <code>reserve_memory</code>, <code>release_memory</code>, <code>reservations</code>, <code>incidents</code> — for all sessions. Add <code>--hook</code> and a quiet hook after each shell command tells the model the moment memory turns tight. <code>--remove</code> undoes it.</p>
+        <p><code>oomph setup-claude</code> installs the skill and registers the <span class="wm">oomph</span> MCP server — <code>memory_check</code>, <code>reserve_memory</code>, <code>update_reservation</code>, <code>release_memory</code>, <code>reservations</code>, <code>reservation_history</code>, <code>incidents</code> — for all sessions. Add <code>--hook</code> and a quiet hook after each shell command tells the model the moment memory turns tight. <code>--remove</code> undoes it.</p>
         <p style="margin-top:10px"><code>oomph session</code> shows what the session itself is using — its whole process tree, biggest children first.</p>
       </div>
     </div>
     <div class="card turns">
-      <h3>Several sessions? They take turns.</h3>
-      <p>Before heavy work a session reserves its peak — <code>oomph run --reserve 6G -- ./gradlew build</code>, or <code>reserve_memory</code> over MCP. <span class="wm">oomph</span> grants reservations first-come-first-served: side by side while they fit, one after another when they don't. Nobody starts early, a running job's memory isn't counted twice, and a session that exits gives its share back. Each finished job's real peak is recorded, so the next estimate is better.</p>
-      <div class="lanes" role="img" aria-label="Session A runs a 6 GB build. Session B asks for 4 GB, waits in the queue until A finishes, then runs. Session C's 1 GB job fits next to B and runs right away.">
-        <div class="lane"><span class="who">session A</span><div class="track"><i class="run" style="left:1%;width:47%">gradle build · 6G</i></div></div>
-        <div class="lane"><span class="who">session B</span><div class="track"><i class="wait" style="left:12%;width:36%">queued #1</i><i class="run" style="left:49%;width:33%">jest · 4G</i></div></div>
-        <div class="lane"><span class="who">session C</span><div class="track"><i class="run" style="left:60%;width:16%">1G</i></div></div>
-        <div class="axis">time →</div>
-      </div>
+      <h3>More than one session on the Mac?</h3>
+      <p>The same skill has every session reserve its peak before heavy work, wait in the shared ledger while others' reservations don't leave room, shrink what it overestimated and release when it's done — <a href="#turns">how the ledger works</a>. In a shell: <code>oomph run --reserve 6G -- …</code>, <code>oomph reserve</code> · <code>amend</code> · <code>release</code>, <code>oomph reservations --history</code>.</p>
     </div>
   </div>
 </section>
 
 <section>
   <div class="wrap">
-    <span class="tc">0x06 · The numbers</span>
+    <span class="tc">0x07 · The numbers</span>
     <h2>Watches everything, costs nothing.</h2>
     <div class="numbers">
       <div class="num"><div class="v">30<em>s</em> / 5<em>s</em></div><div class="k">sampling interval — calm / under pressure</div></div>
@@ -621,7 +743,7 @@ then read .claude/skills/oomph/SKILL.md and follow it for the rest of this sessi
 
 <section>
   <div class="wrap">
-    <span class="tc">0x07 · Good to know</span>
+    <span class="tc">0x08 · Good to know</span>
     <h2>Honest answers.</h2>
     <div class="faq">
       <details>
@@ -638,15 +760,15 @@ open ~/Applications/oomph.app</pre>
       </details>
       <details>
         <summary>Will it fix my memory problems?</summary>
-        <p>No — on purpose. <span class="wm">oomph</span> never kills, pauses or throttles anything; it could take down the very job you care about. It tells you what happened. Most of the time the answer turns out to be “free some disk space”, and it warns you about that before it bites.</p>
+        <p>No — on purpose. <span class="wm">oomph</span> never kills, pauses or throttles anything; it could take down the very job you care about. It tells you what happened, and agents that use the ledger take turns by agreement, not by force. Most of the time the answer turns out to be “free some disk space”, and it warns you about that before it bites.</p>
       </details>
       <details>
         <summary>What does it record, and where does it go?</summary>
-        <p>Memory and disk figures, process names, app names and the working directories of agent sessions — never command-line arguments or file contents. Everything stays in <code>/Library/Logs/oomph</code> on your Mac. No network access, no telemetry.</p>
+        <p>Memory and disk figures, process names, app names, the working directories of agent sessions and the size and stated purpose of their reservations — never command-line arguments or file contents. Everything stays in <code>/Library/Logs/oomph</code> on your Mac. No network access, no telemetry.</p>
       </details>
       <details>
         <summary>Can my Claude sessions use it?</summary>
-        <p>Yes — that's what the skill is for. Paste the skill link into a session, or run <code>oomph setup-claude</code> once to give every session the skill and the MCP tools. The commands work even without the background logger; they measure live.</p>
+        <p>Yes — that's what the skill is for. Paste the skill link into a session, or run <code>oomph setup-claude</code> once to give every session the skill and the MCP tools. With several sessions on one Mac they <a href="#turns" style="color:inherit">take turns through the shared ledger</a>; other agents and scripts can join through the same CLI or MCP server. The commands work even without the background logger; they measure live.</p>
       </details>
       <details>
         <summary>What does it cost?</summary>
@@ -661,7 +783,7 @@ open ~/Applications/oomph.app</pre>
     <div class="cols">
       <div>
         <div class="brand"><svg viewBox="0 0 28 18" data-chip="normal" data-label="OOM" aria-hidden="true"></svg><span><span class="wm">oomph</span></span></div>
-        <p style="margin-top: 14px;">A one-purpose tool: a papertrail for the moments you weren't watching.<br>
+        <p style="margin-top: 14px;">A small tool: a papertrail for the moments you weren't watching, and a ledger so your agents take turns.<br>
         © 2026 Philipp Holzschneider · <span class="mono">v1.0.0</span><br>
         <a href="https://kleinzeug.github.io/oomph/">kleinzeug.github.io/oomph</a> · <a href="mailto:impressum@kleinzeug.app">impressum@kleinzeug.app</a> · <a href="https://github.com/kleinzeug/oomph">source on GitHub</a><br>
         oom + oomph, ph for Philipp<br>
