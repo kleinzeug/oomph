@@ -6,12 +6,15 @@ import Security
 import SwiftUI
 
 let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
+/// The agents' coordination ledger (ledger.json) and its history log (reservations.jsonl).
+let ledgerDir = ProcessInfo.processInfo.environment["OOMPH_LEDGER_DIR"] ?? "/Users/Shared/oomph"
 let agentLabel = "local.oomph.menubar"
 let popupWidth: CGFloat = 480
 let statColumn: CGFloat = 96
 var renderHoverX: CGFloat?  // --ai hover:X / hoverlog:X renders the hover tooltip at x = X pt
 var renderBlend: Double?  // --ai blend:0.5 renders the 24h → ∞ morph halfway
 var renderMode = false  // --render-popup: static renders don't draw scroll-view contents
+var renderStripHover: CGPoint?  // --ai rhover:X:Y renders the reservation strip's tooltip at (X, Y) pt
 let skillURL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
 
 // MARK: - AI analysis settings
@@ -87,10 +90,6 @@ let agentPlist = NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
 struct Away: Decodable { var idle_s: Int?; var display_on: Bool?; var locked: Bool?; var sleep_preventers: [String]? }
 struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
-struct Lease: Decodable, Identifiable {
-    var id: String; var state: String; var gb: Double; var purpose: String; var project: String?
-    var used_gb: Double?; var for_min: Double?; var waiting_min: Double?
-}
 struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool? }
 
 struct Sample: Decodable {
@@ -109,7 +108,6 @@ struct Sample: Decodable {
     var away: Away?
     var groups: [Group]?
     var claude: [Session]?
-    var leases: [Lease]?
     var daemon: DaemonInfo?
 
     var isAway: Bool {
@@ -180,6 +178,110 @@ struct Point: Identifiable {
     let kills: Int
 }
 
+/// One reservation of the agents' memory ledger: live (ledger.json) or finished (reservations.jsonl).
+struct Reservation: Identifiable {
+    let id: String                       // "r12@1795172655": unique across ledger resets
+    let rid: String                      // "r12"
+    var purpose: String
+    var project: String?
+    var holder: String?                  // session / process / run
+    var segments: [(t: Double, gb: Double)]  // its size over time (one entry unless edited)
+    var requested: Double
+    var granted: Double?
+    var ended: Double?                   // nil while live
+    var outcome: String?
+    var peak = 0.0
+    var used: Double?
+    var expires: Double?
+
+    var live: Bool { ended == nil }
+    var gb: Double { segments.last?.gb ?? 0 }
+    func gb(at t: Double) -> Double { (segments.last { $0.t <= t } ?? segments.first)?.gb ?? 0 }
+    var projectName: String? { project.map { ($0 as NSString).lastPathComponent }.flatMap { $0.isEmpty ? nil : $0 } }
+
+    /// Colours avoid the memory chart's grey, blue, orange and red. The same purpose always gets the
+    /// same colour (a stable hash, not Swift's per-launch one), in the blocks and in the list.
+    static let palette: [Color] = [.teal, .purple, .pink, .indigo, Color(red: 0.84, green: 0.62, blue: 0.0), .brown, .green]
+    var color: Color {
+        var h: UInt32 = 5381
+        for u in purpose.unicodeScalars { h = (h &* 33) ^ u.value }
+        return Reservation.palette[Int(h % UInt32(Reservation.palette.count))]
+    }
+
+    /// From a ledger lease, a ledger history entry or a reservations.jsonl record.
+    init?(_ o: [String: Any], ended: Double? = nil, outcome: String? = nil) {
+        func num(_ k: String) -> Double? { (o[k] as? NSNumber)?.doubleValue }
+        guard let rid = o["id"] as? String, let req = num("requested"), let gb = num("gb") else { return nil }
+        self.rid = rid
+        id = (o["key"] as? String) ?? "\(rid)@\(Int(req))"
+        purpose = (o["purpose"] as? String) ?? "?"
+        project = o["project"] as? String
+        holder = (o["holder"] as? String) ?? ((o["holder"] as? [String: Any])?["kind"] as? String)
+        requested = req
+        granted = num("granted")
+        self.ended = ended ?? num("ended")
+        self.outcome = outcome ?? (o["outcome"] as? String)
+        peak = num("peak_gb") ?? 0
+        used = num("used_gb")
+        expires = num("expires")
+        let segs = ((o["segments"] as? [[String: Any]]) ?? []).compactMap { x -> (t: Double, gb: Double)? in
+            guard let t = (x["t"] as? NSNumber)?.doubleValue, let g = (x["gb"] as? NSNumber)?.doubleValue else { return nil }
+            return (t, g)
+        }
+        segments = segs.isEmpty ? [(req, gb)] : segs
+    }
+}
+
+/// A reservation laid out on the strip: steps of [a, b) in time with the stacked GB below (lo) and
+/// at its top (hi). Reservations overlapping in time stack in lanes, so the top of the stack is the
+/// total reserved; lanes are packed first-fit by start time.
+struct ResBlock: Identifiable {
+    let res: Reservation
+    var lane = 0
+    var end: Double
+    var steps: [(a: Double, b: Double, lo: Double, hi: Double)] = []
+    var id: String { res.id }
+
+    static func stack(_ rs: [Reservation], now: Double) -> [ResBlock] {
+        var blocks = rs.sorted { $0.requested < $1.requested }
+            .map { ResBlock(res: $0, end: max($0.ended ?? now, $0.requested + 1)) }
+        var laneEnd: [Double] = []
+        for i in blocks.indices {
+            if let k = laneEnd.firstIndex(where: { $0 <= blocks[i].res.requested }) {
+                blocks[i].lane = k; laneEnd[k] = blocks[i].end
+            } else {
+                blocks[i].lane = laneEnd.count; laneEnd.append(blocks[i].end)
+            }
+        }
+        var bps = Set<Double>()
+        for b in blocks {
+            bps.insert(b.res.requested); bps.insert(b.end)
+            if let g = b.res.granted, g > b.res.requested, g < b.end { bps.insert(g) }
+            for s in b.res.segments where s.t > b.res.requested && s.t < b.end { bps.insert(s.t) }
+        }
+        let ts = bps.sorted()
+        var active: [Int] = []
+        var next = 0
+        for (i, a) in ts.enumerated().dropLast() {
+            let b = ts[i + 1]
+            while next < blocks.count && blocks[next].res.requested <= a { active.append(next); next += 1 }
+            active.removeAll { blocks[$0].end <= a }
+            var acc = 0.0
+            for j in active.sorted(by: { blocks[$0].lane < blocks[$1].lane }) {
+                let hi = acc + blocks[j].res.gb(at: a)
+                if let last = blocks[j].steps.last, last.b == a, last.lo == acc, last.hi == hi,
+                   (blocks[j].res.granted ?? .infinity) != a {
+                    blocks[j].steps[blocks[j].steps.count - 1].b = b
+                } else {
+                    blocks[j].steps.append((a, b, acc, hi))
+                }
+                acc = hi
+            }
+        }
+        return blocks
+    }
+}
+
 struct Reason: Decodable { var kind: String; var desc: String }
 struct IncidentSummary: Decodable { var jetsam_kills: Int?; var max_swap_used_gb: Double?; var min_disk_free_gb: Double? }
 struct Incident: Decodable, Identifiable {
@@ -211,6 +313,11 @@ final class Store: ObservableObject {
     @Published var gaps: [Gap] = []
     /// events.jsonl(.1), oldest first, for the hover tooltip.
     @Published var events: [ChartEvent] = []
+    /// The agents' reservations, live and of the last 14 days, stacked for the strip under the chart.
+    @Published var reservations: [ResBlock] = []
+    var liveReservations: [Reservation] {
+        reservations.map(\.res).filter(\.live).sorted { ($0.granted == nil ? 1 : 0, $0.requested) < ($1.granted == nil ? 1 : 0, $1.requested) }
+    }
     private var eventsStamp = ""
     @Published var incidents: [Incident] = []
     /// The chart's range in seconds; .infinity = all history on a log time axis.
@@ -315,13 +422,55 @@ final class Store: ObservableObject {
         }
     }
 
-    private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]? }
+    private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]?
+                            let reservations: [ResBlock] }
 
     private func apply(_ r: Loaded) {
         history = r.history
         gaps = r.gaps
         historyNow = r.now
         if let e = r.events { events = e }
+        reservations = r.reservations
+    }
+
+    /// Finished reservations from the history log and the ledger's own short history, plus the live
+    /// ones. A live lease whose holder is gone, that expired or whose queue place lapsed ends there
+    /// (the logger retires it within a sample; an older logger may not have yet). On loadQueue only.
+    private func loadReservations(now: Double) -> [ResBlock] {
+        var byKey: [String: Reservation] = [:]
+        var events: [String: String] = [:]
+        if let d = FileManager.default.contents(atPath: ledgerDir + "/reservations.jsonl") {
+            for line in d.split(separator: 0x0A) {
+                guard let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+                      let r = Reservation(o) else { continue }
+                let ev = (o["event"] as? String) ?? "end"
+                if ev == "end" || events[r.id] != "end" { byKey[r.id] = r; events[r.id] = ev }
+            }
+        }
+        let ledger = FileManager.default.contents(atPath: ledgerDir + "/ledger.json")
+            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+        for h in (ledger["history"] as? [[String: Any]]) ?? [] {
+            if let r = Reservation(h), byKey[r.id] == nil { byKey[r.id] = r }
+        }
+        for l in (ledger["leases"] as? [[String: Any]]) ?? [] {
+            guard var r = Reservation(l) else { continue }
+            let seen = (l["seen"] as? NSNumber)?.doubleValue ?? r.requested
+            let pid = ((l["holder"] as? [String: Any])?["pid"] as? NSNumber)?.int32Value ?? 0
+            if let e = r.expires, r.granted != nil, e < now { r.ended = e; r.outcome = "expired" }
+            else if r.granted == nil, now - seen > 180 { r.ended = seen + 180; r.outcome = "lapsed" }
+            else if pid > 0, kill(pid, 0) != 0, errno == ESRCH { r.ended = max(seen, r.granted ?? r.requested); r.outcome = "holder_gone" }
+            byKey[r.id] = r
+        }
+        // an edit record whose reservation neither ended nor is live: the ledger was reset under it
+        for (k, ev) in events where ev == "edit" && byKey[k]?.live == true {
+            if !((ledger["leases"] as? [[String: Any]]) ?? []).contains(where: { Reservation($0)?.id == k }),
+               var r = byKey[k] {
+                r.ended = r.segments.last?.t ?? r.requested; r.outcome = "unknown"
+                byKey[k] = r
+            }
+        }
+        let keep = now - 14 * 86400
+        return ResBlock.stack(byKey.values.filter { ($0.ended ?? now) >= keep }, now: now)
     }
 
     /// On loadQueue only.
@@ -346,7 +495,8 @@ final class Store: ObservableObject {
         // drop cached files that are gone (a day's plain file once it is gzipped)
         let present = Set(files.map { "\(logDir)/\($0)" })
         for k in cache.keys where !present.contains(k) { cache[k] = nil }
-        return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents())
+        return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents(),
+                      reservations: loadReservations(now: now))
     }
 
     /// The events, or nil when the files haven't changed since the last load. On loadQueue only.
@@ -828,8 +978,13 @@ struct MemoryChart: View, Animatable {
     var ram: Double?
     var lgRange: Double          // log10 of the linear range, seconds
     var blend: Double            // 0 = linear, 1 = log
+    /// The agents' reservations, drawn as a strip of blocks under the chart on the same time axis.
+    var reservations: [ResBlock] = []
+    var stripHeight: CGFloat = 0 // 0 = no strip
     /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
     @State private var hoverX: CGFloat? = renderHoverX
+    /// The pointer over the reservation strip (strip coordinates).
+    @State private var stripHover: CGPoint? = renderStripHover
 
     var animatableData: AnimatablePair<Double, Double> {
         get { AnimatablePair(lgRange, blend) }
@@ -849,8 +1004,13 @@ struct MemoryChart: View, Animatable {
 
     /// Time → x in 0…1 (1 = now) for the current blend.
     func mapper() -> (Double) -> Double {
-        let r = pow(10, lgRange), m = MemoryChart.minAge, b = blend, now = now
-        let span = log10(max(now - (points.first?.id ?? now), 3600) / m)
+        MemoryChart.mapper(now: now, first: points.first?.id ?? now, lgRange: lgRange, blend: blend)
+    }
+
+    /// Linear: the last 10^lgRange s. Log: all history, ages under minAge at the right edge.
+    static func mapper(now: Double, first: Double, lgRange: Double, blend b: Double) -> (Double) -> Double {
+        let r = pow(10, lgRange), m = MemoryChart.minAge
+        let span = log10(max(now - first, 3600) / m)
         return { t in
             let a = max(now - t, 0)
             return (1 - b) * (1 - a / r) + b * (1 - log10(max(a, m) / m) / span)
@@ -862,36 +1022,250 @@ struct MemoryChart: View, Animatable {
             let f = mapper()
             let plotW = max(geo.size.width - 30, 50)
             let (entries, away) = columns(f)
+            let gaps = gapBands(f)
             let grid = gridLines(f, plotW: plotW)
             let labels = axisLabels(f, plotW: plotW)
-            Chart {
-                bandMarks(away, style: AnyShapeStyle(Color.gray.opacity(0.15)))
-                gridMarks(grid, color: .primary, scale: 1)
-                areaMarks(entries)
-                gridMarks(grid, color: .white, scale: 0.45)
-                bandMarks(gapBands(f), style: AnyShapeStyle(MemoryChart.hatch))
-                ramMark
-                incidentMarks(f)
-            }
-            .chartXScale(domain: 0...1)
-            .chartXAxis {
-                // ticks here; the labels are drawn centered on them in the overlay (Charts would
-                // left-align them to the tick). The blank label keeps the axis's height.
-                AxisMarks(values: labels.map(\.x)) { _ in
-                    AxisTick(length: 3)
-                    AxisValueLabel { Text(" ").font(.system(size: 10)) }
+            VStack(spacing: MemoryChart.stripGap) {
+                Chart {
+                    gridMarks(grid, color: .primary, scale: 1)
+                    areaMarks(entries)
+                    gridMarks(grid, color: .white, scale: 0.45)
+                    ramMark
+                    incidentMarks(f)
+                }
+                .chartXScale(domain: 0...1)
+                .chartXAxis {
+                    // ticks here; the labels are drawn centered on them in the overlay (Charts would
+                    // left-align them to the tick). The blank label keeps the axis's height.
+                    AxisMarks(values: labels.map(\.x)) { _ in
+                        AxisTick(length: 3)
+                        AxisValueLabel { Text(" ").font(.system(size: 10)) }
+                    }
+                }
+                .chartForegroundStyleScale(domain: MemoryChart.series, range: MemoryChart.seriesColors)
+                .chartLegend(.hidden)  // the compact legend sits in the header row (ChartLegend)
+                .transaction { $0.animation = nil }  // this view animates itself, frame by frame
+                .chartBackground { proxy in bandLayer(proxy, away: away, gaps: gaps) }
+                .chartOverlay { proxy in
+                    ZStack(alignment: .topLeading) {
+                        axisLabelLayer(proxy, labels: labels)
+                        hoverTracker(proxy)
+                    }
+                }
+                if stripHeight > 0 {
+                    Color.clear.frame(height: stripHeight).tourAnchor("strip")
                 }
             }
-            .chartForegroundStyleScale(domain: MemoryChart.series, range: [Color.gray, Color.blue, Color.orange, Color.red])
-            .chartLegend(position: .bottom, spacing: 4)
-            .transaction { $0.animation = nil }  // this view animates itself, frame by frame
-            .chartOverlay { proxy in
+            // drawn over both: the strip needs the chart's plot frame, and the tooltips reach over
+            // the other part (the chart's tooltip over the strip, the strip's over the chart)
+            .overlayPreferenceValue(PlotRectKey.self) { plot in
                 ZStack(alignment: .topLeading) {
-                    axisLabelLayer(proxy, labels: labels)
-                    hoverLayer(proxy, mapper: f)
+                    if let plot {
+                        if stripHeight > 0 { stripLayer(plot: plot, top: geo.size.height - stripHeight, mapper: f, grid: grid) }
+                        hoverLayer(plot: plot, mapper: f, stripTop: geo.size.height - stripHeight)
+                        if stripHeight > 0 { stripCard(plot: plot, top: geo.size.height - stripHeight, width: geo.size.width, mapper: f) }
+                    }
                 }
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
             }
         }
+    }
+
+    static let seriesColors: [Color] = [.gray, .blue, .orange, .red]
+    static let stripGap: CGFloat = 4
+
+    // MARK: away bands and no-data hatching
+
+    /// Away bands and no-data stretches, drawn behind the series in one Canvas: stretches closer
+    /// than 2 px merge (a Mac that keeps dozing off reads as one calm band, not a grey comb), and
+    /// one hatch pattern, anchored to the plot, shows through all no-data stretches.
+    func bandLayer(_ proxy: ChartProxy, away: [Band], gaps: [Band]) -> some View {
+        GeometryReader { g in
+            let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
+            Canvas { ctx, size in
+                let W = Double(size.width)
+                let (grey, hatched) = MemoryChart.calmBands(away: away.map { ($0.from * W, $0.to * W) },
+                                                            gaps: gaps.map { ($0.from * W, $0.to * W) }, tolerance: 2)
+                var greyPath = Path(), hatchPath = Path()
+                for (a, b) in grey { greyPath.addRect(CGRect(x: a, y: 0, width: max(b - a, 1), height: size.height)) }
+                for (a, b) in hatched { hatchPath.addRect(CGRect(x: a, y: 0, width: max(b - a, 1), height: size.height)) }
+                ctx.fill(greyPath, with: .color(.gray.opacity(0.15)))
+                ctx.fill(hatchPath, with: .color(.gray.opacity(0.06)))
+                var c = ctx
+                c.clip(to: hatchPath)
+                c.stroke(MemoryChart.hatchLines(in: CGRect(origin: .zero, size: size)), with: .color(.gray.opacity(0.45)), lineWidth: 1)
+            }
+            .frame(width: plot.width, height: plot.height)
+            .offset(x: plot.minX, y: plot.minY)
+        }
+        .allowsHitTesting(false)
+    }
+
+    /// Merges spans (in px) closer than `tolerance`. Grey: away spans, bridged by no-data stretches
+    /// that touch them (asleep while away); a no-data stretch with nobody away near it stays white.
+    static func calmBands(away: [(Double, Double)], gaps: [(Double, Double)], tolerance: Double)
+        -> (grey: [(Double, Double)], hatched: [(Double, Double)]) {
+        func merge(_ spans: [(Double, Double, Bool)]) -> [(Double, Double, Bool)] {
+            var out: [(Double, Double, Bool)] = []
+            for s in spans.sorted(by: { $0.0 < $1.0 }) {
+                if let l = out.last, s.0 - l.1 <= tolerance {
+                    out[out.count - 1] = (l.0, max(l.1, s.1), l.2 || s.2)
+                } else {
+                    out.append(s)
+                }
+            }
+            return out
+        }
+        let grey = merge(away.map { ($0.0, $0.1, true) } + gaps.map { ($0.0, $0.1, false) }).filter(\.2).map { ($0.0, $0.1) }
+        return (grey, merge(gaps.map { ($0.0, $0.1, true) }).map { ($0.0, $0.1) })
+    }
+
+    /// Diagonal hatch lines over `r`, on a grid anchored at the origin: clipped to several shapes,
+    /// they form one continuous pattern.
+    static func hatchLines(in r: CGRect, spacing: CGFloat = 6) -> Path {
+        var p = Path()
+        var c = ((r.minX + r.minY) / spacing).rounded(.down) * spacing
+        while c <= r.maxX + r.maxY {
+            p.move(to: CGPoint(x: c - r.maxY, y: r.maxY))
+            p.addLine(to: CGPoint(x: c - r.minY, y: r.minY))
+            c += spacing
+        }
+        return p
+    }
+
+    // MARK: reservation strip
+
+    /// Every reservation as blocks on the chart's time axis: height ∝ GB, stacked where they
+    /// overlap, solid while granted, hatched while queued. The scale's top is a round figure above
+    /// the highest stack in view.
+    func stripRects(_ f: (Double) -> Double, W: CGFloat, H: CGFloat) -> (rects: [(i: Int, r: CGRect, queued: Bool)], top: Double) {
+        var vis = 0.0
+        for b in reservations where f(b.end) >= 0 {
+            for st in b.steps where f(st.b) >= 0 { vis = max(vis, st.hi) }
+        }
+        let top = [2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256].first { $0 >= vis } ?? vis
+        let usable = H - 4
+        var out: [(i: Int, r: CGRect, queued: Bool)] = []
+        for (i, b) in reservations.enumerated() {
+            let bx0 = f(b.res.requested) * W, bx1 = f(b.end) * W
+            guard bx1 >= 0, bx0 <= W else { continue }
+            let widen = max(0, 1.5 - (bx1 - bx0))  // even a 10-second reservation stays visible
+            for (k, st) in b.steps.enumerated() {
+                let x0 = max(f(st.a) * W, 0), x1 = min(f(st.b) * W + (k == b.steps.count - 1 ? widen : 0), W)
+                guard x1 > x0 else { continue }
+                let y0 = H - CGFloat(st.hi / top) * usable, y1 = H - CGFloat(st.lo / top) * usable
+                let queued = b.res.granted.map { st.a < $0 } ?? true
+                // half a point off top and bottom: stacked blocks get a hairline between them
+                out.append((i, CGRect(x: x0, y: y0 + 0.5, width: x1 - x0, height: max(y1 - y0 - 1, 0.75)), queued))
+            }
+        }
+        return (out, top)
+    }
+
+    func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [GridLine]) -> some View {
+        let W = plot.width, H = stripHeight
+        let (rects, scaleTop) = stripRects(f, W: W, H: H)
+        let blocks = reservations, now = now
+        return ZStack(alignment: .topLeading) {
+            Canvas { ctx, size in
+                let usable = H - 4
+                for l in grid {
+                    ctx.fill(Path(CGRect(x: l.x * W - 0.25, y: 0, width: 0.5, height: H)), with: .color(.primary.opacity(l.alpha)))
+                }
+                ctx.fill(Path(CGRect(x: 0, y: H - 0.5, width: W, height: 0.5)), with: .color(.primary.opacity(0.25)))
+                var topLine = Path()
+                topLine.move(to: CGPoint(x: 0, y: H - usable)); topLine.addLine(to: CGPoint(x: W, y: H - usable))
+                ctx.stroke(topLine, with: .color(.primary.opacity(0.12)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
+                var plotCtx = ctx
+                plotCtx.clip(to: Path(CGRect(x: 0, y: 0, width: W, height: H)))
+                var solid: [Int: Path] = [:], waiting: [Int: Path] = [:]
+                for x in rects {
+                    if x.queued { waiting[x.i, default: Path()].addRect(x.r) } else { solid[x.i, default: Path()].addRect(x.r) }
+                }
+                for (i, p) in solid { plotCtx.fill(p, with: .color(blocks[i].res.color.opacity(0.8))) }
+                for (i, p) in waiting {
+                    let c = blocks[i].res.color
+                    plotCtx.fill(p, with: .color(c.opacity(0.12)))
+                    var h = plotCtx
+                    h.clip(to: p)
+                    h.stroke(MemoryChart.hatchLines(in: p.boundingRect, spacing: 4), with: .color(c.opacity(0.75)), lineWidth: 1)
+                }
+                // purpose labels on the widest granted part of each block, when it fits
+                var best: [Int: CGRect] = [:]
+                for x in rects where !x.queued && x.r.height >= 9 && x.r.width > (best[x.i]?.width ?? 0) { best[x.i] = x.r }
+                for (i, r) in best where r.width >= 24 {
+                    let purpose = blocks[i].res.purpose
+                    var n = purpose.count
+                    while n >= 4 {
+                        let s = n == purpose.count ? purpose : String(purpose.prefix(n)) + "…"
+                        let t = plotCtx.resolve(Text(s).font(.system(size: 8.5, weight: .medium)).foregroundColor(.white))
+                        if t.measure(in: CGSize(width: 1000, height: 20)).width <= r.width - 6 {
+                            plotCtx.draw(t, at: CGPoint(x: r.minX + 3, y: r.midY), anchor: .leading)
+                            break
+                        }
+                        n = n > 24 ? 24 : n - 3
+                    }
+                }
+                // right of the plot: the scale, and how long each live grant has left
+                var used: [CGFloat] = []
+                for x in rects where blocks[x.i].res.live && !x.queued && x.r.maxX >= W - 0.5 {
+                    guard let e = blocks[x.i].res.expires, !used.contains(where: { abs($0 - x.r.midY) < 9 }) else { continue }
+                    used.append(x.r.midY)
+                    ctx.draw(Text(MemoryChart.shortDuration(e - now)).font(.system(size: 8.5)).foregroundColor(.secondary),
+                             at: CGPoint(x: W + 4, y: x.r.midY), anchor: .leading)
+                }
+                if !used.contains(where: { abs($0 - (H - usable)) < 9 }) {
+                    ctx.draw(Text(String(format: "%.0fG", scaleTop)).font(.system(size: 8.5)).foregroundColor(.secondary),
+                             at: CGPoint(x: W + 4, y: H - usable), anchor: .leading)
+                }
+                if rects.isEmpty {
+                    ctx.draw(Text("No reservations in this range").font(.system(size: 9)).foregroundColor(.secondary),
+                             at: CGPoint(x: W / 2, y: H / 2), anchor: .center)
+                }
+            }
+            .frame(width: W + 40, height: H)
+            .allowsHitTesting(false)
+            Rectangle().fill(Color.clear).contentShape(Rectangle())
+                .frame(width: W, height: H)
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let p): stripHover = p
+                    case .ended: stripHover = nil
+                    }
+                }
+                .help(stripHover.flatMap { stripHit($0, f, W: W) } != nil ? "" : "Memory reserved by agents (Claude sessions, oomph run), one block per reservation: height = GB reserved, hatched while queued, stacked where they overlap. Hover a block for details.")
+        }
+        .offset(x: plot.minX, y: top)
+    }
+
+    /// The reservation under the pointer on the strip, if any.
+    func stripHit(_ p: CGPoint, _ f: (Double) -> Double, W: CGFloat) -> (block: ResBlock, rect: CGRect)? {
+        let (rects, _) = stripRects(f, W: W, H: stripHeight)
+        let hit = rects.last { $0.r.insetBy(dx: -2, dy: -1).contains(p) }
+            ?? rects.filter { p.x >= $0.r.minX - 2 && p.x <= $0.r.maxX + 2 }.min { abs($0.r.midY - p.y) < abs($1.r.midY - p.y) }
+        return hit.map { (reservations[$0.i], $0.r) }
+    }
+
+    @ViewBuilder func stripCard(plot: CGRect, top: CGFloat, width: CGFloat, mapper f: (Double) -> Double) -> some View {
+        if let p = stripHover, let (b, r) = stripHit(p, f, W: plot.width) {
+            let x = plot.minX + p.x
+            let w = MemoryChart.cardWidth
+            Rectangle().strokeBorder(Color.primary.opacity(0.7), lineWidth: 1)
+                .frame(width: max(r.width, 1.5) + 2, height: r.height + 2)
+                .offset(x: plot.minX + r.minX - 1, y: top + r.minY - 1)
+                .allowsHitTesting(false)
+            ReservationCard(res: b.res, now: now)
+                .frame(width: w, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: w, height: max(top - 6, 1), alignment: .bottom)  // above the strip, over the chart
+                .offset(x: min(max(x - w / 2, 0), width - w))
+                .allowsHitTesting(false)
+        }
+    }
+
+    static func shortDuration(_ s: Double) -> String {
+        let m = max(Int((s / 60).rounded()), 0)
+        return m < 60 ? "\(m)m" : (m % 60 == 0 || m >= 600 ? "\(m / 60)h" : "\(m / 60)h\(String(format: "%02d", m % 60))")
     }
 
     func axisLabelLayer(_ proxy: ChartProxy, labels: [Label]) -> some View {
@@ -909,31 +1283,40 @@ struct MemoryChart: View, Animatable {
 
     // MARK: hover
 
-    /// A vertical line following the pointer and a live tooltip for the time under it.
-    func hoverLayer(_ proxy: ChartProxy, mapper f: @escaping (Double) -> Double) -> some View {
+    /// Follows the pointer over the chart, and hands the plot's frame to the layers drawn over
+    /// the chart and the strip.
+    func hoverTracker(_ proxy: ChartProxy) -> some View {
         GeometryReader { g in
             let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
-            ZStack(alignment: .topLeading) {
-                Rectangle().fill(Color.clear).contentShape(Rectangle())
-                    .onContinuousHover { phase in
-                        switch phase {
-                        case .active(let p): hoverX = p.x
-                        case .ended: hoverX = nil
-                        }
+            Rectangle().fill(Color.clear).contentShape(Rectangle())
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let p): hoverX = p.x
+                    case .ended: hoverX = nil
                     }
-                if let x = hoverX, x >= plot.minX, x <= plot.maxX,
-                   let u = proxy.value(atX: x - plot.minX, as: Double.self) {
-                    let info = hoverInfo(u: u, du: 1 / Double(plot.width), mapper: f)
-                    Rectangle().fill(Color.primary.opacity(0.55))
-                        .frame(width: 1, height: plot.height)
-                        .offset(x: x - 0.5, y: plot.minY)
-                        .allowsHitTesting(false)
-                    HoverCard(info: info)
-                        .frame(width: MemoryChart.cardWidth, alignment: .leading)
-                        .offset(x: x < plot.midX ? x + 10 : x - 10 - MemoryChart.cardWidth, y: plot.minY + 2)
-                        .allowsHitTesting(false)
                 }
+                .preference(key: PlotRectKey.self, value: plot)
+        }
+    }
+
+    /// A vertical line following the pointer and a live tooltip for the time under it.
+    @ViewBuilder func hoverLayer(plot: CGRect, mapper f: @escaping (Double) -> Double, stripTop: CGFloat) -> some View {
+        if let x = hoverX, x >= plot.minX, x <= plot.maxX {
+            let info = hoverInfo(u: Double((x - plot.minX) / plot.width), du: 1 / Double(plot.width), mapper: f)
+            Rectangle().fill(Color.primary.opacity(0.55))
+                .frame(width: 1, height: plot.height)
+                .offset(x: x - 0.5, y: plot.minY)
+                .allowsHitTesting(false)
+            if stripHeight > 0 {  // the same moment on the reservation strip
+                Rectangle().fill(Color.primary.opacity(0.4))
+                    .frame(width: 1, height: stripHeight)
+                    .offset(x: x - 0.5, y: stripTop)
+                    .allowsHitTesting(false)
             }
+            HoverCard(info: info)
+                .frame(width: MemoryChart.cardWidth, alignment: .leading)
+                .offset(x: x < plot.midX ? x + 10 : x - 10 - MemoryChart.cardWidth, y: plot.minY + 2)
+                .allowsHitTesting(false)
         }
     }
 
@@ -951,6 +1334,8 @@ struct MemoryChart: View, Animatable {
         var incidents: [String] = []
         var events: [(String, Bool)] = []   // text, alarming
         var moreEvents = 0
+        var reserved: [(String, Color)] = []  // reservations active under the pointer
+        var moreReserved = 0
     }
 
     /// Time for x (the mapper is monotonic, so bisection inverts it).
@@ -1033,6 +1418,13 @@ struct MemoryChart: View, Animatable {
         }
         info.events = Array(lines.prefix(6))
         info.moreEvents = max(lines.count - 6, 0)
+        let res = reservations.filter { $0.res.requested <= t1 && $0.end >= t0 }
+        info.reserved = res.prefix(4).map { b in
+            let queued = (b.res.granted ?? .infinity) > tc
+            return (String(format: "%.1f GB ", b.res.gb(at: min(max(tc, b.res.requested), b.end))) + b.res.purpose
+                    + (queued ? " (queued)" : ""), b.res.color)
+        }
+        info.moreReserved = max(res.count - 4, 0)
         return info
     }
 
@@ -1116,6 +1508,19 @@ struct MemoryChart: View, Animatable {
                 }
                 if info.moreEvents > 0 {
                     Text("+ \(info.moreEvents) more kinds of events").font(.system(size: 9)).foregroundStyle(.tertiary)
+                }
+                if !info.reserved.isEmpty {
+                    Divider().padding(.vertical, 1)
+                    Text("Reserved by agents").font(.system(size: 9)).foregroundStyle(.secondary)
+                    ForEach(Array(info.reserved.enumerated()), id: \.offset) { _, r in
+                        HStack(spacing: 5) {
+                            RoundedRectangle(cornerRadius: 1.5).fill(r.1.opacity(0.8)).frame(width: 7, height: 7)
+                            Text(r.0).font(.system(size: 10)).lineLimit(1).truncationMode(.tail)
+                        }
+                    }
+                    if info.moreReserved > 0 {
+                        Text("+ \(info.moreReserved) more").font(.system(size: 9)).foregroundStyle(.tertiary)
+                    }
                 }
             }
             .padding(8)
@@ -1247,27 +1652,6 @@ struct MemoryChart: View, Animatable {
         return unit >= 86400 ? dayFmt.string(from: d) : timeFmt.string(from: d)
     }
 
-    /// Diagonal hatching for "no data", visible on either theme.
-    static let hatch: ImagePaint = {
-        let img = NSImage(size: NSSize(width: 6, height: 6), flipped: false) { r in
-            NSColor.gray.withAlphaComponent(0.45).setStroke()
-            let p = NSBezierPath(); p.lineWidth = 1
-            p.move(to: NSPoint(x: -1, y: -1)); p.line(to: NSPoint(x: 7, y: 7))
-            p.move(to: NSPoint(x: -1, y: 5)); p.line(to: NSPoint(x: 1, y: 7))
-            p.move(to: NSPoint(x: 5, y: -1)); p.line(to: NSPoint(x: 7, y: 1))
-            p.stroke()
-            return true
-        }
-        return ImagePaint(image: Image(nsImage: img))
-    }()
-
-    @ChartContentBuilder func bandMarks(_ bands: [Band], style: AnyShapeStyle) -> some ChartContent {
-        ForEach(bands) { (b: Band) in
-            RectangleMark(xStart: .value("from", b.from), xEnd: .value("to", max(b.to, b.from + 0.002)))
-                .foregroundStyle(style)
-        }
-    }
-
     @ChartContentBuilder func gridMarks(_ lines: [GridLine], color: Color, scale: Double) -> some ChartContent {
         ForEach(lines) { (l: GridLine) in
             RuleMark(x: .value("grid", l.x))
@@ -1299,6 +1683,126 @@ struct MemoryChart: View, Animatable {
     }
 }
 
+/// The plot's frame inside the memory chart, for the layers drawn over the chart and the strip.
+struct PlotRectKey: PreferenceKey {
+    static var defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) { value = value ?? nextValue() }
+}
+
+/// A reservation's details, for the strip's tooltip.
+struct ReservationCard: View {
+    let res: Reservation
+    let now: Double
+
+    static let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+    static let dayClock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d HH:mm"; return f }()
+    func at(_ t: Double) -> String {
+        let d = Date(timeIntervalSince1970: t)
+        return Calendar.current.isDateInToday(d) ? ReservationCard.clock.string(from: d) : ReservationCard.dayClock.string(from: d)
+    }
+    static let outcomes = ["released": "released", "expired": "expired (not released in time)",
+                           "holder_gone": "ended: its session or process exited", "lapsed": "lapsed: stopped waiting in the queue",
+                           "cancelled": "cancelled while queued", "unknown": "ended (the ledger was reset)"]
+
+    func row(_ k: String, _ v: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text(k).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 58, alignment: .leading)
+            Text(v).font(.system(size: 10)).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    var body: some View {
+        let gbs = res.segments.map { String(format: "%.1f", $0.gb) }.joined(separator: " → ") + " GB"
+        let edits = res.segments.count > 1 ? " (changed " + res.segments.dropFirst().map { at($0.t) }.joined(separator: ", ") + ")" : ""
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                RoundedRectangle(cornerRadius: 2).fill(res.color.opacity(0.85)).frame(width: 8, height: 8)
+                Text(res.purpose).font(.system(size: 11, weight: .semibold)).lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Text(res.rid).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary)
+            }
+            if res.projectName != nil || res.holder != nil {
+                Text([res.projectName, res.holder.map { $0 == "run" ? "oomph run" : $0 }].compactMap { $0 }.joined(separator: " · "))
+                    .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Divider().padding(.vertical, 1)
+            row("Reserved", gbs + edits)
+            row("Peak used", res.live && res.granted != nil
+                ? String(format: "%.1f GB so far (%.1f GB now)", res.peak, res.used ?? 0)
+                : String(format: "%.1f GB", res.peak))
+            if let g = res.granted {
+                row("Granted", at(g) + (g - res.requested >= 60 ? " · waited " + MemoryChart.duration(g - res.requested) : ""))
+            } else {
+                row("Requested", at(res.requested) + " · waited " + MemoryChart.duration((res.ended ?? now) - res.requested))
+            }
+            if let e = res.ended {
+                row("Ended", at(e) + " · " + (ReservationCard.outcomes[res.outcome ?? ""] ?? (res.outcome ?? "")))
+                if let g = res.granted { row("Held", MemoryChart.duration(e - g)) }
+            } else if res.granted == nil {
+                row("Now", "queued, waiting for room")
+            } else {
+                row("Now", "active for " + MemoryChart.duration(now - (res.granted ?? now))
+                    + (res.expires.map { " · expires in " + MemoryChart.duration(max($0 - now, 0)) } ?? ""))
+            }
+        }
+        .padding(8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.primary.opacity(0.12)))
+        .shadow(color: .black.opacity(0.18), radius: 6, y: 2)
+    }
+}
+
+/// The chart's legend, two tiny rows next to the range buttons; every entry explains itself on hover.
+struct ChartLegend: View {
+    struct Item { let name: String; let help: String; let kind: Int }  // 0 swatch, 1 away, 2 hatch, 3 incident
+    static let rows: [[Item]] = [
+        [Item(name: "Wired", help: "Wired: memory the kernel and drivers hold in RAM. It is never compressed or swapped out.", kind: 0),
+         Item(name: "App", help: "App memory: what apps and processes use — Activity Monitor's App Memory.", kind: 0),
+         Item(name: "Compressed", help: "Compressed: memory macOS squeezed to make room instead of swapping it out. It grows when RAM gets tight.", kind: 0),
+         Item(name: "Swap", help: "Swap: memory written out to disk. Lasting swap means the work needs more RAM than the Mac has.", kind: 0)],
+        [Item(name: "away", help: "Grey band: you were away — idle for 5 minutes or more, the screen locked or the display off. Stretches close together merge into one band.", kind: 1),
+         Item(name: "no data", help: "Hatched: no samples — the Mac was asleep or off, or the logger wasn't running.", kind: 2),
+         Item(name: "incident", help: "Red line: an incident starts — high memory pressure, apps killed for memory, or a stall. Each one is listed under Incidents with its report.", kind: 3)],
+    ]
+
+    @ViewBuilder func swatch(_ it: Item, _ color: Color) -> some View {
+        switch it.kind {
+        case 0: RoundedRectangle(cornerRadius: 1.5).fill(color).frame(width: 7, height: 7)
+        case 1: RoundedRectangle(cornerRadius: 1.5).fill(Color.gray.opacity(0.3)).frame(width: 9, height: 7)
+        case 2:
+            Canvas { ctx, size in
+                let r = CGRect(origin: .zero, size: size)
+                ctx.fill(Path(r), with: .color(.gray.opacity(0.08)))
+                ctx.clip(to: Path(r))
+                ctx.stroke(MemoryChart.hatchLines(in: r, spacing: 3.5), with: .color(.gray.opacity(0.75)), lineWidth: 1)
+            }
+            .frame(width: 9, height: 7)
+        default: Rectangle().fill(Color.red).frame(width: 1.5, height: 8).frame(width: 5)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(ChartLegend.rows.enumerated()), id: \.offset) { r, row in
+                HStack(spacing: 7) {
+                    ForEach(Array(row.enumerated()), id: \.offset) { i, it in
+                        HStack(spacing: 3) {
+                            swatch(it, r == 0 ? MemoryChart.seriesColors[i] : .clear)
+                            Text(it.name)
+                        }
+                        .contentShape(Rectangle())
+                        .help(it.help)
+                    }
+                }
+            }
+        }
+        .font(.system(size: 9))
+        .foregroundStyle(.secondary)
+        .fixedSize()
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: Store
     @State private var error: String?
@@ -1324,8 +1828,8 @@ struct PopoverView: View {
             Divider()
             VStack(alignment: .leading, spacing: 10) {
                 if let c = store.current, store.daemonRunning { stats(c).tourAnchor("stats") }
-                if let ls = store.current?.leases, !ls.isEmpty, store.daemonRunning { leases(ls).tourAnchor("leases") }
                 chart.tourAnchor("chart").zIndex(1)
+                if !store.reservations.isEmpty { reservedList(store.liveReservations).tourAnchor("leases") }
                 incidentsList.tourAnchor("incidents")
                 Divider()
                 footer.tourAnchor("footer")
@@ -1461,27 +1965,48 @@ struct PopoverView: View {
         }
     }
 
-    // Memory Claude sessions have reserved through `oomph reserve` / `oomph run` / the MCP server.
-    func leases(_ ls: [Lease]) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text("Reserved by sessions").font(.caption).foregroundStyle(.secondary)
-            ForEach(ls) { (l: Lease) in
+    // Memory Claude sessions and other agents reserved through `oomph reserve` / `oomph run` / the
+    // MCP server, in the colours of their blocks on the strip above.
+    func reservedList(_ live: [Reservation]) -> some View {
+        let now = Date().timeIntervalSince1970
+        let day = store.reservations.filter { ($0.res.ended ?? now) >= now - 86400 }.count
+        return VStack(alignment: .leading, spacing: 3) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Reserved by agents").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                Text(live.isEmpty ? "\(day) in the last 24 h"
+                     : String(format: "%.1f GB reserved · %d in the last 24 h", live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }, day))
+                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+            if live.isEmpty {
+                Text("Nothing reserved right now").font(.caption).foregroundStyle(.tertiary)
+            }
+            ForEach(live) { (r: Reservation) in
                 HStack(spacing: 6) {
-                    Circle().fill(l.state == "granted" ? Color.green : Color.orange).frame(width: 6, height: 6)
-                    Text(String(format: "%.1fG", l.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                    ZStack {
+                        RoundedRectangle(cornerRadius: 2).fill(r.color.opacity(r.granted == nil ? 0.15 : 0.8))
+                        if r.granted == nil {
+                            RoundedRectangle(cornerRadius: 2).strokeBorder(r.color.opacity(0.8), lineWidth: 1)
+                        }
+                    }
+                    .frame(width: 8, height: 8)
+                    Text(String(format: "%.1fG", r.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                         .frame(width: 40, alignment: .trailing)
-                    Text(l.purpose).font(.system(size: 11)).lineLimit(1).help(l.purpose + (l.project.map { " — " + $0 } ?? ""))
-                    if let p = l.project { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
-                    Spacer()
-                    Text(leaseTail(l)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                    Text(r.purpose).font(.system(size: 11)).lineLimit(1)
+                    if let p = r.projectName { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
+                    Spacer(minLength: 4)
+                    Text(reservationTail(r, now: now)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                        .lineLimit(1).fixedSize()
                 }
+                .help("\(r.rid): \(r.purpose)" + (r.project.map { " — " + $0 } ?? "")
+                      + String(format: " · reserved %.1f GB, peak %.1f GB so far", r.gb, r.peak))
             }
         }
     }
 
-    func leaseTail(_ l: Lease) -> String {
-        if l.state == "granted" { return String(format: "using %.1fG", l.used_gb ?? 0) }
-        return "waiting \(Int(l.waiting_min ?? 0)) min"
+    func reservationTail(_ r: Reservation, now: Double) -> String {
+        guard r.granted != nil else { return "waiting " + MemoryChart.duration(now - r.requested) }
+        return String(format: "using %.1fG", r.used ?? 0) + (r.expires.map { " · " + MemoryChart.shortDuration($0 - now) + " left" } ?? "")
     }
 
     // The biggest app: its size as the figure, its name below (shortened in the middle,
@@ -1579,18 +2104,10 @@ struct PopoverView: View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
                 // ranges animate into each other (0.5 s): the chart morphs, nothing reloads
-                Picker("", selection: Binding(get: { store.range }, set: { v in
+                RangeSegments(selection: Binding(get: { store.range }, set: { v in
                     withAnimation(.easeInOut(duration: 0.5)) { store.range = v }
-                })) {
-                    Image(systemName: "infinity").tag(Double.infinity)
-                    Text("24h").tag(24 * 3600.0); Text("6h").tag(6 * 3600.0); Text("1h").tag(3600.0)
-                }.pickerStyle(.segmented).labelsHidden()
-                // pinned geometry: always its own height (never stretched or squeezed while the panel
-                // re-fits its content) and never animated (only the chart morphs, not the control)
-                .fixedSize(horizontal: false, vertical: true).frame(width: 180)
-                .transaction { $0.animation = nil }
+                }))
                 .tourAnchor("picker")
-                .focusable(false).focusEffectDisabled()
                 if store.needsUpdate {  // the logger is a different version than the one this app ships
                     if store.busy {
                         ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 16, height: 16)
@@ -1603,9 +2120,12 @@ struct PopoverView: View {
                         .help("Update the logger: it runs v\(store.installedVersion ?? "?"), this app ships v\(store.bundledVersion ?? "?")")
                     }
                 }
-                Spacer()
-                Text(store.allHistory ? "Memory, GB · log time" : "Memory, GB")
-                    .font(.caption).foregroundStyle(.secondary)
+                Spacer(minLength: 6)
+                ChartLegend()
+                Text("GB").font(.caption).foregroundStyle(.secondary)
+                    .help("Memory in GB; the dashed line is the Mac's RAM. " + (store.allHistory
+                          ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
+                          : "Time runs left to right up to now."))
             }
             ZStack {
                 if !store.historyLoaded {
@@ -1619,17 +2139,21 @@ struct PopoverView: View {
                     MemoryChart(points: store.history, gaps: store.gaps, now: store.historyNow,
                                 incidents: store.incidents, events: store.events, ram: store.current?.ram_gb,
                                 lgRange: log10(store.allHistory ? 24 * 3600 : store.range),
-                                blend: renderBlend ?? (store.allHistory ? 1 : 0))
+                                blend: renderBlend ?? (store.allHistory ? 1 : 0),
+                                reservations: store.reservations, stripHeight: stripHeight)
                         .transition(.opacity)  // fades in (0.33 s) once the history has loaded
                 }
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 160)
+            .frame(height: 160 + (stripHeight > 0 ? MemoryChart.stripGap + stripHeight : 0))
             .tourAnchor("plot")
-            .zIndex(1)  // the hover tooltip may reach over the caption below
-            Text("Grey bands = away (idle, locked or display off) · hatched = no data · red lines = incidents")
-                .font(.system(size: 9)).foregroundStyle(.secondary)
+            .zIndex(1)  // the hover tooltips may reach over what follows
         }
+    }
+
+    /// The reservation strip under the chart: there once any agent reserved memory (14 days kept).
+    var stripHeight: CGFloat {
+        store.historyLoaded && !store.history.isEmpty && !store.reservations.isEmpty ? 46 : 0
     }
 
     var incidentsList: some View {
@@ -1709,7 +2233,7 @@ struct PopoverView: View {
         }
         switch step {
         case 0:
-            let zone = union(["header", "stats", "leases"])
+            let zone = union(["header", "stats"])
             let chip = r["chip"] ?? .zero, top = r["topapp"] ?? CGRect(x: W - 120, y: zone.maxY - 30, width: 100, height: 30)
             let half = (W - 2 * m - 8) / 2
             return (zone, [
@@ -1723,19 +2247,31 @@ struct PopoverView: View {
                          xs: [top.midX], y: top.maxY + 3, reach: zone.maxY - top.maxY + 10),
             ])
         case 1:
-            let zone = union(["chart"])
+            let zone = union(["chart", "leases"])
             let picker = r["picker"] ?? .zero, plot = r["plot"] ?? zone
             let half = (W - 2 * m - 8) / 2
-            return (zone, [
-                TourNote(title: "Time range",
-                         text: "∞ shows all history on a logarithmic time axis: the last hours wide, older days and weeks squeezed. 24h, 6h and 1h are linear. A blue ↻ beside it means the logger needs an update.",
-                         left: m, width: half, above: true,
-                         xs: [picker.minX + 30], y: picker.minY - 3),
-                // below the chart: above it, the right half belongs to the tour's bar
+            let timeRange = TourNote(title: "Time range",
+                                     text: "∞ shows all history on a logarithmic time axis: the last hours wide, older days and weeks squeezed. 24h, 6h and 1h are linear. A blue ↻ beside it means the logger needs an update.",
+                                     left: m, width: half, above: true,
+                                     xs: [picker.minX + 30], y: picker.minY - 3)
+            // below the zone: above it, the right half belongs to the tour's bar
+            guard let strip = r["strip"] else {
+                return (zone, [timeRange,
+                    TourNote(title: "Memory over time",
+                             text: "Hover to read the values and events under the cursor; try it now. The legend above the chart explains the colours: hover an entry for more.",
+                             left: W * 0.36, width: W * 0.64 - m, above: false,
+                             xs: [plot.midX + 70], y: zone.maxY + 7, reach: 10)])
+            }
+            let chartBottom = strip.minY - 22
+            return (zone, [timeRange,
                 TourNote(title: "Memory over time",
-                         text: "Hover to read the values and events under the cursor; try it now. Grey bands: away (idle, locked or display off). Hatched: no data. Red lines: incidents.",
-                         left: W * 0.36, width: W * 0.64 - m, above: false,
-                         xs: [plot.midX + 70], y: zone.maxY + 7, reach: 10),
+                         text: "Hover to read the values and events under the cursor; try it now. The legend above the chart explains the colours: hover an entry for more.",
+                         left: m, width: half, above: false,
+                         xs: [plot.minX + 90], y: chartBottom, reach: zone.maxY - chartBottom + 10),
+                TourNote(title: "Reserved by agents",
+                         text: "Claude sessions and other agents reserve memory before heavy work and take turns (the oomph skill). One block per reservation: its height the GB, hatched while it waited, stacked where they overlap. Hover a block for its peak and how it ended.",
+                         left: m + half + 8, width: half, above: false,
+                         xs: [strip.midX + 60], y: strip.maxY + 2, reach: zone.maxY - strip.maxY + 11),
             ])
         case 2:
             let zone = union(["incidents"])
@@ -2268,6 +2804,58 @@ struct TopAppAnchorKey: PreferenceKey {
     static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
 }
 
+/// The chart's time ranges as a segmented control drawn in SwiftUI. Every segment has a fixed
+/// width, so nothing gets re-measured: the native NSSegmentedControl re-measured itself right
+/// after the popup opened and briefly changed width.
+struct RangeSegments: View {
+    @Binding var selection: Double
+    @Environment(\.colorScheme) private var scheme
+    static let options: [(symbol: String?, label: String, value: Double, help: String)] = [
+        ("infinity", "", .infinity, "All history, on a logarithmic time axis"),
+        (nil, "24h", 24 * 3600, "The last 24 hours"),
+        (nil, "6h", 6 * 3600, "The last 6 hours"),
+        (nil, "1h", 3600, "The last hour"),
+    ]
+    let segment: CGFloat = 45, height: CGFloat = 22
+
+    var body: some View {
+        let opts = Self.options
+        let idx = opts.firstIndex { $0.value == selection } ?? 0
+        ZStack(alignment: .leading) {
+            RoundedRectangle(cornerRadius: 6, style: .continuous).fill(Color.primary.opacity(0.07))
+            // separators between neighbours that aren't next to the selected segment
+            ForEach(1..<opts.count, id: \.self) { i in
+                Rectangle().fill(Color.primary.opacity(i == idx || i == idx + 1 ? 0 : 0.15))
+                    .frame(width: 1, height: 12)
+                    .offset(x: CGFloat(i) * segment - 0.5)
+            }
+            RoundedRectangle(cornerRadius: 5, style: .continuous)
+                .fill(scheme == .dark ? Color.white.opacity(0.25) : Color.white)
+                .shadow(color: .black.opacity(0.2), radius: 0.5, y: 0.5)
+                .frame(width: segment - 4, height: height - 4)
+                .offset(x: CGFloat(idx) * segment + 2)
+                .animation(.easeOut(duration: 0.2), value: idx)
+            HStack(spacing: 0) {
+                ForEach(opts.indices, id: \.self) { i in
+                    Button { if opts[i].value != selection { selection = opts[i].value } } label: {
+                        SwiftUI.Group {
+                            if let sym = opts[i].symbol { Image(systemName: sym).font(.system(size: 12, weight: .semibold)) }
+                            else { Text(opts[i].label).font(.system(size: 12, weight: .medium)) }
+                        }
+                        .foregroundStyle(i == idx ? Color.primary : Color.primary.opacity(0.75))
+                        .frame(width: segment, height: height)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain).focusable(false)
+                    .help(opts[i].help)
+                }
+            }
+        }
+        .frame(width: segment * CGFloat(opts.count), height: height)
+        .focusEffectDisabled()
+    }
+}
+
 /// Where the dashboard's parts are, for the guided tour's spotlight and bubbles.
 struct TourAnchorKey: PreferenceKey {
     static var defaultValue: [String: Anchor<CGRect>] = [:]
@@ -2542,7 +3130,13 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
         if ai.hasPrefix("hoverlog:") { store.range = .infinity }
     }
     if ai.hasPrefix("blend:") { renderBlend = Double(ai.dropFirst(6)) }
+    if ai.hasPrefix("rhover:") {  // rhover:X:Y — the reservation strip's tooltip at (X, Y) in strip points
+        let v = ai.split(separator: ":").dropFirst().compactMap { Double($0) }
+        if v.count >= 2 { renderStripHover = CGPoint(x: v[0], y: v[1]) }
+    }
     if ai == "log" { store.range = .infinity }  // the ∞ range: all history on a log time axis
+    if ai == "6h" || ai.hasSuffix(":6h") { store.range = 6 * 3600 }    // e.g. `--ai 6h`, `--ai rhover:200:20:6h`
+    if ai == "1h" || ai.hasSuffix(":1h") { store.range = 3600 }
     if ai == "changelog" {
         store.upgradeButton = .upgrade
         let p = Process()

@@ -332,8 +332,12 @@ session B  → granted r8, tests start
   time, so they stay unique even if the ledger is reset. `oomph reservations --history`
   and MCP `reservation_history` read it.
 - **Visible everywhere:** `oomph check` turns *tight* when other sessions' reservations
-  exceed what's free, the menu-bar popup lists every reservation, and the logger records
-  them in each sample, so an incident report shows what was planned at the time.
+  exceed what's free, and the logger records them in each sample, so an incident report
+  shows what was planned at the time. In the menu-bar popup a block chart under the
+  memory chart shows every reservation over time — one block per reservation, its
+  height the GB reserved, stacked when they overlap, hatched while queued, aligned with
+  the memory chart in every range — and the **Reserved by agents** list below it shows
+  the active ones in the same colours.
 - **Advisory:** ***oomph*** still never stops or kills anything. Taking turns is
   something the sessions agree on through the skill.
 
