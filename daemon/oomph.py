@@ -20,8 +20,13 @@ for agents and scripts (work without the daemon too — they measure live):
 coordinating memory between sessions (a shared first-come-first-served ledger):
   oomph run --reserve 6G [--for "what"] [--wait 30m] -- <cmd…>   wait for a grant, run, release; records the peak
   oomph reserve <6G> --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]   exit 0 granted, 75 not (yet)
+  oomph amend <id> [--gb 3G] [--ttl 20m] [--for "what"] [--json]   change a reservation: shrinking applies at
+                                    once; growing a grant only if it fits now with nobody queued (else refused:
+                                    reserve the extra separately); --ttl counts from now; exit 0 ok, 75 refused
   oomph release <id | all>          give a reservation back (all = this session's)
   oomph reservations [--json]       who holds / waits for how much, and past peaks
+  oomph reservations --history [--last 24h] [--json]   past reservations (14 days are kept): spans, edits,
+                                    reserved vs peak, how each ended
   oomph hook                        Claude Code PostToolUse hook: silent when ok, warns when tight
   oomph mcp                         MCP server over stdio (memory_check, reserve_memory, release_memory, ...)
   oomph setup-claude [--hook] [--remove]   install the skill + register the MCP server for Claude Code
@@ -1395,7 +1400,10 @@ QUEUE_STALE_S = 180          # a queued request lapses if its owner hasn't polle
 DEFAULT_TTL_S = 30 * 60      # session-held grants expire unless released or extended
 MAX_TTL_S = 8 * 3600
 POLL_S = 2
-HISTORY_KEEP = 100
+HISTORY_KEEP = 100           # finished reservations kept in ledger.json (the log keeps 14 days)
+HISTORY_FILE = "reservations.jsonl"  # append-only: one record per edit and per finished reservation
+HISTORY_DAYS = 14
+HISTORY_PRUNE_S = 3600       # drop records older than HISTORY_DAYS at most this often
 _sample_override = None      # tests: a function returning the sample to decide on
 
 
@@ -1445,7 +1453,90 @@ def read_ledger():
             return L
     except Exception:
         pass
-    return {"seq": 0, "leases": [], "history": []}
+    # a fresh (or lost) ledger: continue the numbering of the history log, so ids don't repeat
+    return {"seq": _history_max_seq(), "leases": [], "history": []}
+
+
+# ----- the reservation history log (LEDGER_DIR/reservations.jsonl)
+# One JSON object per line, written under the ledger lock:
+#   {"event": "edit" | "end", "t": when written, "key": "r12@1795172655", "id": "r12", "purpose", "project",
+#    "holder": "session" | "process" | "run", "gb": current GB, "segments": [{"t", "gb"}, …] (only once edited),
+#    "requested", "granted", "peak_gb", and for "end": "ended", "outcome"; for "edit": "change", "expires"}
+# The last record per key wins. `key` stays unique across ledger resets: it carries the request time.
+def _history_path():
+    return os.path.join(LEDGER_DIR, HISTORY_FILE)
+
+
+def _key(r):
+    return r.get("key") or "%s@%d" % (r["id"], int(r.get("requested") or 0))
+
+
+def _history_max_seq():
+    best = 0
+    for rec in read_history():
+        m = re.fullmatch(r"r(\d+)", str(rec.get("id", "")))
+        if m:
+            best = max(best, int(m.group(1)))
+    return best
+
+
+def read_history(since=None):
+    """Records of the history log, oldest first (optionally only those that end after `since`)."""
+    out = []
+    try:
+        with open(_history_path()) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if since is None or (rec.get("ended") or rec.get("t") or 0) >= since:
+                    out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def _record(r, event, t, **extra):
+    h = r.get("holder")  # a live lease's holder, or a finished one's holder kind
+    rec = {"event": event, "t": round(t, 1), "key": _key(r), "id": r["id"], "purpose": r["purpose"],
+           "project": r.get("project"), "holder": h.get("kind") if isinstance(h, dict) else h,
+           "gb": r["gb"], "requested": r["requested"], "granted": r.get("granted"),
+           "peak_gb": round(r.get("peak_gb", 0) or 0, 2)}
+    if len(r.get("segments") or []) > 1:
+        rec["segments"] = r["segments"]
+    rec.update(extra)
+    return rec
+
+
+def _append_history(L, recs, now):
+    """Append records to the log (under the ledger lock). The first write seeds the log with the
+    ledger's own short history; now and then records older than HISTORY_DAYS are dropped."""
+    path = _history_path()
+    old = os.umask(0)
+    try:
+        fresh = not os.path.exists(path)
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+    finally:
+        os.umask(old)
+    with os.fdopen(fd, "a") as f:
+        if fresh:
+            for h in L["history"]:
+                if h.get("key") not in {x["key"] for x in recs}:
+                    f.write(json.dumps(dict(_record(h, "end", h["ended"]),
+                                            ended=h["ended"], outcome=h["outcome"], backfilled=True)) + "\n")
+        for rec in recs:
+            f.write(json.dumps(rec) + "\n")
+    if now - L.get("history_pruned", 0) > HISTORY_PRUNE_S:
+        L["history_pruned"] = round(now)
+        cutoff = now - HISTORY_DAYS * 86400
+        keep = read_history(cutoff)
+        if len(keep) < sum(1 for _ in open(path)):
+            tmp = "%s.%d.tmp" % (path, os.getpid())
+            with open(tmp, "w") as f:
+                f.writelines(json.dumps(rec) + "\n" for rec in keep)
+            os.chmod(tmp, 0o666)
+            os.replace(tmp, path)
 
 
 def _alive(procs, pid, start):
@@ -1481,13 +1572,28 @@ def _tree_gb(procs, children, root):
 
 
 def _retire(L, r, outcome, now):
-    L["history"].append({
-        "id": r["id"], "purpose": r["purpose"], "project": r.get("project"), "gb": r["gb"],
-        "peak_gb": round(r.get("peak_gb", 0), 2), "outcome": outcome,
-        "requested": r["requested"], "granted": r.get("granted"), "ended": round(now, 1),
-        "waited_s": round((r.get("granted") or now) - r["requested"]),
-        "held_s": round(now - r["granted"]) if r.get("granted") else 0})
+    """Move a lease into the history, ending it when it really ended: an expired grant at its
+    expiry, a lapsed request when its owner stopped polling, anything else now."""
+    end = now
+    if outcome == "expired" and r.get("expires"):
+        end = min(now, r["expires"])
+    elif outcome == "lapsed":
+        end = min(now, r["seen"] + QUEUE_STALE_S)
+    end = round(max(end, r.get("granted") or r["requested"]), 1)
+    h = {"id": r["id"], "key": _key(r), "purpose": r["purpose"], "project": r.get("project"), "gb": r["gb"],
+         "holder": (r.get("holder") or {}).get("kind"),
+         "peak_gb": round(r.get("peak_gb", 0), 2), "outcome": outcome,
+         "requested": r["requested"], "granted": r.get("granted"), "ended": end,
+         "waited_s": round((r.get("granted") or end) - r["requested"]),
+         "held_s": round(end - r["granted"]) if r.get("granted") else 0}
+    if len(r.get("segments") or []) > 1:
+        h["segments"] = r["segments"]
+    L["history"].append(h)
     L["history"] = L["history"][-HISTORY_KEEP:]
+    try:
+        _append_history(L, [_record(r, "end", now, ended=end, outcome=outcome)], now)
+    except OSError:
+        pass  # the log is a record, not the ledger: never let it block coordination
 
 
 def _evaluate(L, s, procs, now):
@@ -1594,7 +1700,7 @@ def _status(L, rid, now):
         pos = [x["id"] for x in queued].index(r["id"]) + 1
         out["position"] = pos
         out["ahead"] = [_brief(x, now) for x in L["leases"]
-                        if x["state"] == "granted" or (x["state"] == "queued" and x["requested"] < r["requested"])]
+                        if x["state"] == "granted" or (x["state"] == "queued" and x["id"] in [q["id"] for q in queued[:pos - 1]])]
         why = ("memory is critical" if st.get("level") == "critical" else
                "%d request(s) are ahead of you" % (pos - 1) if pos > 1 else
                "only %.1f GB is available for new reservations" % max(0.0, st.get("available_gb") or 0))
@@ -1632,7 +1738,9 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                  "project": holder.get("project"), "holder": {k: holder.get(k) for k in ("pid", "start", "kind")},
                  "watch": holder["pid"] if watch == "holder" else watch,
                  "ttl": None if ttl_s is None else min(max(60, ttl_s), MAX_TTL_S),
-                 "requested": round(now, 1), "seen": round(now, 1)}
+                 "requested": round(now, 1), "seen": round(now, 1),
+                 "segments": [{"t": round(now, 1), "gb": round(gb, 2)}]}
+            r["key"] = _key(r)
             L["leases"].append(r)
         else:
             r["seen"] = round(now, 1)
@@ -1669,6 +1777,76 @@ def release(rid, holder_pid=None, outcome="released"):
                 "next_granted": [r["id"] for r in L["leases"] if r["state"] == "granted" and r.get("granted") == round(now, 1)]}
 
 
+def amend(rid, gb=None, ttl_s=None, purpose=None):
+    """Change a reservation in place: its size, its time to live (from now) or its purpose.
+    Shrinking applies at once and hands the room to whoever waits. Growing a grant applies only
+    when the extra memory would be granted to a new request right now (it fits, and nobody is
+    queued); otherwise it is refused, with advice to reserve the extra separately, which queues
+    fairly. Growing a queued request moves it to the back of the queue. Every applied change is
+    written to the history log, and a new size starts a new segment of the reservation's span."""
+    s, procs, now = _decide_inputs()
+    with Ledger() as L:
+        _evaluate(L, s, procs, now)
+        r = next((x for x in L["leases"] if x["id"] == rid), None)
+        if r is None:
+            return _status(L, rid, now)
+        ram = s.get("ram_gb") or 0
+        change, refused = {}, None
+        if gb is not None and round(gb, 2) != r["gb"]:
+            gb = round(gb, 2)
+            if gb <= 0 or (ram and gb > 0.9 * ram):
+                refused = ("Can't reserve %.1f GB on a Mac with %.0f GB RAM. Release the reservation instead "
+                           "(release_memory / `oomph release %s`) if the work is done." % (gb, ram, rid))
+            elif gb > r["gb"] and r["state"] == "granted":
+                extra, st = gb - r["gb"], L["state"]
+                waiting = [x for x in L["leases"] if x["state"] == "queued"]
+                if waiting or extra > st["available_gb"] or st["level"] == "critical":
+                    why = ("%d request(s) are queued and come first" % len(waiting) if waiting else
+                           "memory is critical" if st["level"] == "critical" else
+                           "only %.1f GB is available" % max(0.0, st["available_gb"]))
+                    refused = ("Can't grow %s from %.1f to %.1f GB now: %s. Keep the %.1f GB grant and reserve the "
+                               "extra %.1f GB separately (reserve_memory gb=%.1f / `oomph reserve %.1fG --for \"…\"`): "
+                               "it queues fairly and is granted when it fits." % (
+                                   rid, r["gb"], gb, why, r["gb"], extra, extra, extra))
+            if refused is None:
+                change["gb"] = [r["gb"], gb]
+                if gb > r["gb"] and r["state"] == "queued":  # a bigger request takes a new place in line
+                    L["leases"].remove(r)
+                    L["leases"].append(r)
+                    change["requeued"] = True
+                r["gb"] = gb
+                r.setdefault("segments", [{"t": r.get("granted") or r["requested"], "gb": change["gb"][0]}])
+                if r["segments"][-1]["t"] >= round(now, 1):
+                    r["segments"][-1]["gb"] = gb
+                else:
+                    r["segments"].append({"t": round(now, 1), "gb": gb})
+        if refused is None and ttl_s:
+            ttl = min(max(60, ttl_s), MAX_TTL_S)
+            r["ttl"] = ttl
+            if r["state"] == "granted":
+                change["expires_in_min"] = [round((r["expires"] - now) / 60, 1) if r.get("expires") else None,
+                                            round(ttl / 60, 1)]
+                r["expires"] = round(now + ttl, 1)
+            else:
+                change["ttl_min"] = round(ttl / 60, 1)
+        if refused is None and purpose and purpose[:80] != r["purpose"]:
+            change["purpose"] = [r["purpose"], purpose[:80]]
+            r["purpose"] = purpose[:80]
+        r["seen"] = round(now, 1)
+        if change:
+            _evaluate(L, s, procs, now)  # a smaller grant may let the next request go
+            try:
+                _append_history(L, [_record(r, "edit", now, change=change, expires=r.get("expires"))], now)
+            except OSError:
+                pass
+        out = _status(L, rid, now)
+        if refused:
+            out.update(status="refused", id=rid, gb=r["gb"], requested_gb=gb, advice=refused, keeps=r["state"])
+        else:
+            out["changed"] = change
+        return out
+
+
 def set_watch(rid, pid):
     """Point a grant at the process tree that does the work (`oomph run`'s child)."""
     s, procs, now = _decide_inputs()
@@ -1697,6 +1875,84 @@ def coordination(mine=None, s=None):
             "history": [dict(h, project=os.path.basename(h.get("project") or "") or None)
                         for h in L["history"][-15:]][::-1],
         }
+
+
+def _span(rec, now):
+    """A history record or live lease as a span for agents: when, how big, how it ended."""
+    def iso(t):
+        return datetime.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds") if t else None
+    start = rec.get("granted") or rec["requested"]
+    end = rec.get("ended")
+    out = {"id": rec["id"], "key": _key(rec), "purpose": rec["purpose"],
+           "project": os.path.basename(rec.get("project") or "") or None, "holder": rec.get("holder"),
+           "gb": rec["gb"], "peak_gb": rec.get("peak_gb", 0), "requested": iso(rec["requested"]),
+           "granted": iso(rec.get("granted")), "ended": iso(end),
+           "outcome": rec.get("outcome") or ("active" if rec.get("granted") else "queued"),
+           "waited_min": round(((rec.get("granted") or end or now) - rec["requested"]) / 60, 1),
+           "held_min": round(((end or now) - start) / 60, 1) if rec.get("granted") else 0}
+    if len(rec.get("segments") or []) > 1:
+        out["gb_changes"] = [{"at": iso(x["t"]), "gb": x["gb"]} for x in rec["segments"]]
+    return out
+
+
+def reservation_history(since_s=24 * 3600, limit=50):
+    """Finished reservations from the history log (last `since_s` seconds) plus the live ones,
+    newest first: what each reserved, what it really used at its peak, and how it ended."""
+    now = time.time()
+    last = {}
+    for rec in read_history(now - since_s):
+        if rec.get("event") == "end" or last.get(rec["key"], {}).get("event") != "end":
+            last[rec["key"]] = rec
+    for h in read_ledger()["history"]:  # finished before the log existed
+        if h.get("ended", 0) >= now - since_s:
+            last.setdefault(_key(h), h)
+    L = read_ledger()
+    live = [dict(r, holder=r["holder"].get("kind")) for r in L["leases"]]
+    for r in live:
+        last.pop(_key(r), None)
+    done = [x for x in last.values() if x.get("ended")]
+    spans = [_span(r, now) for r in live] + sorted((_span(x, now) for x in done), key=lambda x: x["ended"], reverse=True)
+    return {"since": datetime.datetime.fromtimestamp(now - since_s).astimezone().isoformat(timespec="seconds"),
+            "active": len(live), "finished": len(done), "reservations": spans[:limit],
+            "log": _history_path()}
+
+
+def refresh_ledger(s, procs):
+    """The daemon's tick: retire leases whose holder died or that expired, close to when it
+    happened, and keep the usage figures current. Skips the lock when nothing is reserved."""
+    if not read_ledger()["leases"]:
+        return
+    with Ledger() as L:
+        _evaluate(L, s, procs, time.time())
+
+
+def refresh_ledger_unprivileged(s, procs, timeout=15):
+    """refresh_ledger for the root daemon. The ledger directory is world-writable (every
+    session and user shares it), so root must never write there: a planted symlink would
+    turn the temp file, its chmod 666 or the history append into a write to any file on the
+    system. As root this runs the refresh in a child process as `nobody`, which can write
+    the shared files (they are 0666 in a 0777 directory) and nothing else. Not root: direct."""
+    if os.geteuid() != 0:
+        return refresh_ledger(s, procs)
+    if not read_ledger()["leases"]:  # reading is harmless; skip the child when nothing is reserved
+        return
+    payload = json.dumps({"s": s, "procs": list(procs.values())}, default=str)
+    env = {"PATH": "/usr/bin:/bin", "OOMPH_LEDGER_DIR": LEDGER_DIR}
+    r = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"],
+                       input=payload, capture_output=True, text=True, timeout=timeout, cwd="/", env=env,
+                       user="nobody", group="nobody", extra_groups=[])
+    if r.returncode != 0:
+        raise RuntimeError("ledger refresh as nobody failed: %s" % (r.stderr.strip().splitlines() or ["?"])[-1])
+
+
+def _cmd_ledger_refresh():
+    """Internal: the unprivileged half of refresh_ledger_unprivileged (sample + procs on stdin)."""
+    if os.geteuid() == 0:
+        print("oomph: _ledger-refresh refuses to run as root", file=sys.stderr)
+        return 1
+    d = json.load(sys.stdin)
+    refresh_ledger(d["s"], {p["pid"]: p for p in d["procs"]})
+    return 0
 
 
 def ledger_snapshot(procs=None):
@@ -1787,7 +2043,45 @@ def cmd_release(args):
     return 0
 
 
+def cmd_amend(args):
+    rid = args[0] if args and not args[0].startswith("--") else None
+    if not rid or not any(o in args for o in ("--gb", "--ttl", "--for")):
+        print("usage: oomph amend <id> [--gb 3G] [--ttl 20m] [--for \"what\"] [--json]")
+        return 2
+    st = amend(rid, _parse_gb(_opt(args, "--gb")) if "--gb" in args else None,
+               parse_dur(_opt(args, "--ttl")) if "--ttl" in args else None, _opt(args, "--for"))
+    if "--json" in args:
+        print(json.dumps(st))
+    else:
+        ch = st.get("changed") or {}
+        what = ", ".join(("%.1fG → %.1fG" % tuple(v)) if k == "gb" else
+                         ("expires in %.0f min" % v[1]) if k == "expires_in_min" else
+                         ("ttl %.0f min" % v) if k == "ttl_min" else
+                         ("for \"%s\"" % v[1]) if k == "purpose" else "back of the queue"
+                         for k, v in ch.items())
+        print("oomph: %s %s%s — %s" % (st["status"].upper(), st.get("id", rid), " (%s)" % what if what else "",
+                                       st["advice"]))
+    return 75 if st["status"] in ("refused", "gone") else 0
+
+
+def cmd_reservation_history(args):
+    h = reservation_history(parse_dur(_opt(args, "--last", "24h")), limit=int(_opt(args, "--limit", "50")))
+    if "--json" in args:
+        print(json.dumps(h))
+        return 0
+    print("%d active, %d finished since %s  (log: %s)" % (h["active"], h["finished"], h["since"][:16], h["log"]))
+    for x in h["reservations"]:
+        when = (x["granted"] or x["requested"])[5:16].replace("T", " ")
+        end = (x["ended"] or "now")[11:16] if x["ended"] else "now"
+        gbs = " → ".join("%.1fG" % c["gb"] for c in x.get("gb_changes", [])) or "%.1fG" % x["gb"]
+        print("  %-6s %s–%-5s %-13s peak %4.1fG  %-26s %-14s %s" % (
+            x["id"], when, end, gbs, x["peak_gb"], x["purpose"][:26], (x["project"] or "")[:14], x["outcome"]))
+    return 0
+
+
 def cmd_reservations(args):
+    if "--history" in args:
+        return cmd_reservation_history(args)
     c = coordination(holder_for()["pid"])
     if "--json" in args:
         print(json.dumps(c))
@@ -1912,7 +2206,8 @@ MCP_TOOLS = [
                     "reserved, so heavy steps run side by side when there's room and one after another when there "
                     "isn't. Returns status granted (start now), queued (do NOT start yet; call again with ticket=id "
                     "within 180 s to keep your place, and see who is ahead) or refused. Calling again with the ticket "
-                    "of a granted reservation extends it. Release it with release_memory when the heavy part is over.",
+                    "of a granted reservation extends it. Change its size, ttl or purpose with update_reservation, "
+                    "and release it with release_memory when the heavy part is over.",
      "inputSchema": {"type": "object", "required": ["gb", "purpose"], "properties": {
          "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB"},
          "purpose": {"type": "string", "description": "short label, e.g. 'gradle assembleDebug' — reuse the same "
@@ -1926,11 +2221,33 @@ MCP_TOOLS = [
      "description": "Release a reservation (id) — or 'all' of this session's — as soon as the memory-heavy work has "
                     "finished, so queued sessions can go. Returns the peak memory the work actually added.",
      "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+    {"name": "update_reservation",
+     "description": "Change a reservation (granted or queued) in place: a new size in GB, a new time to live "
+                    "(counted from now: shorter or longer), or a new purpose. Shrink as soon as the heaviest part is "
+                    "over, so others can start. Shrinking applies at once. Growing a granted reservation applies only "
+                    "if the extra memory fits right now and nobody is queued; otherwise it is refused (status refused, "
+                    "nothing changes, your grant stays) and you should reserve the extra separately with "
+                    "reserve_memory, which queues fairly. Growing a queued request moves it to the back of the queue. "
+                    "To end a reservation use release_memory.",
+     "inputSchema": {"type": "object", "required": ["id"], "properties": {
+         "id": {"type": "string", "description": "the reservation's id, e.g. r12"},
+         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "new size in GB"},
+         "ttl_min": {"type": "integer", "minimum": 1, "maximum": 480, "description": "expire this many minutes from now"},
+         "purpose": {"type": "string", "description": "new short label"}}}},
     {"name": "reservations",
      "description": "All current reservations on this Mac (yours and other sessions': granted and queued, with "
                     "purpose, project and memory actually used), the memory available for new ones, and recent "
                     "finished reservations with the peak each really needed — use those peaks to estimate.",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "reservation_history",
+     "description": "Past reservations on this Mac (14 days are kept, also of sessions that are gone): each one's "
+                    "span (requested, granted, ended), GB reserved and its changes over time, the peak memory the "
+                    "work really added, and how it ended (released, expired, holder_gone, lapsed, cancelled). Use "
+                    "it to estimate what to reserve for work done before.",
+     "inputSchema": {"type": "object", "properties": {
+         "hours": {"type": "number", "minimum": 0.1, "maximum": 336, "default": 24},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+         "purpose": {"type": "string", "description": "only reservations whose purpose contains this text"}}}},
     {"name": "my_session",
      "description": "Memory used by the Claude Code session this server belongs to: its whole process tree, total, "
                     "and the biggest child processes (pid, name, MB). Use it to find what to stop when memory is tight.",
@@ -1966,8 +2283,18 @@ def _mcp_call(name, a):
     if name == "release_memory":
         rid = str(a.get("id", ""))
         return release(rid, holder_for()["pid"] if rid == "all" else None)
+    if name == "update_reservation":
+        return amend(str(a["id"]), float(a["gb"]) if a.get("gb") is not None else None,
+                     min(max(int(a["ttl_min"]), 1), 480) * 60 if a.get("ttl_min") else None,
+                     str(a["purpose"]) if a.get("purpose") else None)
     if name == "reservations":
         return coordination(holder_for()["pid"])
+    if name == "reservation_history":
+        h = reservation_history(min(max(float(a.get("hours", 24)), 0.1), 336) * 3600, 500)
+        if a.get("purpose"):
+            h["reservations"] = [x for x in h["reservations"] if str(a["purpose"]).lower() in x["purpose"].lower()]
+        h["reservations"] = h["reservations"][:int(a.get("limit", 50))]
+        return h
     if name == "my_session":
         return find_session() or {"error": "this MCP server is not running under a Claude Code session"}
     if name == "memory_status":
@@ -2018,10 +2345,12 @@ def cmd_mcp():
                           "capabilities": {"tools": {}},
                           "serverInfo": {"name": "oomph", "version": VERSION},
                           "instructions": "oomph reports this Mac's memory, swap and disk, and coordinates memory between "
-                                          "Claude sessions. Before memory-heavy work call reserve_memory with the "
-                                          "work's estimated peak; start only when granted, and release_memory when "
-                                          "done. Call memory_check periodically and back off when it says tight or "
-                                          "critical."}
+                                          "Claude sessions and other agents. Before memory-heavy work call "
+                                          "reserve_memory with the work's estimated peak (reservation_history shows "
+                                          "what similar work really needed); start only when granted. Shrink or "
+                                          "extend it with update_reservation as the work changes, and "
+                                          "release_memory when done. Call memory_check periodically and back off "
+                                          "when it says tight or critical."}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
@@ -2135,6 +2464,8 @@ def main(argv):
         return cmd_reserve(rest)
     if c == "release":
         return cmd_release(rest)
+    if c == "amend":
+        return cmd_amend(rest)
     if c == "reservations":
         return cmd_reservations(rest)
     if c == "run":
@@ -2153,6 +2484,8 @@ def main(argv):
         return cmd_hook(rest)
     if c == "mcp":
         return cmd_mcp()
+    if c == "_ledger-refresh":
+        return _cmd_ledger_refresh()
     if c == "setup-claude":
         return cmd_setup_claude(rest)
     if c == "report":

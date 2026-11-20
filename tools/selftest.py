@@ -173,7 +173,7 @@ resp = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
 check(resp.get(1, {}).get("result", {}).get("serverInfo", {}).get("name") == "oomph", "MCP initialize")
 names = [t["name"] for t in resp.get(2, {}).get("result", {}).get("tools", [])]
 check({"memory_check", "my_session", "wait_for_memory", "incidents", "incident", "memory_status",
-       "reserve_memory", "release_memory", "reservations"} <= set(names),
+       "reserve_memory", "release_memory", "reservations", "update_reservation", "reservation_history"} <= set(names),
       "MCP tools/list: %s" % ", ".join(names))
 txt = resp.get(3, {}).get("result", {}).get("content", [{}])[0].get("text", "{}")
 check(json.loads(txt).get("level") in oomph.LEVELS, "MCP tools/call memory_check")
@@ -215,13 +215,112 @@ rc = oomph.main(["run", "--reserve", "256M", "--for", "selftest run", "--", "/bi
 hist = oomph.read_ledger()["history"]
 check(rc == 3 and hist[-1]["purpose"] == "selftest run" and hist[-1]["outcome"] == "released",
       "oomph run: waits for a grant, passes the exit code through, releases")
+
+# --- editing reservations, and the persistent history log
+log_path = os.path.join(os.environ["OOMPH_LEDGER_DIR"], "reservations.jsonl")
+
+
+def log_recs():
+    return [json.loads(x) for x in open(log_path)] if os.path.exists(log_path) else []
+
+
+check([r["id"] for r in log_recs()] == [h["id"] for h in oomph.read_ledger()["history"]],
+      "history log: every finished reservation recorded (%d)" % len(log_recs()))
+os.rename(log_path, log_path + ".bak")
+oomph.release(oomph.reserve(0.1, "seed", me)["id"])
+check([r.get("backfilled", False) for r in log_recs()] == [True] * (len(log_recs()) - 1) + [False],
+      "history log: a new log is seeded with the ledger's own history")
+os.replace(log_path + ".bak", log_path)
+other_proc = subprocess.Popen(["/bin/sleep", "120"])
+other = {"pid": other_proc.pid, "start": None, "kind": "session", "project": "/tmp/other"}
+a = oomph.reserve(4, "amend A", me)
+b = oomph.reserve(6, "amend B", other)
+check(a["status"] == "granted" and b["status"] == "queued", "amend: 4G granted, 6G queued behind it")
+g = oomph.amend(a["id"], gb=5)
+lease = lambda rid: next((x for x in oomph.read_ledger()["leases"] if x["id"] == rid), {})  # noqa: E731
+check(g["status"] == "refused" and "separately" in g["advice"] and lease(a["id"])["gb"] == 4,
+      "amend: growing a grant while others are queued is refused, with advice; the grant stays")
+time.sleep(0.15)  # spans are kept to 0.1 s: changes within that merge
+sh = oomph.amend(a["id"], gb=1.5)
+check(sh["status"] == "granted" and sh["changed"]["gb"] == [4, 1.5], "amend: shrinking applies at once")
+check(oomph.reserve(6, "amend B", other, ticket=b["id"])["status"] == "granted",
+      "amend: the room a shrink frees goes to the queue")
+oomph.release(b["id"])
+time.sleep(0.15)
+gr = oomph.amend(a["id"], gb=3)
+check(gr["status"] == "granted" and gr["changed"]["gb"] == [1.5, 3], "amend: growing applies when it fits and nobody waits")
+t_before = time.time()
+tt = oomph.amend(a["id"], ttl_s=600, purpose="amend A, second phase")
+ex = lease(a["id"]).get("expires", 0)
+check(abs(ex - (t_before + 600)) < 5 and lease(a["id"])["purpose"] == "amend A, second phase",
+      "amend: new ttl counts from now (%.0f s left), new purpose" % (ex - time.time()))
+check(oomph.amend(a["id"], gb=40)["status"] == "refused", "amend: more than the Mac's RAM refused")
+check([x["gb"] for x in lease(a["id"])["segments"]] == [4, 1.5, 3], "amend: the size timeline keeps a segment per change")
+edits = [x for x in log_recs() if x["event"] == "edit" and x["id"] == a["id"]]
+check(len(edits) == 3 and edits[-1]["change"].get("purpose") and edits[-1]["change"].get("expires_in_min"), "history log: one edit record per applied change (%d)" % len(edits))
+t_rel = time.time()
+oomph.release(a["id"])
+end = [x for x in log_recs() if x["event"] == "end" and x["id"] == a["id"]]
+check(end and end[-1]["outcome"] == "released" and abs(end[-1]["ended"] - t_rel) < 3 and
+      [x["gb"] for x in end[-1].get("segments", [])] == [4, 1.5, 3] and end[-1]["holder"] == "process",
+      "history log: a release ends the span at the release time, with its size timeline")
+x = oomph.reserve(0.5, "will expire", me, ttl_s=60)
+with oomph.Ledger() as L:
+    for r in L["leases"]:
+        if r["id"] == x["id"]:
+            r["granted"], r["expires"] = round(time.time() - 200, 1), round(time.time() - 100, 1)
+            planned = r["expires"]
+oomph.coordination()
+end = [r for r in log_recs() if r["event"] == "end" and r["id"] == x["id"]]
+check(end and end[-1]["outcome"] == "expired" and end[-1]["ended"] == planned,
+      "history log: an expired grant ends at its expiry, not when it was noticed")
+y = oomph.reserve(0.5, "holder dies", other)
+other_proc.kill()
+other_proc.wait()
+# the root daemon hands the refresh to `oomph _ledger-refresh` running as nobody; same payload here
+payload = json.dumps({"s": dict(fake), "procs": list(oomphd.collect_procs().values())}, default=str)
+rr = subprocess.run([sys.executable, "-I", "-B", oomph.__file__, "_ledger-refresh"], input=payload,
+                    capture_output=True, text=True, env=dict(os.environ))
+check(rr.returncode == 0, "daemon tick: the unprivileged ledger refresh runs (%s)" % rr.stderr.strip()[-200:])
+end = [r for r in log_recs() if r["event"] == "end" and r["id"] == y["id"]]
+check(end and end[-1]["outcome"] == "holder_gone" and not oomph.read_ledger()["leases"],
+      "daemon tick: a dead holder's reservation is retired and logged")
+hist = oomph.reservation_history(3600)
+mine_a = next((h for h in hist["reservations"] if h["id"] == a["id"]), {})
+check(len(mine_a.get("gb_changes", [])) == 3 and mine_a["outcome"] == "released" and hist["finished"] >= 4,
+      "reservation_history: spans with their size changes (%d finished)" % hist["finished"])
+seen_ids = {r["id"] for r in log_recs()}
+os.remove(os.path.join(os.environ["OOMPH_LEDGER_DIR"], "ledger.json"))
+z = oomph.reserve(0.5, "after a reset", me)
+check(z["id"] not in seen_ids and lease(z["id"])["key"].startswith(z["id"] + "@"),
+      "ids stay unique after the ledger is deleted (%s, key %s)" % (z["id"], lease(z["id"]).get("key")))
+with open(log_path, "a") as f:
+    f.write(json.dumps({"event": "end", "t": time.time() - 20 * 86400, "ended": time.time() - 20 * 86400,
+                        "key": "r0@1", "id": "r0", "purpose": "ancient", "gb": 1, "requested": 1}) + "\n")
+with oomph.Ledger() as L:
+    L["history_pruned"] = 0
+oomph.release(z["id"])
+check(not any(r["id"] == "r0" for r in log_recs()) and any(r["id"] == z["id"] for r in log_recs()),
+      "history log: records older than 14 days are pruned")
+w = oomph.reserve(0.5, "cli amend", me)
+for args, want in ((["amend", w["id"], "--gb", "256M", "--ttl", "5m"], 0), (["amend", "r999999", "--gb", "1G"], 75),
+                   (["amend", w["id"]], 2), (["reservations", "--history", "--last", "1h"], 0)):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = oomph.main(args)
+    check(rc == want and buf.getvalue().strip(), "oomph %s → exit %d" % (" ".join(args), rc))
+oomph.release(w["id"])
 oomph._sample_override = None
 
 reqs = [reqs[0], reqs[1],
         {"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "reserve_memory",
                                                                        "arguments": {"gb": 0.1, "purpose": "mcp", "wait_s": 5}}},
         {"jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": {"name": "reservations", "arguments": {}}},
-        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "release_memory", "arguments": {"id": "all"}}}]
+        {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "release_memory", "arguments": {"id": "all"}}},
+        {"jsonrpc": "2.0", "id": 8, "method": "tools/call", "params": {"name": "update_reservation",
+                                                                       "arguments": {"id": "r999999", "gb": 1}}},
+        {"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "reservation_history",
+                                                                       "arguments": {"hours": 1, "purpose": "amend"}}}]
 out = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.join(ROOT, "daemon", "oomph.py"), "mcp"],
                      input="\n".join(json.dumps(r) for r in reqs) + "\n", capture_output=True, text=True,
                      env=dict(os.environ), timeout=60).stdout
@@ -232,6 +331,11 @@ res6 = json.loads(resp.get(6, {}).get("result", {}).get("content", [{}])[0].get(
 check("available_gb" in res6, "MCP reservations")
 res7 = json.loads(resp.get(7, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
 check(len(res7.get("released", [])) == 1, "MCP release_memory all")
+res8 = json.loads(resp.get(8, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
+check(res8.get("status") == "gone", "MCP update_reservation (unknown id: %s)" % res8.get("status"))
+res9 = json.loads(resp.get(9, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
+check(res9.get("reservations") and all("amend" in x["purpose"] for x in res9["reservations"]),
+      "MCP reservation_history, filtered by purpose (%d)" % len(res9.get("reservations") or []))
 
 # --- AI report harness against a local mock of the Claude, OpenAI and Ollama APIs
 import http.server  # noqa: E402

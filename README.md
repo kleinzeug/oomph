@@ -206,7 +206,7 @@ oomph html --open               # HTML report of the last 24 h (switch to 6 h / 
 ```
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
-`oomph run --reserve`, `oomph reserve` / `release` / `reservations`,
+`oomph run --reserve`, `oomph reserve` / `amend` / `release` / `reservations`,
 `oomph status --json`, `oomph hook` and `oomph mcp` — see
 [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
 
@@ -270,11 +270,13 @@ What a session gets:
 | `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations; exit code 0 / 1 / 2; `--json` |
 | `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
 | `oomph reserve 6G --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
+| `oomph amend r7 --gb 2G [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
 | `oomph reservations` | who holds or waits for how much (project, purpose, memory actually used), what's available, and the measured peaks of recent work |
+| `oomph reservations --history --last 3d` | every reservation of the last 14 days, also of sessions that are gone: span, size changes, reserved vs. peak, how it ended |
 | `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
 | `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
 | `oomph status --json` | the full latest sample |
-| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `release_memory`, `reservations`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` |
+| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` |
 | `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
@@ -312,9 +314,23 @@ session B  → granted r8, tests start
   reservation, so memory is never counted once as used and again as reserved. That
   growth is also how the real peak gets measured, and `oomph reservations` shows it next
   to what was reserved, so the next estimate is better.
+- **Edits:** a session changes its reservation as the work changes (`oomph amend`,
+  MCP `update_reservation`). **Shrinking** applies at once and hands the room to whoever
+  waits. **Growing** a grant applies only when the extra memory would be granted to a new
+  request right now — it fits, and nobody is queued; otherwise it is *refused*, nothing
+  changes, and the session reserves the extra separately, which queues fairly behind the
+  others. (Growing a queued request moves it to the back of the queue.) A new `--ttl`
+  counts from now, shorter or longer.
 - **Nothing gets stuck:** a reservation disappears when the process or session holding it
   exits, a session's grant expires after 30 minutes unless extended, and a queued request
-  lapses if its session stops asking for 3 minutes.
+  lapses if its session stops asking for 3 minutes. The logger checks the ledger every
+  sample, so a reservation of a session that died ends within half a minute.
+- **A history that outlives the agents:** every edit and every finished reservation is
+  appended to `/Users/Shared/oomph/reservations.jsonl` (14 days kept): its span from
+  request and grant to its *actual* end — the release, the expiry, the holder's exit —
+  its size over time, the peak it really used and how it ended. Ids carry the request
+  time, so they stay unique even if the ledger is reset. `oomph reservations --history`
+  and MCP `reservation_history` read it.
 - **Visible everywhere:** `oomph check` turns *tight* when other sessions' reservations
   exceed what's free, the menu-bar popup lists every reservation, and the logger records
   them in each sample, so an incident report shows what was planned at the time.
@@ -332,6 +348,7 @@ session B  → granted r8, tests start
 | `/usr/local/libexec/oomph/` | the installed daemon and CLI |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job |
 | `/Users/Shared/oomph/ledger.json` | the sessions' memory reservations and the last 100 finished ones (shared by all users; advisory) |
+| `/Users/Shared/oomph/reservations.jsonl` | every reservation edit and finished reservation, one JSON record per line; kept 14 days |
 
 All in, that is roughly 50–150 MB of logs. The daemon itself uses about 25 MB of
 memory and no measurable CPU.

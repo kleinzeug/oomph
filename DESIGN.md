@@ -79,8 +79,10 @@ Two practical lessons that shaped the implementation:
 │                                 │ flock, read/write        │
 │                                 ▼                          │
 │        /Users/Shared/oomph/ledger.json  (reservations)     │
+│        /Users/Shared/oomph/reservations.jsonl  (history)   │
 └───────────────────────────────────────────────────────────┘
-       (the daemon reads the ledger into each sample)
+       (the daemon retires dead/expired leases each sample and
+        copies the live ones into the sample)
 ```
 
 ## Decisions
@@ -200,6 +202,8 @@ reservation queue that the sessions use through the skill, the CLI and the MCP s
 | Waiting | Clients poll every 2 s (CLI) or within the MCP call (≤ 300 s); a queued response carries the position and who is ahead | Polling a locked file is simple and robust; no daemon, sockets or notifications to keep alive. The MCP cap keeps tool calls bounded; the ticket keeps the place across calls. |
 | Visibility | `oomph check` folds in others' reservations (tight when they exceed what's free); the daemon copies live reservations into every sample; the popup lists them | Uncoordinated checks still see planned work, and incidents show what was reserved at the time. |
 | Enforcement | None — advisory, like the rest of oomph | Killing or pausing an agent's work would be worse than the problem. The skill tells sessions never to start reserved-for work early and never to release others' entries. |
+| Edits | `oomph amend` / MCP `update_reservation`: gb, ttl (from now), purpose. Shrinking applies at once. Growing a grant applies only if a new request for the extra would be granted now (fits, nobody queued, not critical); otherwise refused with advice to reserve the extra separately, and nothing changes. Growing a queued request moves it to the back | Growth that skipped the queue would let a holder overtake everyone waiting; a pending-growth state would complicate every client. Refusal keeps the grant intact and the queue fair, and the advice is one tool call. |
+| History | Append-only `reservations.jsonl` next to the ledger (666), written under the ledger lock: an `edit` record per applied change, an `end` record when a lease is retired, each a full snapshot (key, purpose, project, holder kind, gb and `segments` [{t, gb}] once edited, requested, granted, ended, outcome, peak). Pruned to 14 days at most hourly; seeded once from the ledger's own last-100 history | Agents and the popup need spans of sessions that are long gone. Snapshots make the last record per key self-contained. The key is `id@requested`, and a fresh ledger continues the id numbering from the log, so ids never repeat after a reset. Ends are the real ones: an expiry at its expiry time, a lapse when polling stopped, a dead holder within one daemon sample. |
 
 ## AI analysis (1.4)
 

@@ -597,6 +597,10 @@ class Daemon:
         s["top"] = top
         s["groups"] = groups
         s["claude"] = sessions
+        try:  # retire reservations of sessions that died or expired, close to when it happened
+            oomph.refresh_ledger_unprivileged(s, procs)  # never as root: the ledger dir is world-writable
+        except Exception as e:
+            self.event("daemon_error", where="ledger", error=repr(e))
         leases = oomph.ledger_snapshot(procs)
         if leases:
             s["leases"] = leases  # memory sessions have reserved through oomph's ledger

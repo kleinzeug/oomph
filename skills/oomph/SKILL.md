@@ -25,8 +25,8 @@ So: **announce heavy work before starting it, and start only when oomph grants i
 
 Use the first one that works and remember it as `OOMPH` for the rest of the session:
 
-1. MCP tools named `memory_check`, `reserve_memory`, `release_memory`, `reservations`,
-   `my_session`, `wait_for_memory`, `incidents`, `incident`, `memory_status` (server
+1. MCP tools named `memory_check`, `reserve_memory`, `update_reservation`,
+   `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `incidents`, `incident`, `memory_status` (server
    `oomph`) — prefer these if present.
 2. `oomph` on the PATH (`command -v oomph`), normally `/usr/local/bin/oomph`.
 3. A checkout: `/usr/bin/python3 -I <checkout>/daemon/oomph.py`.
@@ -52,8 +52,10 @@ and use the checks in §4 until then.
 |---|---|
 | `OOMPH run --reserve 6G --for "what" [--wait 9m] -- <cmd…>` | Queue for 6 GB, run the command when granted, release when it exits, record its real peak. Exit code is the command's; **75** if it was never granted within `--wait` (then nothing ran). |
 | `OOMPH reserve 6G --for "what" [--wait 5m] [--ttl 30m] [--ticket rN]` | Reserve for multi-step work. Exit 0 = granted, 75 = still queued (prints the ticket and who is ahead) or refused. Re-run with `--ticket` to keep your place or to extend a grant. |
+| `OOMPH amend rN [--gb 3G] [--ttl 20m] [--for "what"]` | Change a reservation in place. Shrinking applies at once; growing a grant applies only if the extra fits now and nobody is queued, else it is **refused** (exit 75, nothing changes) — then reserve the extra separately. `--ttl` counts from now (shorter or longer). |
 | `OOMPH release <id \| all>` | Give it back (`all` = everything this session holds). |
 | `OOMPH reservations` | Who holds or waits for how much (with project and actual use), memory available for new reservations, and recent finished reservations with the **peak each really needed**. |
+| `OOMPH reservations --history [--last 24h]` | Past reservations of every session, also ones that are gone (14 days kept): spans, size changes, reserved vs. peak, how each ended. |
 | `OOMPH check` | One-line verdict **ok / tight / critical**, reasons, advice, and other sessions' reservations. Exit code 0 / 1 / 2. `--json` for structured output. |
 | `OOMPH session` | This Claude session's memory: its whole process tree, total, biggest children (pid, name, MB). |
 | `OOMPH wait --timeout 10m [--free 4G]` | Blocks until memory is ok again. Exit 1 on timeout. |
@@ -61,7 +63,9 @@ and use the checks in §4 until then.
 | `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger) and their summaries; `--html` opens the report. |
 
 The MCP tools map one-to-one: `reserve_memory` (gb, purpose, wait_s ≤ 300, ttl_min,
-ticket), `release_memory` (id or "all"), `reservations`, `memory_check`, `my_session`,
+ticket), `update_reservation` (id, gb?, ttl_min?, purpose?), `release_memory` (id or
+"all"), `reservations`, `reservation_history` (hours ≤ 336, limit, purpose filter),
+`memory_check`, `my_session`,
 `wait_for_memory` (timeout ≤ 300 s), `memory_status`, `incidents`, `incident`.
 `oomph run` has no MCP twin: run it through your shell.
 
@@ -74,7 +78,9 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
 
 **1. Estimate the peak** extra memory the step adds (not the average):
 - First look at `OOMPH reservations` / `reservations`: the "recent" list shows the peak
-  that earlier runs with the same purpose label actually added. Use it, plus ~25%.
+  that earlier runs with the same purpose label actually added. Use it, plus ~25%. For
+  older runs, `reservation_history` with `purpose` set (or `OOMPH reservations --history
+  --last 7d`) goes back 14 days.
 - Otherwise rough guides: Gradle/Android build 4–8 GB · Xcode build 3–6 GB · cargo /
   C++ `-jN` ≈ 0.5–1 GB per job · Jest/Vitest/pytest-xdist ≈ 0.5–1 GB per worker ·
   headless Chrome 0.3–1 GB per instance · a container: its memory limit, or 1–2 GB ·
@@ -92,7 +98,21 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
   sub-agents): `reserve_memory` (or `OOMPH reserve`), start only once `status` is
   `granted`, and `release_memory` with its `id` as soon as the heavy part is over — not
   at the end of the session. A grant expires after `ttl_min` (default 30); if the work
-  will take longer, call `reserve_memory` again with `ticket` set to extend it.
+  will take longer, call `reserve_memory` again with `ticket` set to extend it, or
+  `update_reservation` with a new `ttl_min`.
+
+**Keep the reservation honest while the work runs** (`update_reservation` /
+`OOMPH amend`); every change is recorded, and the menu-bar app draws it:
+- The heavy part is over but you still need some memory (the build finished, the dev
+  server keeps running): **shrink** it to what is left, e.g. `gb: 1`. It applies at once
+  and lets the next session start.
+- The work turns out bigger: **grow** it. If the extra fits now and nobody is waiting it
+  is granted at once; otherwise the answer is `refused`, your grant stays as it was, and
+  you reserve the extra separately with `reserve_memory` — it queues fairly behind the
+  others. Don't start the bigger work before that grant.
+- Done earlier, or later, than planned: set `ttl_min` (from now). A new `purpose` is fine
+  when the work changes.
+- Finished: `release_memory`. Don't shrink to zero instead.
 
 **3. When you are queued:**
 - Don't start the work, and don't "just start it anyway" because memory looks free —
