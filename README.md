@@ -55,7 +55,12 @@ Click it for the popup:
 - the list of incidents — click one to open its report; right-click to copy its path
   or reveal it in Finder;
 - **Activate / Deactivate**, **Report** (HTML report for the selected range),
-  **Launch at login**, and Quit.
+  **Launch at login**, and Quit. Each button explains itself in a tooltip.
+
+New to it? Hover the chip in the popup's top-left corner: it turns into a **?**. Click it
+for a four-step tour. It lights up one part of the dashboard at a time, with notes on what
+each control does. Move through it with the bar under the header or with ← / →, and close
+it with Esc.
 
 ## What gets recorded
 

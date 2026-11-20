@@ -1305,6 +1305,8 @@ struct PopoverView: View {
     @State private var copied = false
     @State var showAI = false
     @State var showTopApps = false
+    @State var tourStep: Int? = nil  // the guided tour (the chip turns into a ? on hover)
+    @State private var chipHover = false
     @State private var draftProvider: AIProvider = .claude
     @State private var draftToken = ""
     @State private var draftModel = ""
@@ -1318,14 +1320,15 @@ struct PopoverView: View {
                 .padding(.horizontal, 14).padding(.vertical, 11)
                 .frame(maxWidth: .infinity)
                 .background(Color.primary.opacity(0.045))
+                .tourAnchor("header")
             Divider()
             VStack(alignment: .leading, spacing: 10) {
-                if let c = store.current, store.daemonRunning { stats(c) }
-                if let ls = store.current?.leases, !ls.isEmpty, store.daemonRunning { leases(ls) }
-                chart.zIndex(1)
-                incidentsList
+                if let c = store.current, store.daemonRunning { stats(c).tourAnchor("stats") }
+                if let ls = store.current?.leases, !ls.isEmpty, store.daemonRunning { leases(ls).tourAnchor("leases") }
+                chart.tourAnchor("chart").zIndex(1)
+                incidentsList.tourAnchor("incidents")
                 Divider()
-                footer
+                footer.tourAnchor("footer")
             }
             .padding(14)
         }
@@ -1364,13 +1367,21 @@ struct PopoverView: View {
                 }
             }
         }
+        .overlayPreferenceValue(TourAnchorKey.self) { anchors in
+            GeometryReader { geo in
+                if let step = tourStep {
+                    tourLayer(step: step, rects: anchors.mapValues { geo[$0] }, size: geo.size)
+                        .transition(.opacity)
+                }
+            }
+        }
         .overlay { if store.showChangelog { changelogSheet.transition(.opacity) } }
         .overlay(alignment: .bottom) {
             if store.building || store.buildError != nil { buildDrawer.transition(.move(edge: .bottom)) }
         }
         .animation(.easeOut(duration: 0.2), value: store.showChangelog)
         .animation(.easeOut(duration: 0.25), value: store.building)
-        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false } }
+        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false; tourStep = nil } }
         .onChange(of: store.alertText) { _, e in
             if let e { error = e; store.alertText = nil }
         }
@@ -1387,11 +1398,20 @@ struct PopoverView: View {
         let p = live ? (Pressure(rawValue: store.current!.pressure) ?? .unknown) : .unknown
         let tint: Color = live ? p.color : .secondary
         return HStack(alignment: .center, spacing: 10) {
-            Image(systemName: "memorychip")
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(tint)
-                .frame(width: 32, height: 32)
-                .background(tint.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            // hover: the chip turns into a ?, a click starts the guided tour
+            Button { startTour() } label: {
+                Image(systemName: chipHover ? "questionmark" : "memorychip")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(chipHover ? Color.accentColor : tint)
+                    .frame(width: 32, height: 32)
+                    .background((chipHover ? Color.accentColor : tint).opacity(0.16),
+                                in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain).focusable(false)
+            .onHover { h in withAnimation(.easeOut(duration: 0.12)) { chipHover = h } }
+            .help("Take a quick tour of the dashboard")
+            .tourAnchor("chip")
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     (Text("oomph").fontWeight(.bold) + Text(": memory monitor").fontWeight(.medium))
@@ -1490,6 +1510,7 @@ struct PopoverView: View {
         .buttonStyle(.plain)
         .focusable(false)
         .focusEffectDisabled()
+        .tourAnchor("topapp")
         .help(g.map { "Top app: \($0.name) — \(String(format: "%.1f GB", Double($0.mb) / 1024))\($0.n.map { " in \($0) processes" } ?? "") · click for the top apps" } ?? "")
         .anchorPreference(key: TopAppAnchorKey.self, value: .bounds) { $0 }
     }
@@ -1563,7 +1584,12 @@ struct PopoverView: View {
                 })) {
                     Image(systemName: "infinity").tag(Double.infinity)
                     Text("24h").tag(24 * 3600.0); Text("6h").tag(6 * 3600.0); Text("1h").tag(3600.0)
-                }.pickerStyle(.segmented).frame(width: 180).labelsHidden()
+                }.pickerStyle(.segmented).labelsHidden()
+                // pinned geometry: always its own height (never stretched or squeezed while the panel
+                // re-fits its content) and never animated (only the chart morphs, not the control)
+                .fixedSize(horizontal: false, vertical: true).frame(width: 180)
+                .transaction { $0.animation = nil }
+                .tourAnchor("picker")
                 .focusable(false).focusEffectDisabled()
                 if store.needsUpdate {  // the logger is a different version than the one this app ships
                     if store.busy {
@@ -1599,6 +1625,7 @@ struct PopoverView: View {
             }
             .frame(maxWidth: .infinity)
             .frame(height: 160)
+            .tourAnchor("plot")
             .zIndex(1)  // the hover tooltip may reach over the caption below
             Text("Grey bands = away (idle, locked or display off) · hatched = no data · red lines = incidents")
                 .font(.system(size: 9)).foregroundStyle(.secondary)
@@ -1647,6 +1674,194 @@ struct PopoverView: View {
         }
         .padding(.vertical, 3).padding(.horizontal, 4)
         .contentShape(Rectangle())
+    }
+
+    // MARK: Guided tour (click the chip's ? in the header)
+
+    static let tourSteps = ["Right now", "History", "Incidents", "Actions"]
+
+    func startTour() {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        chipHover = false
+        withAnimation(.easeOut(duration: 0.2)) { showAI = false; showTopApps = false; tourStep = 0 }
+    }
+
+    func goTour(_ step: Int?) {
+        withAnimation(.easeInOut(duration: 0.35)) { tourStep = step }
+    }
+
+    /// One explanation bubble: its text, where it sits, and the point its stem reaches.
+    struct TourNote {
+        var title: String, text: String
+        var left: CGFloat, width: CGFloat
+        var above: Bool           // the bubble sits above its targets (stems downwards) or below them
+        var xs: [CGFloat]         // one stem per target; the dots sit on line y
+        var y: CGFloat
+        var reach: CGFloat = 12   // stem length between bubble and dots
+    }
+
+    /// The step's zone (lit up, everything else dimmed) and its bubbles, laid out from the
+    /// measured positions of the dashboard's parts.
+    func tourPlan(_ step: Int, _ r: [String: CGRect], _ size: CGSize) -> (zone: CGRect, notes: [TourNote]) {
+        let W = size.width, m: CGFloat = 12
+        func union(_ ids: [String]) -> CGRect {
+            ids.compactMap { r[$0] }.reduce(CGRect.null) { $0.union($1) }
+        }
+        switch step {
+        case 0:
+            let zone = union(["header", "stats", "leases"])
+            let chip = r["chip"] ?? .zero, top = r["topapp"] ?? CGRect(x: W - 120, y: zone.maxY - 30, width: 100, height: 30)
+            let half = (W - 2 * m - 8) / 2
+            return (zone, [
+                TourNote(title: "Memory pressure",
+                         text: "The chip's colour is macOS memory pressure, and the badge on the right names it. The figure in the menu bar is free memory. Hover the chip to come back to this tour.",
+                         left: m, width: half, above: false,
+                         xs: [chip.midX], y: chip.maxY + 3, reach: zone.maxY - chip.maxY + 10),
+                TourNote(title: "Live readings",
+                         text: "Updated every 30 seconds: the same figures as Activity Monitor. Click the biggest app for the twelve largest.",
+                         left: m + half + 8, width: half, above: false,
+                         xs: [top.midX], y: top.maxY + 3, reach: zone.maxY - top.maxY + 10),
+            ])
+        case 1:
+            let zone = union(["chart"])
+            let picker = r["picker"] ?? .zero, plot = r["plot"] ?? zone
+            let half = (W - 2 * m - 8) / 2
+            return (zone, [
+                TourNote(title: "Time range",
+                         text: "∞ shows all history on a logarithmic time axis: the last hours wide, older days and weeks squeezed. 24h, 6h and 1h are linear. A blue ↻ beside it means the logger needs an update.",
+                         left: m, width: half, above: true,
+                         xs: [picker.minX + 30], y: picker.minY - 3),
+                // below the chart: above it, the right half belongs to the tour's bar
+                TourNote(title: "Memory over time",
+                         text: "Hover to read the values and events under the cursor; try it now. Grey bands: away (idle, locked or display off). Hatched: no data. Red lines: incidents.",
+                         left: W * 0.36, width: W * 0.64 - m, above: false,
+                         xs: [plot.midX + 70], y: zone.maxY + 7, reach: 10),
+            ])
+        case 2:
+            let zone = union(["incidents"])
+            return (zone, [
+                TourNote(title: "Incidents",
+                         text: "Each stretch of high memory pressure, with the apps macOS killed to free memory. Red: still open. Orange: new since you last looked. Click one for its report; right-click to copy its path or show it in Finder.",
+                         left: m, width: W * 0.62, above: true,
+                         xs: [zone.minX + 40], y: zone.minY - 7),
+            ])
+        default:
+            let zone = union(["footer"])
+            let acts = r["actions"] ?? .zero, rep = r["report"] ?? .zero, login = r["login"] ?? .zero
+            return (zone, [
+                TourNote(title: "Actions",
+                         text: """
+                         **Deactivate** stops the background logger, **Activate** starts it; both ask for your password. **Check** asks GitHub for a newer oomph, and **Upgrade** builds and installs it.
+                         **Report** opens an HTML report of the last 24 hours; **✦** adds an AI analysis to it. The **link** copies the oomph skill, so Claude sessions can check memory before heavy work.
+                         **Launch at login** and **Quit** concern only this menu-bar app: the logger keeps recording.
+                         """,
+                         left: m, width: W - 2 * m, above: true,
+                         xs: [acts.minX + 30, rep.midX, login.midX], y: zone.minY - 7, reach: 14),
+            ])
+        }
+    }
+
+    func tourLayer(step: Int, rects: [String: CGRect], size: CGSize) -> some View {
+        let plan = tourPlan(step, rects, size)
+        let hole = plan.zone.isNull ? CGRect(x: size.width / 2, y: size.height / 2, width: 0, height: 0)
+                                    : plan.zone.insetBy(dx: -4, dy: -4)
+        let spot = TourSpotlight(hole: hole)
+        let header = rects["header"] ?? CGRect(x: 0, y: 0, width: size.width, height: 54)
+        return ZStack(alignment: .topLeading) {
+            // the dim catches clicks; the lit zone stays live (hover the chart, click an incident)
+            spot.fill(Color.black.opacity(0.42), style: FillStyle(eoFill: true))
+                .contentShape(spot, eoFill: true)
+                .onTapGesture {}
+            TourSpotlight(hole: hole, frameOnly: true).stroke(Color.white.opacity(0.55), lineWidth: 1)
+                .allowsHitTesting(false)
+            ZStack(alignment: .topLeading) {
+                ForEach(Array(plan.notes.enumerated()), id: \.offset) { _, n in tourBubble(n, size: size) }
+            }
+            .id(step)
+            .transition(.opacity)
+            tourBar(step)
+                .padding(.top, header.maxY - 13)
+                .padding(.trailing, 12)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        }
+        .frame(width: size.width, height: size.height)
+    }
+
+    func tourBubble(_ n: TourNote, size: CGSize) -> some View {
+        let stem = VStack(spacing: 0) {
+            if !n.above { Circle().fill(Color.white).frame(width: 6, height: 6) }
+            Rectangle().fill(Color.white.opacity(0.85)).frame(width: 1.5, height: n.reach)
+            if n.above { Circle().fill(Color.white).frame(width: 6, height: 6) }
+        }
+        .frame(width: 6)
+        .shadow(color: .black.opacity(0.4), radius: 1.5)
+        let stems = ZStack(alignment: .topLeading) {
+            ForEach(Array(n.xs.enumerated()), id: \.offset) { _, x in
+                stem.offset(x: min(max(x - n.left, 14), n.width - 14) - 3)
+            }
+        }
+        .frame(width: n.width, height: n.reach + 6, alignment: .topLeading)
+        let paragraphs = n.text.split(separator: "\n").map {
+            (try? AttributedString(markdown: String($0))) ?? AttributedString(String($0))
+        }
+        let bubble = VStack(alignment: .leading, spacing: 4) {
+            Text(n.title).font(.system(size: 12, weight: .semibold))
+            ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, t in
+                Text(t).font(.system(size: 11)).foregroundStyle(.secondary).lineSpacing(1.5)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(width: n.width, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.25), radius: 10, y: 3)
+        return VStack(alignment: .leading, spacing: 0) {
+            if n.above { bubble; stems } else { stems; bubble }
+        }
+        .padding(.leading, n.left)
+        // the dots sit on line y: measured from the bottom when the bubble is above, from the top when below
+        .padding(n.above ? .bottom : .top, n.above ? size.height - n.y - 3 : n.y - 3)
+        .frame(width: size.width, height: size.height, alignment: n.above ? .bottomLeading : .topLeading)
+    }
+
+    func tourBar(_ step: Int) -> some View {
+        let last = Self.tourSteps.count - 1
+        return HStack(spacing: 2) {
+            Button { goTour(step - 1) } label: {
+                Image(systemName: "chevron.left").frame(width: 24, height: 22).contentShape(Rectangle())
+            }
+            .disabled(step == 0).keyboardShortcut(.leftArrow, modifiers: []).help("Previous")
+            VStack(spacing: 0) {
+                Text(Self.tourSteps[step]).font(.system(size: 11, weight: .semibold))
+                Text("\(step + 1) of \(last + 1)").font(.system(size: 9)).foregroundStyle(.secondary).monospacedDigit()
+            }
+            .frame(width: 70)
+            if step < last {
+                Button { goTour(step + 1) } label: {
+                    Image(systemName: "chevron.right").frame(width: 24, height: 22).contentShape(Rectangle())
+                }
+                .keyboardShortcut(.rightArrow, modifiers: []).help("Next")
+            } else {
+                Button { goTour(nil) } label: {
+                    Text("Done").font(.system(size: 11, weight: .semibold)).foregroundStyle(Color.accentColor)
+                        .frame(width: 40, height: 22).contentShape(Rectangle())
+                }
+                .keyboardShortcut(.defaultAction).help("End the tour")
+            }
+            Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 16).padding(.horizontal, 2)
+            Button { goTour(nil) } label: {
+                Image(systemName: "xmark").frame(width: 22, height: 22).contentShape(Rectangle())
+            }
+            .help("Close the tour (Esc)")
+        }
+        .font(.system(size: 11, weight: .semibold))
+        .buttonStyle(.plain).focusable(false).focusEffectDisabled()
+        .padding(.horizontal, 6).padding(.vertical, 2)
+        .background(.regularMaterial, in: Capsule())
+        .overlay(Capsule().stroke(Color.primary.opacity(0.15), lineWidth: 0.5))
+        .shadow(color: .black.opacity(0.3), radius: 8, y: 2)
+        .transaction { $0.animation = nil }  // the bar stays put while the spotlight moves
     }
 
     // MARK: Upgrade button, changelog dialog, build drawer
@@ -2019,23 +2234,30 @@ struct PopoverView: View {
 
     var footer: some View {
         HStack {
-            if store.installed {
-                Button("Deactivate") {
-                    store.runPrivileged("uninstall.sh") { error = $0 }
-                }.disabled(store.busy)
-            } else {
-                Button("Activate") {
-                    store.runPrivileged("install.sh") { error = $0 }
-                }.buttonStyle(.borderedProminent).disabled(store.busy)
-            }
-            upgradeButtonView
-            reportPair
+            HStack {
+                if store.installed {
+                    Button("Deactivate") {
+                        store.runPrivileged("uninstall.sh") { error = $0 }
+                    }.disabled(store.busy)
+                    .help("Stop and remove the background logger (asks for your password). The logs are kept.")
+                } else {
+                    Button("Activate") {
+                        store.runPrivileged("install.sh") { error = $0 }
+                    }.buttonStyle(.borderedProminent).disabled(store.busy)
+                    .help("Install and start the background logger that records memory every 30 s (asks for your password)")
+                }
+                upgradeButtonView
+            }.tourAnchor("actions")
+            reportPair.tourAnchor("report")
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
                 .toggleStyle(.checkbox).font(.caption).lineLimit(1).fixedSize()
+                .help("Open oomph in the menu bar when you log in. The logger records either way.")
+                .tourAnchor("login")
             Button {
                 NSApp.terminate(nil)
-            } label: { Image(systemName: "power") }.help("Quit oomph")
+            } label: { Image(systemName: "power") }
+            .help("Quit oomph. The background logger keeps recording.")
         }
         .controlSize(.small)
     }
@@ -2044,6 +2266,37 @@ struct PopoverView: View {
 struct TopAppAnchorKey: PreferenceKey {
     static var defaultValue: Anchor<CGRect>? = nil
     static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
+}
+
+/// Where the dashboard's parts are, for the guided tour's spotlight and bubbles.
+struct TourAnchorKey: PreferenceKey {
+    static var defaultValue: [String: Anchor<CGRect>] = [:]
+    static func reduce(value: inout [String: Anchor<CGRect>], nextValue: () -> [String: Anchor<CGRect>]) {
+        value.merge(nextValue()) { a, _ in a }
+    }
+}
+
+extension View {
+    func tourAnchor(_ id: String) -> some View {
+        // transform, not set: a part inside another part (the chip in the header) keeps its own entry
+        transformAnchorPreference(key: TourAnchorKey.self, value: .bounds) { $0[id] = $1 }
+    }
+}
+
+/// The tour's dim: the whole panel minus a rounded hole, which glides from zone to zone.
+struct TourSpotlight: Shape {
+    var hole: CGRect
+    var frameOnly = false
+    var animatableData: AnimatablePair<AnimatablePair<CGFloat, CGFloat>, AnimatablePair<CGFloat, CGFloat>> {
+        get { .init(.init(hole.minX, hole.minY), .init(hole.width, hole.height)) }
+        set { hole = CGRect(x: newValue.first.first, y: newValue.first.second, width: newValue.second.first, height: newValue.second.second) }
+    }
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        if !frameOnly { p.addRect(r.insetBy(dx: -2, dy: -2)) }
+        p.addRoundedRect(in: hole, cornerSize: CGSize(width: 8, height: 8), style: .continuous)
+        return p
+    }
 }
 
 struct StarAnchorKey: PreferenceKey {
@@ -2305,7 +2558,9 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
         store.building = true; store.buildVersion = "1.5.0"; store.buildProgress = "Compiling oomph 1.5.0"
         store.buildLines = ["==> Compiling oomph 1.5.0", "app/oomph.swift:42: note: building for macOS 14"]
     }
-    let view = PopoverView(store: store, showAI: ai == "callout", showTopApps: ai == "top")
+    // `--ai tour:N` draws step N of the guided tour (1-based)
+    let tour = ai.hasPrefix("tour:") ? Int(ai.dropFirst(5)).map { $0 - 1 } : nil
+    let view = PopoverView(store: store, showAI: ai == "callout", showTopApps: ai == "top", tourStep: tour)
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.colorScheme, dark ? .dark : .light)
     let r = ImageRenderer(content: view)
