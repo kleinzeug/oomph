@@ -359,7 +359,17 @@ class Mock(http.server.BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_GET(self):
-        self.reply({"models": [{"name": "mock-model"}]})
+        seen.append((self.path, dict(self.headers), None))
+        if self.headers.get("x-api-key") == "sk-bad" or self.headers.get("authorization") == "Bearer sk-bad":
+            b = json.dumps({"error": {"type": "authentication_error", "message": "invalid x-api-key"}}).encode()
+            self.send_response(401)
+            self.send_header("content-length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        elif "/models/" in self.path:
+            self.reply({"id": self.path.rsplit("/", 1)[1], "type": "model"})
+        else:
+            self.reply({"models": [{"name": "mock-model"}]})
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["content-length"])))
@@ -393,9 +403,21 @@ for pk, url in (("claude", base), ("openai", base + "/v1"), ("ollama", base)):
         rc = oomph_ai.cmd_ai_report(["--provider", pk, "--base-url", url, "--last", "1h", "-o", out])
     lines = [json.loads(x) for x in buf.getvalue().splitlines() if x.startswith("{")]
     page = open(out).read() if os.path.exists(out) else ""
-    check(rc == 0 and lines[-1].get("done") and "AI analysis" in page and "<table>" in page and len(seen) == 2,
+    check(rc == 0 and lines[-1].get("done") and "AI analysis" in page and "<table>" in page and sum(b is not None for _, _, b in seen) == 2,
           "AI report via mock %s: %d requests, %d progress lines, tool %s" % (
               pk, len(seen), sum("progress" in x for x in lines), lines[-1].get("tool_calls") if lines else "?"))
+for pk, url, tok, model, want in (("claude", base, "sk-test", "claude-opus-5-5", 0), ("claude", base, "sk-bad", None, 3),
+                                   ("openai", base + "/v1", "sk-test", None, 0), ("ollama", base, "", "mock-model", 0),
+                                   ("ollama", base, "", "nope", 3)):
+    seen.clear()
+    os.environ["OOMPH_AI_TOKEN"] = tok
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = oomph_ai.cmd_ai_check(["--provider", pk, "--base-url", url] + (["--model", model] if model else []))
+    last = json.loads(buf.getvalue().splitlines()[-1])
+    check(rc == want and (last.get("ok") if want == 0 else last.get("error")) and len(seen) == 1,
+          "ai-check %s %s: %s" % (pk, "accepts" if want == 0 else "rejects", last.get("model") or last.get("error")))
+os.environ["OOMPH_AI_TOKEN"] = "sk-test"
 claude_req = None
 seen.clear()
 with redirect_stdout(io.StringIO()):

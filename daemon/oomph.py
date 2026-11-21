@@ -10,6 +10,8 @@
   oomph ai-report [--provider claude|openai|ollama] [--model M] [--base-url URL] [--last 24h] [--open]
                                      a model investigates the logs and writes an analysis on top of the
                                      report (token in OOMPH_AI_TOKEN / ANTHROPIC_API_KEY / OPENAI_API_KEY)
+  oomph ai-check --provider P [--model M] [--base-url URL]   does the provider accept the token
+                                     (OOMPH_AI_TOKEN) and know the model? one cheap request, no tokens
 
 for agents and scripts (work without the daemon too — they measure live):
   oomph check [--json]              verdict ok / tight / critical + advice; exit 0 / 1 / 2
@@ -2475,6 +2477,11 @@ def main(argv):
             sys.path.insert(0, HERE)
         import oomph_upgrade
         return oomph_upgrade.cmd_upgrade(rest)
+    if c == "ai-check":
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import oomph_ai
+        return oomph_ai.cmd_ai_check(rest)
     if c == "ai-report":
         if HERE not in sys.path:
             sys.path.insert(0, HERE)

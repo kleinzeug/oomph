@@ -331,6 +331,8 @@ final class Store: ObservableObject {
         didSet { UserDefaults.standard.set(aiProvider.rawValue, forKey: "aiProvider") }
     }
     @Published var aiRunning = false
+    @Published var aiConnecting = false     // `oomph ai-check` confirming a new connection
+    @Published var aiConnectError: String?
     @Published var aiProgress = ""
     @Published var aiError: String?
     private var aiProcess: Process?
@@ -874,6 +876,59 @@ final class Store: ObservableObject {
     }
     func hasToken(_ p: AIProvider) -> Bool { (Keychain.get(p.rawValue) ?? "").isEmpty == false }
     func aiConfigured(_ p: AIProvider) -> Bool { !p.needsToken || hasToken(p) }
+    /// Reports include an AI analysis from this provider (the render aid has no keychain).
+    var aiConnected: Bool { aiOn && (renderMode || aiConfigured(aiProvider)) }
+
+    /// Connect: confirm the provider takes the token and knows the model (one cheap request
+    /// via `oomph ai-check`, no tokens spent), then save the token and switch AI reports on.
+    func connectAI(_ p: AIProvider, token: String, model: String, url: String, done: @escaping (Bool) -> Void) {
+        aiConnecting = true
+        aiConnectError = nil
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        var args = ["-I", "-B", cliPath, "ai-check", "--provider", p.rawValue]
+        if !model.isEmpty { args += ["--model", model] }
+        if p == .ollama { args += ["--base-url", url] }
+        proc.arguments = args
+        var env = ProcessInfo.processInfo.environment
+        env["OOMPH_AI_TOKEN"] = token  // via the environment, not argv
+        proc.environment = env
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        DispatchQueue.global().async {
+            var reply: [String: Any] = [:]
+            do {
+                try proc.run()
+                let d = out.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                let last = String(decoding: d, as: UTF8.self).split(separator: "\n").last.map(String.init) ?? ""
+                reply = (try? JSONSerialization.jsonObject(with: Data(last.utf8)) as? [String: Any]) ?? [:]
+            } catch {
+                reply = ["error": "couldn't run the check: \(error.localizedDescription)"]
+            }
+            DispatchQueue.main.async {
+                self.aiConnecting = false
+                guard reply["ok"] as? Bool == true else {
+                    self.aiConnectError = (reply["error"] as? String) ?? "the connection check failed"
+                    done(false)
+                    return
+                }
+                if p.needsToken { Keychain.set(token, p.rawValue) }
+                self.setAIModel(model.isEmpty ? (reply["model"] as? String ?? "") : model, p)
+                if p == .ollama { self.ollamaURL = url }
+                self.aiProvider = p
+                self.aiOn = true
+                done(true)
+            }
+        }
+    }
+
+    /// Disconnect: reports go back to plain HTML. The token stays in the keychain for a reconnect.
+    func disconnectAI() {
+        aiOn = false
+        aiConnectError = nil
+    }
 
     var aiSummary: String {
         let m = aiModel(aiProvider)
@@ -882,7 +937,7 @@ final class Store: ObservableObject {
 
     func runReport() {
         if aiRunning { return }
-        if aiOn && aiConfigured(aiProvider) { runAIReport() } else { runCLI(["html", "--last", "24h", "--open"]) }
+        if aiConnected { runAIReport() } else { runCLI(["html", "--last", "24h", "--open"]) }
     }
 
     func runAIReport() {
@@ -2573,9 +2628,7 @@ struct PopoverView: View {
 
     var reportPair: some View {
         let running = store.aiRunning
-        let lit = store.aiOn && store.aiConfigured(store.aiProvider)
-        let grad = LinearGradient(colors: [Color(red: 0.55, green: 0.36, blue: 0.96), Color(red: 0.23, green: 0.51, blue: 0.96)],
-                                  startPoint: .topLeading, endPoint: .bottomTrailing)
+        let lit = store.aiConnected
         return HStack(spacing: 0) {
             Button { store.runReport() } label: {
                 ZStack {
@@ -2594,29 +2647,33 @@ struct PopoverView: View {
 
             Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14)
 
+            // ✦ when not connected; a spinner while a connection is confirmed; then the provider's
+            // mark. A click always opens the dialog, which shows (and changes) the connection.
             Button {
-                if running { store.abortAI() }
-                else if lit { withAnimation(.easeOut(duration: 0.15)) { store.aiOn = false } }
-                else { openAICallout() }
+                if running { store.abortAI() } else { openAICallout() }
             } label: {
                 SwiftUI.Group {
                     if running {
                         Image(systemName: "stop.fill").foregroundStyle(.red)
+                    } else if store.aiConnecting {
+                        ProgressView().controlSize(.small).scaleEffect(0.55)
                     } else if lit {
-                        Image(systemName: "sparkles").foregroundStyle(grad)
+                        AIProviderMark(provider: store.aiProvider)
                     } else {
                         Image(systemName: "sparkles").foregroundStyle(.secondary)
                     }
                 }
                 .font(.system(size: 11, weight: .semibold))
                 .frame(width: 30, height: 20)
-                .background(lit && !running ? AnyShapeStyle(grad.opacity(0.22)) : AnyShapeStyle(showAI ? Color.primary.opacity(0.08) : .clear))
+                .background(showAI ? Color.primary.opacity(0.08) : .clear)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .focusable(false)
             .anchorPreference(key: StarAnchorKey.self, value: .bounds) { $0 }
-            .help(running ? "Stop the AI report" : lit ? "AI analysis on (\(store.aiSummary)) — click to turn off"
+            .help(running ? "Stop the AI report"
+                  : store.aiConnecting ? "Checking the connection to \(store.aiProvider.title)…"
+                  : lit ? "Reports include an AI analysis by \(store.aiSummary). Click to see or disconnect."
                   : "Add an AI analysis to reports")
 
             Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14)
@@ -2643,7 +2700,6 @@ struct PopoverView: View {
         .focusEffectDisabled()
         .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 5))
         .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
-        .shadow(color: lit && !running ? Color(red: 0.45, green: 0.4, blue: 0.96).opacity(0.35) : .clear, radius: 4)
     }
 
     func openAICallout() {
@@ -2653,7 +2709,9 @@ struct PopoverView: View {
     }
 
     func loadDraft(for p: AIProvider) {
-        draftToken = ""
+        // the saved token comes back into the field: reconnecting never needs a new one
+        draftToken = p.needsToken ? (Keychain.get(p.rawValue) ?? "") : ""
+        store.aiConnectError = nil
         draftModel = store.aiModel(p)
         draftURL = store.ollamaURL
         if p == .ollama { fetchOllamaModels() }
@@ -2672,80 +2730,119 @@ struct PopoverView: View {
         }.resume()
     }
 
-    var canApply: Bool { !draftProvider.needsToken || !draftToken.isEmpty || store.hasToken(draftProvider) }
+    var canConnect: Bool { !draftProvider.needsToken || !draftToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
-    func applyAI() {
-        if !draftToken.isEmpty { Keychain.set(draftToken.trimmingCharacters(in: .whitespacesAndNewlines), draftProvider.rawValue) }
-        store.setAIModel(draftModel.trimmingCharacters(in: .whitespaces), draftProvider)
-        if draftProvider == .ollama { store.ollamaURL = draftURL.isEmpty ? "http://localhost:11434" : draftURL }
-        store.aiProvider = draftProvider
-        withAnimation(.easeOut(duration: 0.15)) {
-            store.aiOn = store.aiConfigured(draftProvider)
-            showAI = false
+    func connectAI() {
+        let p = draftProvider
+        store.connectAI(p, token: p.needsToken ? draftToken.trimmingCharacters(in: .whitespacesAndNewlines) : "",
+                        model: draftModel.trimmingCharacters(in: .whitespaces),
+                        url: draftURL.isEmpty ? "http://localhost:11434" : draftURL) { ok in
+            if ok { withAnimation(.easeOut(duration: 0.15)) { showAI = false } }
+        }
+    }
+
+    func aiCalloutHeader(connected: Bool, busy: Bool) -> some View {
+        HStack(spacing: 6) {
+            if connected { AIProviderMark(provider: store.aiProvider) } else {
+                Image(systemName: "sparkles").foregroundStyle(.purple)
+            }
+            Text("AI analysis in reports").font(.system(size: 13, weight: .semibold))
+            Spacer()
+            if connected {
+                HStack(spacing: 4) {
+                    Circle().fill(Color.green).frame(width: 6, height: 6)
+                    Text("Connected").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+                }
+            } else if busy {
+                Text("Connecting…").font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder func aiCalloutFields(connected: Bool, busy: Bool) -> some View {
+        if draftProvider.needsToken {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    SecureField("Paste access token", text: $draftToken)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { if canConnect && !connected && !busy { connectAI() } }
+                    Button("Paste") { draftToken = NSPasteboard.general.string(forType: .string) ?? "" }
+                }
+                Text(draftProvider.keyHint).font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    TextField("http://localhost:11434", text: $draftURL).textFieldStyle(.roundedBorder)
+                        .onSubmit { fetchOllamaModels() }
+                    Button { fetchOllamaModels() } label: { Image(systemName: "arrow.clockwise") }
+                        .help("Look for local models")
+                }
+                Text(ollamaModels.isEmpty ? "No Ollama models found at this address yet — is `ollama serve` running?"
+                     : "\(ollamaModels.count) local model\(ollamaModels.count == 1 ? "" : "s") found")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+        HStack(spacing: 6) {
+            Text("Model").font(.system(size: 11)).foregroundStyle(.secondary)
+            if draftProvider == .ollama && !ollamaModels.isEmpty {
+                Picker("", selection: $draftModel) { ForEach(ollamaModels, id: \.self) { Text($0).tag($0) } }
+                    .labelsHidden()
+            } else {
+                TextField(draftProvider.defaultModel, text: $draftModel).textFieldStyle(.roundedBorder)
+            }
+        }
+    }
+
+    @ViewBuilder func aiCalloutNote(connected: Bool) -> some View {
+        if let e = store.aiConnectError {
+            SwiftUI.Label(e, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 10)).foregroundStyle(.red)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        } else if connected {
+            Text("Reports include an analysis by \(store.aiSummary). Disconnect to switch provider or key; the key stays saved for a reconnect.")
+                .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        } else {
+            Text(draftProvider == .ollama
+                 ? "Reports are analysed on this Mac; nothing leaves it."
+                 : "AI reports send memory figures, process names and project paths from oomph's logs to \(draftProvider == .claude ? "Anthropic" : "OpenAI"). The key stays in your keychain.")
+                .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    func aiCalloutButtons(connected: Bool, busy: Bool) -> some View {
+        HStack {
+            Button(connected ? "Close" : "Cancel") { withAnimation(.easeOut(duration: 0.15)) { showAI = false } }
+                .keyboardShortcut(.cancelAction)
+            Spacer()
+            Button("Disconnect") { withAnimation(.easeOut(duration: 0.15)) { store.disconnectAI() } }
+                .disabled(!connected)
+                .help(connected ? "Stop adding an AI analysis to reports. The key stays saved." : "Not connected")
+            Button { connectAI() } label: { Text(busy ? "Connecting…" : "Connect") }
+                .keyboardShortcut(.defaultAction)
+                .disabled(connected || busy || !canConnect)
+                .help("Check that \(draftProvider.title) accepts the key and knows the model (no tokens spent), then use it for reports")
         }
     }
 
     func aiCallout(arrowX: CGFloat) -> some View {
-        VStack(spacing: 0) {
+        // connected: the provider's tab is fixed, the fields are read-only, only Disconnect works
+        let connected = store.aiConnected
+        let busy = store.aiConnecting
+        return VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
-                HStack(spacing: 6) {
-                    Image(systemName: "sparkles").foregroundStyle(.purple)
-                    Text("AI analysis in reports").font(.system(size: 13, weight: .semibold))
-                    Spacer()
-                }
+                aiCalloutHeader(connected: connected, busy: busy)
                 Picker("", selection: $draftProvider) {
                     ForEach(AIProvider.allCases) { Text($0.title).tag($0) }
                 }
                 .pickerStyle(.segmented).labelsHidden()
+                .disabled(connected || busy)
                 .onChange(of: draftProvider) { _, p in loadDraft(for: p) }
-
-                if draftProvider.needsToken {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            SecureField(store.hasToken(draftProvider) ? "Key saved — paste to replace" : "Paste access token",
-                                        text: $draftToken)
-                                .textFieldStyle(.roundedBorder)
-                            Button("Paste") { draftToken = NSPasteboard.general.string(forType: .string) ?? "" }
-                        }
-                        Text(draftProvider.keyHint).font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
-                } else {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 6) {
-                            TextField("http://localhost:11434", text: $draftURL).textFieldStyle(.roundedBorder)
-                                .onSubmit { fetchOllamaModels() }
-                            Button { fetchOllamaModels() } label: { Image(systemName: "arrow.clockwise") }
-                                .help("Look for local models")
-                        }
-                        Text(ollamaModels.isEmpty ? "No Ollama models found at this address yet — is `ollama serve` running?"
-                             : "\(ollamaModels.count) local model\(ollamaModels.count == 1 ? "" : "s") found")
-                            .font(.system(size: 10)).foregroundStyle(.secondary)
-                    }
-                }
-
-                HStack(spacing: 6) {
-                    Text("Model").font(.system(size: 11)).foregroundStyle(.secondary)
-                    if draftProvider == .ollama && !ollamaModels.isEmpty {
-                        Picker("", selection: $draftModel) { ForEach(ollamaModels, id: \.self) { Text($0).tag($0) } }
-                            .labelsHidden()
-                    } else {
-                        TextField(draftProvider.defaultModel, text: $draftModel).textFieldStyle(.roundedBorder)
-                    }
-                }
-
-                Text(draftProvider == .ollama
-                     ? "Reports are analysed on this Mac; nothing leaves it."
-                     : "AI reports send memory figures, process names and project paths from oomph's logs to \(draftProvider == .claude ? "Anthropic" : "OpenAI"). The key stays in your keychain.")
-                    .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-
-                HStack {
-                    Button("Cancel") { withAnimation(.easeOut(duration: 0.15)) { showAI = false } }
-                        .keyboardShortcut(.cancelAction)
-                    Spacer()
-                    Button("Apply") { applyAI() }
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(!canApply)
-                }
+                aiCalloutFields(connected: connected, busy: busy)
+                    .disabled(connected || busy)
+                aiCalloutNote(connected: connected)
+                aiCalloutButtons(connected: connected, busy: busy)
             }
             .padding(12)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -2796,6 +2893,42 @@ struct PopoverView: View {
             .help("Quit oomph. The background logger keeps recording.")
         }
         .controlSize(.small)
+    }
+}
+
+/// The connected provider's mark on the ✦ button: Claude's orange burst, OpenAI's aperture,
+/// Ollama's llama. Drawn here (no bundled brand artwork).
+struct AIProviderMark: View {
+    let provider: AIProvider
+    var body: some View {
+        switch provider {
+        case .claude:
+            ClaudeBurst().fill(Color(red: 0.85, green: 0.47, blue: 0.34)).frame(width: 14, height: 14)
+        case .openai:
+            Image(systemName: "camera.aperture").font(.system(size: 12, weight: .semibold)).foregroundStyle(.primary)
+        case .ollama:
+            Text("🦙").font(.system(size: 12))
+        }
+    }
+}
+
+/// A burst of tapered rays of slightly varying length, after Claude's mark.
+struct ClaudeBurst: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        let c = CGPoint(x: r.midX, y: r.midY), R = min(r.width, r.height) / 2
+        let n = 12
+        for i in 0..<n {
+            let a = Double(i) / Double(n) * 2 * .pi - .pi / 2
+            let len = R * (i % 2 == 0 ? 1.0 : 0.84)
+            let w = 0.26  // half the ray's angular width at its base
+            let tip = CGPoint(x: c.x + cos(a) * len, y: c.y + sin(a) * len)
+            let l = CGPoint(x: c.x + cos(a - w) * R * 0.3, y: c.y + sin(a - w) * R * 0.3)
+            let rr = CGPoint(x: c.x + cos(a + w) * R * 0.3, y: c.y + sin(a + w) * R * 0.3)
+            p.move(to: c); p.addLine(to: l); p.addLine(to: tip); p.addLine(to: rr); p.closeSubpath()
+        }
+        p.addEllipse(in: CGRect(x: c.x - R * 0.3, y: c.y - R * 0.3, width: R * 0.6, height: R * 0.6))
+        return p
     }
 }
 
@@ -3119,6 +3252,11 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
     if ai != "loading" { store.reloadPoints(sync: true) }  // `--ai loading` draws the spinner
     // `--ai callout|on|running` draws the AI states (render only; nothing is saved)
     if ai == "on" || ai == "running" { store.aiOn = true; store.aiProvider = .ollama }
+    // `--ai connected:claude|openai|ollama`, `connecting`, `dialog-connected`, `dialog-error` (render only)
+    if ai.hasPrefix("connected:") { store.aiOn = true; store.aiProvider = AIProvider(rawValue: String(ai.dropFirst(10))) ?? .claude }
+    if ai == "connecting" { store.aiConnecting = true }
+    if ai == "dialog-connected" { store.aiOn = true; store.aiProvider = .claude }
+    if ai == "dialog-error" { store.aiConnectError = "api.anthropic.com returned 401: invalid x-api-key" }
     if ai == "running" { store.aiRunning = true; store.aiProgress = "Tracing WebKit.GPU" }
     // `--ai upgrade|changelog|build` draws the upgrade states (render only)
     if ai == "upgrade" { store.upgradeButton = .upgrade }
@@ -3154,7 +3292,7 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
     }
     // `--ai tour:N` draws step N of the guided tour (1-based)
     let tour = ai.hasPrefix("tour:") ? Int(ai.dropFirst(5)).map { $0 - 1 } : nil
-    let view = PopoverView(store: store, showAI: ai == "callout", showTopApps: ai == "top", tourStep: tour)
+    let view = PopoverView(store: store, showAI: ["callout", "dialog-connected", "dialog-error"].contains(ai), showTopApps: ai == "top", tourStep: tour)
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.colorScheme, dark ? .dark : .light)
     let r = ImageRenderer(content: view)

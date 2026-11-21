@@ -219,15 +219,20 @@ For scripts and agents there are also `oomph check`, `oomph session`, `oomph wai
 
 ### AI analysis
 
-Turn on the **✦** next to **Report** in the popup, pick **Claude**, **OpenAI Codex** or a
-local **Ollama**, and paste an access token (Ollama needs none). From then on **Report**
+Click the **✦** next to **Report** in the popup, pick **Claude**, **OpenAI Codex** or a
+local **Ollama**, paste an access token (Ollama needs none) and click **Connect**. oomph
+first confirms that the provider accepts the token and knows the model (one cheap request,
+no tokens spent; `oomph ai-check` does the same from a terminal) and shows a spinner in
+place of ✦ meanwhile. Once connected, ✦ shows the provider's mark, and from then on **Report**
 asks the model to investigate the last 24 hours before writing the page: it reads the
 timeline, follows the processes that rose, their parents and Claude sessions, the events
 and the incidents' system-log excerpts through read-only tools, and puts its analysis —
 verdict, timeline, root cause, evidence, who was involved, risk now, recommendations —
 above the usual charts, with the list of tool calls it made. While it works, Report
-shows a spinner whose tooltip says what it is looking at, and ✦ turns into a stop
-button. Click ✦ again to go back to plain reports.
+shows a spinner whose tooltip says what it is looking at, and the mark turns into a stop
+button. Click the mark to see which provider and model are connected; **Disconnect** there
+goes back to plain reports. The token stays in your keychain and in the dialog, so
+connecting again takes one click.
 
 ```sh
 OOMPH_AI_TOKEN=sk-ant-… oomph ai-report --open                     # Claude (claude-opus-5-5)

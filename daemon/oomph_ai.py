@@ -671,6 +671,54 @@ def _opt(args, name, default=None):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
 
 
+def check_connection(pk, token, model=None, base_url=None):
+    """Confirm a provider answers with this token and knows the model: one cheap GET, no
+    tokens spent. Returns the model name it confirmed; raises AIError otherwise."""
+    model = model or None
+    if pk == "claude":
+        prov = Claude(token, model, base_url)
+        h = {"anthropic-version": prov.headers["anthropic-version"]}
+        for k in ("authorization", "x-api-key"):
+            if k in prov.headers:
+                h[k] = prov.headers[k]
+        if "authorization" in h:
+            h["anthropic-beta"] = "oauth-2025-04-20"
+        base = base_url.rstrip("/") if base_url else "https://api.anthropic.com"
+        r = http_json(base + "/v1/models/" + urllib.request.quote(prov.model, safe=""), None, h, timeout=20, method="GET")
+        return r.get("id") or prov.model
+    if pk == "openai":
+        prov = OpenAI(token, model, base_url)
+        base = base_url.rstrip("/") if base_url else "https://api.openai.com/v1"
+        r = http_json(base + "/models/" + urllib.request.quote(prov.model, safe=""), None, prov.headers, timeout=20,
+                      method="GET")
+        return r.get("id") or prov.model
+    base = (base_url or "http://localhost:11434").rstrip("/")
+    tags = http_json(base + "/api/tags", None, {"authorization": "Bearer " + token} if token else {}, timeout=10,
+                     method="GET")
+    names = [m.get("name") for m in tags.get("models") or []]
+    if not names:
+        raise AIError("Ollama at %s has no models — pull one first (ollama pull qwen3)" % base)
+    if model and model not in names and model + ":latest" not in names:
+        raise AIError("Ollama at %s has no model %s (it has %s)" % (base, model, ", ".join(names[:5])))
+    return model or names[0]
+
+
+def cmd_ai_check(args):
+    """oomph ai-check --provider P [--model M] [--base-url URL]: is the connection good? (token in OOMPH_AI_TOKEN)"""
+    pk = (_opt(args, "--provider") or "claude").lower()
+    if pk not in PROVIDERS:
+        emit(error="unknown provider %s (claude, openai or ollama)" % pk)
+        return 2
+    token = os.environ.get("OOMPH_AI_TOKEN") or ""
+    try:
+        m = check_connection(pk, token, _opt(args, "--model"), _opt(args, "--base-url"))
+    except AIError as e:
+        emit(error=str(e))
+        return 3
+    emit(ok=True, provider=pk, model=m)
+    return 0
+
+
 def cmd_ai_report(args):
     pk = (_opt(args, "--provider") or "claude").lower()
     if pk not in PROVIDERS:
