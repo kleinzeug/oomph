@@ -2919,9 +2919,10 @@ struct ClaudeBurst: Shape {
         let c = CGPoint(x: r.midX, y: r.midY), R = min(r.width, r.height) / 2
         let n = 12
         for i in 0..<n {
-            let a = Double(i) / Double(n) * 2 * .pi - .pi / 2
-            let len = R * (i % 2 == 0 ? 1.0 : 0.84)
-            let w = 0.26  // half the ray's angular width at its base
+            // Everything CGFloat: older compilers find `cos` ambiguous with mixed Double/CGFloat.
+            let a: CGFloat = CGFloat(i) / CGFloat(n) * 2 * .pi - .pi / 2
+            let len: CGFloat = R * (i % 2 == 0 ? 1.0 : 0.84)
+            let w: CGFloat = 0.26  // half the ray's angular width at its base
             let tip = CGPoint(x: c.x + cos(a) * len, y: c.y + sin(a) * len)
             let l = CGPoint(x: c.x + cos(a - w) * R * 0.3, y: c.y + sin(a - w) * R * 0.3)
             let rr = CGPoint(x: c.x + cos(a + w) * R * 0.3, y: c.y + sin(a + w) * R * 0.3)
