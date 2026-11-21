@@ -14,6 +14,7 @@ import plistlib
 import re
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -317,6 +318,91 @@ def write_atomic(path, text):
     os.replace(tmp, path)
 
 
+def ledger_signature():
+    """What lstat — which opens nothing — says about the shared ledger.json: it changes whenever a
+    writer renames a new one in."""
+    try:
+        if not stat.S_ISDIR(os.lstat(oomph.LEDGER_DIR).st_mode):
+            return ("not a directory",)
+        st = os.lstat(os.path.join(oomph.LEDGER_DIR, "ledger.json"))
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError as e:
+        return (e.errno,)
+
+
+class LedgerWorker:
+    """The daemon's ledger work (oomph.ledger_tick: retire dead and expired reservations, take
+    the snapshot of live ones) on a thread of its own, so the sampler never waits on the shared
+    directory or on a child that does: sample() drops its newest sample and process list into a
+    one-slot mailbox (the latest wins) and goes on; this thread runs the child with them and
+    keeps the snapshot it answers with. Errors become a daemon_error event (where "ledger", at
+    most one per ERROR_EVERY), never an exception in the sampler. While nothing is reserved the
+    child is skipped as long as ledger.json's lstat is unchanged, at most for FORCE_EVERY."""
+    FORCE_EVERY = 300
+    ERROR_EVERY = 900
+
+    def __init__(self, event, tick=None):
+        self.event = event
+        self.tick = tick or oomph.ledger_tick
+        self.cond = threading.Condition()
+        self.slot = None
+        self.leases, self.at = [], 0.0  # the last snapshot, and when it arrived
+        self.sig, self.last_run, self.runs = None, 0.0, 0  # runs: children run so far, answered or not
+        self.last_err, self.suppressed = 0.0, 0
+
+    def start(self):
+        threading.Thread(target=self.loop, name="ledger", daemon=True).start()
+        return self
+
+    def offer(self, s, procs):
+        with self.cond:
+            self.slot = (s, procs)
+            self.cond.notify()
+
+    def latest(self, max_age):
+        """The last snapshot, unless it is older than `max_age` seconds."""
+        with self.cond:
+            return list(self.leases) if time.time() - self.at <= max_age else []
+
+    def loop(self):
+        while True:
+            with self.cond:
+                while self.slot is None:
+                    self.cond.wait()
+                (s, procs), self.slot = self.slot, None
+            try:
+                self.run_once(s, procs)
+            except Exception as e:
+                self.sig = None
+                self.error(str(e) if isinstance(e, oomph.LedgerError) else repr(e))
+                with self.cond:
+                    self.runs += 1
+
+    def run_once(self, s, procs):
+        sig, now = ledger_signature(), time.time()
+        if not self.leases and sig == self.sig and now - self.last_run < self.FORCE_EVERY:
+            with self.cond:
+                self.at = now  # still nothing reserved
+            return
+        self.sig, self.last_run = sig, now
+        leases, err = self.tick(s, procs)
+        if err:  # e.g. busy: the snapshot still counts
+            self.sig = None
+            self.error(err)
+        with self.cond:
+            self.leases, self.at = leases, time.time()
+            self.runs += 1
+
+    def error(self, msg):
+        now = time.time()
+        if now - self.last_err < self.ERROR_EVERY:
+            self.suppressed += 1
+            return
+        extra = {"suppressed": self.suppressed} if self.suppressed else {}
+        self.last_err, self.suppressed = now, 0
+        self.event("daemon_error", where="ledger", error=str(msg)[:300], **extra)
+
+
 class Daemon:
     def __init__(self):
         os.umask(0o022)
@@ -347,6 +433,7 @@ class Daemon:
         self.console = {"uid": None, "user": None}
         self.stopping = False
         self.stream_proc = None
+        self.ledger = LedgerWorker(self.event)  # started by run()
 
     # -- events
     def event(self, kind, **kw):
@@ -597,11 +684,13 @@ class Daemon:
         s["top"] = top
         s["groups"] = groups
         s["claude"] = sessions
-        try:  # retire reservations of sessions that died or expired, close to when it happened
-            oomph.refresh_ledger_unprivileged(s, procs)  # never as root: the ledger dir is world-writable
-        except Exception as e:
-            self.event("daemon_error", where="ledger", error=repr(e))
-        leases = oomph.ledger_snapshot(procs)
+        # Retire reservations of sessions that died or expired, close to when it happened, and
+        # copy the live ones into the sample. The shared ledger directory is world-writable, so
+        # the daemon never opens anything in it: its thread hands the work to an unprivileged
+        # child and the sample carries the last snapshot that child answered with (none if it
+        # is older than two intervals).
+        self.ledger.offer({k: v for k, v in s.items() if k not in ("top", "groups", "claude")}, procs)
+        leases = self.ledger.latest(2 * (HOT_INTERVAL if self.hot else INTERVAL))
         if leases:
             s["leases"] = leases  # memory sessions have reserved through oomph's ledger
         if gone:
@@ -706,6 +795,7 @@ class Daemon:
                 pass
         threading.Thread(target=self.stream_loop, daemon=True).start()
         threading.Thread(target=self.poll_loop, daemon=True).start()
+        self.ledger.start()
         while not self.stopping:
             t0 = time.time()
             try:

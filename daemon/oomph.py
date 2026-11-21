@@ -34,19 +34,26 @@ coordinating memory between sessions (a shared first-come-first-served ledger):
   oomph setup-claude [--hook] [--remove]   install the skill + register the MCP server for Claude Code
 """
 import datetime
+import functools
 import glob
 import gzip
 import html as _html
 import json
+import math
 import os
 import pwd
 import re
+import secrets
+import select
+import stat
 import subprocess
 import sys
+import threading
 import time
 
 VERSION = "dev"  # stamped by build-app.sh / install.sh from `git describe` (tools/version.sh)
 COMMIT = ""      # the git commit the stamped copy was built from
+HARDENING = 1    # H0 (1.8.4): root never opens the shared ledger directory; `oomph share on` requires it
 
 
 def _checkout_version():
@@ -1050,7 +1057,10 @@ def cmd_status():
         print("\nclaude sessions:")
         for s in c["claude"]:
             print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], s.get("cwd")))
-    leases = ledger_snapshot()
+    try:
+        leases = ledger_snapshot()
+    except LedgerError:
+        leases = []
     if leases:
         print("\nreservations (oomph reservations for details):")
         for b in leases:
@@ -1403,9 +1413,8 @@ DEFAULT_TTL_S = 30 * 60      # session-held grants expire unless released or ext
 MAX_TTL_S = 8 * 3600
 POLL_S = 2
 HISTORY_KEEP = 100           # finished reservations kept in ledger.json (the log keeps 14 days)
-HISTORY_FILE = "reservations.jsonl"  # append-only: one record per edit and per finished reservation
+HISTORY_FILE = "reservations.jsonl"  # one record per edit and per finished reservation
 HISTORY_DAYS = 14
-HISTORY_PRUNE_S = 3600       # drop records older than HISTORY_DAYS at most this often
 _sample_override = None      # tests: a function returning the sample to decide on
 
 
@@ -1414,49 +1423,381 @@ def margin_gb(ram):
     return max(1.5, 0.05 * (ram or 0))
 
 
+# ----- the shared directory (H0)
+# LEDGER_DIR is world-writable (dir 0777, files 0666): every session and user on this Mac
+# shares it, so anything in it may have been planted — a symbolic or hard link to someone
+# else's file, a FIFO, a device, an endless or sparse file, JSON with huge numbers or deep
+# nesting. Everybody's file handling goes through the few functions below, and nothing
+# running as root comes here at all: a root caller runs its ledger operation in a child as
+# the invoking user (or nobody), and the root daemon only ever sees what such a child
+# printed, rebuilt from typed, capped fields.
+LIMITS = {                   # the one table of limits for what is read from the directory
+    "ledger": 4 << 20,       # ledger.json: bytes; a bigger one is treated as absent
+    "history": 8 << 20,      # reservations.jsonl: readers take its newest 8 MB, writers keep it below
+    "child": 1 << 20,        # a root caller's unprivileged child: bytes of answer
+    "tick": 64 << 10,        # the daemon's child (refresh + snapshot): bytes of answer
+    "leases": 16 << 10,      # the leases block of a sample: bytes in all ...
+    "leases_n": 64,          # ... entries ...
+    "str": 200,              # ... and characters per string
+    "digits": 30,            # an integer longer than this is not JSON oomph wrote (int() is quadratic)
+    "keys": 256,             # keys per JSON object
+    "depth": 32,             # nesting (newer Pythons parse far deeper than the recursion limit)
+}
+LOCK_WAIT_S = 5.0            # interactive callers: a holder keeps the lock for milliseconds, so 5 s
+                             # only runs out when it is stuck or hostile, yet survives a swapped-out
+                             # holder on a Mac under pressure
+LOCK_WAIT_TICK_S = 1.0       # the daemon's child: it runs again next sample anyway
+CHILD_TIMEOUT_S = 20         # a root caller's child (lock wait included)
+TICK_TIMEOUT_S = 5           # the daemon's child
+PY = "/usr/bin/python3"
+_lock_wait = LOCK_WAIT_S
+_held = None                 # the Ledger whose lock this process holds (the history log is written under it)
+_given = None                # (sample, procs) a root parent measured for its unprivileged child
+_RID = re.compile(r"r\d{1,15}")
+
+
+class LedgerError(Exception):
+    """The shared ledger can't be used safely right now (refused, busy, or its child failed)."""
+
+
+class LedgerBusy(LedgerError):
+    """The ledger lock wasn't free within the deadline."""
+
+
+def _not_root(what):
+    """The fence: whatever path leads here, a process running as root stops."""
+    if os.geteuid() == 0:
+        raise LedgerError("%s as root refused: root never opens the shared ledger directory" % what)
+
+
+def read_bounded(name, cap, dir_fd=None, tail=False):
+    """The bytes of a regular file with a single link, read without following a symbolic link,
+    without blocking on a FIFO and never more than `cap` of them; None for anything else (missing,
+    a link, a FIFO, a device, a directory, a hard-linked file, or bigger than `cap`). With `tail`
+    a bigger file gives its last whole lines within `cap` instead."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return None
+        cut = st.st_size > cap
+        if cut:
+            if not tail:
+                return None
+            os.lseek(fd, st.st_size - cap, os.SEEK_SET)
+        parts, n = [], 0
+        while n <= cap:
+            b = os.read(fd, min(1 << 16, cap + 1 - n))
+            if not b:
+                break
+            parts.append(b)
+            n += len(b)
+        data = b"".join(parts)
+        if len(data) > cap:  # it grew while we read
+            if not tail:
+                return None
+            data, cut = data[-cap:], True
+        if cut:  # the first line is a fragment
+            data = data[data.find(b"\n") + 1:] if b"\n" in data else b""
+        return data
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _parse_int(s):
+    if len(s) > LIMITS["digits"]:
+        raise ValueError("integer too long")
+    return int(s)
+
+
+def _parse_float(s):
+    f = float(s)
+    if not math.isfinite(f):
+        raise ValueError("number out of range")
+    return f
+
+
+def _no_constant(s):
+    raise ValueError("%s is not JSON" % s)
+
+
+def _object(pairs):
+    if len(pairs) > LIMITS["keys"]:
+        raise ValueError("too many keys")
+    return dict(pairs)
+
+
+def loads_untrusted(data):
+    """JSON from the shared directory (or from a child that read it), or None if it isn't JSON
+    oomph could have written: no integers over LIMITS["digits"] digits, no NaN or Infinity, at
+    most LIMITS["keys"] keys per object, no nesting deeper than LIMITS["depth"]."""
+    if data is None:
+        return None
+    try:
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        v = json.loads(data, parse_int=_parse_int, parse_float=_parse_float, parse_constant=_no_constant,
+                       object_pairs_hook=_object)
+    except (ValueError, RecursionError, TypeError, MemoryError):
+        return None
+    return v if _depth_ok(v) else None
+
+
+def _depth_ok(v):
+    """No container nested deeper than LIMITS["depth"] (iterative: the value may be very deep)."""
+    stack = [(v, 0)]
+    while stack:
+        x, d = stack.pop()
+        if isinstance(x, (dict, list)):
+            if d >= LIMITS["depth"]:
+                return False
+            stack.extend((y, d + 1) for y in (x.values() if isinstance(x, dict) else x))
+    return True
+
+
+def _num(x, lo=-1e15, hi=1e15):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and lo <= x <= hi
+
+
+def _t(x):
+    """A unix time oomph could have written (datetime can't take just any float)."""
+    return _num(x, 0, 1e11)
+
+
+def _pid(x):
+    return isinstance(x, int) and not isinstance(x, bool) and 0 < x < 2 ** 31
+
+
+def _segments(x):
+    segs = [{"t": s["t"], "gb": s["gb"]} for s in (x if isinstance(x, list) else [])
+            if isinstance(s, dict) and _t(s.get("t")) and _num(s.get("gb"), 0, 1e6)]
+    return segs or None
+
+
+def _typed(src, out, times=(), nums=(), strs=()):
+    """Optional fields: kept unchanged when they have their type (or are None), else dropped.
+    Nothing is cut here: this is the read-modify-write path, and a view limit must not reach it."""
+    for k in times + nums + strs:
+        if k in src and not (src[k] is None or (_t(src[k]) if k in times else _num(src[k]) if k in nums
+                                                 else isinstance(src[k], str))):
+            out.pop(k, None)
+    return out
+
+
+def _valid_lease(r):
+    """A live lease as oomph writes it, with the types the code relies on, or None."""
+    if not isinstance(r, dict):
+        return None
+    h = r.get("holder")
+    if not (isinstance(r.get("id"), str) and _RID.fullmatch(r["id"]) and r.get("state") in ("queued", "granted")
+            and _num(r.get("gb"), 0, 1e6) and r["gb"] > 0 and isinstance(r.get("purpose"), str)
+            and isinstance(h, dict) and _pid(h.get("pid")) and _t(r.get("requested"))):
+        return None
+    if r["state"] == "granted" and not _t(r.get("granted")):
+        return None
+    out = dict(r)
+    start = h.get("start")
+    out["holder"] = dict(h, start=start if isinstance(start, int) and not isinstance(start, bool) else None,
+                         kind=h["kind"] if isinstance(h.get("kind"), str) else None)
+    out["seen"] = r["seen"] if _t(r.get("seen")) else r["requested"]
+    _typed(r, out, times=("granted", "expires"), nums=("ttl", "peak_gb", "used_gb", "baseline_gb"),
+           strs=("project", "key", "note"))
+    if "watch" in r and not (r["watch"] is None or _pid(r["watch"])):
+        out["watch"] = None
+    if "segments" in r:
+        segs = _segments(r["segments"])
+        if segs:
+            out["segments"] = segs
+        else:
+            out.pop("segments")
+    return out
+
+
+def _valid_finished(h, log=False):
+    """A finished reservation (ledger.json's history) or, with `log`, a record of the history log,
+    with the types the code relies on, or None."""
+    if not (isinstance(h, dict) and isinstance(h.get("id"), str) and _RID.fullmatch(h["id"])
+            and _num(h.get("gb"), 0, 1e6) and _t(h.get("requested"))):
+        return None
+    if not log and not (_t(h.get("ended")) and isinstance(h.get("outcome"), str)):
+        return None
+    out = dict(h, purpose=h["purpose"] if isinstance(h.get("purpose"), str) else "?")
+    _typed(h, out, times=("granted", "ended", "t", "expires"), nums=("peak_gb", "held_s", "waited_s"),
+           strs=("project", "holder", "outcome", "event"))
+    if not isinstance(out.get("key"), str):
+        out.pop("key", None)
+    if "segments" in h:
+        segs = _segments(h["segments"])
+        if segs:
+            out["segments"] = segs
+        else:
+            out.pop("segments")
+    return out
+
+
+def _valid_ledger(L):
+    """The ledger with every lease and history entry checked field by field. One that doesn't
+    fit was never written by oomph and is dropped — and with it the KeyError or TypeError it
+    would cause in every reader. None if it isn't a ledger at all."""
+    if not isinstance(L, dict) or not isinstance(L.get("leases"), list):
+        return None
+    out = dict(L)
+    out["leases"] = [x for x in map(_valid_lease, L["leases"]) if x]
+    out["history"] = [x for x in map(_valid_finished, L.get("history") if isinstance(L.get("history"), list) else [])
+                      if x][-HISTORY_KEEP:]
+    seq = L.get("seq")
+    out["seq"] = max([seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0] +
+                     [int(x["id"][1:]) for x in out["leases"] + out["history"]])
+    st = L.get("state")
+    out["state"] = {k: v for k, v in st.items() if _num(v) or (k == "level" and v in LEVELS)} \
+        if isinstance(st, dict) else {}
+    if "history_pruned" in L and not _num(L["history_pruned"]):
+        out.pop("history_pruned")
+    return out
+
+
+def _ledger_dir(create=False):
+    """A descriptor of LEDGER_DIR, opened without following a symbolic link (anyone who could
+    replace the directory by a link would otherwise choose where everything goes); every file
+    in it is opened relative to it. None if it doesn't exist and `create` is false."""
+    _not_root("opening %s" % LEDGER_DIR)
+    if create and not os.path.lexists(LEDGER_DIR):
+        old = os.umask(0)
+        try:  # shared by every session (and user) on this Mac
+            os.makedirs(LEDGER_DIR, mode=0o777, exist_ok=True)
+        except OSError:
+            pass  # the open below says what is wrong
+        finally:
+            os.umask(old)
+    try:
+        return os.open(LEDGER_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        if create:
+            raise LedgerError("can't create %s" % LEDGER_DIR)
+        return None
+    except OSError as e:
+        raise LedgerError("%s is not a plain directory (%s)" % (LEDGER_DIR, e.strerror))
+
+
+def _replace(dfd, name, data):
+    """Write `name` in the ledger directory without opening any file that is already there: a
+    temporary file with a random name, created exclusively (a link or file planted under that
+    name makes it fail instead of being written through), made 0666 on its descriptor, then
+    renamed over `name` — which replaces whatever had the name, link or not."""
+    tmp = "%s.%s.tmp" % (name, secrets.token_hex(8))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
+    try:
+        try:
+            os.fchmod(fd, 0o666)  # shared by every user
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
+            os.close(fd)
+        os.rename(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    except BaseException:
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+
+
+def _lock(dfd, wait):
+    """Take the ledger lock: ledger.lock opened read-only (flock needs no more), never through
+    a link, never blocking on a FIFO, a regular file; polled until `wait` runs out, then
+    LedgerBusy rather than a hang."""
+    import fcntl
+    old = os.umask(0)
+    try:
+        fd = os.open("ledger.lock", os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o666,
+                     dir_fd=dfd)
+    except OSError as e:
+        raise LedgerError("can't open the ledger lock (%s)" % e.strerror)
+    finally:
+        os.umask(old)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise LedgerError("%s/ledger.lock is not a regular file" % LEDGER_DIR)
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return fd
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise LedgerBusy("the reservation ledger is busy: its lock has been held for over %g s "
+                                     "(%s/ledger.lock); try again" % (wait, LEDGER_DIR))
+                time.sleep(0.05)
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 class Ledger:
     """`with Ledger() as L:` — exclusive, read-modify-write access to the shared ledger."""
 
+    def __init__(self, wait=None):
+        self.wait = _lock_wait if wait is None else wait
+
     def __enter__(self):
-        import fcntl
+        global _held
+        _not_root("writing the ledger")
         self.dir = LEDGER_DIR
-        old = os.umask(0)
-        try:  # shared by every session (and user) on this Mac
-            os.makedirs(self.dir, mode=0o777, exist_ok=True)
-            self.fd = os.open(os.path.join(self.dir, "ledger.lock"), os.O_RDWR | os.O_CREAT, 0o666)
-        finally:
-            os.umask(old)
-        fcntl.flock(self.fd, fcntl.LOCK_EX)
-        self.data = read_ledger()
+        self.dfd = _ledger_dir(create=True)
+        try:
+            self.fd = _lock(self.dfd, self.wait)
+            try:
+                self.data = _read_ledger_at(self.dfd)
+            except BaseException:
+                os.close(self.fd)
+                raise
+        except BaseException:
+            os.close(self.dfd)
+            raise
+        _held = self
         return self.data
 
     def __exit__(self, et, e, tb):
-        import fcntl
+        global _held
         try:
             if et is None:
-                path = os.path.join(self.dir, "ledger.json")
-                tmp = "%s.%d.tmp" % (path, os.getpid())
-                with open(tmp, "w") as f:
-                    json.dump(self.data, f, indent=1)
-                os.chmod(tmp, 0o666)
-                os.replace(tmp, path)
+                try:
+                    _replace(self.dfd, "ledger.json", json.dumps(self.data, indent=1).encode())
+                except OSError as x:
+                    raise LedgerError("can't write %s/ledger.json (%s)" % (self.dir, x.strerror or x))
         finally:
-            fcntl.flock(self.fd, fcntl.LOCK_UN)
-            os.close(self.fd)
+            _held = None
+            os.close(self.fd)  # closing it releases the lock
+            os.close(self.dfd)
         return False
 
 
+def _read_ledger_at(dfd):
+    L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd)))
+    if L is None:
+        # a fresh (or lost) ledger: continue the numbering of the history log, so ids don't repeat
+        L = {"seq": _history_max_seq(dfd), "leases": [], "history": []}
+    return L
+
+
 def read_ledger():
+    _not_root("reading the ledger")
     try:
-        L = json.load(open(os.path.join(LEDGER_DIR, "ledger.json")))
-        if isinstance(L.get("leases"), list):
-            L.setdefault("history", [])
-            L.setdefault("seq", 0)
-            return L
-    except Exception:
-        pass
-    # a fresh (or lost) ledger: continue the numbering of the history log, so ids don't repeat
-    return {"seq": _history_max_seq(), "leases": [], "history": []}
+        dfd = _ledger_dir()
+    except LedgerError:
+        dfd = None  # replaced by a link: nothing to read
+    if dfd is None:
+        return {"seq": 0, "leases": [], "history": []}
+    try:
+        return _read_ledger_at(dfd)
+    finally:
+        os.close(dfd)
 
 
 # ----- the reservation history log (LEDGER_DIR/reservations.jsonl)
@@ -1473,29 +1814,41 @@ def _key(r):
     return r.get("key") or "%s@%d" % (r["id"], int(r.get("requested") or 0))
 
 
-def _history_max_seq():
+def _history_max_seq(dfd=None):
     best = 0
-    for rec in read_history():
-        m = re.fullmatch(r"r(\d+)", str(rec.get("id", "")))
-        if m:
-            best = max(best, int(m.group(1)))
+    for rec in read_history(dfd=dfd):
+        best = max(best, int(rec["id"][1:]))
     return best
 
 
-def read_history(since=None):
-    """Records of the history log, oldest first (optionally only those that end after `since`)."""
-    out = []
+def _rec_time(rec):
+    t = rec.get("ended") or rec.get("t") or 0
+    return t if _num(t) else 0
+
+
+def read_history(since=None, dfd=None):
+    """Records of the history log, oldest first (optionally only those that end after `since`):
+    its newest LIMITS["history"] bytes, every record checked like a lease."""
+    _not_root("reading the history log")
+    own = dfd is None
+    if own:
+        try:
+            dfd = _ledger_dir()
+        except LedgerError:
+            return []
+        if dfd is None:
+            return []
     try:
-        with open(_history_path()) as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if since is None or (rec.get("ended") or rec.get("t") or 0) >= since:
-                    out.append(rec)
-    except OSError:
-        pass
+        data = read_bounded(HISTORY_FILE, LIMITS["history"], dfd, tail=True)
+    finally:
+        if own:
+            os.close(dfd)
+    out = []
+    for line in (data or b"").splitlines():
+        rec = _valid_finished(loads_untrusted(line), log=True)
+        if rec and (since is None or _rec_time(rec) >= since):
+            rec["key"] = _key(rec)
+            out.append(rec)
     return out
 
 
@@ -1512,33 +1865,38 @@ def _record(r, event, t, **extra):
 
 
 def _append_history(L, recs, now):
-    """Append records to the log (under the ledger lock). The first write seeds the log with the
-    ledger's own short history; now and then records older than HISTORY_DAYS are dropped."""
-    path = _history_path()
-    old = os.umask(0)
-    try:
-        fresh = not os.path.exists(path)
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
-    finally:
-        os.umask(old)
-    with os.fdopen(fd, "a") as f:
-        if fresh:
-            for h in L["history"]:
-                if h.get("key") not in {x["key"] for x in recs}:
-                    f.write(json.dumps(dict(_record(h, "end", h["ended"]),
-                                            ended=h["ended"], outcome=h["outcome"], backfilled=True)) + "\n")
-        for rec in recs:
-            f.write(json.dumps(rec) + "\n")
-    if now - L.get("history_pruned", 0) > HISTORY_PRUNE_S:
-        L["history_pruned"] = round(now)
-        cutoff = now - HISTORY_DAYS * 86400
-        keep = read_history(cutoff)
-        if len(keep) < sum(1 for _ in open(path)):
-            tmp = "%s.%d.tmp" % (path, os.getpid())
-            with open(tmp, "w") as f:
-                f.writelines(json.dumps(rec) + "\n" for rec in keep)
-            os.chmod(tmp, 0o666)
-            os.replace(tmp, path)
+    """Add records to the log, under the ledger lock. No writer opens the log's existing name for
+    writing: a hard link planted there would turn an append into a write to another user's
+    file, and no open flag can refuse a hard link. So every write reads the log (its newest
+    LIMITS["history"] bytes, a file with a single link only), keeps the records of the last
+    HISTORY_DAYS, adds the new ones, drops the oldest beyond LIMITS["history"] bytes and renames
+    a fresh file over the name. The format stays one record per line: readers, and 1.8.1–1.8.3
+    writers (which append under the same lock), work on it unchanged. A new log is seeded with
+    the ledger's own short history."""
+    _not_root("writing the history log")
+    if _held is None:
+        raise LedgerError("the history log is written under the ledger lock only")
+    dfd = _held.dfd
+    data = read_bounded(HISTORY_FILE, LIMITS["history"], dfd, tail=True)
+    cutoff = now - HISTORY_DAYS * 86400
+    lines = []
+    for line in (data or b"").splitlines():
+        rec = loads_untrusted(line)
+        if isinstance(rec, dict) and _rec_time(rec) >= cutoff:
+            lines.append(line)  # carried through unchanged
+    if data is None:  # no log yet (or something other than a log had its name)
+        keys = {x["key"] for x in recs}
+        lines += [json.dumps(dict(_record(h, "end", h["ended"]), ended=h["ended"], outcome=h["outcome"],
+                                  backfilled=True)).encode()
+                  for h in L["history"] if h.get("key") not in keys]
+    lines += [json.dumps(rec).encode() for rec in recs]
+    keep, size = [], 0
+    for line in reversed(lines):  # newest first, within the size limit
+        size += len(line) + 1
+        if size > LIMITS["history"]:
+            break
+        keep.append(line)
+    _replace(dfd, HISTORY_FILE, b"".join(x + b"\n" for x in reversed(keep)))
 
 
 def _alive(procs, pid, start):
@@ -1662,7 +2020,166 @@ def _evaluate(L, s, procs, now):
                   "reserved_gb": round(outstanding, 1), "available_gb": round(avail, 1)}
 
 
+# ----- root callers: the ledger operation runs in a child as the invoking user (H0)
+_LEDGER_CALLS = {}
+
+
+def _child_user():
+    """Whom a root caller's ledger operation runs as: the user who ran sudo, else nobody."""
+    try:
+        uid, gid = int(os.environ.get("SUDO_UID") or 0), int(os.environ.get("SUDO_GID") or 0)
+    except ValueError:
+        uid = gid = 0
+    if uid > 0:
+        try:
+            gid = gid if gid > 0 else pwd.getpwuid(uid).pw_gid
+        except KeyError:
+            gid = 0
+        if gid > 0:
+            return uid, gid
+    return "nobody", "nobody"
+
+
+def _drop_to(user, group):
+    """subprocess arguments that run a child as user:group without root's other groups, when we
+    are root; none when we aren't (the child then simply is us)."""
+    return {"user": user, "group": group, "extra_groups": []} if os.geteuid() == 0 else {}
+
+
+def run_bounded(cmd, data, cap, timeout, **kw):
+    """Run `cmd` (in /, with a minimal environment) with `data` on its stdin and read at most
+    `cap` bytes of its stdout, and the last few KB of its stderr, within `timeout` seconds. A
+    child that takes longer or says more is killed; either way it is reaped. Returns (exit
+    status, stdout, stderr text); raises LedgerError on a timeout or an overflow."""
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/",
+                         env={"PATH": "/usr/bin:/bin", "OOMPH_LEDGER_DIR": LEDGER_DIR}, **kw)
+
+    def feed():
+        try:
+            p.stdin.write(data)
+        except (OSError, ValueError):
+            pass  # it died or stopped reading
+        try:
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+    feeder = threading.Thread(target=feed, daemon=True)
+    feeder.start()
+    out_fd, err_fd = p.stdout.fileno(), p.stderr.fileno()
+    out, err, n, fail = [], b"", 0, None
+    deadline = time.monotonic() + timeout
+    fds = [out_fd, err_fd]
+    try:
+        while fds and not fail:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                fail = "timed out after %g s" % timeout
+                break
+            for fd in select.select(fds, [], [], left)[0]:
+                b = os.read(fd, 1 << 16)
+                if not b:
+                    fds.remove(fd)
+                elif fd == out_fd:
+                    out.append(b)
+                    n += len(b)
+                    if n > cap:
+                        fail = "answered more than %d bytes" % cap
+                else:
+                    err = (err + b)[-4096:]
+        if not fail:
+            try:
+                p.wait(max(0.01, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                fail = "timed out after %g s" % timeout
+    finally:
+        if p.returncode is None:
+            p.kill()
+            p.wait()
+        feeder.join(2)
+        p.stdout.close()
+        p.stderr.close()
+    if fail:
+        raise LedgerError("%s %s" % (" ".join(cmd[-2:]), fail))
+    return p.returncode, b"".join(out), err.decode("utf-8", "replace")
+
+
+def _unprivileged(inputs=False):
+    """Ledger operations never run as root. Called as root (`sudo oomph reserve …`, a root
+    agent's MCP server, the bookkeeping of `sudo oomph run`), the operation runs in a child as
+    the user who ran sudo, else as nobody: `oomph _ledger-call <name>` gets the arguments as
+    JSON on stdin — with `inputs` also the sample and process table, which only root measures
+    whole — and answers with JSON on stdout, at most LIMITS["child"] bytes, within
+    CHILD_TIMEOUT_S. Not root: a plain call."""
+    def wrap(fn):
+        _LEDGER_CALLS[fn.__name__] = fn
+
+        @functools.wraps(fn)
+        def call(*args, **kw):
+            if os.geteuid() != 0:
+                return fn(*args, **kw)
+            return _call_as_user(fn.__name__, args, kw, inputs)
+        return call
+    return wrap
+
+
+def _enc(x):  # a process table is keyed by int pid; JSON would make the keys strings
+    if isinstance(x, dict) and x and all(isinstance(k, int) for k in x):
+        return {"__by_int__": [[k, v] for k, v in x.items()]}
+    return x
+
+
+def _dec(x):
+    if isinstance(x, dict) and list(x) == ["__by_int__"]:
+        return {int(k): v for k, v in x["__by_int__"]}
+    return x
+
+
+def _call_as_user(name, args, kw, inputs):
+    d = {"args": [_enc(a) for a in args], "kw": {k: _enc(v) for k, v in kw.items()}}
+    if inputs:
+        s, procs, _ = _decide_inputs()
+        d["s"], d["procs"] = s, list(procs.values())
+    user, group = _child_user()
+    rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-call", name],
+                               json.dumps(d, default=str).encode(), LIMITS["child"], CHILD_TIMEOUT_S,
+                               **_drop_to(user, group))
+    res = loads_untrusted(out)
+    if not isinstance(res, dict) or not ("ok" in res or "error" in res):
+        raise LedgerError("the ledger operation (run as %s) failed: %s"
+                          % (user, (err.strip().splitlines() or ["exit status %s" % rc])[-1][:300]))
+    if "error" in res:
+        raise (LedgerBusy if res.get("busy") else LedgerError)(str(res["error"])[:500])
+    return res["ok"]
+
+
+def _cmd_ledger_call(name):
+    """Internal: the unprivileged half of a root caller's ledger operation (see _unprivileged)."""
+    global _given
+    if os.geteuid() == 0:
+        print("oomph: _ledger-call refuses to run as root", file=sys.stderr)
+        return 1
+    fn = _LEDGER_CALLS.get(name)
+    if fn is None:
+        print("oomph: _ledger-call: no ledger operation %r" % name, file=sys.stderr)
+        return 2
+    d = json.loads(sys.stdin.read())
+    if "s" in d:
+        _given = (d["s"], {p["pid"]: p for p in d["procs"]})
+    try:
+        out = {"ok": fn(*[_dec(a) for a in d["args"]], **{k: _dec(v) for k, v in d["kw"].items()})}
+    except LedgerBusy as e:
+        out = {"error": str(e), "busy": True}
+    except LedgerError as e:
+        out = {"error": str(e)}
+    except Exception as e:
+        out = {"error": "%s: %s" % (type(e).__name__, e)}
+    sys.stdout.write(json.dumps(out))
+    return 0
+
+
 def _decide_inputs(s=None):
+    if _given:  # an unprivileged child: root measured them
+        return s or _given[0], _given[1], time.time()
     s = s or (_sample_override() if _sample_override else live_sample(with_procs=False))
     return s, _daemon_module().collect_procs(), time.time()
 
@@ -1722,6 +2239,7 @@ def holder_for(pid=None, kind=None):
             "project": d.proc_cwd(hp)}
 
 
+@_unprivileged(inputs=True)
 def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder"):
     """Request (or re-poll with `ticket`) a reservation. Returns its status dict."""
     s, procs, now = _decide_inputs()
@@ -1763,6 +2281,7 @@ def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, wat
     return st
 
 
+@_unprivileged(inputs=True)
 def release(rid, holder_pid=None, outcome="released"):
     """Release one reservation, or with rid='all' every one held by `holder_pid`."""
     s, procs, now = _decide_inputs()
@@ -1779,6 +2298,7 @@ def release(rid, holder_pid=None, outcome="released"):
                 "next_granted": [r["id"] for r in L["leases"] if r["state"] == "granted" and r.get("granted") == round(now, 1)]}
 
 
+@_unprivileged(inputs=True)
 def amend(rid, gb=None, ttl_s=None, purpose=None):
     """Change a reservation in place: its size, its time to live (from now) or its purpose.
     Shrinking applies at once and hands the room to whoever waits. Growing a grant applies only
@@ -1849,6 +2369,7 @@ def amend(rid, gb=None, ttl_s=None, purpose=None):
         return out
 
 
+@_unprivileged(inputs=True)
 def set_watch(rid, pid):
     """Point a grant at the process tree that does the work (`oomph run`'s child)."""
     s, procs, now = _decide_inputs()
@@ -1859,6 +2380,7 @@ def set_watch(rid, pid):
         _evaluate(L, s, procs, now)
 
 
+@_unprivileged(inputs=True)
 def coordination(mine=None, s=None):
     """Current reservations (refreshed), seen from session `mine`: what others hold or wait for."""
     s, procs, now = _decide_inputs(s)
@@ -1897,6 +2419,7 @@ def _span(rec, now):
     return out
 
 
+@_unprivileged()
 def reservation_history(since_s=24 * 3600, limit=50):
     """Finished reservations from the history log (last `since_s` seconds) plus the live ones,
     newest first: what each reserved, what it really used at its peak, and how it ended."""
@@ -1919,6 +2442,7 @@ def reservation_history(since_s=24 * 3600, limit=50):
             "log": _history_path()}
 
 
+@_unprivileged()
 def refresh_ledger(s, procs):
     """The daemon's tick: retire leases whose holder died or that expired, close to when it
     happened, and keep the usage figures current. Skips the lock when nothing is reserved."""
@@ -1928,35 +2452,46 @@ def refresh_ledger(s, procs):
         _evaluate(L, s, procs, time.time())
 
 
-def refresh_ledger_unprivileged(s, procs, timeout=15):
-    """refresh_ledger for the root daemon. The ledger directory is world-writable (every
-    session and user shares it), so root must never write there: a planted symlink would
-    turn the temp file, its chmod 666 or the history append into a write to any file on the
-    system. As root this runs the refresh in a child process as `nobody`, which can write
-    the shared files (they are 0666 in a 0777 directory) and nothing else. Not root: direct."""
-    if os.geteuid() != 0:
-        return refresh_ledger(s, procs)
-    if not read_ledger()["leases"]:  # reading is harmless; skip the child when nothing is reserved
-        return
-    payload = json.dumps({"s": s, "procs": list(procs.values())}, default=str)
-    env = {"PATH": "/usr/bin:/bin", "OOMPH_LEDGER_DIR": LEDGER_DIR}
-    r = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"],
-                       input=payload, capture_output=True, text=True, timeout=timeout, cwd="/", env=env,
-                       user="nobody", group="nobody", extra_groups=[])
-    if r.returncode != 0:
-        raise RuntimeError("ledger refresh as nobody failed: %s" % (r.stderr.strip().splitlines() or ["?"])[-1])
+def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S):
+    """The daemon's ledger work for one sample: refresh_ledger, then the snapshot of live
+    reservations for the sample, both in a child — as nobody when the daemon is root (root
+    never opens anything in the shared directory, to read or to write), as the same user when
+    it isn't. Its answer is at most LIMITS["tick"] bytes of JSON, read within `timeout`, and the
+    sample's block is rebuilt from it field by field (sample_leases). Returns (leases, error
+    or None). The daemon calls this from a thread of its own: the sampler never waits on it."""
+    payload = json.dumps({"s": s, "procs": list(procs.values())}, default=str).encode()
+    rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"], payload,
+                               LIMITS["tick"], timeout, **_drop_to("nobody", "nobody"))
+    d = loads_untrusted(out)
+    if rc != 0 or not isinstance(d, dict):
+        raise LedgerError("ledger refresh failed: %s" % (err.strip().splitlines() or ["exit status %s" % rc])[-1][:300])
+    e = d.get("error")
+    return sample_leases(d.get("leases")), (e[:300] if isinstance(e, str) else None)
 
 
 def _cmd_ledger_refresh():
-    """Internal: the unprivileged half of refresh_ledger_unprivileged (sample + procs on stdin)."""
+    """Internal: the unprivileged half of ledger_tick (sample + procs on stdin, snapshot on stdout)."""
+    global _lock_wait
     if os.geteuid() == 0:
         print("oomph: _ledger-refresh refuses to run as root", file=sys.stderr)
         return 1
+    _lock_wait = LOCK_WAIT_TICK_S  # busy now: it runs again next sample
     d = json.load(sys.stdin)
-    refresh_ledger(d["s"], {p["pid"]: p for p in d["procs"]})
+    procs = {p["pid"]: p for p in d["procs"]}
+    out = {}
+    try:
+        fd = _ledger_dir()  # readers see a directory replaced by a link as empty; the daemon should hear of it
+        if fd is not None:
+            os.close(fd)
+        refresh_ledger(d["s"], procs)
+    except Exception as e:  # the snapshot is still worth having
+        out["error"] = "%s: %s" % (type(e).__name__, e) if not isinstance(e, LedgerError) else str(e)
+    out["leases"] = sample_leases(ledger_snapshot(procs))
+    sys.stdout.write(json.dumps(out))
     return 0
 
 
+@_unprivileged()
 def ledger_snapshot(procs=None):
     """Compact read-only view of live reservations, for the daemon's samples (no lock, no write)."""
     try:
@@ -1975,6 +2510,33 @@ def ledger_snapshot(procs=None):
         b = _brief(r, now)
         b.pop("holder_pid", None)
         out.append(b)
+    return out
+
+
+SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min")
+
+
+def sample_leases(x):
+    """The leases block of a sample, rebuilt from typed fields only — what root republishes can't
+    be bigger, deeper or differently shaped than this, whatever the shared directory held: at
+    most LIMITS["leases_n"] entries of id, state, gb, purpose, project and the numbers of
+    SAMPLE_LEASE_NUMS, strings cut to LIMITS["str"], LIMITS["leases"] bytes in all. A malformed
+    entry is skipped, never raised."""
+    out, size, n = [], 2, LIMITS["str"]
+    for b in x if isinstance(x, list) else []:
+        if len(out) >= LIMITS["leases_n"]:
+            break
+        if not (isinstance(b, dict) and isinstance(b.get("id"), str) and b.get("state") in ("queued", "granted")
+                and _num(b.get("gb"), 0, 1e6)):
+            continue
+        e = {"id": b["id"][:n], "state": b["state"], "gb": b["gb"],
+             "purpose": b["purpose"][:n] if isinstance(b.get("purpose"), str) else "?",
+             "project": b["project"][:n] if isinstance(b.get("project"), str) else None}
+        e.update((k, b[k]) for k in SAMPLE_LEASE_NUMS if _num(b.get(k)))
+        size += len(json.dumps(e)) + 1
+        if size > LIMITS["leases"]:
+            break
+        out.append(e)
     return out
 
 
@@ -2136,7 +2698,7 @@ def cmd_run(args):
     st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress)
     if st["status"] != "granted":
         if st["status"] == "queued":
-            release(st["id"])
+            _quietly(release, st["id"])
         sys.stderr.write("oomph: not started — %s\n" % (
             "still queued after %ds (%s)" % (wait_s, st["advice"]) if st["status"] == "queued" else st["advice"]))
         return 75
@@ -2146,27 +2708,37 @@ def cmd_run(args):
     try:
         child = subprocess.Popen(cmd)
     except OSError as e:
-        release(st["id"])
+        _quietly(release, st["id"])
         sys.stderr.write("oomph run: %s\n" % e)
         return 127
     for sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(sig, lambda n, f: child.send_signal(n))
     rc = None
     try:
-        set_watch(st["id"], child.pid)
+        _quietly(set_watch, st["id"], child.pid)
         while rc is None:
             try:
                 rc = child.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                coordination()  # refresh: records this run's peak, hands spare room to others
+                _quietly(coordination)  # refresh: records this run's peak, hands spare room to others
     except KeyboardInterrupt:
         rc = child.wait()  # the child got the same SIGINT
     finally:
-        res = release(st["id"])
+        res = _quietly(release, st["id"]) or {"released": []}  # else it ends when this process does
     h = (res["released"] or [{}])[0]
     sys.stderr.write("oomph: %s — reserved %.1fG, peak %.1fG, %ds\n" % (
         st["id"], gb, h.get("peak_gb", 0), time.time() - t0))
     return rc if rc >= 0 else 128 - rc
+
+
+def _quietly(fn, *a):
+    """Bookkeeping that mustn't stop `oomph run` (its command runs regardless): a ledger error
+    is reported, not raised."""
+    try:
+        return fn(*a)
+    except LedgerError as e:
+        sys.stderr.write("oomph: %s\n" % e)
+        return None
 
 
 def cmd_hook(args):
@@ -2364,6 +2936,8 @@ def cmd_mcp():
                 except KeyError:
                     send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown tool"}})
                     continue
+                except LedgerError as e:  # busy, or refused: say so plainly
+                    result = {"content": [{"type": "text", "text": "oomph: %s" % e}], "isError": True}
                 except Exception as e:
                     result = {"content": [{"type": "text", "text": "oomph error: %r" % e}], "isError": True}
             else:
@@ -2450,6 +3024,14 @@ def cmd_setup_claude(args):
 
 
 def main(argv):
+    try:
+        return _main(argv)
+    except LedgerError as e:  # the ledger is busy, or something planted in its directory was refused
+        sys.stderr.write("oomph: %s\n" % e)
+        return 75 if isinstance(e, LedgerBusy) else 1
+
+
+def _main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__.strip())
         return 0
@@ -2493,6 +3075,8 @@ def main(argv):
         return cmd_mcp()
     if c == "_ledger-refresh":
         return _cmd_ledger_refresh()
+    if c == "_ledger-call":
+        return _cmd_ledger_call(rest[0] if rest else "")
     if c == "setup-claude":
         return cmd_setup_claude(rest)
     if c == "report":
@@ -2504,7 +3088,8 @@ def main(argv):
     if c == "html":
         return cmd_html(rest)
     if c == "version":
-        print(VERSION)
+        print(json.dumps({"version": VERSION, "commit": COMMIT, "hardening": HARDENING}) if "--json" in rest
+              else VERSION)
         return 0
     print(__doc__.strip())
     return 2

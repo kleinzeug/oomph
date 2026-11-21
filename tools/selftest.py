@@ -277,11 +277,12 @@ check(end and end[-1]["outcome"] == "expired" and end[-1]["ended"] == planned,
 y = oomph.reserve(0.5, "holder dies", other)
 other_proc.kill()
 other_proc.wait()
-# the root daemon hands the refresh to `oomph _ledger-refresh` running as nobody; same payload here
+# the root daemon's thread hands the refresh to `oomph _ledger-refresh` running as nobody; same payload here
 payload = json.dumps({"s": dict(fake), "procs": list(oomphd.collect_procs().values())}, default=str)
 rr = subprocess.run([sys.executable, "-I", "-B", oomph.__file__, "_ledger-refresh"], input=payload,
                     capture_output=True, text=True, env=dict(os.environ))
-check(rr.returncode == 0, "daemon tick: the unprivileged ledger refresh runs (%s)" % rr.stderr.strip()[-200:])
+check(rr.returncode == 0 and isinstance(json.loads(rr.stdout).get("leases"), list),
+      "daemon tick: the unprivileged ledger refresh runs, answers the snapshot (%s)" % rr.stderr.strip()[-200:])
 end = [r for r in log_recs() if r["event"] == "end" and r["id"] == y["id"]]
 check(end and end[-1]["outcome"] == "holder_gone" and not oomph.read_ledger()["leases"],
       "daemon tick: a dead holder's reservation is retired and logged")
@@ -310,6 +311,275 @@ for args, want in ((["amend", w["id"], "--gb", "256M", "--ttl", "5m"], 0), (["am
         rc = oomph.main(args)
     check(rc == want and buf.getvalue().strip(), "oomph %s → exit %d" % (" ".join(args), rc))
 oomph.release(w["id"])
+# --- H0: the shared ledger directory is world-writable, so anything in it may be hostile
+import hashlib  # noqa: E402
+import secrets  # noqa: E402
+import stat  # noqa: E402
+import threading  # noqa: E402
+LD = os.environ["OOMPH_LEDGER_DIR"]
+scratch = tempfile.mkdtemp(prefix="oomph-h0-")
+
+
+def timed(fn, *a, **kw):
+    t = time.time()
+    try:
+        return fn(*a, **kw), time.time() - t
+    except Exception as e:  # noqa: B902
+        return e, time.time() - t
+
+
+def digest(p):
+    st = os.lstat(p)
+    return hashlib.sha256(open(p, "rb").read()).hexdigest(), st.st_size, st.st_mtime_ns, st.st_nlink
+
+
+fifo = os.path.join(scratch, "fifo")
+os.mkfifo(fifo)
+os.symlink("/dev/zero", os.path.join(scratch, "zero"))
+reg = os.path.join(scratch, "reg")
+open(reg, "w").write('{"a": 1}')
+os.symlink(reg, os.path.join(scratch, "link"))
+sparse = os.path.join(scratch, "sparse")
+with open(sparse, "wb") as f:
+    f.truncate(1 << 30)
+under = os.path.join(scratch, "under")
+open(under, "wb").write(b"x" * (oomph.LIMITS["ledger"] - 1))
+os.link(reg, os.path.join(scratch, "hard"))
+os.mkdir(os.path.join(scratch, "dir"))
+lines = os.path.join(scratch, "lines")
+open(lines, "wb").write(b"".join(b'{"n": %d}\n' % i for i in range(200000)))
+for name, want in (("fifo", None), ("zero", None), ("link", None), ("sparse", None), ("hard", None), ("dir", None),
+                   ("missing", None)):
+    got, dt = timed(oomph.read_bounded, os.path.join(scratch, name), oomph.LIMITS["ledger"])
+    check(got is want and dt < 1, "read_bounded: %s → refused at once (%.2f s)" % (name, dt))
+got, dt = timed(oomph.read_bounded, under, oomph.LIMITS["ledger"])
+check(isinstance(got, bytes) and len(got) == oomph.LIMITS["ledger"] - 1, "read_bounded: a file just under the limit is read")
+open(under, "ab").write(b"xx")
+check(oomph.read_bounded(under, oomph.LIMITS["ledger"]) is None, "read_bounded: just over the limit is refused")
+tail = oomph.read_bounded(lines, 4096, tail=True)
+check(tail and tail.endswith(b'{"n": 199999}\n') and tail.startswith(b'{"n": ') and len(tail) <= 4096,
+      "read_bounded tail: the newest whole lines of a bigger file")
+got, dt = timed(oomph.read_bounded, sparse, oomph.LIMITS["history"], tail=True)
+check(isinstance(got, bytes) and len(got) == 0 and dt < 2, "read_bounded tail: 1 GB sparse file → nothing, %.2f s" % dt)
+U = oomph.loads_untrusted
+check(U(b'{"a": [1, 2.5, "x", null]}') == {"a": [1, 2.5, "x", None]} and U("9" * 30) == int("9" * 30),
+      "loads_untrusted: ordinary JSON")
+check(all(U(x) is None for x in ("9" * 31, "-" + "9" * 31, "NaN", "[Infinity]", "1e999", "[" * 100000 + "]" * 100000,
+                                 json.dumps({str(i): i for i in range(300)}), b"\xff\xfe", "{", "")),
+      "loads_untrusted: huge int, NaN/Infinity, overflow, deep nesting, too many keys, bad bytes → None")
+
+# malformed leases and records: dropped, never raised, by every reader and writer
+me_pid = os.getpid()
+good = {"id": "r900", "state": "granted", "gb": 0.5, "purpose": "valid one", "project": "/tmp/" + "p" * 300,
+        "holder": {"pid": me_pid, "start": None, "kind": "process"}, "watch": me_pid, "ttl": 1800,
+        "requested": time.time() - 5, "seen": time.time() - 5, "granted": time.time() - 5, "expires": time.time() + 900}
+bad = [{"id": "r1"}, {"id": "r2", "state": "granted", "gb": "x", "purpose": "p", "holder": {"pid": 1}, "requested": 1},
+       {"id": "r3", "state": "queued", "gb": 1, "purpose": "p", "holder": {"pid": "x"}, "requested": 1},
+       {"id": "r4", "state": "granted", "gb": 1, "purpose": "p", "holder": {"pid": me_pid}, "requested": 1},
+       {"id": "../x", "state": "queued", "gb": 1, "purpose": "p", "holder": {"pid": me_pid}, "requested": 1},
+       {"id": "r6", "state": "queued", "gb": 1e300, "purpose": "p", "holder": {"pid": me_pid}, "requested": 1},
+       {"id": "r7", "state": "queued", "gb": 1, "purpose": "p", "holder": {"pid": me_pid}, "requested": 1e300}, "r8", None]
+odd = dict(good, id="r901", watch=[1], segments="x", used_gb="lots", holder={"pid": me_pid, "start": "x"})
+open(os.path.join(LD, "ledger.json"), "w").write(json.dumps({"seq": "zz", "leases": bad + [good, odd],
+                                                              "history": [{"id": 5}, {"id": "r3"}], "state": []}))
+with open(log_path, "a") as f:
+    f.write('{"id": "r1"}\n{"key": "x"}\nnot json\n' + "[" * 50000 + "\n" + '{"id": "r2", "gb": 1, "requested": %s}\n'
+            % ("9" * 40) + '{"event": "end", "id": "r3", "gb": "x", "requested": 1, "ended": 2}\n')
+L0 = oomph.read_ledger()
+check([r["id"] for r in L0["leases"]] == ["r900", "r901"] and L0["history"] == [] and L0["seq"] == 901,
+      "malformed ledger: invalid leases and history dropped, seq repaired (%s)" % [r["id"] for r in L0["leases"]])
+o = next(r for r in L0["leases"] if r["id"] == "r901")
+check(o["watch"] is None and "segments" not in o and "used_gb" not in o and o["holder"]["start"] is None,
+      "malformed ledger: mistyped optional fields reset")
+check(next(r for r in L0["leases"] if r["id"] == "r900")["project"] == good["project"],
+      "malformed ledger: a long project path is carried through uncut (no view limit on the write path)")
+ok, snap = True, []
+try:
+    oomph.coordination(me_pid)
+    oomph.reservation_history(30 * 86400, 500)
+    snap = oomph.ledger_snapshot(oomphd.collect_procs())
+    oomph.release("r901")
+    oomph.release("r900")
+except Exception as e:  # noqa: B902
+    ok = repr(e)
+check(ok is True and [b["id"] for b in snap] == ["r900", "r901"], "malformed ledger: coordination, history, snapshot, "
+      "release all work (%s)" % ok)
+tick, dt = timed(oomph.ledger_tick, dict(fake), oomphd.collect_procs())
+check(isinstance(tick, tuple) and tick[1] is None and dt < 5, "daemon tick on the repaired ledger (%.2f s)" % dt)
+
+# what root republishes: typed fields, capped
+blk = oomph.sample_leases([{"id": "r%d" % i, "state": "granted", "gb": 1.0, "purpose": "p" * 5000, "project": i,
+                            "used_gb": 0.5, "for_min": "x", "evil": {"deep": [1]}} for i in range(500)] + ["x", None])
+check(0 < len(blk) <= 64 and len(json.dumps(blk)) <= 16 << 10 and all(len(b["purpose"]) == 200 and b["project"] is None
+      and set(b) == {"id", "state", "gb", "purpose", "project", "used_gb"} for b in blk),
+      "sample leases block: %d entries, %d bytes, typed fields only" % (len(blk), len(json.dumps(blk))))
+
+# a held lock: a clean "busy" within the deadline, never a hang
+holder = subprocess.Popen([sys.executable, "-I", "-c", "import fcntl, os, sys, time\n"
+                           "fd = os.open(sys.argv[1], os.O_RDONLY)\nfcntl.flock(fd, fcntl.LOCK_EX)\n"
+                           "print('held', flush=True)\ntime.sleep(60)", os.path.join(LD, "ledger.lock")],
+                          stdout=subprocess.PIPE, text=True)
+holder.stdout.readline()
+got, dt = timed(oomph.reserve, 0.1, "while locked", me)
+check(isinstance(got, oomph.LedgerBusy) and oomph.LOCK_WAIT_S <= dt < oomph.LOCK_WAIT_S + 2,
+      "held lock: reserve gives up with LedgerBusy after %.1f s" % dt)
+oomph._lock_wait = 0.5
+err = io.StringIO()
+from contextlib import redirect_stderr  # noqa: E402
+with redirect_stdout(io.StringIO()), redirect_stderr(err):
+    rc = oomph.main(["reserve", "100M", "--for", "while locked"])
+check(rc == 75 and "busy" in err.getvalue(), "held lock: `oomph reserve` exits 75 with %r" % err.getvalue().strip()[:60])
+oomph._lock_wait = oomph.LOCK_WAIT_S
+open(os.path.join(LD, "ledger.json"), "w").write(json.dumps({"seq": 1, "leases": [good], "history": []}))
+tick, dt = timed(oomph.ledger_tick, dict(fake), oomphd.collect_procs())
+check(isinstance(tick, tuple) and "busy" in (tick[1] or "") and [b["id"] for b in tick[0]] == ["r900"] and dt < 3,
+      "held lock: the daemon's child gives up after 1 s, still answers the snapshot (%.2f s)" % dt)
+holder.kill()
+holder.wait()
+oomph.release("r900")
+
+# planted links: zero writes through them, by construction
+victim = os.path.join(scratch, "victim")  # someone's ~/.zshrc
+open(victim, "w").write("export PATH=/usr/bin\n")
+before = digest(victim)
+for name in ("ledger.json", "reservations.jsonl"):
+    p = os.path.join(LD, name)
+    keep = open(p, "rb").read() if os.path.exists(p) else None
+    for how in ("symlink", "hardlink"):
+        if os.path.lexists(p):
+            os.remove(p)
+        (os.symlink if how == "symlink" else os.link)(victim, p)
+        x = oomph.reserve(0.1, "planted " + how, me)
+        oomph.release(x["id"])
+        st = os.lstat(p)
+        check(digest(victim) == before and stat.S_ISREG(st.st_mode) and st.st_nlink == 1,
+              "planted %s at %s: the victim is unchanged, a fresh file took the name" % (how, name))
+    if keep is not None and name == "reservations.jsonl":
+        open(p, "ab").write(keep)
+pid = os.getpid()
+for name in ("ledger.json", "reservations.jsonl"):  # 1.8.3's predictable temporary names
+    os.symlink(victim, os.path.join(LD, "%s.%d.tmp" % (name, pid)))
+real_hex = secrets.token_hex
+secrets.token_hex = lambda n=None: "c0ffee"  # make the random name predictable, and plant a link there
+os.symlink(victim, os.path.join(LD, "ledger.json.c0ffee.tmp"))
+got = timed(oomph.reserve, 0.1, "planted temp", me)[0]
+secrets.token_hex = real_hex
+check(isinstance(got, (oomph.LedgerError, OSError)) and digest(victim) == before,
+      "planted link at the temporary name: the write fails (O_EXCL), nothing through it (%s)" % type(got).__name__)
+x = oomph.reserve(0.1, "temp names", me)
+oomph.release(x["id"])
+check(digest(victim) == before, "planted links at 1.8.3's temporary names: unused, the victim is unchanged")
+for f in os.listdir(LD):
+    if f.endswith(".tmp"):
+        os.remove(os.path.join(LD, f))
+
+# the directory itself replaced by a link
+real_ld = oomph.LEDGER_DIR
+other_dir = os.path.join(scratch, "elsewhere")
+os.mkdir(other_dir)
+open(os.path.join(other_dir, "ledger.json"), "w").write(json.dumps({"seq": 1, "leases": [good], "history": []}))
+os.symlink(other_dir, os.path.join(scratch, "linked"))
+oomph.LEDGER_DIR = os.path.join(scratch, "linked")
+listing = sorted(os.listdir(other_dir))
+err = io.StringIO()
+with redirect_stdout(io.StringIO()), redirect_stderr(err):
+    rc = oomph.main(["reserve", "100M", "--for", "linked dir"])
+r1 = oomph.read_ledger()
+check(rc == 1 and "not a plain directory" in err.getvalue() and r1["leases"] == [] and sorted(os.listdir(other_dir))
+      == listing, "directory replaced by a link: refused (exit %d), nothing read or written there" % rc)
+tick = timed(oomph.ledger_tick, dict(fake), oomphd.collect_procs())[0]
+check(isinstance(tick, tuple) and tick[0] == [] and "not a plain directory" in (tick[1] or ""),
+      "directory replaced by a link: the daemon's child reports it, no snapshot")
+oomph.LEDGER_DIR = real_ld
+
+# the sampler never waits for the ledger child
+x = timed(oomph.run_bounded, ["/bin/sleep", "30"], b"", 100, 0.5)
+check(isinstance(x[0], oomph.LedgerError) and "timed out" in str(x[0]) and x[1] < 2,
+      "run_bounded: a hanging child is killed after its timeout (%.2f s)" % x[1])
+x = timed(oomph.run_bounded, ["/usr/bin/yes"], b"", 1000, 5)
+check(isinstance(x[0], oomph.LedgerError) and "more than" in str(x[0]) and x[1] < 2,
+      "run_bounded: a child that says too much is killed")
+x = timed(oomph.run_bounded, ["/bin/cat"], b"z" * (1 << 20), 2 << 20, 5)[0]
+check(isinstance(x, tuple) and x[0] == 0 and len(x[1]) == 1 << 20, "run_bounded: input bigger than a pipe buffer")
+hang = threading.Event()
+calls = []
+
+
+def slow_tick(s, procs):
+    calls.append(s["t"])
+    hang.wait(20)
+    return [], None
+
+
+dd = oomphd.Daemon()
+dd.ledger = oomphd.LedgerWorker(dd.event, tick=slow_tick)
+dd.ledger.FORCE_EVERY = 0  # no skipping here
+dd.ledger.start()
+times = [timed(dd.sample)[1] for _ in range(4)]
+time.sleep(0.2)
+check(max(times) < 1 and len(calls) == 1, "daemon: the sampler doesn't wait for a hanging ledger child "
+      "(samples took %s s)" % ", ".join("%.2f" % t for t in times))
+latest_t = dd.ledger.slot[0]["t"] if dd.ledger.slot else None
+hang.set()
+time.sleep(0.3)
+check(len(calls) == 2 and calls[1] == latest_t, "daemon: the mailbox keeps only the latest sample")
+dd2 = oomphd.Daemon()
+dd2.ledger.start()
+x = oomph.reserve(0.5, "in the sample", me)
+dd2.sample()
+for _ in range(100):
+    if dd2.ledger.runs:
+        break
+    time.sleep(0.05)
+s2 = dd2.sample()
+check([b["id"] for b in s2.get("leases", [])] == [x["id"]] and set(s2["leases"][0]) <= {"id", "state", "gb", "purpose", "project"}
+      | set(oomph.SAMPLE_LEASE_NUMS), "daemon: the next sample carries the live reservation from the child")
+dd2.ledger.at -= 3 * oomphd.INTERVAL
+check(not dd2.ledger.latest(2 * oomphd.INTERVAL), "daemon: a snapshot older than two intervals is dropped")
+oomph.release(x["id"])
+dd2.sample()
+for _ in range(100):
+    if dd2.ledger.runs >= 2 and not dd2.ledger.slot:
+        break
+    time.sleep(0.05)
+time.sleep(0.5)
+n = dd2.ledger.runs
+for _ in range(3):
+    dd2.sample()
+    time.sleep(0.2)
+check(dd2.ledger.runs == n, "daemon: no child while nothing is reserved and ledger.json is unchanged")
+
+# old and new on one ledger: 1.8.3 (still running as MCP servers) and this code read each other's files
+old = os.path.join(scratch, "v183")
+os.mkdir(old)
+for f in ("oomph.py", "oomphd.py"):
+    src = subprocess.run(["git", "-C", ROOT, "show", "v1.8.3:daemon/" + f], capture_output=True, text=True).stdout
+    open(os.path.join(old, f), "w").write(src)
+if os.path.getsize(os.path.join(old, "oomph.py")) > 1000:
+    def old_cli(*a):
+        r = subprocess.run([sys.executable, "-I", "-B", os.path.join(old, "oomph.py")] + list(a), capture_output=True,
+                           text=True, env=dict(os.environ), timeout=60)
+        return json.loads(r.stdout) if r.stdout.strip().startswith("{") else {"rc": r.returncode, "err": r.stderr[-300:]}
+    n_new = oomph.reserve(0.1, "new A", me)
+    seen = old_cli("reservations", "--json")
+    o_b = old_cli("reserve", "100M", "--for", "old B", "--json")
+    ids = [r["id"] for r in oomph.read_ledger()["leases"]]
+    check(any(b["id"] == n_new["id"] for b in seen.get("others", []) + seen.get("mine", [])) and o_b.get("id") in ids,
+          "1.8.3 reads the new ledger, the new code keeps 1.8.3's lease (%s)" % ids)
+    rel = old_cli("release", o_b.get("id", "r0"), "--json")
+    oomph.release(n_new["id"])
+    hist = old_cli("reservations", "--history", "--last", "1h", "--limit", "500", "--json")
+    got = {x["id"]: x["outcome"] for x in hist.get("reservations", [])}
+    mine_h = {x["id"]: x["outcome"] for x in oomph.reservation_history(3600, 500)["reservations"]}
+    check(rel.get("released") and got.get(o_b.get("id")) == mine_h.get(o_b.get("id")) in ("released", "cancelled"),
+          "history log: 1.8.3 appends, the new code rewrites, each reads the other's records")
+    check(got.get(n_new["id"]) == "released", "1.8.3 reads the history log the new code rewrote")
+else:
+    print("skip  1.8.3 compatibility: tag v1.8.3 not in this clone")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    oomph.main(["version", "--json"])
+check(json.loads(buf.getvalue()).get("hardening") == 1, "oomph version --json says hardening 1")
 oomph._sample_override = None
 
 reqs = [reqs[0], reqs[1],

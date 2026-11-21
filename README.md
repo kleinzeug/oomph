@@ -338,7 +338,7 @@ session B  → granted r8, tests start
   lapses if its session stops asking for 3 minutes. The logger checks the ledger every
   sample, so a reservation of a session that died ends within half a minute.
 - **A history that outlives the agents:** every edit and every finished reservation is
-  appended to `/Users/Shared/oomph/reservations.jsonl` (14 days kept): its span from
+  recorded in `/Users/Shared/oomph/reservations.jsonl` (14 days kept): its span from
   request and grant to its *actual* end — the release, the expiry, the holder's exit —
   its size over time, the peak it really used and how it ended. Ids carry the request
   time, so they stay unique even if the ledger is reset. `oomph reservations --history`
@@ -352,6 +352,14 @@ session B  → granted r8, tests start
   the active ones in the same colours.
 - **Advisory:** ***oomph*** still never stops or kills anything. Taking turns is
   something the sessions agree on through the skill.
+- **Nothing in the shared folder is trusted:** every user can write to
+  `/Users/Shared/oomph`, so anyone could plant a link, a FIFO or a huge file there.
+  oomph never follows a link there (not even when the folder itself was replaced by
+  one), takes only plain files of bounded size, writes every file as a new one renamed
+  into place, and gives up with "busy" instead of hanging on a held lock. Nothing
+  running as root ever opens anything in it: the logger's ledger work runs in a child as
+  `nobody` that the sampler never waits for, and `sudo oomph reserve` (any root caller)
+  runs its ledger operation as the user who ran sudo.
 
 ## Files
 

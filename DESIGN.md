@@ -81,8 +81,9 @@ Two practical lessons that shaped the implementation:
 │        /Users/Shared/oomph/ledger.json  (reservations)     │
 │        /Users/Shared/oomph/reservations.jsonl  (history)   │
 └───────────────────────────────────────────────────────────┘
-       (the daemon retires dead/expired leases each sample and
-        copies the live ones into the sample)
+       (each sample, a child of the daemon running as nobody retires
+        dead/expired leases and answers the live ones for the sample;
+        root itself never opens anything in /Users/Shared/oomph)
 ```
 
 ## Decisions
@@ -193,7 +194,7 @@ reservation queue that the sessions use through the skill, the CLI and the MCP s
 
 | Topic | Decision | Why |
 |---|---|---|
-| Where the queue lives | A JSON ledger in `/Users/Shared/oomph/` (dir 777, files 666), every read-modify-write under `flock`, written with an atomic rename | Works without the root daemon, so checks-only installs and CI get it too. RAM is shared by all users, so one ledger per Mac rather than per user. A root daemon as broker would make every request depend on the logger being installed and current. |
+| Where the queue lives | A JSON ledger in `/Users/Shared/oomph/` (dir 777, files 666), every read-modify-write under `flock`, written with an atomic rename. No installer creates or changes the directory; the first session that reserves creates it | Works without the root daemon, so checks-only installs and CI get it too. RAM is shared by all users, so one ledger per Mac rather than per user. A root daemon as broker would make every request depend on the logger being installed and current. |
 | Unit | A **reservation**: estimated *peak extra* GB + a purpose label + the holder (Claude session, or the `oomph run` process) | Peak, because the peak is what tips the machine over. The label makes past peaks reusable for estimates. |
 | Admission | Strict FIFO. Grant the head while `gb ≤ free − outstanding − margin`; margin = max(1.5 GB, 5 % RAM). Never while pressure is critical. Head bigger than that is granted only when no other grant exists and the verdict is ok; > 90 % of RAM is refused | FIFO is what "one after another" means and prevents starving big jobs. The alone rule prevents a deadlock on requests that can never fit; it is flagged with a note so the agent expects swapping. |
 | Free figure | Activity Monitor's (RAM − app − wired − compressed), from a live sample | Conservative on purpose: cached files are reclaimable, but the point is to space out heavy steps, and the same figure is shown everywhere. |
@@ -203,8 +204,30 @@ reservation queue that the sessions use through the skill, the CLI and the MCP s
 | Visibility | `oomph check` folds in others' reservations (tight when they exceed what's free); the daemon copies live reservations into every sample; the popup lists them | Uncoordinated checks still see planned work, and incidents show what was reserved at the time. |
 | Enforcement | None — advisory, like the rest of oomph | Killing or pausing an agent's work would be worse than the problem. The skill tells sessions never to start reserved-for work early and never to release others' entries. |
 | Edits | `oomph amend` / MCP `update_reservation`: gb, ttl (from now), purpose. Shrinking applies at once. Growing a grant applies only if a new request for the extra would be granted now (fits, nobody queued, not critical); otherwise refused with advice to reserve the extra separately, and nothing changes. Growing a queued request moves it to the back | Growth that skipped the queue would let a holder overtake everyone waiting; a pending-growth state would complicate every client. Refusal keeps the grant intact and the queue fair, and the advice is one tool call. |
-| History | Append-only `reservations.jsonl` next to the ledger (666), written under the ledger lock: an `edit` record per applied change, an `end` record when a lease is retired, each a full snapshot (key, purpose, project, holder kind, gb and `segments` [{t, gb}] once edited, requested, granted, ended, outcome, peak). Pruned to 14 days at most hourly; seeded once from the ledger's own last-100 history | Agents and the popup need spans of sessions that are long gone. Snapshots make the last record per key self-contained. The key is `id@requested`, and a fresh ledger continues the id numbering from the log, so ids never repeat after a reset. Ends are the real ones: an expiry at its expiry time, a lapse when polling stopped, a dead holder within one daemon sample. |
+| History | `reservations.jsonl` next to the ledger (666), one record per line, written under the ledger lock: an `edit` record per applied change, an `end` record when a lease is retired, each a full snapshot (key, purpose, project, holder kind, gb and `segments` [{t, gb}] once edited, requested, granted, ended, outcome, peak). Every write rewrites it (see the next table): 14 days and at most 8 MB are kept; seeded once from the ledger's own last-100 history | Agents and the popup need spans of sessions that are long gone. Snapshots make the last record per key self-contained. The key is `id@requested`, and a fresh ledger continues the id numbering from the log, so ids never repeat after a reset. Ends are the real ones: an expiry at its expiry time, a lapse when polling stopped, a dead holder within one daemon sample. |
 | Popup strip | One block per reservation under the memory chart, drawn on the chart's own time mapping (same plot frame, same animated linear/log blend). Height ∝ GB; stacked by lanes (first-fit by start), and the stack at any moment is the sum of what is reserved there, so a block steps down when one below ends or shrinks; queued stretches hatched. The list below uses the same colours, hashed from the purpose | Lining up with the chart lets you read cause and effect; stacking shows the total the ledger promised. |
+
+### The shared directory is untrusted (1.8.4, H0)
+
+Every user can write to `/Users/Shared/oomph`, so anything in it may be planted: a symbolic
+or hard link to someone else's file, a FIFO, a device, an endless or sparse file, JSON with
+huge numbers or deep nesting. The invariant: **no process running as root opens anything
+inside it, to read or to write, by any route; root never waits on it; whatever root
+republishes from it is rebuilt from typed, capped fields.**
+
+| Topic | Decision | Why |
+|---|---|---|
+| The logger | Its ledger work (retire, evaluate, snapshot) runs in `oomph _ledger-refresh` as `nobody`, started by a thread of its own. The sampler drops its newest sample and process table into a one-slot mailbox (latest wins) and goes on; the thread reads at most 64 KB of answer within 5 s, kills the child after that, and the sample carries the last snapshot, unless it is older than two intervals. While nothing is reserved the child is skipped as long as `ledger.json`'s `lstat` is unchanged (at most 5 min) | A FIFO planted as `ledger.json` used to stop the logger, a held lock delayed every sample, a malformed lease made every sample raise |
+| Other root callers | `sudo oomph reserve/release/amend/run/reservations/check/status/mcp…`: each ledger operation runs in `oomph _ledger-call` as the user who ran sudo (`SUDO_UID`), else `nobody`, with the sample and process table root measured. `oomph run` still runs its command as root; only its bookkeeping drops privileges. The ledger code refuses to run as root at all (a fence in `Ledger`, `read_ledger`, `read_history` and the history writer) | `sudo oomph reserve` followed planted links |
+| Reading | One reader, `read_bounded`: `O_NOFOLLOW` + `O_NONBLOCK`, a regular file with a single link (checked on the descriptor), a size cap; the directory itself opened `O_DIRECTORY` + `O_NOFOLLOW` and every file relative to it. One parser, `loads_untrusted`: no integers over 30 digits, no NaN/Infinity, ≤ 256 keys per object, no deep nesting. One table of limits (`LIMITS`). The app's `readShared` does the same | No FIFO, device or giant file can hang or flood a reader |
+| Validation | `read_ledger` checks every lease and history entry field by field; one that doesn't fit was never written by oomph and is dropped. Types are checked, nothing is cut: a view limit never reaches the read-modify-write path | A malformed ledger can't make the CLI, the MCP server or the logger raise |
+| Writing | No writer opens an existing name for writing: a random temporary name created `O_EXCL`, `fchmod` on the descriptor, then a rename. The history log is rewritten the same way on every write (read, keep 14 days and ≤ 8 MB, add, rename) instead of being appended to, so it stays one file in the same format; 1.8.1–1.8.3, which append under the same lock, keep working | A hard link can't be refused by any open flag; a rename never writes through one |
+| The lock | `ledger.lock` opened read-only, `O_NOFOLLOW` + `O_NONBLOCK`, a regular file; `flock` polled to a deadline: 5 s for interactive callers (a holder keeps it for milliseconds, so this only runs out when it is stuck or hostile, yet survives one swapped out under pressure), 1 s for the logger's child (it runs again next sample). Then "busy" (exit 75), never a hang | |
+| Installers | Leave the directory alone: no `chown`, `chmod`, `install -d` or sticky bit | Root touching it is exactly what this rules out |
+| Tests | `tools/selftest.py` covers the unprivileged half; `tools/roottest.py` runs as real root in CI with an audit hook on every file root opens | |
+
+`oomph version --json` reports `"hardening": 1`, so a later `oomph share on` can refuse code
+without it.
 
 ## AI analysis (1.4)
 

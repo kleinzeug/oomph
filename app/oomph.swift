@@ -87,6 +87,43 @@ let agentPlist = NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
 
 // MARK: - Model
 
+/// Limits for what is read from the shared ledger directory (oomph.py's LIMITS).
+let ledgerCap = 4 << 20, historyCap = 8 << 20
+
+/// Reads a file of the shared ledger directory. That directory is world-writable, so anyone can
+/// plant a link, a FIFO or an endless or huge file there: this never follows a symbolic link
+/// (neither the file nor the directory itself), never blocks on a FIFO, takes only a regular
+/// file with a single link, and reads at most `cap` bytes — with `tail`, the last whole lines
+/// within `cap` of a bigger file, else nothing.
+func readShared(_ path: String, cap: Int, tail: Bool = false) -> Data? {
+    let dir = (path as NSString).deletingLastPathComponent, name = (path as NSString).lastPathComponent
+    let dfd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard dfd >= 0 else { return nil }
+    defer { close(dfd) }
+    let fd = openat(dfd, name, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+    guard fd >= 0 else { return nil }
+    defer { close(fd) }
+    var st = stat()
+    guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_nlink == 1 else { return nil }
+    let size = Int(st.st_size)
+    let cut = size > cap
+    if cut {
+        guard tail, lseek(fd, off_t(size - cap), SEEK_SET) >= 0 else { return nil }
+    }
+    var data = Data(count: min(size, cap))
+    var got = 0
+    while got < data.count {
+        let n = data.withUnsafeMutableBytes { read(fd, $0.baseAddress! + got, $0.count - got) }
+        if n <= 0 { break }
+        got += n
+    }
+    data.count = got
+    if cut {  // the first line is a fragment
+        data = data.firstIndex(of: 0x0A).map { data.subdata(in: ($0 + 1)..<data.count) } ?? Data()
+    }
+    return data
+}
+
 struct Away: Decodable { var idle_s: Int?; var display_on: Bool?; var locked: Bool?; var sleep_preventers: [String]? }
 struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
@@ -441,7 +478,7 @@ final class Store: ObservableObject {
     private func loadReservations(now: Double) -> [ResBlock] {
         var byKey: [String: Reservation] = [:]
         var events: [String: String] = [:]
-        if let d = FileManager.default.contents(atPath: ledgerDir + "/reservations.jsonl") {
+        if let d = readShared(ledgerDir + "/reservations.jsonl", cap: historyCap, tail: true) {
             for line in d.split(separator: 0x0A) {
                 guard let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
                       let r = Reservation(o) else { continue }
@@ -449,7 +486,7 @@ final class Store: ObservableObject {
                 if ev == "end" || events[r.id] != "end" { byKey[r.id] = r; events[r.id] = ev }
             }
         }
-        let ledger = FileManager.default.contents(atPath: ledgerDir + "/ledger.json")
+        let ledger = readShared(ledgerDir + "/ledger.json", cap: ledgerCap)
             .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
         for h in (ledger["history"] as? [[String: Any]]) ?? [] {
             if let r = Reservation(h), byKey[r.id] == nil { byKey[r.id] = r }

@@ -34,13 +34,22 @@ jobs:
         run: |
           bash -n build-app.sh install.sh uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py tools/selftest.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py tools/selftest.py tools/roottest.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
 
       - name: Daemon + CLI self-test
         # Samples this runner into a temp dir, simulates a jetsam storm, and checks
         # the incident lifecycle, the HTML report and every CLI command.
         run: /usr/bin/python3 -I -B tools/selftest.py
+
+      - name: Root test (H0)
+        # As real root (the runner has passwordless sudo): neither the daemon nor
+        # `sudo oomph reserve` opens anything in the world-writable ledger directory,
+        # whatever is planted there, and the sampler never waits on it. First the dry
+        # run (unprivileged, pretending), then the real one.
+        run: |
+          /usr/bin/python3 -I -B tools/roottest.py
+          sudo /usr/bin/python3 -I -B tools/roottest.py
 
       - name: Build oomph.app
         # Exactly what a contributor runs; ad-hoc signed, no Apple account.
