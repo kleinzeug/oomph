@@ -34,7 +34,7 @@ jobs:
         run: |
           bash -n build-app.sh install.sh uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py tools/selftest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py tools/selftest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/fixtureplat.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
@@ -138,7 +138,7 @@ jobs:
           grep -q "^VERSION = \"$version\"" "$APP/Contents/Resources/oomph.py" || { echo "::error::bundled CLI not stamped"; exit 1; }
 
           # Activate/Deactivate run these from the bundle.
-          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py local.oomph.daemon.plist; do
+          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py local.oomph.daemon.plist; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }
@@ -158,3 +158,32 @@ jobs:
           path: ${{ runner.temp }}/dist/oomph.zip
           retention-days: 14
           if-no-files-found: error
+
+  linux:
+    # The portable half on Linux: oomph and oomphd import without macOS's libraries, and the
+    # self-test runs everything that needs no Mac (the logger's bookkeeping, incidents, reports,
+    # the ledger and its hardening, the CLI, oomph top, the AI harness) on a stand-in backend
+    # (tools/fixtureplat.py). What needs macOS or a backend that measures Linux (1.9.4) is
+    # skipped and says so.
+    name: Portable half on Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the version derives from `git describe`
+
+      - name: Toolchain
+        run: |
+          uname -a
+          python3 --version
+
+      - name: Import without macOS
+        run: |
+          python3 -I -m py_compile daemon/*.py tools/*.py
+          python3 -I -B -c 'import sys; sys.path.insert(0, "daemon"); import oomph, oomphd, oomph_top, oomph_view, oomph_ai, oomph_upgrade; assert "ctypes" not in sys.modules and "oomph_darwin" not in sys.modules; print("imported", oomph.VERSION, oomph.LOG_DIR, oomph.LEDGER_DIR)'
+          set +e; python3 -I -B daemon/oomph.py doctor; rc=$?; set -e
+          echo "doctor exit $rc"; test "$rc" = 2   # nothing measures Linux yet: it says so, and exits 2
+
+      - name: Self-test, portable half
+        run: python3 -I -B tools/selftest.py

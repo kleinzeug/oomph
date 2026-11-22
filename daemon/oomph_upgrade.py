@@ -23,8 +23,7 @@ import time
 import oomph
 
 REPO = os.environ.get("OOMPH_REPO", "https://github.com/kleinzeug/oomph.git")
-HOME = os.path.expanduser("~")
-BASE = os.environ.get("OOMPH_UPGRADE_DIR", os.path.join(HOME, "Library", "Application Support", oomph.CMD))
+BASE = os.environ.get("OOMPH_UPGRADE_DIR", oomph.STATE_DIR)  # the path table's state folder
 SRC = os.path.join(BASE, "src")
 STAGING = os.path.join(BASE, "staging")
 

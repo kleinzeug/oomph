@@ -1,21 +1,21 @@
 #!/usr/bin/python3 -I
-"""oomphd — continuous memory papertrail for macOS. See ../DESIGN.md.
+"""oomphd — continuous memory papertrail. See ../DESIGN.md.
 
 Runs as a root LaunchDaemon. For unprivileged testing set OOMPH_DIR to a
 writable directory (only your own processes will report a footprint then).
+
+The logger itself is portable and imports on any system: it measures only through
+oomph.plat(), the backend for this system (oomph_darwin on a Mac), loaded at the first sample.
 """
-import ctypes
 import datetime
 import glob
 import gzip
 import json
 import os
-import plistlib
 import re
 import shutil
 import signal
 import stat
-import struct
 import subprocess
 import sys
 import threading
@@ -28,6 +28,21 @@ import oomph  # noqa: E402  (shared paths + HTML/summary rendering)
 
 VERSION = oomph.VERSION
 LOG_DIR = oomph.LOG_DIR
+
+# Names that measured here until 1.8.7 and now live in the backend. oomph.py 1.6.2 to 1.8.7 calls
+# them on this module, and an MCP server of those versions started from a real
+# /usr/local/libexec/oomph imports this file at its first tool call, after an install has swapped
+# that path for a link to this version. Forwarded on use (PEP 562), so importing this module
+# still loads no native code.
+_MOVED = frozenset(("system_memory", "away_state", "collect_procs", "proc_cwd", "ownership", "uptime_s",
+                    "group_key", "list_pids", "proc_rusage", "proc_bsdinfo", "proc_path", "sysctl_raw",
+                    "sysctl_int"))
+
+
+def __getattr__(name):
+    if name in _MOVED:
+        return getattr(oomph.plat(), name)
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 INTERVAL = 30
 HOT_INTERVAL = 5
@@ -53,74 +68,6 @@ FLAP_REPORT_EVERY = 15 * 60
 MB = 1024 * 1024
 GB = 1024 * MB
 
-# ---------------------------------------------------------------- native bits
-_libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
-_proc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
-
-
-class _RUsage(ctypes.Structure):  # rusage_info_v4 prefix (+ padding)
-    _fields_ = [("uuid", ctypes.c_uint8 * 16), ("user", ctypes.c_uint64),
-                ("system", ctypes.c_uint64), ("pkg_idle", ctypes.c_uint64),
-                ("intr", ctypes.c_uint64), ("pageins", ctypes.c_uint64),
-                ("wired", ctypes.c_uint64), ("resident", ctypes.c_uint64),
-                ("footprint", ctypes.c_uint64), ("pad", ctypes.c_uint64 * 64)]
-
-
-_BSDINFO_SIZE = 136
-_VNODEPATH_SIZE = 2352
-_bsd_buf = ctypes.create_string_buffer(_BSDINFO_SIZE)
-_vp_buf = ctypes.create_string_buffer(_VNODEPATH_SIZE)
-_path_buf = ctypes.create_string_buffer(4096)
-
-
-def sysctl_raw(name, size=64):
-    buf = ctypes.create_string_buffer(size)
-    sz = ctypes.c_size_t(size)
-    if _libc.sysctlbyname(name.encode(), buf, ctypes.byref(sz), None, ctypes.c_size_t(0)) != 0:
-        return None
-    return buf.raw[:sz.value]
-
-
-def sysctl_int(name):
-    raw = sysctl_raw(name)
-    return int.from_bytes(raw, "little") if raw else None
-
-
-def list_pids():
-    n = _proc.proc_listallpids(None, 0)
-    arr = (ctypes.c_int * (n + 256))()
-    n = _proc.proc_listallpids(arr, ctypes.sizeof(arr))
-    return [p for p in arr[:max(n, 0)] if p > 0]
-
-
-def proc_rusage(pid):
-    r = _RUsage()
-    if _proc.proc_pid_rusage(pid, 4, ctypes.byref(r)) != 0:
-        return None
-    return r.footprint, r.resident
-
-
-def proc_bsdinfo(pid):
-    if _proc.proc_pidinfo(pid, 3, ctypes.c_uint64(0), _bsd_buf, _BSDINFO_SIZE) != _BSDINFO_SIZE:
-        return None
-    raw = _bsd_buf.raw
-    ppid, uid = struct.unpack_from("<II", raw, 16)
-    comm = raw[48:64].split(b"\0")[0].decode("utf-8", "replace")
-    name = raw[64:96].split(b"\0")[0].decode("utf-8", "replace")
-    start = struct.unpack_from("<Q", raw, 120)[0]
-    return ppid, uid, name or comm, start
-
-
-def proc_path(pid):
-    n = _proc.proc_pidpath(pid, _path_buf, 4096)
-    return _path_buf.value.decode("utf-8", "replace") if n > 0 else ""
-
-
-def proc_cwd(pid):
-    if _proc.proc_pidinfo(pid, 9, ctypes.c_uint64(0), _vp_buf, _VNODEPATH_SIZE) <= 0:
-        return None
-    return _vp_buf.raw[152:152 + 1024].split(b"\0")[0].decode("utf-8", "replace") or None
-
 
 def run(cmd, timeout=10):
     try:
@@ -129,100 +76,12 @@ def run(cmd, timeout=10):
         return ""
 
 
-# ------------------------------------------------------------- system sample
-def system_memory():
-    out = run(["/usr/bin/vm_stat"])
-    m = re.search(r"page size of (\d+)", out)
-    ps = int(m.group(1)) if m else 16384
-    v = {}
-    for line in out.splitlines():
-        k, _, val = line.partition(":")
-        val = val.strip().rstrip(".")
-        if val.isdigit():
-            v[k.strip().strip('"').lower()] = int(val)
-    internal = sysctl_int("vm.page_pageable_internal_count") or v.get("anonymous pages", 0)
-    purgeable = v.get("pages purgeable", 0)
-    sw = sysctl_raw("vm.swapusage")
-    sw_total = sw_used = 0
-    if sw and len(sw) >= 24:
-        sw_total, _avail, sw_used = struct.unpack_from("<QQQ", sw, 0)
-    swapfiles = glob.glob("/System/Volumes/VM/swapfile*")
-    st = os.statvfs("/System/Volumes/Data")
-    return {
-        "pressure": sysctl_int("kern.memorystatus_vm_pressure_level") or 0,
-        "free_pct": sysctl_int("kern.memorystatus_level"),
-        "ram_gb": round((sysctl_int("hw.memsize") or 0) / GB, 1),
-        "app_gb": round(max(internal - purgeable, 0) * ps / GB, 2),
-        "wired_gb": round(v.get("pages wired down", 0) * ps / GB, 2),
-        "compressed_gb": round(v.get("pages occupied by compressor", 0) * ps / GB, 2),
-        "compressor_logical_gb": round(v.get("pages stored in compressor", 0) * ps / GB, 2),
-        "cached_gb": round((v.get("file-backed pages", 0) + purgeable) * ps / GB, 2),
-        "free_gb": round((v.get("pages free", 0) + v.get("pages speculative", 0)) * ps / GB, 2),
-        "swap_total_gb": round(sw_total / GB, 2),
-        "swap_used_gb": round(sw_used / GB, 2),
-        "swapfiles": len(swapfiles),
-        "disk_free_gb": round(st.f_bavail * st.f_frsize / GB, 1),
-        "swapins": v.get("swapins", 0),
-        "swapouts": v.get("swapouts", 0),
-    }
-
-
-_PREVENT_RE = re.compile(r"pid \d+\(([^)]*)\):.*?(PreventUserIdleSystemSleep|PreventSystemSleep|PreventUserIdleDisplaySleep|NoDisplaySleepAssertion|NoIdleSleepAssertion)\s+named: \"([^\"]*)\"")
-
-
-def away_state():
-    out = run(["/usr/sbin/ioreg", "-c", "IOHIDSystem", "-r", "-k", "HIDIdleTime", "-d", "1"])
-    m = re.search(r'"HIDIdleTime" = (\d+)', out)
-    idle = int(m.group(1)) // 1_000_000_000 if m else None
-    asr = run(["/usr/bin/pmset", "-g", "assertions"])
-    display_on = "Prevent sleep while display is on" in asr
-    preventers = sorted({mm.group(1) for mm in _PREVENT_RE.finditer(asr) if mm.group(1) != "powerd"})
-    locked, user, uid = False, None, None
-    try:
-        raw = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"], stdin=subprocess.DEVNULL, capture_output=True,
-                             timeout=10).stdout
-        for u in plistlib.loads(raw).get("IOConsoleUsers", []):
-            if u.get("kCGSSessionOnConsoleKey"):
-                user, uid = u.get("kCGSSessionUserNameKey"), u.get("kCGSSessionUserIDKey")
-                locked = bool(u.get("CGSSessionScreenIsLocked", False))
-    except Exception:
-        pass
-    return {"idle_s": idle, "display_on": display_on, "locked": locked,
-            "user": user, "uid": uid, "sleep_preventers": preventers}
-
-
 # ---------------------------------------------------------------- processes
-_path_cache = {}
-
-
-def group_key(path, name):
-    i = path.find(".app/")
-    if i > 0:
-        return os.path.basename(path[:i])
-    return name
-
-
-def collect_procs():
-    procs = {}
-    for pid in list_pids():
-        ru = proc_rusage(pid)
-        bi = proc_bsdinfo(pid)
-        if not bi:
-            continue
-        ppid, uid, name, start = bi
-        key = (pid, start)
-        path = _path_cache.get(key)
-        if path is None:
-            path = _path_cache[key] = proc_path(pid)
-        procs[pid] = {"pid": pid, "ppid": ppid, "uid": uid, "name": name, "start": start,
-                      "fp": ru[0] if ru else 0, "rss": ru[1] if ru else 0, "path": path}
-    live = {(p["pid"], p["start"]) for p in procs.values()}
-    for k in [k for k in _path_cache if k not in live]:
-        del _path_cache[k]
-    return procs
-
-
 def summarize_procs(procs):
+    """The top processes, the biggest groups and the agent sessions of a process table, as a
+    sample carries them. The backend says what a group and a session root are."""
+    P = oomph.plat()
+    group_key, is_claude = P.group_key, P.is_agent
     groups = {}
     for p in procs.values():
         g = groups.setdefault(group_key(p["path"], p["name"]), [0, 0])
@@ -234,9 +93,6 @@ def summarize_procs(procs):
     children = {}
     for p in procs.values():
         children.setdefault(p["ppid"], []).append(p["pid"])
-
-    def is_claude(p):
-        return p["name"] == "claude"
 
     sessions, session_of = [], {}
     for p in procs.values():
@@ -260,7 +116,7 @@ def summarize_procs(procs):
         desc = [procs[m] for m in members if m != p["pid"] and m in procs]
         big = max(desc, key=lambda d: d["fp"]) if desc else None
         sessions.append({
-            "pid": p["pid"], "cwd": proc_cwd(p["pid"]),
+            "pid": p["pid"], "cwd": P.proc_cwd(p["pid"]),
             "mb": round(sum(procs[m]["fp"] for m in members if m in procs) / MB),
             "own_mb": round(p["fp"] / MB), "n": len(members),
             "biggest": {"name": big["name"], "pid": big["pid"], "mb": round(big["fp"] / MB)} if big else None,
@@ -279,22 +135,6 @@ def summarize_procs(procs):
             e["s"] = session_of[p["pid"]]
         top.append(e)
     return top, grp, sessions
-
-
-def ownership(sysm, procs):
-    """What all processes' footprints add up to, and how much memory none of them owns.
-    A footprint counts its compressed and swapped pages at their uncompressed size, so
-    app memory + the compressor's logical size should roughly equal the sum; a large
-    remainder is memory held outside every process (last seen: a WebKit GPU-process leak
-    that survived its processes and froze the Mac)."""
-    procs_gb = sum(p["fp"] for p in procs.values()) / GB
-    return {"procs_gb": round(procs_gb, 1),
-            "unowned_gb": round(max(0.0, sysm["app_gb"] + sysm["compressor_logical_gb"] - procs_gb), 1)}
-
-
-def uptime_s():
-    """Seconds the Mac has been awake since boot (stops while asleep, unlike time.time())."""
-    return time.clock_gettime(time.CLOCK_UPTIME_RAW)
 
 
 def log_time(j, default):
@@ -439,6 +279,7 @@ class Daemon:
         self.stopping = False
         self.stream_proc = None
         self.ledger = LedgerWorker(self.event)  # started by run()
+        self.machine = None  # the `machine` block of current.json, made at the first sample
 
     # -- events
     def event(self, kind, **kw):
@@ -563,20 +404,9 @@ class Daemon:
 
     # -- notifications
     def notify(self, title, msg, **kw):
-        script = 'display notification "%s" with title "%s" sound name "Basso"' % (
-            msg.replace('"', "'"), title.replace('"', "'"))
         try:
-            if os.geteuid() == 0:
-                uid = self.console.get("uid")
-                user = self.console.get("user")
-                if uid is None or not user:
-                    return
-                cmd = ["/bin/launchctl", "asuser", str(uid), "/usr/bin/sudo", "-u", user,
-                       "/usr/bin/osascript", "-e", script]
-            else:
-                cmd = ["/usr/bin/osascript", "-e", script]
-            subprocess.run(cmd, capture_output=True, timeout=15)
-            self.event("notified", title=title, msg=msg, **kw)
+            if oomph.plat().notify(title, msg, self.console):
+                self.event("notified", title=title, msg=msg, **kw)
         except Exception as e:
             self.event("daemon_error", where="notify", error=str(e))
 
@@ -644,10 +474,7 @@ class Daemon:
                 self.event("daemon_error", where="join_incident", error=str(e))
 
     def dump_syslog(self, d):
-        out = run(["/usr/bin/log", "show", "--last", "15m", "--style", "compact",
-                   "--predicate", oomph.LOG_PREDICATE], timeout=300)
-        with open(os.path.join(d, "syslog.txt"), "w") as f:
-            f.write(out)
+        oomph.plat().dump_syslog(d, oomph.LOG_PREDICATE)
 
     def close_incident(self, t, rolled=False):
         """Close, summarise and write the report. Both read the samples one at a time: the
@@ -697,12 +524,13 @@ class Daemon:
 
     # -- main loop
     def sample(self):
+        P = oomph.plat()
         t = time.time()
-        sysm = system_memory()
-        away = away_state()
+        sysm = P.system_memory()
+        away = P.away_state()
         if away.get("uid") is not None:
             self.console = {"uid": away["uid"], "user": away["user"]}
-        procs = collect_procs()
+        procs = P.collect_procs()
         jetsam_kills = self.flush_jetsam()
         top, groups, sessions = summarize_procs(procs)
 
@@ -713,7 +541,7 @@ class Daemon:
         # a pid that is still present with the same start time is not gone
         self.prev_big = big
 
-        up = uptime_s()
+        up = P.uptime_s()
         gap = stall = None
         if self.prev_t and t - self.prev_t > 3 * (HOT_INTERVAL if self.hot else INTERVAL) + 5:
             gap = round(t - self.prev_t)
@@ -730,13 +558,13 @@ class Daemon:
                             "msg": "oomph couldn't run for %d s while the Mac was awake — the system is starved for memory" % gap})
         self.prev_t, self.prev_up = t, up
 
-        s = {"t": round(t, 1), "iso": now_iso(t), "hot": self.hot}
+        s = {"t": round(t, 1), "iso": now_iso(t), "hot": self.hot, "os": P.OS}
         if gap:
             s["gap"] = gap
         if stall:
             s["stall"] = stall
         s.update(sysm)
-        s.update(ownership(sysm, procs))
+        s.update(P.ownership(sysm, procs))
         s["jetsam_kills"] = jetsam_kills
         s["away"] = {k: away[k] for k in ("idle_s", "display_on", "locked", "sleep_preventers")}
         s["top"] = top
@@ -760,10 +588,16 @@ class Daemon:
         with self.lock:
             append_json(os.path.join(LOG_DIR, "samples-%s.jsonl" % day), s)
         cur = dict(s)
+        if self.machine is None:
+            try:
+                self.machine = P.machine()
+            except Exception as e:  # who this machine is matters less than the sample
+                self.machine = {"os": P.OS}
+                self.event("daemon_error", where="machine", error=repr(e)[:300])
         cur["daemon"] = {"pid": os.getpid(), "version": VERSION, "started": self.started,
                          "interval": HOT_INTERVAL if self.hot else INTERVAL,
                          "incident": self.incident["id"] if self.incident else None,
-                         "root": os.geteuid() == 0}
+                         "root": os.geteuid() == 0, "machine": self.machine}
         write_atomic(os.path.join(LOG_DIR, "current.json"), json.dumps(cur))
         return s
 
@@ -834,13 +668,15 @@ class Daemon:
         elif self.incident and t - self.incident["last_trigger"] > INCIDENT_CLOSE_AFTER:
             self.close_incident(t)
 
-        if s["disk_free_gb"] < DISK_LOW_GB and time.time() - self.last_disk_notify > DISK_COOLDOWN:
+        # swap grows on the startup disk of a Mac: there a full disk is a memory problem (roadmap 03 §5.4)
+        mac = s.get("os", "macos") == "macos"
+        if mac and s["disk_free_gb"] < DISK_LOW_GB and time.time() - self.last_disk_notify > DISK_COOLDOWN:
             self.last_disk_notify = time.time()
             self.event("disk_low", disk_free_gb=s["disk_free_gb"])
             self.notify("Disk space low", "Only %.0f GB free — swap can't grow, risk of memory kills."
                         % s["disk_free_gb"])
 
-        self.hot = bool(pr >= 2 or swap_jump or s.get("jetsam_kills") or s["disk_free_gb"] < 5 or self.incident)
+        self.hot = bool(pr >= 2 or swap_jump or s.get("jetsam_kills") or (mac and s["disk_free_gb"] < 5) or self.incident)
 
     def run(self):
         signal.signal(signal.SIGTERM, self.stop)
@@ -854,8 +690,9 @@ class Daemon:
                     self.incident = inc
             except Exception:
                 pass
-        threading.Thread(target=self.stream_loop, daemon=True).start()
-        threading.Thread(target=self.poll_loop, daemon=True).start()
+        if oomph.plat().OS == "macos":  # kills are read from the unified log
+            threading.Thread(target=self.stream_loop, daemon=True).start()
+            threading.Thread(target=self.poll_loop, daemon=True).start()
         self.ledger.start()
         while not self.stopping:
             t0 = time.time()

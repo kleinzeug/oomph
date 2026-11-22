@@ -52,6 +52,10 @@ If `OOMPH reserve` / `reserve_memory` doesn't exist, the installed oomph is olde
 1.2: tell the user once that updating it (click the chip → Update) enables coordination,
 and use the checks in §4 until then.
 
+If a command or tool fails with an error (not a verdict), run `OOMPH doctor` (oomph 1.8.8
+or newer; `--json` for structured output): it says what works on this machine and what to
+fix. Pass its fix lines on to the user; don't run them yourself (most need `sudo`).
+
 ## 2. The commands
 
 | Command | What it gives you |

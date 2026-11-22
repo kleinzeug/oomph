@@ -34,6 +34,8 @@ coordinating memory between sessions (a shared first-come-first-served ledger):
   oomph hook                        Claude Code PostToolUse hook: silent when ok, warns when tight
   oomph mcp                         MCP server over stdio (memory_check, reserve_memory, release_memory, ...)
   oomph setup-claude [--hook] [--remove]   install the skill + register the MCP server for Claude Code
+  oomph doctor [--json]             what works on this machine and what to fix; exit 0 fine, 1 something to
+                                    fix, 2 it cannot work here
 """
 import datetime
 import functools
@@ -88,7 +90,56 @@ def usage(doc):
     return re.sub(r"\boomph\b", lambda m: BRAND, first, count=1) + ("\n" + rest if rest else "")
 
 
-LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
+# Where things live, per system: one table instead of constants scattered over the modules.
+# OOMPH_DIR, OOMPH_LEDGER_DIR and OOMPH_STATE_DIR still win. Reading it imports no backend, so
+# the hook and the readers never load the code that measures. On Linux the ledger is per user
+# (and per machine, for a home folder shared between machines) until a logger there keeps one
+# for everybody (roadmap 03 §8.1); `ledger_mode` is what a new ledger folder is created with.
+PATHS = {
+    "darwin": {"log": "/Library/Logs/oomph",
+               "ledger": "/Users/Shared/oomph", "ledger_mode": 0o777,
+               "state": "~/Library/Application Support/oomph",
+               "config": "/Library/Application Support/oomph/config.json",
+               "libexec": "/usr/local/libexec/oomph", "service": "/Library/LaunchDaemons/local.oomph.daemon.plist"},
+    "linux": {"log": "/var/log/oomph",
+              "ledger": "{state}/ledger/{machine}", "ledger_mode": 0o700,
+              "state": "{xdg_state}/oomph",
+              "config": "/etc/oomph/config.json",
+              "libexec": "/usr/local/libexec/oomph", "service": "/etc/systemd/system/oomphd.service"},
+}
+PATHS_HERE = PATHS["darwin" if sys.platform == "darwin" else "linux"]
+
+
+def _linux_machine():
+    """This machine's id for a per-user ledger's folder name: hashed like machine.id (roadmap
+    01 §4.5), from /etc/machine-id or D-Bus's copy; "local" where neither exists."""
+    import hashlib
+    for f in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(f) as h:
+                v = h.read(64).strip()
+        except OSError:
+            continue
+        if re.fullmatch(r"[0-9a-f]{32}", v):
+            return "m-" + hashlib.sha256(("oomph-machine-v1:" + v).encode()).hexdigest()[:16]
+    return "local"
+
+
+def _path(kind):
+    """A path of the table above, expanded: ~, the XDG state folder, {state} and {machine}."""
+    v = PATHS_HERE[kind]
+    if "{xdg_state}" in v:
+        x = os.environ.get("XDG_STATE_HOME") or ""
+        v = v.replace("{xdg_state}", x if os.path.isabs(x) else "~/.local/state")  # relative: ignored, as XDG says
+    if "{state}" in v:
+        v = v.replace("{state}", STATE_DIR)
+    if "{machine}" in v:
+        v = v.replace("{machine}", _linux_machine())
+    return os.path.expanduser(v)
+
+
+STATE_DIR = os.environ.get("OOMPH_STATE_DIR") or _path("state")
+LOG_DIR = os.environ.get("OOMPH_DIR", PATHS_HERE["log"])
 
 # What the daemon reads from the unified log. On macOS 27 memory kills show up as
 # launchd exits with OS_REASON_JETSAM and as ReportSystemMemory batch lines
@@ -1210,6 +1261,63 @@ def window(args, default="2h"):
     return since, until
 
 
+# ------------------------------------------------------------------ widths
+# Every line the CLI prints fits 80 columns (roadmap 03 §3.12): each variable column has a
+# budget and one way of being cut, and prose (why, advice) is wrapped at the terminal's width,
+# 80 when there is no terminal, continuation lines indented. Nothing is wrapped inside a table.
+def term_width():
+    """The terminal's width if stdout is one (at least 40), else 80."""
+    try:
+        if sys.stdout.isatty():
+            return max(40, os.get_terminal_size(sys.stdout.fileno()).columns)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 80
+
+
+def cut_end(s, w):
+    """Purposes, commands: the beginning says what it is."""
+    s = str(s)
+    return s if len(s) <= w else s[:max(w - 1, 0)] + "…"
+
+
+def cut_middle(s, w):
+    """Names: head and tail both identify."""
+    s = str(s)
+    if len(s) <= w:
+        return s
+    head = w // 2
+    return s[:head] + "…" + s[len(s) - (w - 1 - head):]
+
+
+def cut_left(s, w):
+    """Folders: the end says where."""
+    s = str(s)
+    return s if len(s) <= w else "…" + s[len(s) - w + 1:]
+
+
+def fit_group(name, w):
+    """A group's name in a column of w characters. A container's runtime:id stays whole (it is
+    what `docker ps` shows) and its program is cut; too narrow for that, program first."""
+    name = str(name)
+    if len(name) <= w:
+        return name
+    m = re.match(r"^(\w+:[0-9a-f]{8}) \((.+)\)$", name)
+    if m and w >= len(m.group(1)) + 6:
+        return "%s (%s)" % (m.group(1), cut_end(m.group(2), w - len(m.group(1)) - 3))
+    if m:
+        name = "%s · %s" % (m.group(2), m.group(1).split(":")[0])
+    return cut_middle(name, w)
+
+
+def wrap(text, width=None, first="", indent=2):
+    """`text` after `first`, broken at spaces into lines of at most `width` columns (the
+    terminal's), continuation lines indented by `indent`. A word longer than a line stays whole."""
+    import textwrap
+    return "\n".join(textwrap.wrap(text, width or term_width(), initial_indent=first, subsequent_indent=" " * indent,
+                                    break_long_words=False, break_on_hyphens=False)) or first.rstrip()
+
+
 def cmd_status():
     p = os.path.join(LOG_DIR, "current.json")
     if not os.path.exists(p):
@@ -1220,30 +1328,34 @@ def cmd_status():
     d = c.get("daemon", {})
     alive = age < 3 * (d.get("interval") or 30) + 10
     a = c.get("away") or {}
-    print("daemon     %s (pid %s, v%s, sample %ds ago, interval %ss%s)" % (
+    w = max(80, term_width())
+
+    def line(label, text):
+        print(wrap(text, w, "%-11s" % label, 11))
+    line("daemon", "%s (pid %s, v%s, sample %ds ago, interval %ss%s)" % (
         "running" if alive else "NOT RUNNING", d.get("pid"), d.get("version"), age, d.get("interval"),
         ", root" if d.get("root") else ", NOT root"))
-    print("pressure   %s   free %s%%" % (PRESSURE.get(c["pressure"], c["pressure"]), c.get("free_pct")))
-    print("memory     RAM %.0f GB · app %.1f · wired %.1f · compressed %.1f · cached %.1f · free %.1f GB" % (
+    line("pressure", "%s   free %s%%" % (PRESSURE.get(c["pressure"], c["pressure"]), c.get("free_pct")))
+    line("memory", "RAM %.0f GB · app %.1f · wired %.1f · compressed %.1f · cached %.1f · free %.1f GB" % (
         c["ram_gb"], c["app_gb"], c["wired_gb"], c["compressed_gb"], c["cached_gb"], c["free_gb"]))
-    print("swap       %.1f / %.1f GB used (%d swapfiles)" % (c["swap_used_gb"], c["swap_total_gb"], c["swapfiles"]))
+    line("swap", "%.1f / %.1f GB used (%d swapfiles)" % (c["swap_used_gb"], c["swap_total_gb"], c["swapfiles"]))
     u = unowned_gb(c)
     if u is not None:
-        print("unowned    %.1f GB held outside any process%s" % (
+        line("unowned", "%.1f GB held outside any process%s" % (
             u, "  <- LEAK? only a restart frees it" if u >= unowned_limit_gb(c["ram_gb"]) else ""))
-    print("disk       %.0f GB free" % c["disk_free_gb"])
-    print("you        idle %ss · display %s · %s · sleep held by %s" % (
+    line("disk", "%.0f GB free" % c["disk_free_gb"])
+    line("you", "idle %ss · display %s · %s · sleep held by %s" % (
         a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
         ", ".join(a.get("sleep_preventers") or []) or "nobody"))
     if d.get("incident"):
-        print("INCIDENT   open: %s" % d["incident"])
+        line("INCIDENT", "open: %s" % d["incident"])
     print("\ntop apps:")
     for g in (c.get("groups") or [])[:8]:
-        print("  %6.1f GB  %s (%d)" % (g["mb"] / 1024, g["name"], g["n"]))
+        print("  %6.1f GB  %s (%d)" % (g["mb"] / 1024, fit_group(g["name"], w - 19), g["n"]))
     if c.get("claude"):
         print("\nclaude sessions:")
         for s in c["claude"]:
-            print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], s.get("cwd")))
+            print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], cut_left(s.get("cwd"), w - 24)))
     try:
         leases = ledger_snapshot()
     except LedgerError:
@@ -1272,28 +1384,29 @@ def cmd_report(args):
             rows.append([])
             cur = b
         rows[-1].append(s)
+    w = max(80, term_width())
     for r in rows:
         worst = max(r, key=lambda s: (s.get("pressure", 0), s.get("swap_used_gb", 0)))
         g = (worst.get("groups") or [{}])[0]
-        print("%-8s %-8s %6.1f %6.1f %6.1f %6.0f %5d %4s  %s %.1fG" % (
+        size = " %.1fG" % (g.get("mb", 0) / 1024)
+        print("%-8s %-8s %6.1f %6.1f %6.1f %6.0f %5d %4s  %s%s" % (
             datetime.datetime.fromtimestamp(r[0]["t"]).strftime("%H:%M"), PRESSURE.get(worst.get("pressure", 0)),
             worst["app_gb"], worst["compressed_gb"], worst["swap_used_gb"], worst["disk_free_gb"],
             sum(s.get("jetsam_kills", 0) for s in r), "yes" if any(is_away(s) for s in r) else "",
-            g.get("name", ""), g.get("mb", 0) / 1024))
+            fit_group(g.get("name", ""), w - 58 - len(size)), size))
     summ = summarize(samples, events)
-    print("\nbiggest risers (apps):")
-    for x in summ["group_risers"][:8]:
-        print("  +%6d MB  %-40s peak %d MB at %s" % (x["rise_mb"], x["name"][:40], x["peak_mb"], x["peak_iso"]))
-    print("\nbiggest risers (processes):")
-    for x in summ["process_risers"][:8]:
-        print("  +%6d MB  %-40s peak %d MB at %s" % (x["rise_mb"], x["name"][:40], x["peak_mb"], x["peak_iso"]))
+    for title, key in (("apps", "group_risers"), ("processes", "process_risers")):
+        print("\nbiggest risers (%s):" % title)
+        for x in summ[key][:8]:
+            print("  +%6d MB  %-*s peak %d MB at %s" % (x["rise_mb"], w - 56, fit_group(x["name"], w - 56), x["peak_mb"],
+                                                      x["peak_iso"]))
     notable = [e for e in events if e.get("kind") not in ("jetsam", "notified")]
     if summ["jetsam_kills"]:
         print("\njetsam kills: %d   reasons: %s" % (summ["jetsam_kills"], summ["jetsam_reasons"]))
     if notable:
         print("\nevents:")
         for e in notable[-30:]:
-            print("  %s  %-16s %s" % (e["iso"][11:19], e["kind"], _event_detail(e)[:110]))
+            print("  %s  %-16s %s" % (e["iso"][11:19], e["kind"], cut_end(_event_detail(e), w - 29)))
     return 0
 
 
@@ -1309,16 +1422,24 @@ def list_incidents():
     return out
 
 
+INCIDENT_ROW = "%-15s %5s  %-5s %5s  %s"  # a 36-column prefix, then the headline (44 at 80 columns)
+
+
 def cmd_incidents():
+    """One row per incident: when, how long, open or not, kills, and its headline. A headline
+    longer than the line continues on the next, indented to its column."""
     incs = list_incidents()
     if not incs:
         print("no incidents recorded")
+        return 0
+    w = max(80, term_width())
+    print(INCIDENT_ROW % ("incident", "took", "state", "kills", "headline"))
     for i in incs:
         dur = ("%dm" % ((i.get("end", time.time()) - i["start"]) // 60))
-        s = i.get("summary") or {}
-        print("%s  %-5s %s  swap %.1fG  disk %sG  kills %s  %s" % (
-            i["id"], dur, "OPEN " if i.get("open") else "     ", s.get("max_swap_used_gb", 0),
-            s.get("min_disk_free_gb", "?"), s.get("jetsam_kills", "?"), i["reasons"][0]["desc"][:70]))
+        kills = (i.get("summary") or {}).get("jetsam_kills")
+        head = (i.get("reasons") or [{}])[0].get("desc", "")
+        print(wrap(head, w, INCIDENT_ROW % (i["id"], dur, "OPEN" if i.get("open") else "",
+                                           "–" if kills is None else kills, ""), 36))
     return 0
 
 
@@ -1364,9 +1485,31 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 SKILL_URL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
 LEVELS = ("ok", "tight", "critical")
 _oomphd = None
+_plat = None
+BACKENDS = {"darwin": "oomph_darwin"}  # sys.platform -> the module that measures it (Linux: 1.9.4)
+
+
+class Unsupported(Exception):
+    """This system has no backend: oomph can read logs and ledgers here, not measure."""
+
+
+def plat():
+    """The backend that measures this machine (oomph_darwin.py on a Mac; its docstring lists the
+    contract). Imported on first use, by code that measures: reading logs, the hook's ledger
+    reads and everything else import no native code, here or on any other system."""
+    global _plat
+    if _plat is None:
+        name = BACKENDS.get(sys.platform)
+        if name is None:
+            raise Unsupported("measuring %s is not supported yet: macOS only so far (Linux from 1.9.4)" % sys.platform)
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        _plat = __import__(name)
+    return _plat
 
 
 def _daemon_module():
+    """oomphd, for summarize_procs (it measures nothing itself)."""
     global _oomphd
     if _oomphd is None:
         if HERE not in sys.path:
@@ -1389,16 +1532,16 @@ def _daemon_sample(max_age=45):
 
 
 def live_sample(with_procs=True):
-    d = _daemon_module()
+    P = plat()
     s = {"t": round(time.time(), 1), "iso": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-         "source": "live"}
-    s.update(d.system_memory())
-    s["away"] = {k: v for k, v in d.away_state().items() if k in ("idle_s", "display_on", "locked", "sleep_preventers")}
+         "source": "live", "os": P.OS}
+    s.update(P.system_memory())
+    s["away"] = {k: v for k, v in P.away_state().items() if k in ("idle_s", "display_on", "locked", "sleep_preventers")}
     if with_procs:
-        procs = d.collect_procs()
-        top, groups, sessions = d.summarize_procs(procs)
+        procs = P.collect_procs()
+        top, groups, sessions = _daemon_module().summarize_procs(procs)
         s["top"], s["groups"], s["claude"] = top, groups, sessions
-        s.update(d.ownership(s, procs))
+        s.update(P.ownership(s, procs))
     return s
 
 
@@ -1424,6 +1567,10 @@ ADVICE = {
 
 
 def verdict(s):
+    """ok / tight / critical for a sample, with the reasons. The rules are a system's: a sample
+    without `os` is a Mac's (every sample before 1.8.8). A full disk counts only on a Mac, where
+    swap grows on the startup volume (roadmap 03 §5.4)."""
+    mac = s.get("os", "macos") == "macos"
     ram = s.get("ram_gb") or 0
     free = free_physical_gb(s)
     disk = s.get("disk_free_gb", 999)
@@ -1440,11 +1587,11 @@ def verdict(s):
         bump(2, "macOS memory pressure is CRITICAL")
     elif p >= 2:
         bump(1, "macOS memory pressure is WARNING")
-    if disk < 5:
+    if mac and disk < 5:
         bump(2, "only %.0f GB disk free — swap cannot grow" % disk)
-    elif disk < 20:
+    elif mac and disk < 20:
         bump(1, "only %.0f GB disk free — swap may not be able to grow" % disk)
-    if swap_full and disk < 20:
+    if mac and swap_full and disk < 20:
         bump(2, "swap is full (%.1f/%.1f GB) and the disk is too full to add more" % (s["swap_used_gb"], s["swap_total_gb"]))
     if ram and free < 0.05 * ram:
         bump(1, "only %.1f GB physical memory free" % free)
@@ -1463,26 +1610,31 @@ def verdict(s):
     }
 
 
-def verdict_line(v):
-    line = "oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
+def verdict_line(v, width=None):
+    """The verdict as `oomph check` and the hook print it, wrapped at `width` (the terminal's)."""
+    w = width or term_width()
+    out = [wrap("oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
         v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
-        v["swap_total_gb"] or 0, v["disk_free_gb"])
+        v["swap_total_gb"] or 0, v["disk_free_gb"]), w)]
     if v["reasons"]:
-        line += "\n  why: " + "; ".join(v["reasons"])
+        out.append(wrap("; ".join(v["reasons"]), w, "  why: "))
     c = v.get("coordination") or {}
     if c.get("others") or c.get("mine"):
         g = [o for o in c["others"] if o["state"] == "granted"]
         q = [o for o in c["others"] if o["state"] == "queued"]
-        line += ("\n  reservations: others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG available to you"
-                 % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"]))
-    return line + "\n  advice: " + v["advice"]
+        out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG available to you"
+                        % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"]),
+                        w, "  reservations: "))
+    out.append(wrap(v["advice"], w, "  advice: "))
+    return "\n".join(out)
 
 
 def _session_root(procs, pid):
-    """pid of the outermost `claude` process above `pid`, or None."""
+    """pid of the outermost agent session root (`claude`) above `pid`, or None."""
+    is_agent = plat().is_agent
     cur, root, hops = pid, None, 0
     while cur in procs and hops < 64:
-        if procs[cur]["name"] == "claude":
+        if is_agent(procs[cur]):
             root = cur  # keep walking: the outermost claude is the session
         cur, hops = procs[cur]["ppid"], hops + 1
     return root
@@ -1490,7 +1642,7 @@ def _session_root(procs, pid):
 
 def find_session(pid=None):
     """The Claude Code session (outermost `claude` process) that `pid` (default: our parent) runs in."""
-    d = _daemon_module()
+    d = plat()
     procs = d.collect_procs()
     root = _session_root(procs, pid or os.getppid())
     if root is None:
@@ -1541,7 +1693,7 @@ def cmd_session(args):
     if not ses:
         print("oomph: not running inside a Claude Code session (no `claude` ancestor process)")
         return 1
-    print("session  pid %s · %s" % (ses["pid"], ses["cwd"]))
+    print("session  pid %s · %s" % (ses["pid"], cut_left(ses["cwd"], 60)))
     print("memory   %.1f GB in %d processes (claude itself %.1f GB)" % (
         ses["total_mb"] / 1024, ses["processes"], ses["own_mb"] / 1024))
     for b in ses["biggest"]:
@@ -1594,7 +1746,7 @@ def cmd_status_json():
 # fits into free memory minus what earlier grants have not yet used, minus a safety margin.
 # So concurrent heavy steps from different sessions run side by side when there's room, and
 # one after another when there isn't. Advisory: oomph never stops or kills anything.
-LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR", "/Users/Shared/oomph")
+LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR") or _path("ledger")
 QUEUE_STALE_S = 180          # a queued request lapses if its owner hasn't polled for this long
 DEFAULT_TTL_S = 30 * 60      # session-held grants expire unless released or extended
 MAX_TTL_S = 8 * 3600
@@ -1751,7 +1903,7 @@ def _depth_ok(v):
 # replaces. Keys are the switches' names without the prefix and in lower case
 # ({"ioreport": true} for OOMPH_IOREPORT); none is read yet. The file is root's: one that root
 # does not own, or that anyone else could change, is ignored.
-CONFIG_FILE = "/Library/Application Support/oomph/config.json"
+CONFIG_FILE = PATHS_HERE["config"]
 CONFIG_CAP = 64 << 10
 
 
@@ -1903,9 +2055,10 @@ def _ledger_dir(create=False):
     in it is opened relative to it. None if it doesn't exist and `create` is false."""
     _not_root("opening %s" % LEDGER_DIR)
     if create and not os.path.lexists(LEDGER_DIR):
-        old = os.umask(0)
-        try:  # shared by every session (and user) on this Mac
-            os.makedirs(LEDGER_DIR, mode=0o777, exist_ok=True)
+        mode = PATHS_HERE["ledger_mode"]
+        old = os.umask(0 if mode == 0o777 else 0o077)
+        try:  # on a Mac shared by every session (and user); on Linux, for now, the user's own
+            os.makedirs(LEDGER_DIR, mode=mode, exist_ok=True)
         except OSError:
             pass  # the open below says what is wrong
         finally:
@@ -2417,7 +2570,7 @@ def _decide_inputs(s=None):
     if _given:  # an unprivileged child: root measured them
         return s or _given[0], _given[1], time.time()
     s = s or (_sample_override() if _sample_override else live_sample(with_procs=False))
-    return s, _daemon_module().collect_procs(), time.time()
+    return s, plat().collect_procs(), time.time()
 
 
 def _brief(r, now):
@@ -2466,7 +2619,7 @@ def _status(L, rid, now):
 
 def holder_for(pid=None, kind=None):
     """Who owns a reservation made from here: the Claude session we run in, else our parent process."""
-    d = _daemon_module()
+    d = plat()
     procs = d.collect_procs()
     start_pid = pid or os.getppid()
     root = _session_root(procs, start_pid)
@@ -2766,6 +2919,20 @@ def _cmd_ledger_refresh():
     return 0
 
 
+def _live(r, now):
+    """Does a lease still count: not a grant past its expiry, not a queued entry gone stale."""
+    if r["state"] == "granted" and r.get("expires") and now > r["expires"]:
+        return False
+    return not (r["state"] == "queued" and now - r["seen"] > QUEUE_STALE_S)
+
+
+@_unprivileged()
+def ledger_live_count():
+    """How many leases count (as ledger_snapshot sees them), for doctor; raises what the read raises."""
+    now = time.time()
+    return sum(1 for r in read_ledger()["leases"] if _live(r, now))
+
+
 @_unprivileged()
 def ledger_snapshot(procs=None):
     """Compact read-only view of live reservations, for the daemon's samples (no lock, no write)."""
@@ -2778,9 +2945,7 @@ def ledger_snapshot(procs=None):
     for r in L["leases"]:
         if procs is not None and not _alive(procs, r["holder"]["pid"], r["holder"].get("start")):
             continue
-        if r["state"] == "granted" and r.get("expires") and now > r["expires"]:
-            continue
-        if r["state"] == "queued" and now - r["seen"] > QUEUE_STALE_S:
+        if not _live(r, now):
             continue
         b = _brief(r, now)
         b.pop("holder_pid", None)
@@ -2830,11 +2995,13 @@ def coordination_verdict(v, c):
     return v
 
 
-def _fmt_brief(b):
+def _fmt_brief(b, purpose_w=22):
+    """A reservation as one row: id, state, size, purpose (cut at the end), project (cut in the
+    middle, 10), what it uses or how long it waits. 78 columns with the default budget."""
     tail = ("using %.1fG, %.0f min" % (b.get("used_gb", 0), b["for_min"]) if b["state"] == "granted"
             else "waiting %.0f min" % b["waiting_min"])
-    return "%-5s %-7s %5.1fG  %-28s %-14s %s" % (b["id"], b["state"], b["gb"], b["purpose"][:28],
-                                                (b.get("project") or "")[:14], tail)
+    return "%-5s %-7s %5.1fG  %-*s %-10s %s" % (b["id"], b["state"], b["gb"], purpose_w, cut_end(b["purpose"], purpose_w),
+                                               cut_middle(b.get("project") or "", 10), tail)
 
 
 def _opt(args, name, default=None):
@@ -2913,11 +3080,11 @@ def cmd_reserve(args):
     if "--json" in o:
         print(json.dumps(st))
     else:
-        print("oomph: %s %s — %s" % (st["status"].upper(), st.get("id", ""), st["advice"]))
+        print(wrap("%s %s — %s" % (st["status"].upper(), st.get("id", ""), st["advice"]), first="oomph: "))
         for b in st.get("ahead") or []:
-            print("  ahead: " + _fmt_brief(b))
+            print("  ahead: " + _fmt_brief(b, 15))
         if st.get("note"):
-            print("  note: " + st["note"])
+            print(wrap(st["note"], first="  note: "))
     return 0 if st["status"] == "granted" else 75
 
 
@@ -2991,21 +3158,21 @@ def cmd_reservations(args):
     if "--json" in args:
         print(json.dumps(c))
         return 0
-    print("free %.1fG − reserved %.1fG − margin %.1fG = %.1fG available for new reservations" % (
-        c["free_gb"], c["reserved_gb"], c["margin_gb"], c["available_gb"]))
+    print(wrap("free %.1fG − reserved %.1fG − margin %.1fG = %.1fG available for new reservations" % (
+        c["free_gb"], c["reserved_gb"], c["margin_gb"], c["available_gb"])))
     rows = [("me", b) for b in c["mine"]] + [("", b) for b in c["others"]]
     if rows:
         print("\nactive:")
         for who, b in sorted(rows, key=lambda x: (x[1]["state"] != "granted", x[1]["id"])):
-            print("  %-3s %s" % (who, _fmt_brief(b)))
+            print("  %-3s %s" % (who, _fmt_brief(b, 18)))
     else:
         print("\nno active reservations")
     if c["history"]:
         print("\nrecent (reserved → peak actually added):")
         for h in c["history"][:10]:
-            print("  %-5s %5.1fG → %4.1fG  %-28s %-14s %-11s held %s" % (
-                h["id"], h["gb"], h["peak_gb"], h["purpose"][:28], (h.get("project") or "")[:14], h["outcome"],
-                "%dm%02ds" % divmod(h["held_s"], 60)))
+            print("  %-5s %5.1fG → %4.1fG  %-20s %-10s %-11s held %s" % (
+                h["id"], h["gb"], h["peak_gb"], cut_end(h["purpose"], 20), cut_middle(h.get("project") or "", 10),
+                h["outcome"], "%dm%02ds" % divmod(h["held_s"], 60)))
     return 0
 
 
@@ -3030,7 +3197,7 @@ def cmd_run(args):
     purpose = opts.get("--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
     wait_s = parse_dur(opts.get("--wait", "30m"))
     ses = holder_for()
-    me = {"pid": os.getpid(), "start": _daemon_module().collect_procs().get(os.getpid(), {}).get("start"),
+    me = {"pid": os.getpid(), "start": plat().collect_procs().get(os.getpid(), {}).get("start"),
           "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd()}
     last = [0.0]
 
@@ -3039,8 +3206,9 @@ def cmd_run(args):
             last[0] = time.time()
             ahead = ", ".join("%s %.1fG %s (%s)" % (b["id"], b["gb"], b["purpose"], b.get("project") or "?")
                               for b in st.get("ahead", [])[:3])
-            sys.stderr.write("oomph: waiting for %.1fG — queued #%s, %.1fG available%s\n" % (
-                gb, st.get("position"), st.get("available_gb") or 0, "; ahead: " + ahead if ahead else ""))
+            sys.stderr.write(wrap("waiting for %.1fG — queued #%s, %.1fG available%s" % (
+                gb, st.get("position"), st.get("available_gb") or 0, "; ahead: " + ahead if ahead else ""),
+                first="oomph: ") + "\n")
             sys.stderr.flush()
 
     st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress)
@@ -3327,6 +3495,207 @@ def cmd_mcp():
     return 0
 
 
+# ------------------------------------------------------------------ doctor
+DOCTOR_LEVELS = ("ok", "note", "warn", "fail")  # fail: oomph cannot work here at all
+
+
+def _version_in(path):
+    """The VERSION stamped into an installed oomph.py, or None."""
+    data = read_bounded(path, 1 << 20)
+    m = re.search(rb'^VERSION = "([^"]*)"', data or b"", re.M)
+    return m.group(1).decode("utf-8", "replace") if m else None
+
+
+def _logger_state():
+    """(current.json or None, is it fresh) of the log directory."""
+    data = read_bounded(os.path.join(LOG_DIR, "current.json"), 1 << 20)
+    c = loads_untrusted(data) if data else None
+    if not isinstance(c, dict) or not _num(c.get("t")):
+        return None, False
+    d = c.get("daemon") if isinstance(c.get("daemon"), dict) else {}
+    iv = d.get("interval") if _num(d.get("interval")) else 30
+    return c, time.time() - c["t"] < 3 * iv + 10
+
+
+def _claude_setup():
+    """What `oomph setup-claude` set up for this user: the skill (and whether it is this oomph's),
+    the MCP server in ~/.claude.json, the hook in ~/.claude/settings.json. Bounded reads: under
+    sudo HOME can be the invoking user's, though doctor skips this as root."""
+    home = os.path.expanduser("~")
+    got = {}
+    skill = read_bounded(os.path.join(home, ".claude", "skills", CMD, "SKILL.md"), 1 << 20)
+    src = _skill_source()
+    got["skill"] = skill is not None
+    got["skill_current"] = skill is not None and src is not None and read_bounded(src, 1 << 20) == skill
+
+    def user_json(path):  # the user's own files, often big: plain JSON within a generous cap
+        try:
+            return json.loads((read_bounded(path, 32 << 20) or b"").decode("utf-8"))
+        except (ValueError, RecursionError):
+            return None
+
+    cfg = user_json(os.path.join(home, ".claude.json"))
+    got["mcp"] = isinstance(cfg, dict) and isinstance(cfg.get("mcpServers"), dict) and CMD in cfg["mcpServers"]
+    st = user_json(os.path.join(home, ".claude", "settings.json"))
+    hooks = st.get("hooks") if isinstance(st, dict) else None
+    post = hooks.get("PostToolUse") if isinstance(hooks, dict) else None
+    cmds = [x.get("command") for h in (post if isinstance(post, list) else []) if isinstance(h, dict)
+            for x in (h.get("hooks") if isinstance(h.get("hooks"), list) else []) if isinstance(x, dict)]
+    got["hook"] = any(isinstance(c, str) and c.endswith(" hook") and CMD in c for c in cmds)
+    return got
+
+
+def doctor():
+    """What works on this machine and what to fix (roadmap 03 §3.2): one check per ability,
+    each ok, note (nothing to do), warn (fixable where you stand) or fail (oomph cannot work
+    here), with the fix. Opens nothing in the shared ledger folder as root, like everything else."""
+    checks, root = [], os.geteuid() == 0
+    mac = sys.platform == "darwin"
+
+    def add(cid, level, text, fix=None):
+        checks.append(dict({"id": cid, "level": level, "text": text}, **({"fix": fix} if fix else {})))
+
+    py = "%d.%d.%d" % sys.version_info[:3]
+    if sys.version_info < (3, 9):
+        add("python", "fail", "%s at %s: needs 3.9 or newer" % (py, sys.executable))
+    elif mac and not os.access(PY, os.X_OK):
+        add("python", "warn", "%s at %s, but the logger needs %s" % (py, sys.executable, PY), "xcode-select --install")
+    else:
+        add("python", "ok", "%s at %s (needs 3.9 or newer)" % (py, sys.executable))
+
+    machine, P = None, None
+    try:
+        P = plat()
+        machine = P.machine(all_procs=root)
+        sysm = P.system_memory()
+        add("memory", "ok", "%s · %.0f GB RAM" % ("vm_stat and sysctl" if mac else P.OS, sysm.get("ram_gb") or 0))
+        procs = P.collect_procs()
+        add("processes", "ok", "%d visible, %d with a footprint" % (len(procs), sum(1 for p in procs.values() if p.get("fp"))))
+    except Unsupported as e:
+        add("memory", "fail", str(e))
+    except Exception as e:  # noqa: B902  a collector that breaks is a finding, not a crash
+        add("memory", "warn", "measuring failed: %s" % repr(e)[:200])
+
+    c, fresh = _logger_state()
+    d = c.get("daemon") if c and isinstance(c.get("daemon"), dict) else {}
+    installed = os.path.exists(PATHS_HERE["service"])
+    kick = "sudo launchctl kickstart -k system/local.oomph.daemon" if mac else "sudo systemctl restart oomphd"
+    if fresh:
+        if d.get("root") or not mac:
+            add("logger", "ok", "running (pid %s), every %s s, writes %s" % (d.get("pid"), d.get("interval"), LOG_DIR))
+        else:
+            add("logger", "warn", "running without root: other users' processes are missing from %s" % LOG_DIR,
+                "sudo ./install.sh, or Activate in the menu-bar app")
+    elif installed:
+        when = time.strftime("%H:%M", time.localtime(c["t"])) if c else "never"
+        add("logger", "warn", "installed but silent (last sample: %s)" % when,
+            "%s; the reason is in %s/daemon.err" % (kick, LOG_DIR) if mac else kick)
+    else:
+        add("logger", "note", "not installed: nothing is logged, every reading is live",
+            "Activate in the menu-bar app, or sudo ./install.sh from a checkout" if mac else None)
+
+    inst = _version_in(os.path.join(PATHS_HERE["libexec"], "oomph.py"))
+    run_v = d.get("version") if fresh else None
+    if fresh and inst and run_v != inst:
+        add("versions", "warn", "the logger runs %s, the installed copy is %s" % (run_v, inst), kick)
+    elif inst and inst != VERSION:
+        add("versions", "note", "this is %s (%s), the installed copy is %s" % (VERSION, HERE, inst))
+    elif inst:
+        add("versions", "ok", "%s everywhere: this command, the installed copy%s" % (
+            VERSION, " and the logger" if fresh else ""))
+    else:
+        add("versions", "note", "this is %s (%s); nothing installed" % (VERSION, HERE))
+
+    add(*_doctor_ledger(root))
+
+    if os.path.lexists(CONFIG_FILE):
+        cfg = read_config()
+        add("config", "ok" if cfg else "warn", "%s: %s" % (
+            CONFIG_FILE, "%d setting(s)" % len(cfg) if cfg else "ignored: not root's, or writable by others, or not JSON"),
+            None if cfg else "sudo chown root %s; sudo chmod 644 %s" % (CONFIG_FILE, CONFIG_FILE))
+
+    if root:  # the Claude setup is the user's own: their files, read as them
+        add("claude", "note", "not checked as root", "oomph doctor without sudo checks your Claude setup")
+    else:
+        cs = _claude_setup()
+        parts = ["skill %s" % ("installed" if cs["skill"] else "not installed"),
+                 "MCP %s" % ("registered" if cs["mcp"] else "not registered"),
+                 "hook %s" % ("installed" if cs["hook"] else "not installed")]
+        if cs["skill"] and not cs["skill_current"]:
+            parts[0] = "skill installed, but not this version's"
+        add("claude", "ok" if cs["skill_current"] and cs["mcp"] else "note", " · ".join(parts),
+            None if cs["skill_current"] and cs["mcp"] else "oomph setup-claude (--hook for the hook)")
+
+    worst = max([DOCTOR_LEVELS.index(x["level"]) for x in checks] + [0])
+    code = 2 if worst == 3 else 1 if worst == 2 else 0
+    return {"version": VERSION, "machine": machine,
+            "ledger": {"kind": "shared" if mac else "user", "path": LEDGER_DIR,
+                       "members": "every account on this Mac" if mac else None},
+            "checks": checks, "exit": code}
+
+
+def _doctor_ledger(root):
+    """The ledger folder's check: a real folder this user can write, its files plain files with one
+    link and within the limits. Only lstat and access, which open nothing; the leases are counted
+    by the ledger's own reader (as root, in a child as the invoking user)."""
+    L = LEDGER_DIR
+    try:
+        st = os.lstat(L)
+    except FileNotFoundError:
+        return "ledger", "note", "%s does not exist yet: the first reservation creates it" % L
+    except OSError as e:
+        return "ledger", "warn", "%s: %s" % (L, e.strerror)
+    if not stat.S_ISDIR(st.st_mode):
+        return ("ledger", "warn", "%s is not a folder (%s): every reservation is refused" % (
+            L, "a symbolic link" if stat.S_ISLNK(st.st_mode) else "a file"),
+            "sudo rm %s  (the next reservation makes a new one)" % L)
+    if not root and not os.access(L, os.W_OK | os.X_OK):
+        return "ledger", "warn", "%s is not writable for you: reservations fail" % L, \
+            "sudo chmod 777 %s" % L if sys.platform == "darwin" else None
+    for name in ("ledger.json", HISTORY_FILE, "ledger.lock"):
+        try:
+            f = os.lstat(os.path.join(L, name))
+        except OSError:
+            continue
+        what = (None if stat.S_ISREG(f.st_mode) and f.st_nlink == 1 else
+                "is not a regular file" if not stat.S_ISREG(f.st_mode) else "has %d hard links" % f.st_nlink)
+        if not what and name == "ledger.json" and f.st_size > LIMITS["ledger"]:
+            what = "is bigger than %d MB and read as empty" % (LIMITS["ledger"] >> 20)
+        if what:
+            return ("ledger", "warn", "%s/%s %s, so it is refused" % (L, name, what),
+                    "rm %s  (a new one is written)" % os.path.join(L, name))
+    try:
+        n = ledger_live_count()  # as root in a child as the invoking user
+    except LedgerError as e:
+        return "ledger", "warn", "%s: %s" % (L, e)
+    return "ledger", "ok", "%s · %d live reservation%s" % (L, n, "" if n == 1 else "s")
+
+
+def cmd_doctor(args):
+    r = doctor()
+    if "--json" in args:
+        print(json.dumps(r))
+        return r["exit"]
+    w = max(80, term_width())
+    m = r["machine"] or {}
+    head = "%s %s on %s" % (BRAND, VERSION, m.get("name") or os.uname().nodename.split(".")[0])
+    if m:
+        head += ": %s, %s, %s" % (m.get("os_version"), m.get("arch"), m.get("kind"))
+    print(wrap(head, w, "", 0))
+    if m.get("id"):
+        print("machine id %s" % m["id"])
+    print()
+    for x in r["checks"]:
+        print(wrap(x["text"], w, "  %-5s %-10s " % (x["level"], x["id"]), 19))
+        if x.get("fix"):
+            print(wrap(x["fix"], w, " " * 19 + "→ ", 21))
+    print()
+    print({0: "Everything %s needs is here.   (oomph doctor --json for a bug report)" % BRAND,
+           1: "Something to fix: the lines marked warn say how.",
+           2: "%s cannot work here: see the lines marked fail." % BRAND}[r["exit"]])
+    return r["exit"]
+
+
 # ------------------------------------------------------------ claude setup
 def _skill_source():
     for p in (os.path.join(HERE, "skills", CMD, "SKILL.md"),                 # installed / app bundle
@@ -3407,6 +3776,9 @@ def main(argv):
     except LedgerError as e:  # the ledger is busy, or something planted in its directory was refused
         sys.stderr.write("oomph: %s\n" % e)
         return 75 if isinstance(e, LedgerBusy) else 1
+    except Unsupported as e:  # a command that measures, on a system without a backend
+        sys.stderr.write("oomph: %s\n" % e)
+        return 1
 
 
 def _main(argv):
@@ -3462,6 +3834,8 @@ def _main(argv):
         return _cmd_ledger_call(rest[0] if rest else "")
     if c == "setup-claude":
         return cmd_setup_claude(rest)
+    if c == "doctor":
+        return cmd_doctor(rest)
     if c == "report":
         return cmd_report(rest)
     if c == "incidents":

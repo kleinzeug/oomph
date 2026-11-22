@@ -27,8 +27,8 @@ cp app/Info.plist "$APP/Contents/"
 /usr/bin/plutil -replace CFBundleVersion -string "${COMMIT:0:12}" "$APP/Contents/Info.plist"
 /usr/bin/plutil -replace OOMPHCommit -string "$COMMIT" "$APP/Contents/Info.plist"
 R="$APP/Contents/Resources"
-cp daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py \
-   daemon/local.oomph.daemon.plist install.sh uninstall.sh "$R/"
+cp daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py \
+   daemon/oomph_view.py daemon/local.oomph.daemon.plist install.sh uninstall.sh "$R/"
 # one version for everything: the bundled CLI and daemon report what the app reports
 /usr/bin/sed -i '' -e "s/^VERSION = \"dev\".*/VERSION = \"$VER\"/" -e "s/^COMMIT = \"\".*/COMMIT = \"$COMMIT\"/" "$R/oomph.py"
 mkdir -p "$R/skills/oomph" && cp skills/oomph/SKILL.md "$R/skills/oomph/"

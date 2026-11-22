@@ -65,6 +65,7 @@ Two practical lessons that shaped the implementation:
 │   /usr/bin/python3 -I -B /usr/local/libexec/oomph/oomphd.py│
 │     ├─ sampler loop (30 s, 5 s when hot)                  │
 │     │    libproc · sysctl · vm_stat · ioreg · pmset        │
+│     │    (oomph_darwin.py, the backend: oomph.plat())     │
 │     └─ log stream (jetsam / low-swap / dialog)             │
 │           │                                               │
 │           ▼                                               │
@@ -93,7 +94,7 @@ Two practical lessons that shaped the implementation:
 | Runner | **LaunchDaemon as root** (`local.oomph.daemon`), `KeepAlive`, `RunAtLoad` | Survives logout, reboot and closed terminals — the incidents happen exactly when nobody is watching. Only root can read the physical footprint of *every* process, including root daemons like `spotlightknowledged` and WindowServer. |
 | Install path | Code in `/usr/local/libexec/oomph-<version>/` (root-owned, 755), reached through the link `/usr/local/libexec/oomph`, which an install swaps by one rename once the new directory is complete; old versions go 7 days after they were replaced. CLI symlink `/usr/local/bin/oomph` | A root daemon must never execute user-writable files. A running process (the logger, an MCP server) keeps importing from the directory it started in, so it never mixes two versions' modules. |
 | Interpreter | `/usr/bin/python3 -I -B`, standard library only | Not affected by Homebrew upgrades; no dependencies; `-I` ignores environment and current directory. |
-| Metrics | `libproc` via ctypes (`proc_pid_rusage` → `ri_phys_footprint`, the same figure as Activity Monitor's *Memory* column), `sysctl` via ctypes, `vm_stat`, `ioreg`, `pmset -g assertions` | Fast (~5 ms for ~750 processes), accurate, no third-party tools. |
+| Metrics | Measured only by the backend module for the system (`oomph_darwin.py` on a Mac, reached through `oomph.plat()`; oomph.py and oomphd.py import no native code and load on any system): `libproc` via ctypes (`proc_pid_rusage` → `ri_phys_footprint`, the same figure as Activity Monitor's *Memory* column), `sysctl` via ctypes, `vm_stat`, `ioreg`, `pmset -g assertions` | Fast (~5 ms for ~750 processes), accurate, no third-party tools. |
 | Sampling | **Adaptive**: every 30 s; every 5 s ("hot mode") while pressure ≥ warning, swap grew > 512 MB within 60 s, jetsam kills occurred, free disk < 5 GB, or an incident is open | Fine resolution exactly when it matters, near-zero cost otherwise. |
 | Retention | Samples 14 days (previous days gzip-compressed); incidents 90 days; `events.jsonl` rotated at 20 MB | ~50–150 MB on disk in total. |
 | Logs | `/Library/Logs/oomph/`, world-readable | Inspecting the papertrail never needs `sudo`. |
@@ -108,9 +109,10 @@ Two practical lessons that shaped the implementation:
 One JSON object per line in `samples-YYYY-MM-DD.jsonl`; `current.json` always holds the
 latest one plus daemon status.
 
-- `t` (unix time), `iso`, `hot`, `gap` (seconds since the previous sample when it was
-  more than 3× the interval), `stall` (the same, when the Mac was awake throughout:
-  `CLOCK_UPTIME_RAW` stops during sleep, wall time doesn't)
+- `t` (unix time), `iso`, `os` (`"macos"`; from 1.8.8, older samples lack it), `hot`,
+  `gap` (seconds since the previous sample when it was more than 3× the interval),
+  `stall` (the same, when the Mac was awake throughout: `CLOCK_UPTIME_RAW` stops during
+  sleep, wall time doesn't)
 - **System memory:** pressure level (1 normal / 2 warning / 4 critical),
   `kern.memorystatus_level` (free %), RAM, app memory, wired, compressed (occupied) and
   compressor logical size, file cache, free; swap total/used and swapfile count; free
@@ -133,6 +135,12 @@ latest one plus daemon status.
   process tree and connect it to its app without the full process table
 - `gone` — processes ≥ 300 MB that disappeared since the previous sample (normal exits
   included; context only)
+- `current.json` only, in its `daemon` block (1.8.8): `machine` — `id` (a hash, not the
+  hardware UUID), `name`, `os`, `arch`, `os_version`, `kernel`, `kind` (`laptop` or
+  `desktop` on a Mac), `cpus`, `virt`, and `measures`: what this machine can measure
+  (`memory`, `pressure`, `kills`, `presence`, `footprint`, `unowned`, `scope`, and
+  `all_procs`: whether the logger sees every process). Additive: every reader tolerates
+  samples with and without these keys.
 
 ## Events
 

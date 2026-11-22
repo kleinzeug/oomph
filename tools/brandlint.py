@@ -19,8 +19,9 @@ changes):
      module docstrings), whose first `oomph` on the first line is printed as BRAND.
   3. install.sh links exactly one command into /usr/local/bin, and it is `oomph`.
   4. A brand other than "oomph" never stands before a descriptor that says "memory".
-  5. Root stays out: the brand is not in oomphd.py, install.sh or uninstall.sh, and
-     /Users/Shared appears only in the two ledger-directory definitions.
+  5. Root stays out: the brand is not in oomphd.py, oomph_darwin.py, install.sh or uninstall.sh, and
+     /Users/Shared appears only where the ledger directory is defined: oomph.py's path table
+     and the app's constant.
 
     tools/brandlint.py            exit 0 clean, 1 with findings listed
     tools/brandlint.py --all      also list every accepted occurrence and why
@@ -31,8 +32,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PY = ("daemon/oomph.py", "daemon/oomphd.py", "daemon/oomph_ai.py", "daemon/oomph_upgrade.py", "daemon/oomph_top.py",
-      "daemon/oomph_view.py")
+PY = ("daemon/oomph.py", "daemon/oomphd.py", "daemon/oomph_darwin.py", "daemon/oomph_ai.py", "daemon/oomph_upgrade.py",
+      "daemon/oomph_top.py", "daemon/oomph_view.py")
 SWIFT = ("app/oomph.swift",)
 HELP_DOCS = ("daemon/oomph.py", "daemon/oomph_upgrade.py")  # module docstrings printed as help
 SUBCOMMANDS = {"status", "report", "incidents", "incident", "html", "upgrade", "ai-report", "ai-check",
@@ -237,9 +238,9 @@ def lint(verbose=False):
     # 5: /Users/Shared only in the ledger-directory definitions
     for rel in PY + SWIFT + ("install.sh", "uninstall.sh", "build-app.sh"):
         for k, ln in enumerate(read(rel).splitlines(), 1):
-            if "/Users/Shared" in ln and not re.match(r"(LEDGER_DIR = |let ledgerDir = )", ln):
+            if "/Users/Shared" in ln and not re.match(r'(let ledgerDir = |\s+"ledger": "/Users/Shared/oomph",)', ln):
                 errs.append("rule 5: %s:%d names /Users/Shared outside the ledger-directory definition" % (rel, k))
-    for rel in ("daemon/oomphd.py", "install.sh", "uninstall.sh"):
+    for rel in ("daemon/oomphd.py", "daemon/oomph_darwin.py", "install.sh", "uninstall.sh"):
         if re.search(r"\bBRAND\b|\bbrand\b", read(rel)):
             errs.append("rule 5: %s uses the brand; root's code and the installers say oomph only" % rel)
     return errs

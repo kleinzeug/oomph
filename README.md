@@ -157,7 +157,7 @@ system daemons that are often the ones growing.
 Click the icon → **Activate** and enter your administrator password once. That runs the
 bundled `install.sh`, which:
 
-- copies `oomphd.py` and `oomph.py` to `/usr/local/libexec/oomph-<version>/` (root-owned,
+- copies `oomphd.py`, `oomph.py` and the rest to `/usr/local/libexec/oomph-<version>/` (root-owned,
   so nothing user-writable ever runs as root) and, once that is complete, points the link
   `/usr/local/libexec/oomph` at it in one step: a process that is running keeps the version
   it started with, and versions replaced more than 7 days ago are removed (restart an MCP
@@ -218,6 +218,7 @@ oomph incidents                 # list of incidents
 oomph incident latest --html    # open the latest incident's report
 oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
 oomph top --once                # the popup's dashboard as one frame of text (--span inf|24h|6h|1h, --glyphs cells|ascii)
+oomph doctor                    # what works here and what to fix: logger, versions, ledger, Claude setup (--json)
 ```
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
@@ -415,7 +416,8 @@ that provider for each AI report (Ollama keeps it local).
 
 ```
 daemon/oomphd.py                  the sampler daemon (root)
-daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon)
+daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon), the path table
+daemon/oomph_darwin.py            everything that measures a Mac (the backend the daemon and CLI call)
 daemon/oomph_top.py               `oomph top`: reads the files and prints the frame
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/local.oomph.daemon.plist   the LaunchDaemon job
