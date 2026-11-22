@@ -34,17 +34,30 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL = os.geteuid() == 0
 USER = int(os.environ.get("SUDO_UID") or 0) if REAL else os.getuid()  # whom root's ledger children run as
 NOBODY = pwd.getpwnam("nobody").pw_uid
+
+
+def ps_uid(pid):
+    """The effective uid of `pid` as ps shows it, as pwd gives it (ps prints nobody as -2), or None."""
+    out = subprocess.run(["/bin/ps", "-o", "uid=", "-p", str(pid)], capture_output=True, text=True, timeout=10).stdout
+    try:
+        return int(out.strip()) & 0xffffffff
+    except ValueError:
+        return None
+
+
 base = tempfile.mkdtemp(prefix="oomph-roottest-")
 os.chmod(base, 0o755)
 code, ledgers, victims = (os.path.join(base, x) for x in ("code", "ledgers", "victims"))
 for d in (code, ledgers, victims):
     os.mkdir(d)
     os.chmod(d, 0o755)
-for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py"):
+for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_ioreport.py", "oomph_top.py", "oomph_view.py", "oomph_net.py",
+          "oomph_sync.py"):
     shutil.copy(os.path.join(ROOT, "daemon", f), code)
     os.chmod(os.path.join(code, f), 0o644)
 os.environ["OOMPH_DIR"] = os.path.join(base, "logs")
 os.environ["OOMPH_LEDGER_DIR"] = os.path.join(ledgers, "unused")
+os.environ["OOMPH_IOREPORT"] = "0"  # the daemon's samples start no IOReport helper here; section 12 starts one itself
 sys.path.insert(0, code)
 
 import oomph  # noqa: E402
@@ -445,17 +458,52 @@ try:
         srv.stdin.flush()
         answers.append(json.loads(srv.stdout.readline() or "{}"))
         if i == 0:
-            uid = subprocess.run(["/bin/ps", "-o", "uid=", "-p", str(srv.pid)], capture_output=True, text=True).stdout.strip()
+            uid = ps_uid(srv.pid)
 finally:
     srv.stdin.close()
     srv.wait(10)
     srv.stdout.close()
-want = str(USER or NOBODY) if REAL else str(os.getuid())
+want = (USER or NOBODY) if REAL else os.getuid()
 snap = json.loads(zlib.decompress(base64.b64decode(answers[1].get("result", {}).get("data", ""))) or b"{}") \
     if len(answers) > 1 and "result" in answers[1] else {}
 check(uid == want and snap.get("leases") == [] and answers[2].get("result", {}).get("n") == 0 and time.time() - t < 10,
       "serve --stdio as root runs as uid %s (want %s); a link to root's file and a FIFO are absent (%.1f s)"
       % (uid, want, time.time() - t))
+
+# 12. the IOReport helper (1.9.3): its private library never loads into a process running as root. The
+#     helper refuses root, the logger starts it as nobody, and the logger's own process has not loaded it.
+if sys.platform == "darwin":
+    P = oomph.plat()
+    cmd = P.ioreport_helper()
+    r = subprocess.run(cmd, input=b"\n", capture_output=True, timeout=30)
+    if REAL:
+        check(r.returncode == 3 and not r.stdout, "IOReport: the helper refuses to run as root (exit %s)" % r.returncode)
+    # where this Mac has no usable table (Intel, CI's VMs) the helper is started anyway, with the table of 02 A.4:
+    # who it runs as and what this process loads do not depend on the table
+    table = P.gpu_dvfs_mhz()
+    real_table = oomphd.dvfs_usable(table)
+    fs = oomphd.FullSpeed(cmd, table if real_table else [0.0, 338.0, 618.0, 796.0, 832.0, 924.0, 952.0, 1056.0, 1064.0,
+                                                         1182.0, 1182.0, 1312.0, 1242.0, 1380.0],
+                          os.path.join(os.environ["OOMPH_DIR"], "ioreport.json"), P.boot_id())
+    fs.figure(None)
+    uid = ps_uid(fs.proc.pid) if fs.proc else None
+    time.sleep(0.5)
+    t1 = P.uptime_s()
+    fs.figure(None)
+    time.sleep(0.5)
+    fig = fs.figure(P.uptime_s() - t1)
+    fs.close()
+    import ctypes  # noqa: E402
+    dyld = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    dyld._dyld_get_image_name.restype = ctypes.c_char_p
+    loaded = [dyld._dyld_get_image_name(i) or b"" for i in range(dyld._dyld_image_count())]
+    want = NOBODY if REAL else os.getuid()
+    check(uid == want and not any(b"IOReport" in x for x in loaded) and fs.state["crashes"] == 0 and
+          (fig is not None if real_table else True) and fs.status() in ("on", "unavailable"),
+          "IOReport: the logger starts the helper as uid %s (want %s) and never loads the library itself; %s"
+          % (uid, want, "a reading of %.1f %% at full speed" % fig[0] if fig else
+             "no reading: this Mac has %s" % ("no channel" if fs.status() == "unavailable" else
+                                               "no usable GPU frequency table" if not real_table else fs.status())))
 
 # 10. install.sh as root into a throwaway prefix: everything root's, the old layout migrated
 #     (the real one, with launchd, runs in CI's "Install over 1.8.4" step)

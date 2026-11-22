@@ -2533,7 +2533,7 @@ def _depth_ok(v):
 
 # Switches that survive updates live here, not in the LaunchDaemon's plist, which install.sh
 # replaces. Keys are the switches' names without the prefix and in lower case
-# ({"ioreport": true} for OOMPH_IOREPORT); none is read yet. The file is root's: one that root
+# ({"ioreport": true} for OOMPH_IOREPORT, the first one read: 1.9.3). The file is root's: one that root
 # does not own, or that anyone else could change, is ignored.
 CONFIG_FILE = PATHS_HERE["config"]
 CONFIG_CAP = 64 << 10
@@ -2578,6 +2578,20 @@ def setting(name, default=None, config=None):
     if env is not None:
         return env
     return (read_config() if config is None else config).get(name.lower(), default)
+
+
+def switched_on(v):
+    """A switch's value as a yes: true in the file; 1, true, yes or on in the environment."""
+    return v is True or (type(v) is int and v == 1) or \
+        (isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "on"))
+
+
+def ioreport_wanted(config=None):
+    """Whether the logger may start the IOReport helper for the GPU's full-speed figure (roadmap 02
+    §4.2): opt-in in 1.9.3, so only with "ioreport": true in the configuration file (or
+    OOMPH_IOREPORT=1), and never with "no_ioreport" (OOMPH_NO_IOREPORT=1), which wins."""
+    config = read_config() if config is None else config
+    return switched_on(setting("ioreport", config=config)) and not switched_on(setting("no_ioreport", config=config))
 
 
 def _num(x, lo=-1e15, hi=1e15):
@@ -4596,6 +4610,8 @@ def doctor():
         add("config", "ok" if cfg else "warn", "%s: %s" % (
             CONFIG_FILE, "%d setting(s)" % len(cfg) if cfg else "ignored: not root's, or writable by others, or not JSON"),
             None if cfg else "sudo chown root %s; sudo chmod 644 %s" % (CONFIG_FILE, CONFIG_FILE))
+    if mac:
+        add(*_doctor_gpu(c if fresh else None, kick))
 
     if root:  # the Claude setup is the user's own: their files, read as them
         add("claude", "note", "not checked as root", "oomph doctor without sudo checks your Claude setup")
@@ -4615,6 +4631,54 @@ def doctor():
             "ledger": {"kind": "shared" if mac else "user", "path": LEDGER_DIR,
                        "members": "every account on this Mac" if mac else None},
             "checks": checks, "exit": code}
+
+
+IOREPORT_OFF = {"crashes": "the IOReport helper crashed four times since the Mac started and stays off until the next "
+                           "restart or macOS update",
+                "shape": "60 GPU readings in a row did not fit this Mac; off until the next restart or macOS update",
+                "missing": "switched on, but the logger found no IOReport helper (oomph_ioreport.py) next to it; "
+                           "reinstall %s" % BRAND,
+                "failed": "switched on, but the logger could not set the figure up (its daemon_error events say why)",
+                "unavailable": "this Mac reports no GPU performance states (an Intel Mac or a VM)",
+                "table": "this Mac's device tree has no usable GPU frequency table"}
+
+
+def _no_full_speed():
+    """True where the full-speed figure cannot work, so doctor does not suggest switching it on: an
+    Intel Mac or a VM, whose device tree has no usable GPU frequency table (asked of the device tree,
+    not of uname: a Python under Rosetta says x86_64 on Apple silicon)."""
+    try:
+        t = plat().gpu_dvfs_mhz()
+    except Exception:
+        return False
+    return not (isinstance(t, list) and sum(1 for f in t if isinstance(f, (int, float)) and f > 0) >= 2)
+
+
+def _doctor_gpu(c, kick):
+    """The GPU's full-speed figure: opt-in in 1.9.3 (IOReport, in a helper that runs as nobody).
+    `c`: the logger's current sample when it is fresh, which says what the logger does."""
+    d = c.get("daemon") if c and isinstance(c.get("daemon"), dict) else {}
+    state = d.get("ioreport") if isinstance(d.get("ioreport"), str) else None
+    gpus = c.get("gpu") if c and isinstance(c.get("gpu"), list) else []
+    full = any(isinstance(g, dict) and g.get("src") == "ioreport" for g in gpus)
+    if state in IOREPORT_OFF:
+        return "gpu", "note" if state in ("unavailable", "table") else "warn", "busy time only: " + IOREPORT_OFF[state]
+    if full or state == "on":
+        return "gpu", "ok", "at full speed, from IOReport (a helper that runs as nobody)" if full else \
+            "full speed switched on; the logger's next sample has it"
+    if ioreport_wanted():
+        return "gpu", "note", "full speed switched on in %s, not yet used by the logger" % CONFIG_FILE, \
+            kick if c else None
+    if switched_on(setting("no_ioreport")):
+        return "gpu", "note", "busy time only: the full-speed figure is switched off (no_ioreport)"
+    if _no_full_speed():
+        return "gpu", "note", "busy time only (the share of time the GPU worked, at any speed); this Mac has no GPU " \
+            "frequency table, so the figure at full speed is not available here"
+    turn_on = "add \"ioreport\": true to %s (with sudo); %s" % (CONFIG_FILE, kick) if os.path.lexists(CONFIG_FILE) else \
+        "sudo mkdir -p \"%s\"; echo '{\"ioreport\": true}' | sudo tee \"%s\"; %s" % (
+            os.path.dirname(CONFIG_FILE), CONFIG_FILE, kick)
+    return "gpu", "note", "busy time only (the share of time the GPU worked, at any speed); the figure at full speed " \
+        "is opt-in in this version", turn_on
 
 
 def _doctor_ledger(root):

@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -20,6 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["OOMPH_DIR"] = tempfile.mkdtemp(prefix="oomph-selftest-")
 os.environ["OOMPH_LEDGER_DIR"] = os.path.join(os.environ["OOMPH_DIR"], "ledger")
 os.environ["OOMPH_STATE_DIR"] = os.path.join(os.environ["OOMPH_DIR"], "state")  # pins and settings: never the real ones
+os.environ["OOMPH_IOREPORT"] = "0"  # the daemon samples below never start the IOReport helper, whatever this Mac's config says
+os.environ.pop("OOMPH_NO_IOREPORT", None)
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
 
 import oomph  # noqa: E402
@@ -1376,8 +1379,8 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
         """An app bundle's Resources folder, stamped with `version`."""
         d = os.path.join(inst, name)
         os.makedirs(os.path.join(d, "skills", "oomph"))
-        for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_ai.py", "oomph_upgrade.py", "oomph_top.py",
-                  "oomph_view.py", "oomph_net.py", "oomph_sync.py", "local.oomph.daemon.plist"):
+        for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_ioreport.py", "oomph_ai.py", "oomph_upgrade.py",
+                  "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py", "local.oomph.daemon.plist"):
             shutil.copy(os.path.join(ROOT, "daemon", f), d)
         for f in ("install.sh", "uninstall.sh"):
             shutil.copy(os.path.join(ROOT, f), d)
@@ -1760,6 +1763,230 @@ if MAC:
           "a command that prints 20 MB or never ends costs its reading within the deadline (%.1f s)" % (time.time() - t0))
 else:
     print("skip  the registry parser and the bounded reads are the Mac backend's")
+
+# --- M2 (1.9.3): the GPU at full speed, from the IOReport helper as nobody; opt-in (roadmap 02 §4.2, §10.6)
+A4 = [0.0, 338.0, 618.0, 796.0, 832.0, 924.0, 952.0, 1056.0, 1064.0, 1182.0, 1182.0, 1312.0, 1242.0, 1380.0]  # 02 A.4
+U = 72000  # residency units of one part in a thousand of 3 s at 24 MHz
+
+
+def gpuph(**res):
+    """GPUPH's 16 states (OFF, P1 … P15) with residencies in thousandths of the interval."""
+    return [[n, res.get(n, 0) * U] for n in ["OFF"] + ["P%d" % i for i in range(1, 16)]]
+
+
+A15 = gpuph(OFF=501, P1=427, P2=30, P3=26, P5=16)  # the desktop of 02 A.3
+DT = 1000 * U
+util, active = oomphd.full_speed(A15, A4, DT)
+check(abs(util - 14.37) < 0.01 and abs(active - 49.9) < 1e-9,
+      "full speed: the residencies of A.3 weighed with the table of A.4 give the hand-computed 14.4 %% (busy %.1f %%; %.2f)"
+      % (active, util))
+lower_last = A4[:12] + [1380.0, 1242.0]
+check(abs(oomphd.full_speed(gpuph(P1=1000), lower_last, DT)[0] - 338 / 1380 * 100) < 1e-9 and
+      oomphd.full_speed(gpuph(OFF=1000), A4, DT) == (0.0, 0.0),
+      "full speed: the table's maximum is full speed, not its last entry (it is not monotonic); an idle GPU reads 0")
+for what, args in (("residency in P14, which has no frequency", (gpuph(OFF=900, P14=100), A4, DT)),
+                   ("a renamed state", ([["OFF", 500 * U]] + [["GPU%d" % i, 0] for i in range(1, 15)] + [["P15", 500 * U]], A4, DT)),
+                   ("a table of one frequency", (A15, [0.0, 338.0], DT)),
+                   ("residencies that add up to half the interval", (A15, A4, 2 * DT)),
+                   ("a negative residency", (gpuph(OFF=1001, P1=-1), A4, DT)),
+                   ("a state with residency at 0 MHz", (gpuph(OFF=500, P2=500), [0.0, 338.0, 0.0, 796.0], DT)),
+                   ("states that are not a list of pairs", ([["OFF", 1.5]], A4, DT)),
+                   ("a table that is not one", (A15, ["338"] * 14, DT)),
+                   ("a residency of 2^64", (gpuph(OFF=1000)[:1] + [["P1", 2 ** 64]], A4, DT)),
+                   ("an interval of 2^64", (A15, A4, 2 ** 64))):
+    r = oomphd.full_speed(*args)
+    check(r[0] is None and isinstance(r[1], str), "full speed: %s falls back to busy time (%s)" % (what, r[1]))
+
+# opt-in: off unless the root-owned config or OOMPH_IOREPORT says so; OOMPH_NO_IOREPORT wins
+os.environ.pop("OOMPH_IOREPORT")
+wanted = [oomph.ioreport_wanted(config=c) for c in ({}, {"ioreport": True}, {"ioreport": "yes"}, {"ioreport": 0},
+                                                       {"ioreport": True, "no_ioreport": True})]
+os.environ["OOMPH_IOREPORT"] = "1"
+wanted.append(oomph.ioreport_wanted(config={}))
+os.environ["OOMPH_NO_IOREPORT"] = "1"
+wanted.append(oomph.ioreport_wanted(config={"ioreport": True}))
+os.environ.pop("OOMPH_NO_IOREPORT")
+os.environ["OOMPH_IOREPORT"] = "0"
+wanted.append(oomph.ioreport_wanted(config={"ioreport": True}))
+check(wanted == [False, True, True, False, False, True, False, False] and oomphd.full_speed_rung(P) is None and
+      oomphd.full_speed_rung(StubPlat()) is None,
+      "full speed is opt-in: only \"ioreport\": true in the config or OOMPH_IOREPORT=1 starts it; no_ioreport wins (%s)" % wanted)
+
+# doctor: a designed state is a note, a broken one a warning; no "switch it on" where the figure cannot work
+nfs = oomph._no_full_speed
+dg = [oomph._doctor_gpu({"daemon": {"ioreport": st}}, "kick") for st in ("table", "unavailable", "missing", "shape")]
+oomph._no_full_speed = lambda: True
+no_table = oomph._doctor_gpu(None, "kick")
+oomph._no_full_speed = lambda: False
+table = oomph._doctor_gpu(None, "kick")
+oomph._no_full_speed = nfs
+check([d[1] for d in dg] == ["note", "note", "warn", "warn"] and "reinstall" in dg[2][2] and "60" in dg[3][2] and
+      len(no_table) == 3 and "not available here" in no_table[2] and len(table) == 4 and "sudo" in table[3],
+      "doctor: no table or channel is a note, a missing helper or bad readings a warning; the opt-in is offered only "
+      "where the figure can work")
+
+# the helper's protocol, with stand-ins for it: a good one, one that crashes four ways, one whose readings never fit
+ird = tempfile.mkdtemp(prefix="oomph-ioreport-")
+st_path = os.path.join(ird, "ioreport.json")
+GOOD = json.dumps({"dt": DT, "hz": 24e6, "states": A15})
+
+
+def stand_in(body):
+    """A helper that answers each line of input with `body`, a Python expression for the line."""
+    return [sys.executable, "-I", "-c", "import sys, time\nfor _ in sys.stdin:\n    sys.stdout.write(%s)\n"
+            "    sys.stdout.flush()" % body]
+
+
+fs = oomphd.FullSpeed(stand_in(repr(GOOD + "\n")), A4, st_path, (1000, "27.2 26B1"))
+r = [fs.figure(None), fs.figure(None), fs.figure(3.0), fs.figure(9.0)]
+check(r[0] is None and r[1] is None and r[2] is not None and abs(r[2][0] - util) < 1e-9 and r[3] is None and
+      fs.bad == 0 and not fs.errors and fs.status() == "on",
+      "helper: started at the first sample, asked every sample; a reading over another interval is dropped, not held "
+      "against it (%s)" % r)
+fs.close()
+ident, crashes, t0 = (1000, "27.2 26B1"), [], time.time()
+for what, cmd in (("exits", [sys.executable, "-I", "-c", "import sys; sys.exit(1)"]),
+                  ("hangs", stand_in("time.sleep(30) or ''")),
+                  ("prints garbage", stand_in(repr("{not json\n"))),
+                  ("prints a 10 MB line", stand_in("'x' * 10000000 + '\\n'"))):
+    fs = oomphd.FullSpeed(cmd, A4, st_path, ident)
+    on = fs.status()
+    fs.figure(None)
+    time.sleep(0.2)
+    got = fs.figure(3.0)
+    saved = json.load(open(st_path))
+    crashes.append((what, on, got, saved["crashes"], saved["off"], fs.status()))
+    fs.close()
+check([c[3] for c in crashes] == [1, 2, 3, 4] and all(c[1] == "on" and c[2] is None for c in crashes) and
+      [c[5] for c in crashes] == ["on", "on", "on", "crashes"] and crashes[-1][4] == "crashes" and time.time() - t0 < 10,
+      "helper: one that exits, hangs, prints garbage or a 10 MB line costs that sample; the count is kept in "
+      "ioreport.json and the fourth crash switches it off (%s; %.1f s)" % ([c[:1] + c[3:] for c in crashes], time.time() - t0))
+again = oomphd.FullSpeed(stand_in(repr(GOOD + "\n")), A4, st_path, ident)
+reboot = oomphd.FullSpeed(stand_in(repr(GOOD + "\n")), A4, st_path, (2000, "27.2 26B1"))
+update = oomphd.FullSpeed(stand_in(repr(GOOD + "\n")), A4, st_path, (1000, "27.3 26C1"))
+check(again.status() == "crashes" and again.figure(None) is None and again.proc is None and reboot.status() == "on" and
+      update.status() == "on", "helper: off for the rest of the boot across restarts of the logger; a new boot or macOS "
+      "update starts the count afresh")
+os.remove(st_path)
+fs = oomphd.FullSpeed(stand_in(repr(json.dumps({"dt": DT, "hz": 24e6, "states": gpuph(OFF=900, P14=100)}) + "\n")),
+                      A4, st_path, ident)
+fs.figure(None)
+r = [fs.figure(3.0) for _ in range(oomphd.IOREPORT_BAD_OFF)]
+check(not any(r) and fs.status() == "shape" and json.load(open(st_path))["off"] == "shape" and fs.proc is None and
+      len(fs.errors) == 1 and "P14" in fs.errors[0],
+      "helper: %d readings in a row that do not fit the table switch it off until the next boot, said once"
+      % oomphd.IOREPORT_BAD_OFF)
+os.remove(st_path)
+fs = oomphd.FullSpeed(stand_in(repr('{"error": "no channel"}\n')), A4, st_path, ident)
+fs.figure(None)
+r = fs.figure(3.0)
+check(r is None and fs.status() == "unavailable" and fs.proc is None and not fs.errors and len(fs.notes) == 1 and
+      not os.path.exists(st_path), "helper: a Mac without the GPU's performance states reads busy time for the run, "
+      "a note and no error (no alarm at every start of the logger)")
+fs = oomphd.FullSpeed(stand_in(repr(GOOD + "\n")), [0.0, 338.0], st_path, ident)
+check(fs.status() == "table" and fs.figure(None) is None and fs.proc is None and not fs.errors and len(fs.notes) == 1,
+      "helper: not started without a usable table, a note and no error")
+huge = oomphd.FullSpeed(stand_in(repr(json.dumps({"dt": 2 ** 64, "hz": 24e6, "states": A15}) + "\n")), A4, st_path, ident)
+huge.figure(None)
+r = [huge.figure(3.0), huge.figure(3.0)]
+huge.close()
+check(r == [None, None] and huge.bad == 2 and huge.status() == "on" and not os.path.exists(st_path),
+      "helper: an interval of 2^64 is a bad reading, not an exception that escapes the sample (%s)" % huge.why)
+fs = oomphd.FullSpeed(stand_in("time.sleep(30) or ''"), A4, st_path, ident)
+fs.figure(None)
+fs.close(final=True)  # the logger's stop, while a reading would be pending
+fs._crash("ended (exit status -9)")  # what a reading the stop interrupted would make of it
+check(fs.figure(3.0) is None and fs.proc is None and not os.path.exists(st_path) and not fs.errors,
+      "helper: after the logger's stop nothing is asked, and nothing counts as a crash")
+
+# the sample: util at full speed, active busy time, src ioreport; a process's GPU is its share of busy time × util
+if MAC:
+    class Fig:
+        def __init__(self):
+            self.asked = []
+
+        def figure(self, dt_s):
+            self.asked.append(dt_s)
+            return (14.4, 50.0) if dt_s else None
+    sp, fig = StubPlat(), Fig()
+    seq = [greg["accelerator"], nxt]
+    sp.gpu_registry = lambda: seq.pop(0)
+    sp.gpu_mem_limit_gb = lambda ram: (27.0, True)
+    m = oomphd.Meter(sp, fig)
+    b0, _ = m.read({}, ram_gb=36)
+    sp.up += 1.0
+    b1, u1 = m.read({}, ram_gb=36)
+    g0, g1 = b0["gpu"][0], b1["gpu"][0]
+    check(fig.asked == [None, 1.0] and g0["src"] == "ioreg" and g1["src"] == "ioreport" and g1["util"] == 14.4 and
+          g1["active"] == 50.0 and abs(u1[413]["gpu"] - 10.8) < 1e-6 and abs(u1[900]["gpu"] - 3.6) < 1e-6,
+          "sample: with the helper the GPU reads %.1f %% at full speed and %.0f %% busy; WindowServer's 0.3 s of 0.4 s "
+          "is 10.8 %% of the GPU (%s)" % (g1["util"], g1.get("active", -1), {p: round(x["gpu"], 2) for p, x in u1.items()}))
+
+    # the real helper, where this Mac has the channel: its readings fit, it does not grow, and this process never
+    # loads the private library (CI's runners are VMs: the channel is usually missing there)
+    def images():
+        dyld = __import__("ctypes").CDLL("/usr/lib/libSystem.B.dylib")
+        dyld._dyld_get_image_name.restype = __import__("ctypes").c_char_p
+        return [dyld._dyld_get_image_name(i) or b"" for i in range(dyld._dyld_image_count())]
+    if os.path.exists(st_path):
+        os.remove(st_path)
+    fs = oomphd.FullSpeed(P.ioreport_helper(), P.gpu_dvfs_mhz(), st_path, P.boot_id())
+    fs.figure(None)
+    time.sleep(0.6)
+    t1 = P.uptime_s()
+    fs.figure(None)
+    time.sleep(0.6)
+    real = fs.figure(P.uptime_s() - t1)
+    if fs.status() in ("unavailable", "table"):
+        print("skip  the real IOReport helper: this Mac has no %s" % (
+            "GPU performance-state channel" if fs.status() == "unavailable" else "usable GPU frequency table"))
+    else:
+        check(real is not None and 0 <= real[0] <= real[1] <= 100 and fs.bad == 0 and not fs.errors,
+              "the real helper: a reading fits this Mac's table (%s %% at full speed, %s %% busy; table %s MHz)"
+              % (real and round(real[0], 1), real and round(real[1], 1), P.gpu_dvfs_mhz()))
+    fs.close()
+    hp = subprocess.Popen(P.ioreport_helper(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    def rss_kb():
+        return int(subprocess.run(["/bin/ps", "-o", "rss=", "-p", str(hp.pid)], capture_output=True, text=True,
+                                  timeout=10).stdout.strip() or 0)
+    def answer(deadline=2.0):
+        """One line of the helper's within `deadline` seconds, or b"" (a helper that hangs costs the test, not CI)."""
+        buf, fd, end = b"", hp.stdout.fileno(), time.monotonic() + deadline
+        while not buf.endswith(b"\n") and len(buf) < 1 << 16:
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return b""
+            b = os.read(fd, 1 << 16)  # one question, one line: nothing of the next answer can follow it
+            if not b:
+                return b""
+            buf += b
+        return buf
+    try:
+        lines, rss = [], [0, 0]
+        for i in range(1200):
+            hp.stdin.write(b"\n")
+            hp.stdin.flush()
+            lines.append(answer())
+            if not lines[-1] or b"no channel" in lines[0]:
+                break
+            if i in (199, 1199):
+                rss[i > 199] = rss_kb()
+    finally:
+        try:
+            hp.stdin.close()
+            hp.wait(10)
+        except (OSError, subprocess.TimeoutExpired):
+            hp.kill()
+            hp.wait(10)
+        hp.stdout.close()
+    if b"no channel" not in lines[0]:
+        check(len(lines) == 1200 and all(x.endswith(b"\n") and b'"states"' in x for x in lines) and
+              rss[1] - rss[0] < 2048 and rss[1] < 40 << 10,
+              "the real helper: 1,000 readings leave its memory unchanged (%d -> %d KB; without CFRelease it would grow "
+              "by 6 MB)" % tuple(rss))
+    check(not any(b"IOReport" in x for x in images()), "this process, the logger's, never loads libIOReport")
+shutil.rmtree(ird, ignore_errors=True)
 
 # disks: the class table on captured and made-up mount records; diskutil only for /dev/disk names
 vfix = json.load(open(os.path.join(FIX, "volumes.json")))["mounts"]

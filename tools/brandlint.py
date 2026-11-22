@@ -32,8 +32,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PY = ("daemon/oomph.py", "daemon/oomphd.py", "daemon/oomph_darwin.py", "daemon/oomph_ai.py", "daemon/oomph_upgrade.py",
-      "daemon/oomph_top.py", "daemon/oomph_view.py", "daemon/oomph_net.py", "daemon/oomph_sync.py")
+PY = ("daemon/oomph.py", "daemon/oomphd.py", "daemon/oomph_darwin.py", "daemon/oomph_ioreport.py", "daemon/oomph_ai.py",
+      "daemon/oomph_upgrade.py", "daemon/oomph_top.py", "daemon/oomph_view.py", "daemon/oomph_net.py", "daemon/oomph_sync.py")
 SWIFT = ("app/oomph.swift",)
 HELP_DOCS = ("daemon/oomph.py", "daemon/oomph_upgrade.py")  # module docstrings printed as help
 SUBCOMMANDS = {"status", "report", "incidents", "incident", "html", "upgrade", "ai-report", "ai-check",
@@ -241,7 +241,7 @@ def lint(verbose=False):
         for k, ln in enumerate(read(rel).splitlines(), 1):
             if "/Users/Shared" in ln and not re.match(r'(let ledgerDir = |\s+"ledger": "/Users/Shared/oomph",)', ln):
                 errs.append("rule 5: %s:%d names /Users/Shared outside the ledger-directory definition" % (rel, k))
-    for rel in ("daemon/oomphd.py", "daemon/oomph_darwin.py", "install.sh", "uninstall.sh"):
+    for rel in ("daemon/oomphd.py", "daemon/oomph_darwin.py", "daemon/oomph_ioreport.py", "install.sh", "uninstall.sh"):
         if re.search(r"\bBRAND\b|\bbrand\b", read(rel)):
             errs.append("rule 5: %s uses the brand; root's code and the installers say oomph only" % rel)
     return errs

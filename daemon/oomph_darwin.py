@@ -27,11 +27,15 @@ turn them into the sample's cpu, gpu, io and disks blocks, roadmap 02 §4):
   thermal_level()          0 nominal … 4 sleeping
   gpu_registry()           [{name, now, mem, alloc, clients {id: (pid, ns)}, usage}]
   gpu_mem_limit_gb(ram)    (GB, estimated)
+  gpu_dvfs_mhz()           the GPU's frequency per performance state, from the device tree
+  ioreport_helper()        the command of the IOReport helper (1.9.3), which the caller starts as nobody
+  boot_id()                (boot session UUID, macOS version and build): what the helper's crash count is kept per
   mounts()                 [{mount, from, fs, flags, dev, total_gb, free_gb}]
   mount_key(rec)           volume_facts(dev)           disk_pools(recs, facts)
 
 The ctypes libraries load when this module is imported, so only code that measures imports it:
-the hook and `oomph serve` never do. Nothing here opens anything in the shared ledger folder.
+the hook and `oomph serve` never do. Nothing here opens anything in the shared ledger folder, and
+nothing here loads IOReport: only oomph_ioreport.py does, in a process of its own that never runs as root.
 """
 import ctypes
 import functools
@@ -431,6 +435,54 @@ def gpu_registry():
         return parse_gpu_registry(raw) if raw.strip() else []
     except Exception:
         return None
+
+
+def parse_dvfs(raw):
+    """The GPU's frequencies in MHz from the device tree's `pmgr` node as a property list: its
+    `voltage-states9` is (frequency in Hz, voltage) pairs of little-endian 32-bit numbers, entry i
+    the frequency of performance state Pi (entry 0: 0 MHz, the state OFF). Not monotonic on an
+    M3 Max (02 A.4). None when the node or the key is missing or malformed."""
+    nodes = plistlib.loads(raw) if raw else []
+    for n in nodes if isinstance(nodes, list) else []:
+        v = n.get("voltage-states9") if isinstance(n, dict) else None
+        if isinstance(v, bytes) and 8 <= len(v) <= 8 * 64 and len(v) % 8 == 0:
+            return [int.from_bytes(v[i:i + 4], "little") / 1e6 for i in range(0, len(v), 8)]
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def gpu_dvfs_mhz():
+    """parse_dvfs of this Mac's device tree (read once, with a cap of 1 MB and a deadline of 5 s:
+    80 KB on an M3 Max). The table the IOReport helper's residencies are weighed with."""
+    raw = run_capped(["/usr/sbin/ioreg", "-a", "-p", "IODeviceTree", "-n", "pmgr", "-r", "-d", "1", "-w", "0"], 1 << 20, 5)
+    try:
+        return parse_dvfs(raw)
+    except Exception:
+        return None
+
+
+IOREPORT_HELPER = os.path.join(os.path.dirname(os.path.realpath(__file__)), "oomph_ioreport.py")
+
+
+def ioreport_helper():
+    """The command that starts the IOReport helper (oomph_ioreport.py, next to this file), or None
+    where it is missing. The caller starts it as nobody when it is root: the private library is
+    never loaded into a process that runs as root (02 §10.6)."""
+    return ["/usr/bin/python3", "-I", "-B", IOREPORT_HELPER] if os.path.isfile(IOREPORT_HELPER) else None
+
+
+def boot_id():
+    """This boot and this system, as the crash counter of the IOReport helper keys them: (the boot
+    session's UUID, the macOS version and build). A new boot or an update starts the count afresh.
+    Not the boot time: macOS moves kern.boottime whenever the clock is set (after a wake, an NTP
+    step), which would start the count afresh within one boot. The boot time only where the UUID
+    is missing, and the time of this reading where both are: then each start of the logger counts
+    afresh, which is no worse than a counter that never does."""
+    boot = sysctl_str("kern.bootsessionuuid")
+    if not boot:
+        raw = sysctl_raw("kern.boottime", 16)
+        boot = int.from_bytes(raw[:8], "little") if raw and len(raw) >= 8 else time.time()
+    return boot, "%s %s" % (sysctl_str("kern.osproductversion") or "?", sysctl_str("kern.osversion") or "?")
 
 
 def gpu_mem_limit_gb(ram_gb):

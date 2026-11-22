@@ -231,6 +231,16 @@ backup or network volumes). `oomph status` and `oomph check` show them; the app 
 `oomph volumes watch /Volumes/Scratch` pins such a disk for you: its free space then counts in
 your `oomph check` and hook like the system disk's (`unwatch`, `hide`, `unhide` likewise).
 
+How busy the GPU is says little on its own: an idle desktop keeps it busy half the time, at its
+lowest speed. From 1.9.3 the logger can also record how much of the GPU's capacity at full speed
+was used, from the system's IOReport library, which only a helper process running as `nobody`
+loads (never the logger itself, which runs as root). It is opt-in in this version: put
+`{"ioreport": true}` into the settings file (below) and restart the logger with
+`sudo launchctl kickstart -k system/local.oomph.daemon`. `oomph status` then says "% of full
+speed" instead of "busy … of the time", and `oomph doctor` says whether it works. A helper that
+crashes four times, or whose readings do not fit the Mac, is switched off until the Mac restarts
+or macOS is updated (`/Library/Logs/oomph/ioreport.json` keeps the count).
+
 ### In the terminal
 
 `oomph top` is the popup in a terminal window: the readings, the memory chart with its four
@@ -432,6 +442,7 @@ session B  → granted r8, tests start
 | `/Library/Logs/oomph/samples-YYYY-MM-DD.jsonl[.gz]` | one sample per line; older days compressed; kept 14 days |
 | `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications |
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
+| `/Library/Logs/oomph/ioreport.json` | how often the IOReport helper crashed since the Mac started (only when it is switched on) |
 | `/usr/local/libexec/oomph/` | a link to the installed daemon and CLI, `/usr/local/libexec/oomph-<version>/` |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job (replaced by every install) |
 | `/Library/Application Support/oomph/config.json` | settings that survive updates (optional, see below) |
@@ -448,8 +459,12 @@ a JSON object that no install or upgrade writes: `{"<switch>": value}`, the swit
 without `OOMPH_` and in lower case. An `OOMPH_<SWITCH>` variable in the environment takes
 precedence. The file is read only if it and its folder belong to root and nobody else can
 write them (`sudo mkdir -p "/Library/Application Support/oomph"`, then edit the file with
-`sudo`); otherwise it is ignored. No switch needs it yet; the ones coming (such as
-`OOMPH_IOREPORT`) will be read from it.
+`sudo`); otherwise it is ignored. The switches read from it:
+
+| Switch | Effect |
+|---|---|
+| `"ioreport": true` | the GPU's figure at full speed, from the IOReport helper (opt-in in 1.9.3; see above) |
+| `"no_ioreport": true` | never start the IOReport helper, also once it is on by default |
 
 ### Privacy
 
@@ -469,6 +484,7 @@ local).
 daemon/oomphd.py                  the sampler daemon (root)
 daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon), the path table
 daemon/oomph_darwin.py            everything that measures a Mac (the backend the daemon and CLI call)
+daemon/oomph_ioreport.py          the IOReport helper: the GPU's performance states, as nobody (never root)
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)

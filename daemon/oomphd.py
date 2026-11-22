@@ -13,6 +13,7 @@ import gzip
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import stat
@@ -165,7 +166,9 @@ TOP_RATES = {"top_cpu": ("cpu", 8), "top_gpu": ("gpu", 5), "top_io": ("w", 5)}
 
 class Meter:
     """Rates between two readings: busy cores (system-wide, by cluster and per process), the GPU
-    from the IO registry, bytes read and written. The first reading, and the first after a gap,
+    from the IO registry (with `full`, a FullSpeed, also at full speed: then `util` is the share of
+    the GPU's capacity, `active` its busy time and `src` "ioreport", and a process's GPU is its share
+    of the busy time × util), bytes read and written. The first reading, and the first after a gap,
     has no rates: those blocks then carry only what one reading tells (core count, load, thermal
     level; the GPU's instantaneous figure and memory).
 
@@ -177,8 +180,9 @@ class Meter:
     the machine was busy plus half a core. The backend's readings are optional; one that fails
     costs its block, and is noted in `errors` for the logger to report."""
 
-    def __init__(self, P):
+    def __init__(self, P, full=None):
         self.P = P
+        self.full = full     # the full-speed rung (FullSpeed), when it is switched on
         self.prev = None     # {t, up, ticks, procs {(pid, start): (cpu_s, child_s, ppid, rd, wr)}, gpu [{id: (pid, ns)}]}
         self.debts = {}      # parent pid -> [[seconds still owed, the child's pid, readings since its pid left]]
         self.errors = []     # (where, error) since the caller last looked
@@ -260,6 +264,12 @@ class Meter:
         if not prev:
             self.gpu_apart = {}
         devs = self._get("gpu_registry")
+        fig = None
+        if self.full is not None:
+            try:
+                fig = self.full.figure(dt if prev else None)
+            except Exception as e:  # costs the full-speed figure, never the block
+                self.errors.append(("ioreport", repr(e)[:300]))
         gstate = [{cid: c for cid, c in d["clients"].items()} for d in devs] if devs else []
         if devs:
             lim = self._get("gpu_mem_limit_gb", ram_gb) if ram_gb else None
@@ -277,6 +287,7 @@ class Meter:
                     if lim[1]:
                         g["mem_limit_est"] = True
                 pg = prev["gpu"][i] if prev and i < len(prev["gpu"]) else None
+                full = fig if i == 0 and g["unified"] else None  # IOReport's channel is the built-in GPU's
                 if pg is not None and d.get("usage", True) and i not in self.gpu_off:
                     per = {}
                     for cid, (pid, ns) in d["clients"].items():
@@ -287,11 +298,14 @@ class Meter:
                     busy = min(100.0, sum(per.values()) / (dt * 1e9) * 100)
                     g.update(util=round(busy, 1), active=round(busy, 1), src="clients")
                     self._gpu_check(i, busy, g.get("now"), up)
-                    for pid, ns in per.items():
+                    tot = sum(per.values())
+                    for pid, ns in per.items():  # at full speed: its share of the busy time × util (02 §5.1)
                         x = use.setdefault(pid, {})
-                        x["gpu"] = min(100.0, x.get("gpu", 0.0) + ns / (dt * 1e9) * 100)
+                        x["gpu"] = min(100.0, x.get("gpu", 0.0) + (ns / tot * full[0] if full else ns / (dt * 1e9) * 100))
                 elif g.get("now") is not None:
                     g.update(util=float(g["now"]), src="ioreg")
+                if full:
+                    g.update(util=round(full[0], 1), active=round(full[1], 1), src="ioreport")
                 out["gpu"].append(g)
         elif devs == []:
             out["gpu"] = []
@@ -351,6 +365,231 @@ class Meter:
                 self.debts[ppid] = keep
             else:
                 del self.debts[ppid]
+
+
+# ---------------------------------------------------------------- the GPU at full speed (roadmap 02 §4.2, §10.6)
+IOREPORT_TOL = 0.02     # the residencies add up to the helper's interval within this share
+IOREPORT_BAD_OFF = 60   # unusable readings in a row that switch the figure off until the next boot
+IOREPORT_MAX = 1 << 62  # bound of an interval or a residency (Mach units): a bigger number is a bad reading
+
+
+def dvfs_usable(table):
+    """A DVFS table the residencies can be weighed with: a list of at most 64 frequencies, at least
+    two of them above zero."""
+    return isinstance(table, list) and len(table) <= 64 and \
+        all(isinstance(f, (int, float)) and not isinstance(f, bool) and 0 <= f < 1e5 for f in table) and \
+        sum(1 for f in table if f > 0) >= 2
+
+
+def full_speed(states, table, dt):
+    """One helper reading as (util, active): util the share of the GPU's capacity used at full
+    speed, Σ residency(Pi) × table[i] ÷ (Σ residencies × the table's maximum, which is not its last
+    entry: the table is not monotonic), active the share of the time it was busy at any speed, both
+    in percent. Or (None, why) when the reading does not fit this Mac: the states are not OFF, P1 …
+    Pn in that order; the table has fewer than two non-zero entries; a state with residency has no
+    entry in the table or a zero one (P14 and P15 have none on an M3 Max); a residency is negative
+    or beyond IOREPORT_MAX; or the residencies do not add up to the interval `dt` (Mach time units) within IOREPORT_TOL."""
+    if not dvfs_usable(table):
+        return None, "no usable DVFS table"
+    if not isinstance(states, list) or not 2 <= len(states) <= 64 or not all(
+            isinstance(s, list) and len(s) == 2 and isinstance(s[0], str) and type(s[1]) is int for s in states):
+        return None, "malformed states"
+    if [s[0] for s in states] != ["OFF"] + ["P%d" % i for i in range(1, len(states))]:
+        return None, "states are not OFF, P1 … P%d: %s" % (len(states) - 1, ", ".join(s[0][:8] for s in states[:4]))
+    if any(s[1] < 0 for s in states):
+        return None, "a negative residency"
+    if any(s[1] >= IOREPORT_MAX for s in states):
+        return None, "a residency beyond 2^62"
+    for i, (name, r) in enumerate(states[1:], 1):
+        if r and (i >= len(table) or table[i] <= 0):
+            return None, "%s has residency but no frequency in the table" % name
+    if type(dt) is not int or not 0 < dt < IOREPORT_MAX:
+        return None, "an interval out of range"
+    tot = sum(s[1] for s in states)
+    if tot <= 0 or abs(tot - dt) > IOREPORT_TOL * dt:
+        return None, "the residencies (%s) do not add up to the interval (%s)" % (tot, dt)
+    fmax = max(table)
+    util = sum(r * table[i] for i, (_n, r) in enumerate(states) if 0 < i < len(table)) / (tot * fmax) * 100
+    return min(100.0, util), (tot - states[0][1]) / tot * 100
+
+
+class FullSpeed:
+    """Rung 1 of the GPU reading (02 §4.2): the IOReport helper (oomph_ioreport.py), the only source
+    of how fast the GPU ran. The private library it loads is never loaded here: the helper is a
+    process of its own, as nobody when the logger is root, asked for one line per sample: a newline
+    in, at most ANSWER_CAP bytes of JSON out within DEADLINE seconds.
+
+    A crash, a hang or garbage costs that sample's full-speed figure (the GPU then reads busy time,
+    labelled so) and counts in `ioreport.json` in the log folder, so a crash loop cannot hide behind
+    restarts of the logger. The helper is started again right away, at most MAX_CRASHES times per
+    boot; the next crash switches the figure off until the Mac restarts or macOS changes. So do
+    IOREPORT_BAD_OFF readings in a row that do not fit this Mac's table (full_speed). A Mac without
+    the channel (Intel, most VMs) or without a usable table has the figure off for the run. `errors`:
+    what went wrong, which the logger reports (daemon_error, where "ioreport"), each one once;
+    `notes`: why the figure is off on a Mac that cannot have it, a designed state that the logger
+    only writes to daemon.err (current.json's daemon.ioreport says it too)."""
+    ANSWER_CAP = 64 << 10
+    DEADLINE = 1.0
+    MAX_CRASHES = 3
+
+    def __init__(self, cmd, table, state_path, ident):
+        self.cmd, self.table, self.path, self.ident = cmd, table, state_path, ident
+        self.proc, self.buf = None, b""
+        self.bad, self.why = 0, None   # unusable readings in a row, and the last reason
+        self.errors, self.notes = [], []
+        self.closed = False  # by the logger's stop: nothing more is asked or counted
+        st = self._load()
+        if st.get("boot") != ident[0] or st.get("macos") != ident[1]:
+            st = {"boot": ident[0], "macos": ident[1], "crashes": 0, "off": False}
+        self.state = st
+        self.off = st["off"] or None   # why the figure is off: crashes, shape (persisted), unavailable, table
+        if not self.off and not dvfs_usable(table):
+            self.off = "table"
+            self.notes.append("no usable GPU frequency table in the device tree: the GPU reads busy time")
+
+    def _load(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            return {}
+        try:
+            st = os.fstat(fd)
+            data = os.read(fd, 4096) if stat.S_ISREG(st.st_mode) and st.st_size <= 4096 else b""
+        except OSError:
+            data = b""
+        finally:
+            os.close(fd)
+        d = oomph.loads_untrusted(data) or {}
+        if not isinstance(d, dict) or type(d.get("crashes")) is not int or d.get("off") not in (False, "crashes", "shape"):
+            return {}
+        return d
+
+    def _save(self):
+        try:
+            write_atomic(self.path, json.dumps(self.state, allow_nan=False))
+        except OSError as e:
+            self.errors.append("ioreport.json not written: %s" % e)
+
+    def status(self):
+        """For current.json: "on", or why the figure is off."""
+        return self.off or "on"
+
+    def _start(self):
+        self.buf = b""
+        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     cwd="/", env={"PATH": "/usr/bin:/bin"}, close_fds=True,
+                                     **oomph._drop_to("nobody", "nobody"))
+
+    def close(self, final=False):
+        """Ends the helper; `final` (the logger stops) also ends the asking: a reading the stop
+        interrupts is not counted as a crash."""
+        self.closed = self.closed or final
+        p, self.proc = self.proc, None
+        if p is None:
+            return
+        try:
+            if p.poll() is None:
+                p.kill()
+            p.wait(2)
+        except Exception:
+            pass
+        for f in (p.stdin, p.stdout):
+            try:
+                f.close()
+            except Exception:
+                pass
+
+    def _crash(self, what):
+        if self.closed:
+            return
+        self.close()
+        self.state["crashes"] += 1
+        n = self.state["crashes"]
+        if n > self.MAX_CRASHES:
+            self.off = self.state["off"] = "crashes"
+        self._save()
+        self.errors.append("the IOReport helper %s (crash %d since the Mac started); %s" % (
+            what, n, "the GPU reads busy time until the next restart of the Mac or macOS update" if self.off
+            else "started again"))
+        if not self.off:
+            try:  # now, so that the next sample has its reading: a crash costs one sample's figure
+                self._start()
+            except (OSError, subprocess.SubprocessError):
+                self.proc = None  # tried again, and counted, at the next sample
+
+    def _line(self):
+        """One answer, or raises RuntimeError with what went wrong."""
+        p = self.proc
+        try:
+            p.stdin.write(b"\n")
+            p.stdin.flush()
+        except (OSError, ValueError):
+            raise RuntimeError("ended (exit status %s)" % p.poll())
+        fd, deadline = p.stdout.fileno(), time.monotonic() + self.DEADLINE
+        while b"\n" not in self.buf:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                raise RuntimeError("did not answer within %g s" % self.DEADLINE)
+            b = os.read(fd, 1 << 16)
+            if not b:
+                raise RuntimeError("ended (exit status %s)" % p.poll())
+            self.buf += b
+            if len(self.buf) > self.ANSWER_CAP:
+                raise RuntimeError("said more than %d KB" % (self.ANSWER_CAP >> 10))
+        line, _, self.buf = self.buf.partition(b"\n")
+        if self.buf:
+            raise RuntimeError("said more than one line")
+        return line
+
+    def figure(self, dt_s):
+        """(util, active) for a sample whose interval was `dt_s` seconds, or None. Asked every sample
+        while the figure is on, also when the sample has no interval (dt_s None: the first one, or
+        after a gap), so that the helper's next reading starts where the sample's interval does. A
+        reading whose own interval is far from the sample's is dropped without counting against
+        the helper."""
+        if self.off or self.closed:
+            return None
+        try:
+            if self.proc is None:
+                self._start()
+                return None  # its first reading would be measured from its start
+            d = oomph.loads_untrusted(self._line())
+            if not isinstance(d, dict):
+                raise RuntimeError("answered something that is not JSON")
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            self._crash(str(e) if isinstance(e, RuntimeError) else "could not be started: %s" % e)
+            return None
+        if d.get("error") == "no channel":
+            self.close()
+            self.off = "unavailable"
+            self.notes.append("this Mac reports no GPU performance states: the GPU reads busy time")
+            return None
+        dt, hz = d.get("dt"), d.get("hz")
+        ok = type(dt) is int and 0 < dt < IOREPORT_MAX and isinstance(hz, (int, float)) and not isinstance(hz, bool) and 1e3 < hz < 1e12
+        if dt_s is None or (ok and abs(dt / hz - dt_s) > max(0.5, 0.1 * dt_s)):
+            return None
+        r = full_speed(d.get("states"), self.table, dt) if ok else (None, str(d.get("error") or "no interval")[:100])
+        if r[0] is None:
+            self.bad, self.why = self.bad + 1, r[1]
+            if self.bad >= IOREPORT_BAD_OFF:
+                self.off = self.state["off"] = "shape"
+                self._save()
+                self.close()
+                self.errors.append("%d GPU readings in a row did not fit this Mac (%s): the GPU reads busy time until "
+                                   "the next restart of the Mac or macOS update" % (self.bad, self.why))
+            return None
+        self.bad = 0
+        return r
+
+
+def full_speed_rung(P, log_dir=None):
+    """The full-speed rung when it is switched on (oomph.ioreport_wanted) and this backend has it,
+    else None."""
+    if not oomph.ioreport_wanted() or not all(hasattr(P, f) for f in ("ioreport_helper", "gpu_dvfs_mhz", "boot_id")):
+        return None
+    cmd = P.ioreport_helper()
+    return FullSpeed(cmd, P.gpu_dvfs_mhz(), os.path.join(log_dir or LOG_DIR, "ioreport.json"), P.boot_id()) \
+        if cmd else None
 
 
 def rate_lists(procs, use, session_of, group_key, n=None):
@@ -604,6 +843,8 @@ class Daemon:
         self.ledger = LedgerWorker(self.event)  # started by run()
         self.machine = None  # the `machine` block of current.json, made at the first sample
         self.meter = self.volumes = None  # rates and disks, made at the first sample
+        self.full = None  # the GPU's full-speed figure (FullSpeed), when it is switched on
+        self.full_off = None  # why it is missing although switched on: "missing" (no helper), "failed"
         self.soft_at = {}  # where -> when a failed reading was last reported
         self.clamp_told = False
 
@@ -737,7 +978,16 @@ class Daemon:
     def resources(self, P, procs, ram_gb, gap, up=None):
         """The sample's cpu, gpu, io and disks blocks and the rates per pid; a failure costs its block."""
         if self.meter is None:
-            self.meter, self.volumes = Meter(P), Volumes(P)
+            try:
+                self.full = full_speed_rung(P)
+                if self.full is None and oomph.ioreport_wanted() and hasattr(P, "ioreport_helper"):
+                    self.full_off = "missing"  # switched on, but the helper is not installed next to the logger
+                    self.event("daemon_error", where="ioreport", error="switched on, but the IOReport helper "
+                               "(oomph_ioreport.py) is missing: the GPU reads busy time")
+            except Exception as e:  # the GPU then reads busy time
+                self.full_off = "failed"
+                self.event("daemon_error", where="ioreport", error=repr(e)[:300])
+            self.meter, self.volumes = Meter(P, self.full), Volumes(P)
         try:
             blocks, use = self.meter.read(procs, ram_gb, gap=gap, up=up)
         except Exception as e:
@@ -745,6 +995,13 @@ class Daemon:
             self.meter.prev = None
             self.soft_error("meter", repr(e))
         errs, self.meter.errors = self.meter.errors, []
+        if self.full is not None:  # a handful per boot at most: each is reported
+            for e in self.full.errors:
+                self.event("daemon_error", where="ioreport", error=str(e)[:300])
+            for e in self.full.notes:  # a Mac that cannot have the figure: designed, so no alarm
+                sys.stderr.write("%s oomphd: %s\n" % (now_iso(), e))
+                sys.stderr.flush()
+            del self.full.errors[:], self.full.notes[:]
         for where, e in errs:
             self.soft_error(where, e)
         if self.meter.scaled > 1 and not self.clamp_told:  # once per start, to daemon.err: a diagnostic, no alarm
@@ -960,6 +1217,8 @@ class Daemon:
                          "interval": HOT_INTERVAL if self.hot else INTERVAL,
                          "incident": self.incident["id"] if self.incident else None,
                          "root": os.geteuid() == 0, "machine": self.machine}
+        if self.full is not None or self.full_off:
+            cur["daemon"]["ioreport"] = self.full.status() if self.full is not None else self.full_off
         write_atomic(os.path.join(LOG_DIR, "current.json"), json.dumps(cur))
         return s
 
@@ -1072,6 +1331,8 @@ class Daemon:
 
     def stop(self, *_):
         self.stopping = True
+        if self.full is not None:  # a reading this signal interrupts is not a crash of the helper
+            self.full.close(final=True)
         if self.stream_proc:
             try:
                 self.stream_proc.terminate()
