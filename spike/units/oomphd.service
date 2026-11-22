@@ -1,0 +1,58 @@
+[Unit]
+Description=oomph memory papertrail (sampler)
+Documentation=https://github.com/kleinzeug/oomph
+After=local-fs.target systemd-journald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/oomph/oomphd.py
+User=oomphd
+Group=oomph
+SupplementaryGroups=systemd-journal
+# no capability, and none to be had
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0027
+SyslogIdentifier=oomphd
+
+Restart=always
+RestartSec=10
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+OOMScoreAdjust=-900
+MemoryMax=256M
+TasksMax=64
+
+# no network, ever
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# file system: it writes its logs, its state, and the ledger as the member of group oomph it is (the tick)
+ProtectSystem=strict
+ReadWritePaths=/var/log/oomph /var/lib/oomph/daemon /var/lib/oomph/ledger
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+
+# system calls
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged process_vm_readv process_vm_writev process_madvise kcmp pidfd_getfd ptrace
+SystemCallErrorNumber=EPERM
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

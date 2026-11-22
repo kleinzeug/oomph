@@ -1,0 +1,18 @@
+[Unit]
+Description=oomph share connection (spike draft)
+
+[Service]
+ExecStart=/usr/bin/python3 -I -B /usr/local/libexec/oomph/oomph.py serve --inetd
+StandardInput=socket
+StandardOutput=null
+StandardError=null
+User=oomph-share
+Group=oomph-read
+NoNewPrivileges=yes
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=/var/lib/oomph/share/run
+ReadOnlyPaths=/var/log/oomph /var/lib/oomph/ledger
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=128M
+Nice=5

@@ -1,0 +1,11 @@
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/oomph alert --run-hooks
+DynamicUser=yes
+SupplementaryGroups=oomph-read
+StateDirectory=oomph-alert
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+TimeoutStartSec=300

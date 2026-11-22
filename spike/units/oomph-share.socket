@@ -1,0 +1,11 @@
+[Unit]
+Description=oomph share (spike draft, 01 section 4.2 + 03 Appendix A)
+
+[Socket]
+ListenStream=6674
+Accept=yes
+MaxConnections=12
+MaxConnectionsPerSource=4
+
+[Install]
+WantedBy=sockets.target

@@ -1,0 +1,4 @@
+[Path]
+PathChanged=/var/log/oomph/alerts
+[Install]
+WantedBy=multi-user.target

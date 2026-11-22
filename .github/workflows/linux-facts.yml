@@ -1,0 +1,53 @@
+name: linux-facts
+# The fact spike LS (roadmap/03-linux/DESIGN.md, Appendix E). Throwaway branch; never merged.
+on:
+  push:
+    branches: [spike/linux-facts]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  runner:
+    name: runner ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: facts
+        run: sudo -E env "SYSNAME=${{ matrix.os }}" OUT=/var/tmp/spike-out MODE=runner bash spike/facts.sh all
+      - name: summary
+        if: always()
+        run: python3 spike/py/summarize.py /var/tmp/spike-out "runner ${{ matrix.os }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: facts-runner-${{ matrix.os }}
+          path: /var/tmp/spike-out
+          if-no-files-found: warn
+  guest:
+    name: guest ${{ matrix.guest }}
+    strategy:
+      fail-fast: false
+      matrix:
+        guest: [ubuntu-24.04, debian-12, rocky-9]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+      - name: boot the guest and run the rows inside
+        run: bash spike/guest/run-guest.sh "${{ matrix.guest }}" "$RUNNER_TEMP/guest-out"
+      - name: summary
+        if: always()
+        run: python3 spike/py/summarize.py "$RUNNER_TEMP/guest-out" "guest ${{ matrix.guest }}" >> "$GITHUB_STEP_SUMMARY"
+      - name: upload
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: facts-guest-${{ matrix.guest }}
+          path: ${{ runner.temp }}/guest-out
+          if-no-files-found: warn
