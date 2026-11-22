@@ -43,7 +43,7 @@ UD
 genisoimage -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data
 echo "booting $G at $(date -u +%T)"
 sudo timeout ${GUEST_MINUTES:-55}m qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -nodefaults -vga std -display none \
-  -drive file=disk.qcow2,if=virtio,format=qcow2 \
+  -drive file=disk.qcow2,if=none,id=root,format=qcow2 -device virtio-blk-pci,drive=root,bootindex=0 \
   -drive file=seed.iso,media=cdrom,format=raw \
   -drive if=none,id=in,file=in.tar,format=raw,readonly=on -device virtio-blk-pci,drive=in,serial=spikein \
   -drive if=none,id=out,file=out.raw,format=raw -device virtio-blk-pci,drive=out,serial=spikeout \
