@@ -80,14 +80,35 @@ def run(cmd, timeout=10):
 def summarize_procs(procs):
     """The top processes, the biggest groups and the agent sessions of a process table, as a
     sample carries them. The backend says what a group and a session root are."""
+    return _summarize(procs)[:3]
+
+
+def _rates(e, x, keys=("cpu", "gpu", "w")):
+    """A process's, group's or session's rates (cores, % of the GPU, MB/s written), each only when
+    it is not zero."""
+    for k in keys:
+        v = round(x.get(k) or 0.0, 2)
+        if v > 0:
+            e[k] = v
+    return e
+
+
+def _summarize(procs, use=None):
+    """summarize_procs, and with `use` (the Meter's rates per pid) the same lists with their rates,
+    plus session_of (pid -> the agent session it runs in)."""
     P = oomph.plat()
     group_key, is_claude = P.group_key, P.is_agent
+    use = use or {}
     groups = {}
     for p in procs.values():
-        g = groups.setdefault(group_key(p["path"], p["name"]), [0, 0])
+        g = groups.setdefault(group_key(p["path"], p["name"]), [0, 0, 0.0, 0.0])
         g[0] += p["fp"]
         g[1] += 1
-    grp = [{"name": k, "mb": round(v[0] / MB), "n": v[1]}
+        u = use.get(p["pid"])
+        if u:
+            g[2] += u.get("cpu") or 0.0
+            g[3] += u.get("gpu") or 0.0
+    grp = [_rates({"name": k, "mb": round(v[0] / MB), "n": v[1]}, {"cpu": v[2], "gpu": v[3]})
            for k, v in sorted(groups.items(), key=lambda kv: kv[1][0], reverse=True)[:GROUPS_N]]
 
     children = {}
@@ -115,12 +136,13 @@ def summarize_procs(procs):
             session_of[m] = p["pid"]
         desc = [procs[m] for m in members if m != p["pid"] and m in procs]
         big = max(desc, key=lambda d: d["fp"]) if desc else None
-        sessions.append({
+        tot = {k: sum((use.get(m) or {}).get(k) or 0.0 for m in members) for k in ("cpu", "gpu", "w")} if use else {}
+        sessions.append(_rates({
             "pid": p["pid"], "cwd": P.proc_cwd(p["pid"]),
             "mb": round(sum(procs[m]["fp"] for m in members if m in procs) / MB),
             "own_mb": round(p["fp"] / MB), "n": len(members),
             "biggest": {"name": big["name"], "pid": big["pid"], "mb": round(big["fp"] / MB)} if big else None,
-        })
+        }, tot))
     sessions.sort(key=lambda s: s["mb"], reverse=True)
 
     # g: app group, pn: parent's name, s: Claude session it runs under (for the report's tree)
@@ -133,8 +155,309 @@ def summarize_procs(procs):
             e["pn"] = procs[p["ppid"]]["name"]
         if p["pid"] in session_of:
             e["s"] = session_of[p["pid"]]
-        top.append(e)
-    return top, grp, sessions
+        top.append(_rates(e, use.get(p["pid"]) or {}))
+    return top, grp, sessions, session_of
+
+
+# ---------------------------------------------------------------- CPU, GPU, I/O and disks (roadmap 02 §4, §5.1)
+TOP_RATES = {"top_cpu": ("cpu", 8), "top_gpu": ("gpu", 5), "top_io": ("w", 5)}
+
+
+class Meter:
+    """Rates between two readings: busy cores (system-wide, by cluster and per process), the GPU
+    from the IO registry, bytes read and written. The first reading, and the first after a gap,
+    has no rates: those blocks then carry only what one reading tells (core count, load, thermal
+    level; the GPU's instantaneous figure and memory).
+
+    A process's CPU is its own time plus what its reaped children added to its child time, less
+    what was already counted for those children while a sample could see them: a child that ends
+    leaves a debt with its parent, paid out of the parent's next growth in child time, for as long
+    as the child's pid is still listed (a zombie) and one reading after that (02 §4.1, A.14, A.25).
+    No process reads above the core count, and the per-process figures never add up to more than
+    the machine was busy plus half a core. The backend's readings are optional; one that fails
+    costs its block, and is noted in `errors` for the logger to report."""
+
+    def __init__(self, P):
+        self.P = P
+        self.prev = None     # {t, up, ticks, procs {(pid, start): (cpu_s, child_s, ppid, rd, wr)}, gpu [{id: (pid, ns)}]}
+        self.debts = {}      # parent pid -> [[seconds still owed, the child's pid, readings since its pid left]]
+        self.errors = []     # (where, error) since the caller last looked
+        self.scaled = 0.0    # cores the last clamp took off the per-process sum
+        self.gpu_apart = {}  # device index -> uptime since when the clients rung and `now` disagree
+        self.gpu_off = set() # devices whose clients rung was given up for this run (rung 3 instead)
+
+    def _get(self, name, *a):
+        fn = getattr(self.P, name, None)
+        if fn is None:
+            return None
+        try:
+            return fn(*a)
+        except Exception as e:
+            self.errors.append((name, repr(e)[:300]))
+            return None
+
+    def read(self, procs, ram_gb=None, gap=False, up=None):
+        """(blocks for the sample, {pid: {"cpu", "gpu", "w"}}) for this process table; `up`: the uptime
+        taken right after the table was, so that the per-process deltas and the interval match."""
+        t, up = time.time(), self.P.uptime_s() if up is None else up
+        prev = None if gap else self.prev
+        dt = up - prev["up"] if prev else 0.0
+        if dt <= 0.05:
+            prev = None
+        out, use = {}, {}
+        topo = self._get("cpu_topology") or {}
+        ticks = self._get("cpu_ticks")
+        n = len(ticks) if ticks else topo.get("n") or os.cpu_count() or 1
+        if hasattr(self.P, "cpu_ticks"):
+            cpu = out["cpu"] = {"n": n}
+            if topo.get("e"):
+                cpu["p"], cpu["e"] = topo["p"], topo["e"]
+            try:
+                cpu["load"] = [round(x, 2) for x in os.getloadavg()]
+            except OSError:
+                pass
+            th = self._get("thermal_level")
+            if th is not None:
+                cpu["therm"] = th
+            if prev and ticks and prev["ticks"] and len(prev["ticks"]) == len(ticks):
+                cpu.update(self._busy(prev["ticks"], ticks, topo.get("e_ids")))
+
+        cur = {(p["pid"], p["start"]): (p["cpu_s"], p["child_s"], p["ppid"], p["rd"], p["wr"])
+               for p in procs.values() if "cpu_s" in p}
+        if prev:
+            for k, v in prev["procs"].items():  # gone since the last reading: what was counted becomes a debt
+                if k not in cur and (k[0] not in procs or procs[k[0]]["start"] != k[1]):
+                    self.debts.setdefault(v[2], []).append([v[0] + v[1], k[0], 0])
+            r_sum = w_sum = 0.0
+            for k, (c, ch, _pp, rd, wr) in cur.items():
+                last = prev["procs"].get(k)
+                if last is None:
+                    if k[1] < prev["t"] - 1:
+                        continue  # seen for the first time, but older: no basis to say what it did
+                    last = (0.0, 0.0, 0, 0, 0)
+                own, reaped = max(0.0, c - last[0]), max(0.0, ch - last[1])
+                for d in self.debts.get(k[0], ()):
+                    pay = min(reaped, d[0])
+                    reaped, d[0] = reaped - pay, d[0] - pay
+                if k[0] == 1:
+                    reaped = 0.0  # launchd reaps every orphan
+                x = use.setdefault(k[0], {})
+                x["cpu"] = min((own + reaped) / dt, float(n))
+                rb, wb = max(0, rd - last[3]) / dt / MB, max(0, wr - last[4]) / dt / MB
+                r_sum, w_sum = r_sum + rb, w_sum + wb
+                x["w"] = wb
+            out["io"] = {"r_mb_s": round(r_sum, 2), "w_mb_s": round(w_sum, 2)}
+            busy = out.get("cpu", {}).get("busy")
+            total = sum(x["cpu"] for x in use.values())
+            self.scaled = 0.0
+            if busy is not None and total > busy + 0.5:
+                f = (busy + 0.5) / total
+                self.scaled = total - busy - 0.5
+                for x in use.values():
+                    x["cpu"] *= f
+        self._prune(procs)
+
+        if not prev:
+            self.gpu_apart = {}
+        devs = self._get("gpu_registry")
+        gstate = [{cid: c for cid, c in d["clients"].items()} for d in devs] if devs else []
+        if devs:
+            lim = self._get("gpu_mem_limit_gb", ram_gb) if ram_gb else None
+            out["gpu"] = []
+            for i, d in enumerate(devs):
+                g = {"id": "gpu%d" % i, "name": d["name"], "unified": os.uname().machine == "arm64"}
+                if d["now"] is not None:
+                    g["now"] = d["now"]
+                if d["mem"] is not None:
+                    g["mem_gb"] = round(d["mem"] / GB, 2)
+                if d["alloc"] is not None:
+                    g["mem_alloc_gb"] = round(d["alloc"] / GB, 2)
+                if lim and i == 0:
+                    g["mem_limit_gb"] = lim[0]
+                    if lim[1]:
+                        g["mem_limit_est"] = True
+                pg = prev["gpu"][i] if prev and i < len(prev["gpu"]) else None
+                if pg is not None and d.get("usage", True) and i not in self.gpu_off:
+                    per = {}
+                    for cid, (pid, ns) in d["clients"].items():
+                        old = pg.get(cid)
+                        delta = ns - old[1] if old and old[0] == pid else ns
+                        if delta > 0:
+                            per[pid] = per.get(pid, 0) + delta
+                    busy = min(100.0, sum(per.values()) / (dt * 1e9) * 100)
+                    g.update(util=round(busy, 1), active=round(busy, 1), src="clients")
+                    self._gpu_check(i, busy, g.get("now"), up)
+                    for pid, ns in per.items():
+                        x = use.setdefault(pid, {})
+                        x["gpu"] = min(100.0, x.get("gpu", 0.0) + ns / (dt * 1e9) * 100)
+                elif g.get("now") is not None:
+                    g.update(util=float(g["now"]), src="ioreg")
+                out["gpu"].append(g)
+        elif devs == []:
+            out["gpu"] = []
+        self.prev = {"t": t, "up": up, "ticks": ticks, "procs": cur, "gpu": gstate}
+        return out, use
+
+    GPU_APART, GPU_APART_S = 25.0, 300.0
+
+    def _gpu_check(self, i, busy, now, up):
+        """The safety net of the clients rung (02 §12): its busy time is compared with the driver's
+        own figure every sample; more than GPU_APART points apart for GPU_APART_S and the device
+        reads rung 3 (ioreg) for the rest of the run, which is reported once."""
+        if now is None or abs(busy - now) <= self.GPU_APART:
+            self.gpu_apart.pop(i, None)
+            return
+        since = self.gpu_apart.setdefault(i, up)
+        if up - since >= self.GPU_APART_S:
+            self.gpu_off.add(i)
+            self.errors.append(("gpu", "gpu%d: the clients' GPU time and the driver's figure disagree by more than "
+                                       "%.0f points for %.0f s; reading the driver's figure from now on"
+                                % (i, self.GPU_APART, up - since)))
+
+    @staticmethod
+    def _busy(a, b, e_ids):
+        user = sys_ = pb = eb = 0.0
+        e = set(e_ids or ())
+        for i, (x, y) in enumerate(zip(a, b)):
+            d = [(q - p) % (1 << 32) for p, q in zip(x, y)]
+            tot = sum(d)
+            if tot <= 0:
+                continue
+            u, s = (d[0] + d[3]) / tot, d[1] / tot
+            user, sys_ = user + u, sys_ + s
+            if i in e:
+                eb += u + s
+            else:
+                pb += u + s
+        r = {"busy": round(user + sys_, 2), "user": round(user, 2), "sys": round(sys_, 2)}
+        if e_ids:
+            r["p_busy"], r["e_busy"] = round(pb, 2), round(eb, 2)
+        return r
+
+    def _prune(self, procs):
+        """A debt lives while its child's pid is listed and one reading after; it goes when paid or
+        when its parent is gone (then nobody would be credited with the child's time)."""
+        if not self.debts:
+            return
+        raw = self._get("list_pids")
+        raw = set(raw) if raw else set(procs)
+        for ppid in list(self.debts):
+            keep = []
+            for d in self.debts[ppid] if ppid in procs else ():
+                d[2] = 0 if d[1] in raw else d[2] + 1
+                if d[0] > 1e-6 and d[2] <= 1:
+                    keep.append(d)
+            if keep:
+                self.debts[ppid] = keep
+            else:
+                del self.debts[ppid]
+
+
+def rate_lists(procs, use, session_of, group_key, n=None):
+    """top_cpu (8), top_gpu (5), top_io (5): the biggest consumers of each, in cores, percent of the
+    GPU and MB/s written (`n` of each instead, for `oomph ps`)."""
+    out = {}
+    for key, (field, cap) in TOP_RATES.items():
+        cap = n or cap
+        rows = sorted(((x.get(field) or 0.0, pid) for pid, x in use.items() if pid in procs), reverse=True)
+        lst = []
+        for v, pid in rows[:cap]:
+            if round(v, 2) <= 0:
+                break
+            p = procs[pid]
+            e = {"pid": pid, "name": p["name"], "g": group_key(p["path"], p["name"]), field: round(v, 2)}
+            if pid in session_of:
+                e["s"] = session_of[pid]
+            lst.append(e)
+        if lst:
+            out[key] = lst
+    return out
+
+
+class Volumes:
+    """The sample's `disks` block: the system's pool and every listed pool (02 §4.4). getfsstat
+    runs with every sample (0.1 ms, from the kernel's cache); what diskutil says about a device takes
+    up to half a second, so it is asked once per newly seen mount, on a thread of its own, and until
+    it has answered the volume is not listed. `wait`: ask in the caller's thread instead (the CLI).
+    A failed answer is asked again after RETRY_S."""
+    RETRY_S = 600
+
+    def __init__(self, P, wait=False):
+        self.P, self.wait = P, wait
+        self.facts = {}      # mount_key -> facts ({} when diskutil failed)
+        self.failed = {}     # mount_key -> when it failed
+        self.todo = []       # (mount_key, device) to ask about
+        self.cond = threading.Condition()
+        self.thread = None
+
+    def read(self):
+        """(pools, rows), or (None, None) where this backend cannot list mounts."""
+        P = self.P
+        if not hasattr(P, "mounts"):
+            return None, None
+        recs = P.mounts()
+        if recs is None:
+            return None, None
+        live = {P.mount_key(r): r for r in recs}
+        with self.cond:
+            for k in [k for k in self.facts if k not in live]:
+                del self.facts[k]
+                self.failed.pop(k, None)
+            for k, t in list(self.failed.items()):
+                if time.time() - t > self.RETRY_S:
+                    del self.failed[k]
+                    self.facts.pop(k, None)
+            facts = dict(self.facts)
+        pools, rows = P.disk_pools(recs, facts)
+        ask = [(P.mount_key(r), r["from"]) for r in rows if r["cls"] == "pending"]
+        if ask and self.wait:
+            for k, dev in ask:
+                self._answer(k, dev)
+            with self.cond:
+                facts = dict(self.facts)
+            return P.disk_pools(recs, facts)
+        if ask:
+            with self.cond:
+                queued = {k for k, _ in self.todo}
+                self.todo += [x for x in ask if x[0] not in queued]
+                self.cond.notify()
+            if self.thread is None:
+                self.thread = threading.Thread(target=self._loop, name="volumes", daemon=True)
+                self.thread.start()
+        return pools, rows
+
+    def _answer(self, k, dev):
+        try:
+            f = self.P.volume_facts(dev)
+        except Exception:
+            f = None
+        with self.cond:
+            self.facts[k] = f or {}
+            if not f:
+                self.failed[k] = time.time()
+
+    def _loop(self):
+        while True:
+            with self.cond:
+                while not self.todo:
+                    self.cond.wait()
+                k, dev = self.todo.pop(0)
+                if k in self.facts:
+                    continue
+            self._answer(k, dev)
+
+
+def measure(window=0.25, procs=None):
+    """A live reading of the rates, for the CLI when no logger runs: two readings `window` seconds
+    apart ("window_s" in the result). Returns (blocks, use, procs)."""
+    P = oomph.plat()
+    m = Meter(P)
+    m.read(procs or P.collect_procs())
+    time.sleep(window)
+    procs = P.collect_procs()
+    out, use = m.read(procs, ram_gb=P.system_memory().get("ram_gb"))
+    out["window_s"] = window
+    return out, use, procs
 
 
 def log_time(j, default):
@@ -280,6 +603,9 @@ class Daemon:
         self.stream_proc = None
         self.ledger = LedgerWorker(self.event)  # started by run()
         self.machine = None  # the `machine` block of current.json, made at the first sample
+        self.meter = self.volumes = None  # rates and disks, made at the first sample
+        self.soft_at = {}  # where -> when a failed reading was last reported
+        self.clamp_told = False
 
     # -- events
     def event(self, kind, **kw):
@@ -401,6 +727,38 @@ class Daemon:
             names = sorted(jet["names"].items(), key=lambda kv: -kv[1])[:15]
             self.event("jetsam", kills=jet["kills"], reasons=jet["reasons"], top=dict(names))
         return jet["kills"]
+
+    def soft_error(self, where, err):
+        """A reading that failed costs its block of the sample; it is reported at most hourly."""
+        if time.time() - self.soft_at.get(where, 0) >= 3600:
+            self.soft_at[where] = time.time()
+            self.event("daemon_error", where=where, error=str(err)[:300])
+
+    def resources(self, P, procs, ram_gb, gap, up=None):
+        """The sample's cpu, gpu, io and disks blocks and the rates per pid; a failure costs its block."""
+        if self.meter is None:
+            self.meter, self.volumes = Meter(P), Volumes(P)
+        try:
+            blocks, use = self.meter.read(procs, ram_gb, gap=gap, up=up)
+        except Exception as e:
+            blocks, use = {}, {}
+            self.meter.prev = None
+            self.soft_error("meter", repr(e))
+        errs, self.meter.errors = self.meter.errors, []
+        for where, e in errs:
+            self.soft_error(where, e)
+        if self.meter.scaled > 1 and not self.clamp_told:  # once per start, to daemon.err: a diagnostic, no alarm
+            self.clamp_told = True
+            sys.stderr.write("%s oomphd: per-process CPU scaled down by %.1f cores to what the machine was busy\n"
+                             % (now_iso(), self.meter.scaled))
+            sys.stderr.flush()
+        try:
+            pools = self.volumes.read()[0]
+            if pools is not None:
+                blocks["disks"] = pools
+        except Exception as e:
+            self.soft_error("disks", repr(e))
+        return blocks, use
 
     # -- notifications
     def notify(self, title, msg, **kw):
@@ -531,8 +889,8 @@ class Daemon:
         if away.get("uid") is not None:
             self.console = {"uid": away["uid"], "user": away["user"]}
         procs = P.collect_procs()
+        up = P.uptime_s()  # here, not later: the Meter's interval must be the process table's
         jetsam_kills = self.flush_jetsam()
-        top, groups, sessions = summarize_procs(procs)
 
         big = {(p["pid"], p["start"]): (p["name"], round(p["fp"] / MB)) for p in procs.values()
                if p["fp"] >= GONE_MIN_MB * MB}
@@ -541,7 +899,6 @@ class Daemon:
         # a pid that is still present with the same start time is not gone
         self.prev_big = big
 
-        up = P.uptime_s()
         gap = stall = None
         if self.prev_t and t - self.prev_t > 3 * (HOT_INTERVAL if self.hot else INTERVAL) + 5:
             gap = round(t - self.prev_t)
@@ -557,6 +914,8 @@ class Daemon:
                         self.pending_triggers.append({"kind": "stall", "t": t,
                             "msg": "oomph couldn't run for %d s while the Mac was awake — the system is starved for memory" % gap})
         self.prev_t, self.prev_up = t, up
+        blocks, use = self.resources(P, procs, sysm.get("ram_gb"), bool(gap), up)
+        top, groups, sessions, session_of = _summarize(procs, use)
 
         s = {"t": round(t, 1), "iso": now_iso(t), "hot": self.hot, "os": P.OS}
         if gap:
@@ -566,16 +925,19 @@ class Daemon:
         s.update(sysm)
         s.update(P.ownership(sysm, procs))
         s["jetsam_kills"] = jetsam_kills
+        s.update(blocks)  # cpu, gpu, disks, io (02 §5.1): each where it could be read
         s["away"] = {k: away[k] for k in ("idle_s", "display_on", "locked", "sleep_preventers")}
         s["top"] = top
         s["groups"] = groups
         s["claude"] = sessions
+        s.update(rate_lists(procs, use, session_of, P.group_key))
         # Retire reservations of sessions that died or expired, close to when it happened, and
         # copy the live ones into the sample. The shared ledger directory is world-writable, so
         # the daemon never opens anything in it: its thread hands the work to an unprivileged
         # child and the sample carries the last snapshot that child answered with (none if it
         # is older than two intervals).
-        self.ledger.offer({k: v for k, v in s.items() if k not in ("top", "groups", "claude")}, procs)
+        self.ledger.offer({k: v for k, v in s.items() if k not in ("top", "groups", "claude") and k not in TOP_RATES},
+                          procs)
         leases = self.ledger.latest(2 * (HOT_INTERVAL if self.hot else INTERVAL))
         if leases:
             s["leases"] = leases  # memory sessions have reserved through oomph's ledger

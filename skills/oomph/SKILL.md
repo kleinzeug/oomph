@@ -5,9 +5,10 @@ description: Make a long-running session memory-aware with oomph (macOS), and co
 
 # oomph — be memory-aware, take turns
 
-> **Memory only, unless `oomph resources` works.** Use resource flags (CPU, GPU, disk) only if
-> `oomph resources` succeeds; otherwise reserve memory only. An older oomph may read an unknown
-> flag's number as gigabytes; a newer one refuses the flag (exit 2).
+> **Memory only, unless `oomph resources` says otherwise.** Use resource flags (CPU, GPU, disk)
+> only for a resource that `oomph resources --json` lists under `reservable`; otherwise reserve
+> memory only. An older oomph may read an unknown flag's number as gigabytes; a newer one refuses
+> the flag (exit 2).
 
 > **Installing this skill:** it belongs at `.claude/skills/oomph/SKILL.md` in a project, or
 > `~/.claude/skills/oomph/SKILL.md` for every project. Copy it verbatim — never retype or

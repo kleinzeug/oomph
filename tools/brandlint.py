@@ -38,7 +38,8 @@ SWIFT = ("app/oomph.swift",)
 HELP_DOCS = ("daemon/oomph.py", "daemon/oomph_upgrade.py")  # module docstrings printed as help
 SUBCOMMANDS = {"status", "report", "incidents", "incident", "html", "upgrade", "ai-report", "ai-check",
                "check", "session", "wait", "run", "reserve", "amend", "release", "reservations", "hook",
-               "mcp", "setup-claude", "version", "resources", "top", "doctor", "share", "remote", "serve"}
+               "mcp", "setup-claude", "version", "resources", "top", "doctor", "share", "remote", "serve", "ps",
+               "volumes"}
 WORD = re.compile(r"oomph", re.I)
 
 

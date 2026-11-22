@@ -67,10 +67,25 @@ def tree(d):
     return out
 
 
+# the blocks of a 1.9.1 logger, with disks far bigger than 16 times the RAM (a mirror before 1.9.1
+# refuses any such *_gb: so `disks` must stay home)
+BLOCKS_191 = {"cpu": {"n": 16, "p": 12, "e": 4, "busy": 3.2, "user": 2.5, "sys": 0.7, "p_busy": 2.9, "e_busy": 0.3,
+                      "load": [3.1, 2.8, 2.2], "therm": 0},
+              "gpu": [{"id": "gpu0", "name": "Apple M3 Max", "unified": True, "util": 12.0, "active": 12.0, "now": 10,
+                       "src": "clients", "mem_gb": 1.5, "mem_alloc_gb": 4.2, "mem_limit_gb": 27.0}],
+              "io": {"r_mb_s": 1.2, "w_mb_s": 3.4},
+              "disks": [{"id": "data", "name": "Data", "mount": "/System/Volumes/Data", "total_gb": 926.4, "free_gb": 600.2,
+                         "watch": True, "low_gb": 20, "crit_gb": 5, "level": "ok", "roles": ["home"]},
+                        {"id": "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10", "name": "Scratch", "mount": "/Volumes/Scratch",
+                         "total_gb": 1862.8, "free_gb": 1500.0, "watch": False, "kind": "external"}],
+              "top_cpu": [{"pid": 7, "name": "cargo", "g": "iTerm2", "cpu": 2.0}]}
+
+
 def make_machine(name="default"):
     """topfixture's machine with the samples a real logger writes: iso, pressure, the per-process
     lists and leases (which must stay home), a scalar no reader knows yet and a nested object no
-    reader knows (which must not travel); current.json with its daemon and machine blocks."""
+    reader knows (which must not travel), the blocks of 1.9.1 on the newest day's samples;
+    current.json with its daemon and machine blocks (and the 1.9.1 blocks)."""
     fx = os.path.join(TMP, name)
     log, led = topfixture.write_fixture(fx, "default")
     for n in sorted(os.listdir(log)):
@@ -84,6 +99,8 @@ def make_machine(name="default"):
                      top=[{"pid": 1, "name": "launchd", "mb": 20}], groups=[{"name": "Finder", "mb": 300, "n": 1}],
                      claude=[{"pid": 7, "cwd": "/srv/proj/atlas", "mb": 900, "n": 3}],
                      leases=[{"id": "r1", "state": "granted", "gb": 2.0, "purpose": "build"}])
+            if n == "samples-%s.jsonl" % time.strftime("%Y-%m-%d", time.localtime(NOW)):
+                r.update(BLOCKS_191)
         text = b"".join(json.dumps(r).encode() + b"\n" for r in rows)
         if n.endswith(".gz"):
             with gzip.GzipFile(p, "wb", mtime=0) as f:
@@ -95,6 +112,7 @@ def make_machine(name="default"):
                                 "os_version": "macOS 27.2", "kernel": "27.2.0", "kind": "desktop", "cpus": 16,
                                 "virt": "none", "measures": {"memory": True, "pressure": "kernel"}}
     cur["top"] = [{"pid": 1, "name": "launchd", "mb": 20, "secret": "x" * 500, "nested": {"a": 1}}] * 40
+    cur.update(BLOCKS_191)
     json.dump(cur, open(os.path.join(log, "current.json"), "w"))
     return fx
 
@@ -152,6 +170,11 @@ check(len(gz) == 7 and os.path.exists(os.path.join(mlog, "samples-2026-11-20.jso
 one = json.loads(read(os.path.join(mlog, "samples-2026-11-20.jsonl")).splitlines()[0])
 check(not {"top", "groups", "claude", "leases", "future_block"} & set(one) and one.get("future_scalar") == 1.5
       and set(one["away"]) <= set(oomph.AWAY_KEYS), "slim samples: scalars and away only; a new scalar travels")
+today = [json.loads(x) for x in read(os.path.join(mlog, "samples-2026-11-20.jsonl")).splitlines()]
+check(all(x.get("cpu", {}).get("busy") == 3.2 and x["gpu"][0]["util"] == 12.0 and x["io"]["w_mb_s"] == 3.4 and
+          "disks" not in x and "top_cpu" not in x for x in today),
+      "1.9.1 samples (disks of 926 and 1,863 GB on a 36 GB machine) all reach the mirror with CPU, GPU and I/O; "
+      "the disks stay home (%d samples)" % len(today))
 
 srv = net.Server(slog, os.path.join(fx, "ledger"), now=NOW)
 rpc(srv, "hello", proto=[1, 1])
@@ -171,8 +194,20 @@ check(incs == sorted(i[0] for i in topfixture.INCIDENTS) and all(
     "incidents mirrored from their named fields (%d)" % len(incs))
 cur = json.load(open(os.path.join(mlog, "current.json")))
 check(len(cur["top"]) == 25 and set(cur["top"][0]) == {"pid", "name", "mb"} and cur["daemon"]["machine"]["id"] ==
-      "m-0123456789abcdef" and "virt" in cur["daemon"]["machine"],
-      "current.json: rebuilt from the whitelist (top capped at 25, unknown fields gone)")
+      "m-0123456789abcdef" and "virt" in cur["daemon"]["machine"] and cur["gpu"][0]["name"] == "Apple M3 Max" and
+      cur["cpu"]["busy"] == 3.2 and "disks" not in cur,
+      "current.json: rebuilt from the whitelist (top capped at 25, unknown fields gone; CPU and GPU, no disks)")
+# what a mirror lets in: a disk's size is bounded apart from the RAM (an 8 GB Mac with a 1 TB disk)
+small = dict(BLOCKS_191, t=topfixture.NOW - 60, ram_gb=8.0, app_gb=3.0, free_gb=1.0, disk_free_gb=900.0,
+             disks=[dict(BLOCKS_191["disks"][0], total_gb=1000.0, free_gb=900.0)])
+ing = sync.Ingest({"now": topfixture.NOW, "ram_gb": 8.0})
+check(ing.row(net.dumps(oomph.slim_sample(small)), "samples") and ing.row(net.dumps(oomph.full_sample(small)), "samples")
+      and ing.row(net.dumps(small), "samples") and ing.dropped["samples"] == 0,
+      "ingest: an 8 GB machine with 900 GB free on a 1 TB disk is let in, slim, full and with its disks block")
+check(not ing.row(net.dumps(dict(small, app_gb=200.0)), "samples") and
+      not ing.row(net.dumps(dict(small, disks=[{"id": "data", "total_gb": 1e7}])), "samples") and
+      not ing.row(net.dumps(dict(small, gpu=[{"mem_gb": 1000.0}])), "samples"),
+      "ingest: memory above 16 times the RAM, a 10 PB disk and a GPU's 1 TB on an 8 GB machine are still refused")
 st = json.load(open(os.path.join(mir, "sync.json")))
 mj = json.load(open(os.path.join(mir, "machine.json")))
 check(st["have"] and st["have"][0][0] <= mj["oldest"] and st["have"][-1][1] >= NOW - 120 and len(st["have"]) == 1

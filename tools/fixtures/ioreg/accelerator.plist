@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+	<dict>
+		<key>IOClass</key>
+		<string>AGXAcceleratorG15X</string>
+		<key>IOObjectClass</key>
+		<string>AGXAcceleratorG15X</string>
+		<key>IORegistryEntryChildren</key>
+		<array>
+			<dict>
+				<key>AppUsage</key>
+				<array>
+					<dict>
+						<key>API</key>
+						<string>Metal</string>
+						<key>accumulatedGPUTime</key>
+						<integer>120000000000</integer>
+						<key>lastSubmittedTime</key>
+						<integer>1</integer>
+					</dict>
+					<dict>
+						<key>API</key>
+						<string>Metal</string>
+						<key>accumulatedGPUTime</key>
+						<integer>5000000000</integer>
+						<key>lastSubmittedTime</key>
+						<integer>1</integer>
+					</dict>
+				</array>
+				<key>IOObjectClass</key>
+				<string>AGXDeviceUserClient</string>
+				<key>IORegistryEntryID</key>
+				<integer>4294971540</integer>
+				<key>IOUserClientCreator</key>
+				<string>pid 413, WindowServer</string>
+			</dict>
+			<dict>
+				<key>AppUsage</key>
+				<array/>
+				<key>IOObjectClass</key>
+				<string>AGXDeviceUserClient</string>
+				<key>IORegistryEntryID</key>
+				<integer>4294971541</integer>
+				<key>IOUserClientCreator</key>
+				<string>pid 413, WindowServer</string>
+			</dict>
+			<dict>
+				<key>AppUsage</key>
+				<array>
+					<dict>
+						<key>API</key>
+						<string>Metal</string>
+						<key>accumulatedGPUTime</key>
+						<integer>3000000000</integer>
+						<key>lastSubmittedTime</key>
+						<integer>1</integer>
+					</dict>
+				</array>
+				<key>IOObjectClass</key>
+				<string>AGXDeviceUserClient</string>
+				<key>IORegistryEntryID</key>
+				<integer>4294971600</integer>
+				<key>IOUserClientCreator</key>
+				<string>pid 659, idea</string>
+			</dict>
+			<dict>
+				<key>AppUsage</key>
+				<array>
+					<dict>
+						<key>API</key>
+						<string>Metal</string>
+						<key>accumulatedGPUTime</key>
+						<integer>800000000</integer>
+						<key>lastSubmittedTime</key>
+						<integer>1</integer>
+					</dict>
+				</array>
+				<key>IOObjectClass</key>
+				<string>AGXDeviceUserClient</string>
+				<key>IORegistryEntryID</key>
+				<integer>4294971700</integer>
+				<key>IOUserClientCreator</key>
+				<string>pid 661, iTerm2</string>
+			</dict>
+		</array>
+		<key>PerformanceStatistics</key>
+		<dict>
+			<key>Alloc system memory</key>
+			<integer>7374848000</integer>
+			<key>Device Utilization %</key>
+			<integer>38</integer>
+			<key>In use system memory</key>
+			<integer>992395264</integer>
+			<key>In use system memory (driver)</key>
+			<integer>0</integer>
+			<key>Renderer Utilization %</key>
+			<integer>37</integer>
+			<key>Tiler Utilization %</key>
+			<integer>37</integer>
+		</dict>
+		<key>gpu-core-count</key>
+		<integer>30</integer>
+		<key>model</key>
+		<string>Apple M3 Max</string>
+	</dict>
+</array>
+</plist>

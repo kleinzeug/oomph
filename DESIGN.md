@@ -65,7 +65,11 @@ Two practical lessons that shaped the implementation:
 │   /usr/bin/python3 -I -B /usr/local/libexec/oomph/oomphd.py│
 │     ├─ sampler loop (30 s, 5 s when hot)                  │
 │     │    libproc · sysctl · vm_stat · ioreg · pmset        │
+│     │    host_processor_info · notify (thermal) · getfsstat│
+│     │    · ioreg -c IOAccelerator (1.9.1)                  │
 │     │    (oomph_darwin.py, the backend: oomph.plat())     │
+│     ├─ volumes thread (1.9.1): diskutil info, once per    │
+│     │    newly seen mount, off the sampling path          │
 │     └─ log stream (jetsam / low-swap / dialog)             │
 │           │                                               │
 │           ▼                                               │
@@ -94,7 +98,7 @@ Two practical lessons that shaped the implementation:
 | Runner | **LaunchDaemon as root** (`local.oomph.daemon`), `KeepAlive`, `RunAtLoad` | Survives logout, reboot and closed terminals — the incidents happen exactly when nobody is watching. Only root can read the physical footprint of *every* process, including root daemons like `spotlightknowledged` and WindowServer. |
 | Install path | Code in `/usr/local/libexec/oomph-<version>/` (root-owned, 755), reached through the link `/usr/local/libexec/oomph`, which an install swaps by one rename once the new directory is complete; old versions go 7 days after they were replaced. CLI symlink `/usr/local/bin/oomph` | A root daemon must never execute user-writable files. A running process (the logger, an MCP server) keeps importing from the directory it started in, so it never mixes two versions' modules. |
 | Interpreter | `/usr/bin/python3 -I -B`, standard library only. From 1.9 `install.sh` also compiles the installed modules once, as root (`compileall`: root-owned `__pycache__` in the root-owned version directory); `-B` still keeps every run from writing any | Not affected by Homebrew upgrades; no dependencies; `-I` ignores environment and current directory. Bytecode built by root beside root's files is as trusted as the files; `oomph top` needs it to stay small (see below). A cache that fails to build costs speed, not function. |
-| Metrics | Measured only by the backend module for the system (`oomph_darwin.py` on a Mac, reached through `oomph.plat()`; oomph.py and oomphd.py import no native code and load on any system): `libproc` via ctypes (`proc_pid_rusage` → `ri_phys_footprint`, the same figure as Activity Monitor's *Memory* column), `sysctl` via ctypes, `vm_stat`, `ioreg`, `pmset -g assertions` | Fast (~5 ms for ~750 processes), accurate, no third-party tools. |
+| Metrics | Measured only by the backend module for the system (`oomph_darwin.py` on a Mac, reached through `oomph.plat()`; oomph.py and oomphd.py import no native code and load on any system): `libproc` via ctypes (`proc_pid_rusage` → `ri_phys_footprint`, the same figure as Activity Monitor's *Memory* column), `sysctl` via ctypes, `vm_stat`, `ioreg`, `pmset -g assertions`. From 1.9.1 also `host_processor_info` (ticks per core), the thermal notification (`com.apple.system.thermalpressurelevel`), `getfsstat` (MNT_NOWAIT: the kernel's cached sizes, never blocking on a dead mount), `ioreg -c IOAccelerator` each sample (the GPU, unprivileged; IOReport later) and `diskutil info` once per newly seen mount on a thread of its own | Fast (~5 ms for ~750 processes), accurate, no third-party tools. |
 | Sampling | **Adaptive**: every 30 s; every 5 s ("hot mode") while pressure ≥ warning, swap grew > 512 MB within 60 s, jetsam kills occurred, free disk < 5 GB, or an incident is open | Fine resolution exactly when it matters, near-zero cost otherwise. |
 | Retention | Samples 14 days (previous days gzip-compressed); incidents 90 days; `events.jsonl` rotated at 20 MB | ~50–150 MB on disk in total. |
 | Logs | `/Library/Logs/oomph/`, world-readable | Inspecting the papertrail never needs `sudo`. |
@@ -141,6 +145,34 @@ latest one plus daemon status.
   (`memory`, `pressure`, `kills`, `presence`, `footprint`, `unowned`, `scope`, and
   `all_procs`: whether the logger sees every process). Additive: every reader tolerates
   samples with and without these keys.
+
+### More resources (1.9.1)
+
+Each block is optional: it is there when its reading worked, and every reader tolerates
+samples with and without it (older samples have none).
+
+- `cpu` — `n` cores (`p`, `e`: performance and efficiency cores), `load` (1/5/15 min),
+  `therm` (thermal level 0 nominal … 4), and from the second reading on `busy`, `user`,
+  `sys` in cores and `p_busy`/`e_busy` per cluster. The per-process figures never add up to
+  more than `busy` plus half a core (a larger clamp is noted once per start in `daemon.err`).
+- `gpu` — a list, one per device: `id`, `name`, `unified`, `util` (percent), `src` (`clients`:
+  busy time from the clients' GPU time; `ioreg`: the driver's instantaneous figure, also
+  kept as `now`), `active`, `mem_gb`, `mem_alloc_gb`, `mem_limit_gb` (`mem_limit_est`). If the
+  clients' figure and the driver's disagree by more than 25 points for five minutes, the
+  device reads `ioreg` for the rest of the run.
+- `io` — `r_mb_s`, `w_mb_s`: all processes' reads and writes.
+- `disks` — a list of pools: the system's (`id` `data`, `watch`, `roles`, `low_gb` 20 and
+  `crit_gb` 5, `level`) and every *listed* one (another fixed disk, an external SSD: by
+  `vol:<UUID>`, `name`, `mount`, `dev`, `fs`, `kind`; recorded, not watched unless a user
+  pins it). Memory cards, disk images, backup, network and FUSE volumes are ignored
+  (`oomph volumes --all` says why).
+- `top_cpu` (8), `top_gpu` (5), `top_io` (5): the biggest consumers in cores, percent of
+  the GPU and MB/s written; a list is left out when nothing used that resource and after a
+  start or a gap. Top processes, groups and sessions carry `cpu`, `gpu` and `w` likewise.
+
+On the wire (`serve`, mirrors), slim samples carry the numbers of `cpu`, `gpu` and `io`; the
+top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb` exceeds
+16 times the RAM, which a disk's size does). The full current sample adds the GPU's name.
 
 ## Events
 

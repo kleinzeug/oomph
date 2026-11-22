@@ -18,7 +18,12 @@
                                      (OOMPH_AI_TOKEN) and know the model? one cheap request, no tokens
 
 for agents and scripts (work without the daemon too — they measure live):
-  oomph check [--json]              verdict ok / tight / critical + advice; exit 0 / 1 / 2
+  oomph check [--json] [--measure]  verdict ok / tight / critical + advice; exit 0 / 1 / 2; a line per resource
+                                    (--measure: without the logger, read CPU and GPU for a quarter second)
+  oomph resources [--json]          this machine's memory, cores, GPU and disks; which can be reserved here
+  oomph ps [--cpu | --gpu | --io | --memory] [-n 10] [--json]   the biggest consumers of one resource now
+  oomph volumes [--all] [--json]    the disks the logger records (--all: also those it ignores, and why)
+  oomph volumes watch|unwatch|hide|unhide PATH   pin a listed disk: its free space counts in your checks
   oomph session [--json] [--pid N]  memory of the Claude session this runs in (its whole process tree)
   oomph wait [--timeout 10m] [--free 4G]   block until memory is ok again; exit 1 on timeout
   oomph status --json               the latest full sample
@@ -303,18 +308,31 @@ SAMPLE_KEYS = dict(
     [(k, "keep") for k in ("t", "iso", "hot", "gap", "stall", "os", "pressure", "free_pct", "ram_gb", "app_gb",
                            "wired_gb", "compressed_gb", "compressor_logical_gb", "cached_gb", "free_gb",
                            "swap_total_gb", "swap_used_gb", "swapfiles", "swapins", "swapouts", "disk_free_gb",
-                           "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident")]
-    + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases")]
+                           "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident", "cpu", "gpu", "io")]
+    + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu", "top_io", "disks")]
     + [("daemon", "full")])
 SLIM_STR = 64        # characters of a string in a slim sample
 AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
+# The blocks of 1.9.1 travel in slim samples with the numbers a chart of another machine needs (roadmap
+# 02 §8, about 60 bytes a GPU more), lists capped: {key: (cap or None for an object, fields)}.
+# `disks` stays home for now: every mirror up to 1.9.1 refuses a whole row with a *_gb above 16 times
+# the machine's RAM (oomph_sync.gb_ok), and a disk is bigger than that on most Macs. It travels once
+# the mirrors in use bound a disk's size apart (gb_ok does from 1.9.1), with the remote protocol's next step.
+SLIM_BLOCKS = {"cpu": (None, ("n", "p", "e", "busy", "user", "sys", "p_busy", "e_busy", "therm")),
+               "io": (None, ("r_mb_s", "w_mb_s")),
+               "gpu": (4, ("id", "util", "active", "now", "src", "mem_gb", "mem_alloc_gb"))}
+# ... and in the full current sample with what names and describes them
+FULL_BLOCKS = {"gpu": (4, SLIM_BLOCKS["gpu"][1] + ("name", "unified", "mem_limit_gb", "mem_limit_est"))}
 # The full current sample is rebuilt from these fields only, each list capped (CONTEXT §3.2).
-FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "pn", "s")),
-              "groups": (15, ("name", "mb", "n")),
-              "claude": (64, ("pid", "cwd", "mb", "own_mb", "n", "biggest")),
+FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "pn", "s", "cpu", "gpu", "w")),
+              "groups": (15, ("name", "mb", "n", "cpu", "gpu")),
+              "claude": (64, ("pid", "cwd", "mb", "own_mb", "n", "biggest", "cpu", "gpu", "w")),
               "gone": (64, ("pid", "name", "mb")),
               "leases": (64, ("id", "state", "gb", "purpose", "project", "used_gb", "for_min", "expires_in_min",
-                              "waiting_min"))}
+                              "waiting_min")),
+              "top_cpu": (8, ("pid", "name", "g", "s", "cpu")),
+              "top_gpu": (5, ("pid", "name", "g", "s", "gpu")),
+              "top_io": (5, ("pid", "name", "g", "s", "w"))}
 FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root")
 FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
 
@@ -336,7 +354,7 @@ _NOT = object()
 
 def _fields(src, keys, cut, nested=None):
     """The named fields of a dict that are scalars (or, for the names in `nested`, a dict of
-    scalars), nothing else."""
+    scalars; `roles` may be a short list of strings), nothing else."""
     out = {}
     if not isinstance(src, dict):
         return out
@@ -348,20 +366,37 @@ def _fields(src, keys, cut, nested=None):
             if isinstance(v, dict):
                 out[k] = _fields(v, nested[k], cut)
             continue
+        if k == "roles":
+            if isinstance(v, list):
+                out[k] = [x[:cut] for x in v[:8] if isinstance(x, str)]
+            continue
         v = _scalar(v, cut)
         if v is not _NOT:
             out[k] = v
     return out
 
 
+def _block(v, cap, keys, cut):
+    """A block of SLIM_BLOCKS or FULL_BLOCKS rebuilt from its named scalar fields (a list: of its
+    first `cap` objects), or _NOT."""
+    if cap is None:
+        return _fields(v, keys, cut) if isinstance(v, dict) else _NOT
+    return [_fields(x, keys, cut) for x in v[:cap] if isinstance(x, dict)] if isinstance(v, list) else _NOT
+
+
 def slim_sample(s):
     """What of a sample goes on the wire as history: its top-level scalars (finite numbers, bools,
-    strings cut to SLIM_STR) and the four known fields of `away`; every list and every other
-    object stays home. Keys SAMPLE_KEYS drops never travel; a scalar key it does not know yet does
-    (a newer logger's series reach an older protocol)."""
+    strings cut to SLIM_STR), the four known fields of `away` and the chart's numbers of the blocks
+    in SLIM_BLOCKS; every other list and object stays home. Keys SAMPLE_KEYS drops never travel; a
+    scalar key it does not know yet does (a newer logger's series reach an older protocol)."""
     out = {}
     for k, v in s.items():
         if not isinstance(k, str) or SAMPLE_KEYS.get(k, "keep") != "keep" or len(k) > SLIM_STR:
+            continue
+        if k in SLIM_BLOCKS:
+            v = _block(v, SLIM_BLOCKS[k][0], SLIM_BLOCKS[k][1], SLIM_STR)
+            if v is not _NOT:
+                out[k] = v
             continue
         if k == "away":
             if isinstance(v, dict):
@@ -379,11 +414,16 @@ def slim_sample(s):
 
 def full_sample(s):
     """The latest sample as it may leave the machine whole (current.json, for the stat tiles):
-    what slim_sample keeps, plus the per-process lists and the daemon block rebuilt from the
-    fields of FULL_LISTS, FULL_DAEMON and FULL_MACHINE with their types, strings cut to
+    what slim_sample keeps, plus the GPU block with its names, the per-process lists
+    and the daemon block rebuilt from the fields of FULL_BLOCKS, FULL_LISTS, FULL_DAEMON and
+    FULL_MACHINE with their types, strings cut to
     LIMITS["str"] characters, lists to their caps."""
     out = slim_sample(s)
     n = LIMITS["str"]
+    for k, (cap, keys) in FULL_BLOCKS.items():
+        v = _block(s.get(k), cap, keys, n)
+        if v is not _NOT:
+            out[k] = v
     for k, (cap, keys) in FULL_LISTS.items():
         if isinstance(s.get(k), list):
             out[k] = [_fields(x, keys, n, {"biggest": ("name", "pid", "mb")}) for x in s[k][:cap] if isinstance(x, dict)]
@@ -1457,7 +1497,11 @@ def cmd_status():
     if u is not None:
         line("unowned", "%.1f GB held outside any process%s" % (
             u, "  <- LEAK? only a restart frees it" if u >= unowned_limit_gb(c["ram_gb"]) else ""))
-    line("disk", "%.0f GB free" % c["disk_free_gb"])
+    res = resource_lines(c, *volume_prefs(), io=True)
+    if not c.get("disks"):  # a logger before 1.9.1
+        line("disk", "%.0f GB free" % c["disk_free_gb"])
+    for label, text in res if logger_measures(c) else ():
+        line(label, text)
     line("you", "idle %ss · display %s · %s · sleep held by %s" % (
         a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
         ", ".join(a.get("sleep_preventers") or []) or "nobody"))
@@ -1466,6 +1510,14 @@ def cmd_status():
     print("\ntop apps:")
     for g in (c.get("groups") or [])[:8]:
         print("  %6.1f GB  %s (%d)" % (g["mb"] / 1024, fit_group(g["name"], w - 19), g["n"]))
+    for title, key, field, fmt in (("busiest (cores)", "top_cpu", "cpu", "%7.2f   "), ("GPU (%)", "top_gpu", "gpu", "%7.1f   "),
+                                   ("writing to disk (MB/s)", "top_io", "w", "%7.2f   ")):
+        rows = [r for r in (c.get(key) or [])[:5] if isinstance(r, dict) and _n(r.get(field)) is not None]
+        if rows:
+            print("\n%s:" % title)
+            for r in rows:
+                print(fmt % r[field] + "%s (%s)" % (cut_middle(str(r.get("name")), 30),
+                                                   fit_group(str(r.get("g") or ""), w - 46)))
     if c.get("claude"):
         print("\nclaude sessions:")
         for s in c["claude"]:
@@ -1724,8 +1776,9 @@ def verdict(s):
     }
 
 
-def verdict_line(v, width=None):
-    """The verdict as `oomph check` and the hook print it, wrapped at `width` (the terminal's)."""
+def verdict_line(v, width=None, lines=()):
+    """The verdict as `oomph check` and the hook print it, wrapped at `width` (the terminal's);
+    `lines`: (label, text) of the other resources, which `check` prints before the advice."""
     w = width or term_width()
     out = [wrap("oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
         v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
@@ -1739,6 +1792,10 @@ def verdict_line(v, width=None):
         out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG available to you"
                         % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"]),
                         w, "  reservations: "))
+    for label, text in lines:
+        out.append(wrap(text, w, "  %-6s " % label, 9))
+    for n in v.get("notes") or ():
+        out.append(wrap(n, w, "  note: "))
     out.append(wrap(v["advice"], w, "  advice: "))
     return "\n".join(out)
 
@@ -1781,10 +1838,16 @@ def find_session(pid=None):
     }
 
 
-def checked_verdict(mine=None):
-    """verdict() plus what other sessions have reserved or are waiting for."""
-    s = _sample_override() if _sample_override else sample(with_procs=False)
+def checked_verdict(mine=None, s=None):
+    """verdict() plus what other sessions have reserved or are waiting for, and the disks this user
+    pinned (`resources`: the sample's CPU, GPU, disk and I/O blocks, for the caller to show)."""
+    s = s or (_sample_override() if _sample_override else sample(with_procs=False))
     v = verdict(s)
+    try:
+        pinned_verdict(v, s, volume_prefs()[0])
+    except Exception:  # a damaged settings file is no reason to fail a check
+        pass
+    v["resources"] = {k: s[k] for k in ("cpu", "gpu", "disks", "io") if k in s}
     try:
         coordination_verdict(v, coordination(mine if mine is not None else holder_for()["pid"], s))
     except Exception as e:  # the ledger is a bonus; never let it break a check
@@ -1793,8 +1856,14 @@ def checked_verdict(mine=None):
 
 
 def cmd_check(args):
-    v = checked_verdict()
-    print(json.dumps(v) if "--json" in args else verdict_line(v))
+    """The verdict, and a line per resource. A plain check never waits: without the logger the CPU
+    and GPU are not measured unless --measure takes a quarter-second reading."""
+    s = resource_sample(measure="--measure" in args)
+    v = checked_verdict(s=s)
+    if "--json" in args:
+        print(json.dumps(v))
+    else:
+        print(verdict_line(v, lines=resource_lines(s, *volume_prefs())))
     return v["exit_code"]
 
 
@@ -1851,6 +1920,420 @@ def cmd_wait(args):
 
 def cmd_status_json():
     print(json.dumps(sample()))
+    return 0
+
+
+# ------------------------------------------------- more resources: CPU, GPU, disks (roadmap 02 §3.6, §7.1)
+# The logger records them from 1.9.1; only memory can be reserved yet (cores, GPU and disk from 1.12).
+THERMAL = {0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"}
+RESERVABLE = ("memory",)
+NOT_MEASURED = "not measured (logging is off; `oomph check --measure` takes a quarter-second reading)"
+NOT_LOGGED = "not recorded by the logger, which is older than 1.9.1 (`oomph check --measure` reads it now)"
+NOT_READ = "not read by the logger this time (`oomph check --measure` reads it now)"
+_VOL_ID = re.compile(r"vol:[0-9A-Fa-f-]{8,64}")
+
+
+def _n(x):
+    """A number oomph could have written, else None (samples are read from files)."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+
+def _gb(x):
+    return "{:,.0f}".format(x) if x >= 10 else "%.1f" % x
+
+
+def settings_path():
+    return os.path.join(STATE_DIR, "settings.json")
+
+
+def user_settings():
+    """This user's settings.json (02 §5.4): {"volumes": {"pinned": [pool id], "hidden": [pool id]}};
+    a damaged or missing file reads as none."""
+    d = read_bounded(settings_path(), 64 << 10)
+    v = loads_untrusted(d) if d else None
+    return v if isinstance(v, dict) else {}
+
+
+def volume_prefs(st=None):
+    """(pinned, hidden): sets of pool ids this user chose."""
+    v = (st if st is not None else user_settings()).get("volumes")
+    v = v if isinstance(v, dict) else {}
+    ids = lambda k: {x for x in (v.get(k) if isinstance(v.get(k), list) else [])[:64]
+                     if isinstance(x, str) and (_VOL_ID.fullmatch(x) or x == "data")}
+    return ids("pinned"), ids("hidden")
+
+
+def save_user_settings(st):
+    """Into this user's own state folder (created 700), by a new file and a rename; 600."""
+    import tempfile
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=STATE_DIR, prefix=".settings-", suffix=".json")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(st, f, sort_keys=True, allow_nan=False)
+        os.replace(tmp, settings_path())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def pool_floors(total_gb):
+    """Floors of a pinned pool (02 §4.4): low 5 % of its size (2 to 20 GB), critical 1 % (0.5 to 5)."""
+    return min(20.0, max(2.0, 0.05 * total_gb)), min(5.0, max(0.5, 0.01 * total_gb))
+
+
+def disk_rows(s, pinned=frozenset()):
+    """The sample's disks, checked field by field, each with `pinned`, and floors and a level for a
+    pinned pool that has none of its own."""
+    out = []
+    for d in s.get("disks") or []:
+        if not isinstance(d, dict) or not isinstance(d.get("id"), str) or _n(d.get("free_gb")) is None:
+            continue
+        d = dict(d, pinned=d["id"] in pinned)
+        if d["pinned"] and not d.get("watch") and _n(d.get("total_gb")):
+            low, crit = pool_floors(d["total_gb"])
+            d.update(low_gb=round(low, 1), crit_gb=round(crit, 1),
+                     level="critical" if d["free_gb"] < crit else "low" if d["free_gb"] < low else "ok")
+        out.append(d)
+    return out
+
+
+DISK_ADVICE = ("Disk space is short on %s (pinned): write nothing big there (builds, caches, images, datasets); "
+               "put scratch on another disk or free space on it, and ask the user before deleting anything this "
+               "session did not create.")
+
+
+def pinned_verdict(v, s, pinned):
+    """A pool this user pinned that is low or critical counts like memory for this user's check and
+    hook (02 §7.4), with advice about the disk rather than memory; a listed pool nobody pinned raises
+    nothing. A pin the sample has no pool for is said in `notes`: it could not be checked."""
+    rows = disk_rows(s, pinned)
+    mem, short = v["exit_code"], []
+    for d in rows:
+        if d["pinned"] and not d.get("watch") and d.get("level") in ("low", "critical"):
+            lv = 2 if d["level"] == "critical" else 1
+            name = str(d.get("name") or d["id"])[:40]
+            v["reasons"].append("only %.0f GB free on %s (pinned)" % (d["free_gb"], name))
+            short.append(name)
+            if lv > v["exit_code"]:
+                v["exit_code"], v["level"] = lv, LEVELS[lv]
+    if short:
+        v["advice"] = ((ADVICE[LEVELS[mem]] + " ") if mem else "") + DISK_ADVICE % ", ".join(short)
+    seen = {d["id"] for d in rows}
+    gone = sorted(x for x in pinned if x not in seen)
+    if gone:
+        v.setdefault("notes", []).append(
+            "pinned %s not checked: %s not in the logger's latest sample (not mounted, or the logger is off or older "
+            "than 1.9.1)" % (", ".join(gone), "it is" if len(gone) == 1 else "they are"))
+    return v
+
+
+def live_disks():
+    """The system's pool from the kernel's mount table: no diskutil, so no listed pools (it would
+    take half a second a disk); None where this backend has no mounts."""
+    P = plat()
+    if not hasattr(P, "mounts"):
+        return None
+    recs = P.mounts()
+    return P.disk_pools(recs, {})[0] if recs else None
+
+
+def resource_sample(measure=False, with_procs=False):
+    """A sample with the resource blocks: the logger's if it is fresh, else a live one with the
+    system's disk pool and, with `measure`, a quarter-second reading of the rates."""
+    s = _sample_override() if _sample_override else sample(with_procs=with_procs)
+    if s.get("source") == "live" or "disks" not in s:  # no logger, or one older than 1.9.1
+        try:
+            d = live_disks()
+            if d is not None:
+                s["disks"] = d
+        except Exception:
+            pass
+        if measure:
+            blocks, use, procs = _daemon_module().measure()
+            s.update(blocks)
+            if with_procs:
+                m = _daemon_module()
+                top, s["groups"], s["claude"], session_of = m._summarize(procs, use)
+                s["top"] = top
+                s.update(m.rate_lists(procs, use, session_of, plat().group_key))
+    return s
+
+
+def _gpu_text(g):
+    mem = ""
+    if _n(g.get("mem_gb")) is not None:
+        mem = " · %.1f%s GB GPU memory" % (g["mem_gb"], " of %.0f" % g["mem_limit_gb"] if _n(g.get("mem_limit_gb")) else "")
+    name = " (%s)" % str(g.get("name"))[:40] if g.get("name") else ""
+    if _n(g.get("util")) is None:
+        return "not measured yet%s%s" % (mem, name)
+    if g.get("src") == "ioreport":
+        return "%.0f %% of full speed%s%s" % (g["util"], mem, name)
+    return "busy %.0f %% of the time (speed not reported)%s%s" % (g["util"], mem, name)
+
+
+def logger_measures(s):
+    """Whether a sample comes from a logger that records CPU, GPU, I/O and disks (1.9.1 or later):
+    its cpu block is there, or its daemon block says so. The top lists and the rates are no sign (a
+    list is left out when nothing uses that resource, the rates after a start or a gap), and nor is
+    `disks` (the CLI adds the system's pool itself when the logger has none)."""
+    if s.get("source") == "live":
+        return False
+    if isinstance(s.get("cpu"), dict):
+        return True
+    d = s.get("daemon")
+    m = re.match(r"(\d+)\.(\d+)\.(\d+)", d.get("version") or "") if isinstance(d, dict) and \
+        isinstance(d.get("version"), str) else None
+    return bool(m) and tuple(int(x) for x in m.groups()) >= (1, 9, 1)
+
+
+def resource_lines(s, pinned=frozenset(), hidden=frozenset(), io=False):
+    """(label, text) per resource for check and status: cpu, gpu, one disk line per pool, io."""
+    out = []
+    off = NOT_MEASURED if s.get("source") == "live" else NOT_READ if logger_measures(s) else NOT_LOGGED
+    cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else None
+    if cpu is None:
+        out.append(("cpu", off))
+    else:
+        n = _n(cpu.get("n")) or 0
+        split = " (P %.1f · E %.1f)" % (cpu["p_busy"], cpu["e_busy"]) \
+            if _n(cpu.get("p_busy")) is not None and _n(cpu.get("e_busy")) is not None else ""
+        th = cpu.get("therm")
+        therm = " · thermal %s" % THERMAL.get(th, th) if _n(th) else ""
+        out.append(("cpu", ("%.1f of %d cores busy%s" % (cpu["busy"], n, split) if _n(cpu.get("busy")) is not None
+                            else "%d cores · not measured yet" % n) + therm))
+    gpus = s.get("gpu")
+    if not isinstance(gpus, list):
+        out.append(("gpu", off))
+    elif not gpus:
+        out.append(("gpu", "none the system reports"))
+    for g in gpus if isinstance(gpus, list) else ():
+        if isinstance(g, dict):
+            out.append(("gpu", _gpu_text(g)))
+    first = True
+    for d in disk_rows(s, pinned):
+        if d["id"] in hidden:
+            continue
+        tail = ""
+        if d.get("level") in ("low", "critical"):
+            tail = " · %s" % d["level"].upper()
+        if not d.get("watch"):
+            tail += " · pinned" if d["pinned"] else " · not watched"
+        tot = _n(d.get("total_gb"))
+        out.append(("disk" if first else "", "%s %s GB free%s%s" % (
+            cut_middle(str(d.get("name") or d["id"]), 24), _gb(d["free_gb"]), " of %s" % _gb(tot) if tot else "", tail)))
+        first = False
+    if io and isinstance(s.get("io"), dict) and _n(s["io"].get("w_mb_s")) is not None:
+        out.append(("io", "read %.1f MB/s · write %.1f MB/s (all processes)" % (s["io"].get("r_mb_s") or 0,
+                                                                               s["io"]["w_mb_s"])))
+    return out
+
+
+PS_KINDS = {"--cpu": ("top_cpu", "cpu", "CORES", "%7.2f"), "--gpu": ("top_gpu", "gpu", "% GPU", "%7.1f"),
+            "--io": ("top_io", "w", "MB/s W", "%7.2f"), "--memory": ("top", "mb", "MB", "%7d")}
+PS_USAGE = "usage: oomph ps [--cpu | --gpu | --io | --memory] [-n 10] [--json]"
+
+
+def cmd_ps(args):
+    """The biggest consumers of one resource now: from the logger's latest sample, else (logging off)
+    from a half-second reading of what this user may see."""
+    try:
+        opts, _ = _strict(args, takes=("-n",), flags=tuple(PS_KINDS) + ("--json",), npos=0)
+        n = int(opts.get("-n", 10))
+        if not 1 <= n <= 100:
+            raise ValueError
+    except (UsageError, ValueError) as e:
+        print("oomph ps: %s\n%s" % (e if isinstance(e, UsageError) else "-n takes 1 to 100", PS_USAGE), file=sys.stderr)
+        return 2
+    kinds = [k for k in PS_KINDS if k in opts]
+    if len(kinds) > 1:
+        print("oomph ps: one resource at a time\n" + PS_USAGE, file=sys.stderr)
+        return 2
+    key, field, head, fmt = PS_KINDS[kinds[0] if kinds else "--cpu"]
+    s, note = _daemon_sample(), None
+    if s is None or key != "top" and not logger_measures(s):  # no logger, or one older than 1.9.1
+        older, s = s is not None, live_sample(with_procs=True)
+        if key != "top":
+            blocks, use, procs = _daemon_module().measure(0.5)
+            m = _daemon_module()
+            s.update(m.rate_lists(procs, use, m._summarize(procs, use)[3], plat().group_key, n))
+        note = "%s: a live reading of %s" % ("the logger is older than 1.9.1" if older else "logging is off",
+                                              "your own processes" if os.geteuid() else "every process")
+    rows = [r for r in (s.get(key) or []) if isinstance(r, dict) and _n(r.get(field)) is not None][:n]
+    if key == "top":
+        rows.sort(key=lambda r: -r["mb"])
+    if "--json" in opts:
+        print(json.dumps({"resource": field, "rows": rows, "source": s.get("source", "daemon"), "at": s.get("iso")}))
+        return 0
+    w = max(80, term_width())
+    print("%7s %7s  %-*s %s" % (head, "PID", (w - 18) // 2, "NAME", "APP"))
+    for r in rows:
+        print(fmt % r[field] + " %7s  %-*s %s" % (r.get("pid"), (w - 18) // 2, cut_middle(str(r.get("name")), (w - 18) // 2),
+                                                   fit_group(str(r.get("g") or ""), (w - 18) // 2 - 1)))
+    if not rows:
+        print("  nothing measurable right now" if key != "top" else "  no processes")
+    if note:
+        print("(%s)" % note)
+    return 0
+
+
+def _resources(s, c=None):
+    """What `oomph resources` reports, as data: per pool its capacity, use, what is reserved and
+    whether it can be reserved with this version."""
+    pinned, hidden = volume_prefs()
+    out = {"memory": {"ram_gb": s.get("ram_gb"), "free_gb": free_physical_gb(s), "reservable": True}}
+    if c:
+        out["memory"].update(reserved_gb=c["reserved_gb"], left_gb=c["available_gb"], others_gb=c["reserved_by_others_gb"])
+    cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else None
+    out["cpu"] = dict({k: cpu[k] for k in ("n", "p", "e", "busy", "therm") if k in cpu}, reservable=False) if cpu else None
+    gpus = s.get("gpu") if isinstance(s.get("gpu"), list) else None
+    out["gpu"] = None if gpus is None else [dict({k: g[k] for k in ("id", "name", "util", "active", "src", "mem_gb",
+                                                                    "mem_alloc_gb", "mem_limit_gb", "mem_limit_est",
+                                                                    "unified") if k in g}, reservable=False)
+                                             for g in gpus if isinstance(g, dict)]
+    out["disks"] = [dict({k: d[k] for k in ("id", "name", "mount", "free_gb", "total_gb", "kind", "roles", "level",
+                                            "low_gb", "crit_gb", "pinned") if k in d},
+                         watched=bool(d.get("watch")), reservable=False)
+                    for d in disk_rows(s, pinned) if d["id"] not in hidden]
+    out["reservable"] = list(RESERVABLE)
+    return out
+
+
+def cmd_resources(args):
+    """The resources of this machine: capacity, use, what is reserved and left, and which of them
+    can be reserved here (only memory so far): what an agent asks before reserving anything else."""
+    try:
+        opts, _ = _strict(args, flags=("--json",), npos=0)
+    except UsageError as e:
+        print("oomph resources: %s\nusage: oomph resources [--json]" % e, file=sys.stderr)
+        return 2
+    s = resource_sample(measure=True)
+    try:
+        c = coordination(holder_for()["pid"], s)
+    except Exception:  # the ledger is a bonus here too
+        c = None
+    r = _resources(s, c)
+    if "--json" in opts:
+        print(json.dumps(r, allow_nan=False))
+        return 0
+    w = max(80, term_width())
+    m = r["memory"]
+    line = lambda label, text: print(wrap(text, w, "  %-7s " % label, 10))
+    line("memory", "%.0f GB · %.1f free%s · reservable" % (m["ram_gb"] or 0, m["free_gb"], (
+        " · %.1f GB reserved · %.1f GB left to reserve" % (m["reserved_gb"], m["left_gb"])) if "left_gb" in m else ""))
+    for label, text in resource_lines(s, *volume_prefs()):
+        if label in ("cpu", "gpu") and not text.startswith("not measured"):
+            text += " · not reservable yet"
+        line(label, text)
+    print(wrap("Only memory can be reserved with this version: `oomph reserve 6G --for \"what\"`.", w, "  "))
+    return 0
+
+
+VOLUMES_USAGE = "usage: oomph volumes [--all] [--json]   ·   oomph volumes watch|unwatch|hide|unhide PATH"
+
+
+def _volume_of(path, rows):
+    """The mount row a path is on (by its device), or None."""
+    try:
+        dev = os.stat(path).st_dev & 0xFFFFFFFF
+    except OSError:
+        return None
+    for r in rows:
+        if r["dev"] == dev:
+            return r
+    return None
+
+
+def cmd_volumes(args):
+    """The volumes oomph samples (watched: the system's pool; listed: other fixed disks) and, with
+    --all, those it ignores and why. `watch PATH` pins a listed volume for this user: its free space
+    then counts in this user's check and hook; `hide` keeps it out of this user's lists."""
+    P = plat()
+    if not hasattr(P, "mounts"):
+        print("oomph volumes: listing volumes is not supported on this system yet", file=sys.stderr)
+        return 1
+    sub = args[0] if args and args[0] in ("watch", "unwatch", "hide", "unhide") else None
+    try:
+        opts, pos = _strict(args[1:] if sub else args, flags=("--all", "--json"), npos=1 if sub else 0)
+        if sub and not pos:
+            raise UsageError("%s needs a path on the volume" % sub)
+    except UsageError as e:
+        print("oomph volumes: %s\n%s" % (e, VOLUMES_USAGE), file=sys.stderr)
+        return 2
+    pools, rows = _daemon_module().Volumes(P, wait=True).read()
+    if pools is None:
+        print("oomph volumes: the mount table could not be read", file=sys.stderr)
+        return 1
+    pool_ids = {}
+    for p in pools:
+        pool_ids[p["dev"]] = p
+    if sub:
+        if os.geteuid() == 0:
+            print("oomph volumes: pins are per user: run it without sudo", file=sys.stderr)
+            return 1
+        r = _volume_of(pos[0], rows)
+        p = pool_ids.get(r["pool"]) if r and r["cls"] in ("watched", "listed") else None
+        if p is None:
+            why = r["why"] if r else "no such path"
+            print("oomph volumes: %s: the logger does not record this volume (%s)" % (pos[0], why), file=sys.stderr)
+            return 1
+        if p.get("weak"):
+            print("oomph volumes: %s has no UUID, so it cannot be told from another disk by that name: "
+                  "it cannot be pinned" % p["name"], file=sys.stderr)
+            return 1
+        st = user_settings()
+        v = st.get("volumes") if isinstance(st.get("volumes"), dict) else {}
+        pinned, hidden = volume_prefs(st)
+        if sub == "watch" and p["id"] == "data":
+            print("oomph volumes: %s is the system's pool: always watched" % p["name"])
+            return 0
+        {"watch": pinned.add, "unwatch": pinned.discard, "hide": hidden.add, "unhide": hidden.discard}[sub](p["id"])
+        v.update(pinned=sorted(pinned), hidden=sorted(hidden))
+        st["volumes"] = v
+        save_user_settings(st)
+        print("oomph volumes: %s %s" % (p["name"], {"watch": "pinned: its free space counts in your checks",
+                                                    "unwatch": "no longer pinned", "hide": "hidden from your lists",
+                                                    "unhide": "shown again"}[sub]))
+        return 0
+    pinned, hidden = volume_prefs()
+    out = []
+    for r in rows:
+        p = pool_ids.get(r["pool"]) if r["cls"] in ("watched", "listed") else None
+        main = p is not None and p["mount"] == r["mount"]
+        if not main and "--all" not in opts:
+            continue
+        e = {"mount": r["mount"], "name": r["name"], "fs": r["fs"], "free_gb": r["free_gb"], "total_gb": r["total_gb"],
+             "class": r["cls"], "why": r["why"]}
+        if p is not None:
+            e.update(id=p["id"], pinned=p["id"] in pinned, hidden=p["id"] in hidden)
+            if not main:
+                e["why"] = "shares its space with %s" % p["mount"]
+            elif p.get("roles"):
+                e["roles"] = p["roles"]
+        if e.get("hidden") and "--all" not in opts:
+            continue
+        out.append(e)
+    out.sort(key=lambda e: ({"watched": 0, "listed": 1}.get(e["class"], 2), e["mount"]))
+    if "--json" in opts:
+        print(json.dumps(out))
+        return 0
+    w = max(80, term_width())
+    for e in out:
+        what = "%s: %s" % (e["class"], e["why"])
+        if e.get("roles"):
+            what += " (%s)" % ", ".join(e["roles"])
+        if e.get("pinned"):
+            what += " · pinned"
+        if e.get("hidden"):
+            what += " · hidden by you"
+        size = "%s free of %s GB" % (_gb(e["free_gb"]), _gb(e["total_gb"])) if e["total_gb"] else ""
+        print(wrap("%s · %s" % (what, e["mount"]), w, "  %-14s %-20s " % (cut_middle(e["name"], 14), size), 38))
+    if "--all" not in opts:
+        print("(`oomph volumes --all` also lists the volumes the logger ignores, and why)")
     return 0
 
 
@@ -3030,6 +3513,9 @@ def refresh_ledger(s, procs):
         _evaluate(L, s, procs, time.time())
 
 
+PROC_KEYS = ("pid", "ppid", "uid", "name", "start", "fp", "rss", "path")  # what the ledger's child is told of a process
+
+
 def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S):
     """The daemon's ledger work for one sample: refresh_ledger, then the snapshot of live
     reservations for the sample, both in a child — as nobody when the daemon is root (root
@@ -3037,7 +3523,8 @@ def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S):
     it isn't. Its answer is at most LIMITS["tick"] bytes of JSON, read within `timeout`, and the
     sample's block is rebuilt from it field by field (sample_leases). Returns (leases, error
     or None). The daemon calls this from a thread of its own: the sampler never waits on it."""
-    payload = json.dumps({"s": s, "procs": list(procs.values())}, default=str).encode()
+    payload = json.dumps({"s": s, "procs": [{k: p[k] for k in PROC_KEYS if k in p} for p in procs.values()]},
+                         default=str).encode()
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"], payload,
                                LIMITS["tick"], timeout, **_drop_to("nobody", "nobody"))
     d = loads_untrusted(out)
@@ -3955,6 +4442,12 @@ def _main(argv):
         return cmd_status_json() if "--json" in rest else cmd_status()
     if c == "check":
         return cmd_check(rest)
+    if c == "resources":
+        return cmd_resources(rest)
+    if c == "ps":
+        return cmd_ps(rest)
+    if c == "volumes":
+        return cmd_volumes(rest)
     if c == "session":
         return cmd_session(rest)
     if c == "wait":

@@ -219,7 +219,17 @@ oomph incident latest --html    # open the latest incident's report
 oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
 oomph top                       # the popup's dashboard, full screen in the terminal (see below)
 oomph doctor                    # what works here and what to fix: logger, versions, ledger, Claude setup (--json)
+oomph ps --cpu                  # the busiest processes now (--gpu, --io: writing to disk, --memory)
+oomph volumes --all             # the disks oomph records, and the ones it ignores and why
+oomph resources                 # memory, cores, GPU and disks of this Mac, and which can be reserved
 ```
+
+From 1.9.1 the logger also records the CPU (cores busy, per process too), the thermal level, the
+GPU (how busy, from the IO registry, and its memory), reads and writes to disk, and the free space
+of the system's disk and of other fixed disks (an external SSD; not memory cards, disk images,
+backup or network volumes). `oomph status` and `oomph check` show them; the app does not yet.
+`oomph volumes watch /Volumes/Scratch` pins such a disk for you: its free space then counts in
+your `oomph check` and hook like the system disk's (`unwatch`, `hide`, `unhide` likewise).
 
 ### In the terminal
 
@@ -256,7 +266,8 @@ Groundwork for watching other machines: `oomph serve --stdio` answers for this m
 standard streams (read only), and `oomph remote sync --once [--into DIR] -- COMMAND` mirrors the
 machine whose `serve --stdio` COMMAND starts (for instance through `ssh`) into a directory that
 every reader understands (a logger older than 1.8.8 names no machine id: give such a machine
-a mirror with `--into`). Nothing listens on the network.
+a mirror with `--into`). A mirror receives the CPU, GPU and I/O figures of 1.9.1; the disks
+stay on their machine for now. Nothing listens on the network.
 
 ### AI analysis
 
@@ -327,7 +338,8 @@ What a session gets:
 
 | | |
 |---|---|
-| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations; exit code 0 / 1 / 2; `--json` |
+| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations, then a line each for CPU, GPU and disks; exit code 0 / 1 / 2; `--json`; `--measure` reads CPU and GPU for a quarter second when the logger is off |
+| `oomph resources` | this Mac's memory, cores, GPU and disks, and which of them can be reserved (memory only so far) |
 | `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
 | `oomph reserve 6G --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
 | `oomph amend r7 --gb 2G [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
@@ -440,10 +452,14 @@ write them (`sudo mkdir -p "/Library/Application Support/oomph"`, then edit the 
 ### Privacy
 
 The logs contain process names and working directories — never command-line arguments
-or file contents — and are readable by every user on the Mac. Nothing leaves your
+or file contents — and are readable by every user on the Mac. From 1.9.1 they also hold
+how much CPU, GPU time and disk writing each process used, and the names and mount points
+of the disks oomph records (a volume's name can say something: `oomph volumes hide` keeps it
+out of your own lists, not out of the logs). Nothing leaves your
 machine: no network access, no telemetry — except when you turn on the AI analysis with
-Claude or OpenAI, which sends figures, process names and project paths from the logs to
-that provider for each AI report (Ollama keeps it local).
+Claude or OpenAI, which sends figures, process names, project paths and the names and mount
+points of recorded disks from the logs to that provider for each AI report (Ollama keeps it
+local).
 
 ## Layout
 

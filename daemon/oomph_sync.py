@@ -154,21 +154,27 @@ def clean(v, cut=200, depth=16):
     return v
 
 
+DISK_GB = float(1 << 20)  # a disk's size or free space: up to a pebibyte, whatever the RAM
+
+
 def gb_ok(row, ram):
     """Every gb and *_gb number of a row (and of the dicts in it) finite and between 0 and 16 times the
-    machine's RAM, at most 65,536 (roadmap 01 §4.3: what the chart can be handed is bounded)."""
+    machine's RAM, at most 65,536 (roadmap 01 §4.3: what the chart can be handed is bounded); the
+    sizes of disks (`disk_free_gb`, anything in a `disks` block) up to DISK_GB instead, since a disk
+    is bigger than 16 times the RAM of most Macs."""
     top = min(16 * ram, 65536.0) if oomph._num(ram, 0.1, 65536) else 65536.0
-    stack = [row]
+    stack = [(row, top)]
     while stack:
-        x = stack.pop()
+        x, lim = stack.pop()
         if isinstance(x, dict):
             for k, v in x.items():
-                if isinstance(k, str) and (k == "gb" or k.endswith("_gb")) and v is not None and not oomph._num(v, 0, top):
+                if isinstance(k, str) and (k == "gb" or k.endswith("_gb")) and v is not None and \
+                        not oomph._num(v, 0, DISK_GB if k == "disk_free_gb" else lim):
                     return False
                 if isinstance(v, (dict, list)):
-                    stack.append(v)
+                    stack.append((v, DISK_GB if k == "disks" else lim))
         elif isinstance(x, list):
-            stack.extend(x)
+            stack.extend((y, lim) for y in x)
     return True
 
 

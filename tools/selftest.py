@@ -19,6 +19,7 @@ from contextlib import redirect_stderr, redirect_stdout
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["OOMPH_DIR"] = tempfile.mkdtemp(prefix="oomph-selftest-")
 os.environ["OOMPH_LEDGER_DIR"] = os.path.join(os.environ["OOMPH_DIR"], "ledger")
+os.environ["OOMPH_STATE_DIR"] = os.path.join(os.environ["OOMPH_DIR"], "state")  # pins and settings: never the real ones
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
 
 import oomph  # noqa: E402
@@ -968,8 +969,8 @@ if MAC:  # MCP serverInfo and tool names, from the child process
 else:
     print("skip  MCP serverInfo and tool names, from the child process")
 skill = open(os.path.join(ROOT, "skills", "oomph", "SKILL.md")).read()
-check(skill.startswith("---\nname: oomph\n") and "`oomph resources` succeeds" in skill[:1200],
-      "SKILL.md: name oomph; its first lines say resource flags only if `oomph resources` succeeds")
+check(skill.startswith("---\nname: oomph\n") and "`oomph resources --json` lists under `reservable`" in skill[:1300],
+      "SKILL.md: name oomph; its first lines say resource flags only for what `oomph resources` lists as reservable")
 bl = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "brandlint.py")], capture_output=True,
                     text=True, timeout=60)
 check(bl.returncode == 0, "brandlint: prose and identifiers kept apart (%s)" % bl.stdout.strip().splitlines()[-1:])
@@ -1197,10 +1198,27 @@ check(oomph.verdict(dict(fixed, disk_free_gb=3.0))["level"] == "critical" and
 # every reader takes old samples (no os, no machine) and newer ones (keys it does not know)
 vdir = tempfile.mkdtemp(prefix="oomph-variants-")
 t_v = time.time()
+# the blocks of 1.9.1 as 02 §5.1 writes them, so that every reader meets them on every system (not only this Mac's)
+RES_EXAMPLE = {
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.12, "user": 7.61, "sys": 1.51, "p_busy": 7.9, "e_busy": 1.22,
+            "load": [10.2, 13.9, 13.1], "therm": 2},
+    "gpu": [{"id": "gpu0", "name": "Apple M3 Max", "unified": True, "util": 47.0, "active": 47.0, "now": 52, "src": "clients",
+             "mem_gb": 3.99, "mem_alloc_gb": 11.68, "mem_limit_gb": 27.0, "mem_limit_est": True}],
+    "disks": [{"id": "data", "name": "Data", "mount": "/System/Volumes/Data", "dev": "disk3", "fs": "apfs", "total_gb": 994.7,
+               "free_gb": 63.2, "roles": ["home", "swap", "tmp"], "watch": True, "low_gb": 20, "crit_gb": 5, "level": "ok"},
+              {"id": "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10", "name": "Scratch", "mount": "/Volumes/Scratch",
+               "dev": "disk7", "fs": "apfs", "total_gb": 1863.0, "free_gb": 912.4, "roles": [], "kind": "external",
+               "watch": False}],
+    "io": {"w_mb_s": 12.4, "r_mb_s": 3.1},
+    "top_cpu": [{"pid": 4711, "name": "cargo", "g": "iTerm2", "cpu": 5.2, "s": 640}],
+    "top_gpu": [{"pid": 413, "name": "WindowServer", "g": "WindowServer", "gpu": 9.1}],
+    "top_io": [{"pid": 902, "name": "com.docker.virtualization", "g": "Docker", "w": 18.3}]}
+RES_KEYS = tuple(RES_EXAMPLE)
 newer = dict(cur, os="linux", psi={"mem_some": 0.1}, linux={"avail_gb": 4.0}, killed=[{"name": "x", "mb": 1, "by": "k"}],
              daemon=dict(cur.get("daemon", {}), machine=dict(mach, measures=dict(mach.get("measures") or {}, psi=True),
-                                                             kind="container")))
-older = {k: v for k, v in cur.items() if k != "os"}
+                                                             kind="container")), future_block={"x": [1]}, **RES_EXAMPLE)
+newer["groups"] = [dict(g, cpu=1.5, gpu=2.0) for g in cur.get("groups") or []]
+older = {k: v for k, v in cur.items() if k != "os" and k not in RES_KEYS}
 older["daemon"] = {k: v for k, v in cur.get("daemon", {}).items() if k != "machine"}
 saved_log = oomph.LOG_DIR
 bad_reads = []
@@ -1577,6 +1595,467 @@ if MAC:  # upgrades need macOS (xcrun git, the app build)
         os.environ.pop(k)
 else:
     print("skip  upgrades need macOS (xcrun git, the app build)")
+
+# --- M1 (1.9.1): CPU, GPU, I/O and disks in the samples; status, check, resources, ps, volumes (roadmap 02 §4, §5, §7)
+FIX = os.path.join(ROOT, "tools", "fixtures")
+
+
+class StubPlat:
+    """A backend whose readings the test sets: uptime, ticks, the pid list."""
+    OS = "macos"
+
+    def __init__(self):
+        self.up, self.ticks, self.pids = 1000.0, None, None
+
+    def uptime_s(self):
+        return self.up
+
+    def cpu_ticks(self):
+        return self.ticks
+
+    def cpu_topology(self):
+        return {"n": 4, "p": 2, "e": 2, "e_ids": [0, 1]}
+
+    def thermal_level(self):
+        return 0
+
+    def list_pids(self):
+        return self.pids
+
+
+def ptab(*rows):
+    """A process table: (pid, ppid, start, cpu_s, child_s[, wr])."""
+    return {r[0]: {"pid": r[0], "ppid": r[1], "uid": 501, "name": "p%d" % r[0], "start": r[2], "fp": 0, "rss": 0, "path": "",
+                   "cpu_s": float(r[3]), "child_s": float(r[4]), "rd": 0, "wr": r[5] if len(r) > 5 else 0} for r in rows}
+
+
+def meter_run(steps):
+    """Readings one second apart: each step (process table, raw pids or None). Returns the per-pid CPU of each."""
+    sp, m, out = StubPlat(), None, []
+    m = oomphd.Meter(sp)
+    for procs, raw in steps:
+        sp.up += 1.0
+        sp.pids = raw
+        out.append({pid: round(x["cpu"], 3) for pid, x in m.read(procs)[1].items()})
+    return out
+
+
+old_t = int(time.time()) - 3600
+# a child busy for 2 s, seen alive twice, then reaped at once with 0.5 s more: the parent reads 0.5, not 2.5
+r = meter_run([(ptab((10, 1, old_t, 0, 0), (11, 10, old_t, 0, 0)), None),
+               (ptab((10, 1, old_t, 0, 0), (11, 10, old_t, 1.0, 0)), None),
+               (ptab((10, 1, old_t, 0, 0), (11, 10, old_t, 2.0, 0)), None),
+               (ptab((10, 1, old_t, 0, 2.5)), None)])
+check(r[3].get(10) == 0.5 and r[1].get(11) == 1.0 and max(x.get(10, 0) for x in r) <= 1.3,
+      "cpu: a reaped child's time is counted once: the parent reads 0.5 cores after it, not 2.5 (%s)" % r[3])
+# the zombie case (A.25): the child exits after 3 s, stays unreaped for three readings, then is reaped
+zt = [(ptab((10, 1, old_t, 0, 0), (11, 10, old_t, 0, 0)), [10, 11]),
+      (ptab((10, 1, old_t, 0, 0), (11, 10, old_t, 1.0, 0)), [10, 11]),
+      (ptab((10, 1, old_t, 0, 0), (11, 10, old_t, 2.0, 0)), [10, 11]),
+      (ptab((10, 1, old_t, 0, 0)), [10, 11]), (ptab((10, 1, old_t, 0, 0)), [10, 11]), (ptab((10, 1, old_t, 0, 0)), [10, 11]),
+      (ptab((10, 1, old_t, 0, 3.0)), [10])]
+r = meter_run(zt)
+total = sum(x.get(10, 0) + x.get(11, 0) for x in r)
+check(max(x.get(10, 0) for x in r) <= 1.3 and abs(total - 3.0) < 0.01,
+      "cpu: a child reaped three readings after it exited: no spike in the parent, its 3 s counted once (%.2f)" % total)
+# six short children no reading saw: their time is found in the parent
+r = meter_run([(ptab((10, 1, old_t, 0, 0)), None), (ptab((10, 1, old_t, 0.1, 3.0)), None)])
+check(r[1].get(10) == 3.1, "cpu: six short children nobody saw leave their 3 s in the parent (%s)" % r[1])
+# launchd reaps every orphan: its child time is ignored; nothing reads above the core count
+r = meter_run([(ptab((1, 0, old_t, 0, 0), (12, 1, old_t, 0, 0)), None), (ptab((1, 0, old_t, 0.2, 50.0), (12, 1, old_t, 9.0, 0)), None)])
+check(r[1].get(1) == 0.2 and r[1].get(12) == 4.0, "cpu: launchd's reaped time is ignored; 9 s in a second reads as the "
+      "4 cores there are (%s)" % r[1])
+# the clamp: the per-process sum never exceeds what the machine was busy, plus half a core
+sp = StubPlat()
+m = oomphd.Meter(sp)
+sp.ticks = [[0, 0, 100, 0]] * 4
+m.read(ptab((20, 1, old_t, 0, 0), (21, 1, old_t, 0, 0)))
+sp.up += 1.0
+sp.ticks = [[25, 0, 175, 0]] * 4  # each core a quarter busy: one core in all
+blocks, use = m.read(ptab((20, 1, old_t, 2.0, 0), (21, 1, old_t, 2.0, 0)))
+check(abs(blocks["cpu"]["busy"] - 1.0) < 1e-6 and abs(sum(x["cpu"] for x in use.values()) - 1.5) < 1e-6 and m.scaled > 1,
+      "cpu: 4 cores of processes on a machine 1 core busy are scaled to 1.5, and that is reported (%.2f)"
+      % sum(x["cpu"] for x in use.values()))
+check(blocks["cpu"]["user"] + blocks["cpu"]["sys"] == blocks["cpu"]["busy"] and blocks["cpu"]["e_busy"] == 0.5 and
+      blocks["cpu"]["p_busy"] == 0.5, "cpu: busy = user + sys, split by cluster (%s)" % blocks["cpu"])
+sp.up += 1.0
+sp.ticks = [[25 + (1 << 32) - 10, 0, 175 + 10, 0]] * 4  # a 32-bit counter wrapped
+blocks, _ = m.read(ptab((20, 1, old_t, 2.0, 0)))
+check(blocks["cpu"]["busy"] <= 4 and blocks["cpu"]["busy"] >= 0, "cpu: a wrapped 32-bit tick counter (%s)" % blocks["cpu"]["busy"])
+blocks, _ = m.read(ptab((20, 1, old_t, 2.0, 0)), gap=True)
+check("busy" not in blocks["cpu"] and "io" not in blocks and blocks["cpu"]["n"] == 4,
+      "cpu: no rates in the first reading after a gap, the core count stays")
+# the GPU from the registry: rung 2 (clients) after a first reading of rung 3, hostile creator strings, no clients
+greg = {n: P.parse_gpu_registry(open(os.path.join(FIX, "ioreg", n + ".plist"), "rb").read()) if MAC else None
+        for n in ("accelerator", "hostile", "noclients")}
+if MAC:
+    acc = greg["accelerator"][0]
+    check(acc["name"] == "Apple M3 Max" and acc["now"] == 38 and acc["clients"][4294971540] == (413, 125000000000) and
+          acc["usage"], "gpu: the registry's property list: model, utilization, memory, GPU time per client")
+    hos = greg["hostile"][0]["clients"]
+    check(hos == {4294972000: (4242, 5000000), 4294972002: (77, 2500)},
+          "gpu: a hostile creator string gives its pid and the real time, nothing else (%s)" % hos)
+    check(greg["noclients"][0]["clients"] == {} and not greg["noclients"][0]["usage"], "gpu: a device without clients")
+    sp = StubPlat()
+    seq = [greg["accelerator"]]
+    nxt = json.loads(json.dumps(greg["accelerator"], default=list))
+    nxt[0]["clients"] = {int(k): tuple(v) for k, v in nxt[0]["clients"].items()}
+    nxt[0]["clients"][4294971540] = (413, 125000000000 + 300000000)    # 0.3 s of GPU time in one second
+    nxt[0]["clients"][4294971800] = (900, 100000000)                    # a new client, 0.1 s
+    del nxt[0]["clients"][4294971700]                                   # a client that closed
+    seq.append(nxt)
+    sp.gpu_registry = lambda: seq.pop(0)
+    sp.gpu_mem_limit_gb = lambda ram: (27.0, True)
+    m = oomphd.Meter(sp)
+    b0, _ = m.read({}, ram_gb=36)
+    sp.up += 1.0
+    b1, u1 = m.read({}, ram_gb=36)
+    g0, g1 = b0["gpu"][0], b1["gpu"][0]
+    check(g0["src"] == "ioreg" and g0["util"] == 38.0 and "active" not in g0 and g1["src"] == "clients" and
+          g1["util"] == 40.0 and abs(u1[413]["gpu"] - 30.0) < 1e-6 and abs(u1[900]["gpu"] - 10.0) < 1e-6 and
+          g1["mem_limit_gb"] == 27.0 and g1["mem_limit_est"] and g1["mem_gb"] == 0.92,
+          "gpu: first the driver's instantaneous figure (ioreg), then busy time from the clients' GPU time (%s, %s)"
+          % (g0.get("util"), g1.get("util")))
+    sp.gpu_registry = lambda: None
+    check("gpu" not in m.read({})[0], "gpu: a registry that cannot be read costs the block, nothing else")
+    # the safety net: the clients' figure 30 points from the driver's for five minutes, and the device reads rung 3
+    sp, n_calls = StubPlat(), [0]
+
+    def drift():
+        n_calls[0] += 1
+        d = json.loads(json.dumps(greg["noclients"], default=list))
+        d[0].update(now=0, usage=True, clients={1: (413, n_calls[0] * 3 * 10 ** 9)})  # 30 % of each 10 s
+        return d
+    sp.gpu_registry = drift
+    m = oomphd.Meter(sp)
+    srcs = []
+    for _ in range(40):
+        g = m.read({})[0]["gpu"][0]
+        srcs.append(g.get("src"))
+        sp.up += 10.0
+    errs = [e for w, e in m.errors if w == "gpu"]
+    check(srcs[1] == "clients" and srcs[30] == "clients" and srcs[32:] == ["ioreg"] * 8 and len(errs) == 1,
+          "gpu: the clients' figure 30 points from the driver's for five minutes: that device reads the driver's "
+          "figure from then on, said once (%s)" % "".join(x[0] for x in srcs))
+    # what the system hands the root logger is read with a cap and a deadline
+    t0 = time.time()
+    big = P.run_capped([sys.executable, "-I", "-c", "import sys; sys.stdout.write('x' * 20000000)"], 8 << 20, 5)
+    slow = P.run_capped(["/bin/sleep", "30"], 1 << 20, 1)
+    check(big is None and slow is None and time.time() - t0 < 8,
+          "a command that prints 20 MB or never ends costs its reading within the deadline (%.1f s)" % (time.time() - t0))
+else:
+    print("skip  the registry parser and the bounded reads are the Mac backend's")
+
+# disks: the class table on captured and made-up mount records; diskutil only for /dev/disk names
+vfix = json.load(open(os.path.join(FIX, "volumes.json")))["mounts"]
+SSD = next(i for i, c in enumerate(vfix) if "A.30" in c["case"])
+WORK = next(i for i, c in enumerate(vfix) if "second internal" in c["case"])
+if MAC:
+    wrong = []
+    for c in vfix:
+        if c["want"][0] == "watched":
+            continue
+        got = P.classify_volume(c["rec"], c.get("facts"))
+        if list(got[:2]) != c["want"]:
+            wrong.append("%s: %s" % (c["case"], got))
+    check(not wrong and len(vfix) >= 12, "volumes: %d mount records classified as 02 §4.4 says, the external SSD of A.30 "
+          "listed%s" % (len(vfix), ": " + "; ".join(wrong) if wrong else ""))
+    recs = [c["rec"] for c in vfix]
+    facts = {P.mount_key(c["rec"]): c["facts"] for c in vfix if "facts" in c}
+    pools, rows = P.disk_pools(recs, facts)
+    ids = [p["id"] for p in pools]
+    check(ids == ["data", "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10", "vol:55555555-6666-4777-8888-999999999999"] and
+          pools[0]["watch"] and pools[0]["level"] == "ok" and not pools[1]["watch"] and pools[1]["kind"] == "external" and
+          "low_gb" not in pools[1], "volumes: the system's pool (VM volume and all) is watched, the SSD and a second "
+          "internal disk are listed, by UUID; nothing else is sampled (%s)" % ids)
+    same = dict(vfix[SSD]["rec"], mount="/Volumes/Scratch 1", dev=16777999)
+    twin = dict(vfix[SSD]["rec"], mount="/Volumes/Scratch 2", dev=16777998)
+    twin["from"] = "/dev/disk40s1"
+    f2 = {P.mount_key(same): vfix[SSD]["facts"], P.mount_key(twin): dict(vfix[SSD]["facts"], pool_uuid="77777777-0000-4000-8000-000000000000")}
+    p2 = P.disk_pools([vfix[0]["rec"], same, twin], f2)[0]
+    check([p["id"] for p in p2[1:]] == ["vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10", "vol:77777777-0000-4000-8000-000000000000"],
+          "volumes: the same volume at a new mount point is the same pool; another of the same name is another")
+    weak = P.disk_pools([vfix[0]["rec"], vfix[WORK]["rec"]], {P.mount_key(vfix[WORK]["rec"]): dict(vfix[WORK]["facts"], pool_uuid=None)})[0]
+    check(weak[1]["id"] == "mnt:/Volumes/Work" and weak[1].get("weak"), "volumes: a volume without a UUID is listed by "
+          "its mount point, weakly")
+    low = P.disk_pools([dict(vfix[0]["rec"], free_gb=4.0)], {})[0][0]
+    check(low["level"] == "critical" and P.disk_pools([dict(vfix[0]["rec"], free_gb=19.0)], {})[0][0]["level"] == "low",
+          "volumes: the system's pool is low under 20 GB, critical under 5")
+    sraw = json.load(open(os.path.join(FIX, "volumes.json")))["statfs"]["records"]
+    kept = P.mount_records(sraw)
+    bad_root = [dict(r, free=r["size"] + 1) if r["mount"] == "/" else r for r in sraw]
+    bad_data = [dict(r, size=1 << 61) if r["mount"] == "/System/Volumes/Data" else r for r in sraw]
+    check(kept is not None and [m["mount"] for m in kept] == ["/", "/System/Volumes/Data", "/Volumes/Scratch"] and
+          P.mount_records(bad_root) is None and P.mount_records(bad_data) is None and
+          P.mount_records([r for r in sraw if r["mount"] != "/"]) is None,
+          "volumes: a FUSE mount answering absurd sizes is left out, not the whole table; an absurd or missing "
+          "/ or Data volume refuses it")
+
+    class VolPlat:
+        asked = []
+        mounts = staticmethod(lambda: [c["rec"] for c in vfix])
+        mount_key, disk_pools = staticmethod(P.mount_key), staticmethod(P.disk_pools)
+
+        @staticmethod
+        def volume_facts(dev):
+            VolPlat.asked.append(dev)
+            return next((c.get("facts") for c in vfix if c["rec"]["from"] == dev), None)
+    vp, vr = oomphd.Volumes(VolPlat, wait=True).read()
+    check(all(re.fullmatch(r"/dev/disk\d+(s\d+)*", d) for d in VolPlat.asked) and "-rf" not in VolPlat.asked and
+          "/dev/disk3s5" not in VolPlat.asked and "/dev/disk9s3" not in VolPlat.asked and
+          [p["id"] for p in vp] == ids, "volumes: diskutil is asked about disks only, never about the system's pool, a "
+          "hidden volume or a FUSE mount's 'device' (%s)" % VolPlat.asked)
+    n_ask, VolPlat.asked = len(VolPlat.asked), []
+    bg = oomphd.Volumes(VolPlat)
+    first = [p["id"] for p in bg.read()[0]]
+    deadline = time.time() + 10
+    while len(VolPlat.asked) < n_ask and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.2)
+    later = [p["id"] for p in bg.read()[0]]
+    check(first == ["data"] and later == ids, "volumes: the logger's first sample lists the system's pool only; the "
+          "others follow once diskutil has answered, off the sampling path")
+else:
+    print("skip  the volume class table is the Mac backend's")
+
+# the real thing, on this Mac: two samples of the logger
+if MAC:
+    dm = oomphd.Daemon()
+    s1 = dm.sample()
+    time.sleep(1.0)
+    s2 = dm.sample()
+    c2, n_ = s2.get("cpu") or {}, os.cpu_count()
+    check(s1.get("cpu", {}).get("n") == n_ and "busy" not in s1.get("cpu", {}) and 0 <= c2.get("busy", -1) <= n_ and
+          abs(c2.get("user", 0) + c2.get("sys", 0) - c2.get("busy", 0)) < 0.02 and c2.get("therm") in (0, 1, 2, 3, 4),
+          "sample: cpu %s of %s cores busy, thermal %s; the first sample has no rates" % (c2.get("busy"), n_, c2.get("therm")))
+    dk = {d["id"]: d for d in s2.get("disks") or []}
+    data = dk.get("data") or {}
+    check(0 < data.get("free_gb", 0) <= data.get("total_gb", 0) and {"home", "tmp"} <= set(data.get("roles") or []) and
+          data.get("watch"), "sample: disks has the system's pool, %.0f of %.0f GB free, roles %s"
+          % (data.get("free_gb", 0), data.get("total_gb", 0), data.get("roles")))
+    gl = s2.get("gpu")
+    check(isinstance(gl, list) and all(0 <= g.get("util", 0) <= 100 and g.get("src") in ("ioreport", "clients", "ioreg")
+                                       for g in gl), "sample: gpu %s" % ([(g.get("name"), g.get("util"), g.get("src"))
+                                                                          for g in gl] if gl else gl))
+    check(isinstance(s2.get("io"), dict) and s2["io"]["w_mb_s"] >= 0 and
+          all(isinstance(x.get("cpu"), float) for x in s2.get("top_cpu") or []) and len(s2.get("top_cpu") or []) <= 8,
+          "sample: io %s, top_cpu %d entries" % (s2.get("io"), len(s2.get("top_cpu") or [])))
+    sz = len(json.dumps(s2, separators=(",", ":")))
+    print("      a sample of this run: %d bytes (%s)" % (sz, ", ".join("%s %d" % (k, len(json.dumps(s2[k], separators=(",", ":"))))
+                                                                    for k in RES_KEYS if k in s2)))
+    # the time base: a busy child's CPU as rusage reads it equals what the child counted itself
+    bc = subprocess.Popen([sys.executable, "-I", "-c", "import time, sys\nt = time.process_time()\n"
+                           "while time.process_time() - t < 0.8: pass\nprint(time.process_time(), flush=True)\n"
+                           "time.sleep(5)"], stdout=subprocess.PIPE, text=True)
+    own = float(bc.stdout.readline())
+    seen = P.collect_procs().get(bc.pid, {}).get("cpu_s", 0)
+    bc.kill()
+    bc.wait()
+    check(abs(seen - own) <= 0.1 * own, "cpu: rusage's CPU time in seconds (the Mach time base applied): %.2f s, the child "
+          "counted %.2f s" % (seen, own))
+    # native memory given back: 2,000 rounds of every native reading in a child, its peak size grows < 1 MB
+    soak = r"""
+import os, resource, sys
+sys.path.insert(0, sys.argv[1])
+import oomph_darwin as P
+def once():
+    P.cpu_ticks(); P.thermal_level(); P.mounts(); P._rusage(os.getpid()); P.list_pids()
+for _ in range(300): once()
+a = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+for _ in range(2000): once()
+print(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - a)
+"""
+    r = subprocess.run([sys.executable, "-I", "-B", "-c", soak, os.path.join(ROOT, "daemon")], capture_output=True,
+                       text=True, timeout=60)
+    grew = int(r.stdout.strip() or -1) if r.returncode == 0 else -1
+    check(0 <= grew < 1 << 20, "soak: 2,000 rounds of ticks, thermal level, mounts, rusage and the pid list grow the "
+          "process by %d KB" % (grew // 1024))
+    # the ledger's child is told what it needs of a process, not the new counters
+    check(set(oomph.PROC_KEYS) >= {"pid", "ppid", "start", "fp", "name"} and "cpu_s" not in oomph.PROC_KEYS,
+          "the ledger child's process table: %s" % ", ".join(oomph.PROC_KEYS))
+else:
+    print("skip  sampling CPU, GPU and disks needs macOS")
+
+# the wire: the chart's numbers travel slim, names stay home; the full current sample carries the GPU's name. The
+# disks stay home in 1.9.1: every mirror up to 1.9.0 refuses a row whose *_gb is above 16 x RAM, as a disk's size is
+sl = oomph.slim_sample(dict(cur, **RES_EXAMPLE))
+fu = oomph.full_sample(dict(cur, **RES_EXAMPLE))
+check(sl["cpu"].get("busy") == 9.12 and "load" not in sl["cpu"] and sl["gpu"][0] == {
+      "id": "gpu0", "util": 47.0, "active": 47.0, "now": 52, "src": "clients", "mem_gb": 3.99, "mem_alloc_gb": 11.68} and
+      not {"top_cpu", "top_gpu", "top_io", "disks"} & set(sl), "slim samples: the chart's CPU, GPU and I/O numbers; no "
+      "names, no disks, no per-process lists (%d bytes more)" % (len(json.dumps(sl)) - len(json.dumps(oomph.slim_sample(cur)))))
+check("disks" not in fu and fu["top_cpu"][0]["cpu"] == 5.2 and fu["gpu"][0]["name"] == "Apple M3 Max",
+      "full sample: the GPU's name and the top lists; no disks")
+import oomph_sync  # noqa: E402
+eight = dict(cur, ram_gb=8.0, disk_free_gb=900.0, **dict(RES_EXAMPLE, disks=[dict(RES_EXAMPLE["disks"][0], total_gb=1000.0,
+                                                                                  free_gb=900.0)]))
+ing = oomph_sync.Ingest({"now": time.time(), "ram_gb": 8.0})
+ok_rows = [ing.row(json.dumps(x), "samples") for x in (oomph.slim_sample(eight), oomph.full_sample(eight), eight)]
+check(all(ok_rows) and ing.dropped["samples"] == 0 and not ing.row(json.dumps(dict(eight, app_gb=300.0)), "samples"),
+      "a mirror lets in an 8 GB machine with 900 GB free on a 1 TB disk (slim, full, whole), and still refuses 300 GB "
+      "of app memory there")
+def _walk_gb(x, top):
+    """gb_ok as a mirror up to 1.9.0 has it: every *_gb, nested ones too, at most 16 x RAM."""
+    if isinstance(x, dict):
+        return all((not (isinstance(k, str) and k.endswith("_gb")) or v is None or 0 <= v <= top) and _walk_gb(v, top)
+                   for k, v in x.items())
+    return all(_walk_gb(v, top) for v in x) if isinstance(x, list) else True
+
+
+check(_walk_gb(oomph.slim_sample(dict(eight, disk_free_gb=60.0)), 128.0) and
+      _walk_gb(oomph.full_sample(dict(eight, disk_free_gb=60.0)), 128.0) and not _walk_gb(eight, 128.0), "what a 1.9.1 logger sends passes a 1.9.0 mirror's check; the disks block would not")
+
+# the CLI on a fixed sample: check, status, resources, ps, volumes
+res_s = dict(fixed, t=time.time(), iso="2026-11-22T10:00:00+01:00", source="daemon", **RES_EXAMPLE)
+oomph._sample_override = lambda: dict(res_s)
+real_measure = oomphd.measure
+oomphd.measure = lambda *a, **k: (_ for _ in ()).throw(AssertionError("a plain check measured"))
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = oomph.main(["check"])
+out = " ".join(buf.getvalue().split())
+check(rc == 0 and "9.1 of 14 cores busy (P 7.9 · E 1.2) · thermal heavy" in out and
+      "busy 47 % of the time (speed not reported) · 4.0 of 27 GB GPU memory" in out and "Data 63 GB free of 995" in out and
+      "Scratch 912 GB free of 1,863 · not watched" in out and out.index("cpu") < out.index("advice:"),
+      "oomph check: a line for CPU, GPU and each disk before the advice; the exit code as before")
+oomph._sample_override = lambda: dict(fixed, source="daemon")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    oomph.main(["check"])
+check("not recorded by the logger" in buf.getvalue(), "oomph check: a logger older than 1.9.1 is named as the reason")
+oomph._sample_override = lambda: dict(fixed, source="live")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    oomph.main(["check"])
+check("not measured (logging is off; `oomph check --measure`" in buf.getvalue(), "oomph check without the logger: CPU and "
+      "GPU not measured, and it does not wait")
+oomphd.measure = real_measure
+# pins: a listed volume this user pinned counts in check and hook; one nobody pinned never does
+low_s = dict(res_s, disks=[RES_EXAMPLE["disks"][0], dict(RES_EXAMPLE["disks"][1], free_gb=10.0)])
+oomph._sample_override = lambda: dict(low_s)
+v_unpinned = oomph.checked_verdict()
+oomph.save_user_settings({"volumes": {"pinned": ["vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"]}, "other": 1})
+v_pinned = oomph.checked_verdict()
+mode = os.stat(oomph.settings_path()).st_mode & 0o777
+check(v_unpinned["level"] == "ok" and v_pinned["level"] == "tight" and "on Scratch (pinned)" in " ".join(v_pinned["reasons"])
+      and mode == 0o600 and "disks" in v_pinned["resources"], "pins: 10 GB free on a pinned 1.8 TB disk is low for this "
+      "user (floors 20 and 5 GB there), and nothing when not pinned (%s / %s)" % (v_unpinned["level"], v_pinned["level"]))
+check(v_pinned["advice"].startswith("Disk space is short on Scratch") and "parallelism" not in v_pinned["advice"] and
+      not v_pinned.get("notes"), "pins: a pinned low disk gets disk advice, not memory advice")
+oomph._sample_override = lambda: dict(low_s, pressure=2)
+v_both = oomph.checked_verdict()
+oomph._sample_override = lambda: dict(res_s, disks=RES_EXAMPLE["disks"][:1])
+v_gone = oomph.checked_verdict()
+line_gone = oomph.verdict_line(v_gone, width=200)
+oomph._sample_override = lambda: dict(low_s)
+check("parallelism" in v_both["advice"] and "Disk space is short on Scratch" in v_both["advice"] and
+      v_gone["level"] == "ok" and "not checked" in " ".join(v_gone.get("notes") or []) and "note: pinned vol:5E0C" in
+      line_gone, "pins: memory and disk advice when both are short; a pin the sample has no pool for is said to be "
+      "unchecked")
+open(oomph.settings_path(), "w").write('{"volumes": {"pinned": "vol:x", "hidden": [1, null, "../x"]}}')
+check(oomph.volume_prefs() == (set(), set()) and oomph.checked_verdict()["level"] == "ok",
+      "pins: a damaged settings file reads as none")
+os.unlink(oomph.settings_path())
+# status on a sample with the new blocks
+os.makedirs(os.path.join(LOG, "m1"), exist_ok=True)
+saved_log = oomph.LOG_DIR
+oomph.LOG_DIR = os.path.join(LOG, "m1")
+json.dump(dict(res_s, daemon={"pid": 1, "version": "1.9.1", "interval": 30, "root": True}, away={}, groups=[], claude=[],
+               free_pct=60, cached_gb=3.0, free_gb=4.0, swapfiles=0),
+          open(os.path.join(oomph.LOG_DIR, "current.json"), "w"))
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = oomph.main(["status"])
+out = " ".join(buf.getvalue().split())
+check(rc == 0 and "cpu 9.1 of 14 cores busy" in out and "io read 3.1 MB/s · write 12.4 MB/s" in out and
+      "busiest (cores):" in out and "cargo (iTerm2)" in out and "writing to disk (MB/s):" in out,
+      "oomph status: CPU, GPU, disk and I/O lines and the busiest processes per resource")
+for argv, want in ((["ps", "--json"], ("cpu", 5.2)), (["ps", "--gpu", "--json"], ("gpu", 9.1)),
+                   (["ps", "--io", "--json", "-n", "1"], ("w", 18.3))):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = oomph.main(argv)
+    d = json.loads(buf.getvalue())
+    check(rc == 0 and d["resource"] == want[0] and d["rows"][0][want[0]] == want[1], "oomph %s: from the logger's sample"
+          % " ".join(argv))
+json.dump(dict({k: v for k, v in res_s.items() if k not in ("top_gpu", "top_io")}, away={}, groups=[], claude=[],
+               daemon={"pid": 1, "version": "1.9.1", "interval": 30, "root": True}, free_pct=60, cached_gb=3.0, free_gb=4.0,
+               swapfiles=0),
+          open(os.path.join(oomph.LOG_DIR, "current.json"), "w"))
+oomphd.measure = lambda *a, **k: (_ for _ in ()).throw(AssertionError("ps measured against a current logger"))
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = oomph.main(["ps", "--gpu"])
+oomphd.measure = real_measure
+check(rc == 0 and "nothing measurable right now" in buf.getvalue() and "older" not in buf.getvalue(),
+      "oomph ps --gpu: a 1.9.1 logger with no GPU clients means nothing measurable, not an old logger")
+nocpu = {k: v for k, v in res_s.items() if k not in ("cpu", "disks")}
+lines_new = dict(oomph.resource_lines(dict(nocpu, daemon={"version": "1.9.1"})))
+lines_old = dict(oomph.resource_lines(dict(nocpu, gpu=None, daemon={"version": "1.9.0"})))
+check(lines_new["cpu"] == oomph.NOT_READ and lines_old["cpu"] == oomph.NOT_LOGGED and
+      oomph.logger_measures({"cpu": {}}) and not oomph.logger_measures({"daemon": {"version": "1.10"}}) and
+      oomph.logger_measures({"daemon": {"version": "1.10.0"}}), "a 1.9.1 sample without its cpu block is not "
+      "blamed on an old logger; the version decides when no block is there")
+with redirect_stderr(io.StringIO()):
+    check(oomph.main(["ps", "--cpu", "--gpu"]) == 2 and oomph.main(["ps", "-n", "0"]) == 2 and oomph.main(["ps", "--x"]) == 2,
+          "oomph ps: one resource, 1 to 100 rows, no unknown option")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = oomph.main(["resources", "--json"])
+d = json.loads(buf.getvalue())
+check(rc == 0 and d["reservable"] == ["memory"] and d["memory"]["reservable"] and d["cpu"]["n"] == 14 and
+      not d["cpu"]["reservable"] and d["gpu"][0]["name"] == "Apple M3 Max" and not d["gpu"][0]["reservable"] and
+      [x["id"] for x in d["disks"]] == ["data", "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"] and d["disks"][0]["watched"],
+      "oomph resources --json: memory reservable; cores, GPU and disks listed, not yet reservable")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    rc = oomph.main(["resources"])
+check(rc == 0 and "not reservable yet" in buf.getvalue() and "Only memory can be reserved" in buf.getvalue(),
+      "oomph resources: says what can be reserved")
+oomph.LOG_DIR = saved_log
+oomph._sample_override = None
+if MAC:
+    here = os.stat(LOG).st_dev & 0xFFFFFFFF
+
+    class PinPlat:
+        @staticmethod
+        def mounts():
+            return [dict(vfix[0]["rec"], dev=1), dict(vfix[SSD]["rec"], dev=here)]
+        mount_key, disk_pools = staticmethod(P.mount_key), staticmethod(P.disk_pools)
+        volume_facts = staticmethod(lambda dev: vfix[SSD]["facts"])
+    real_plat = oomph._plat
+    import types
+    oomph._plat = types.SimpleNamespace(**dict({k: getattr(real_plat, k) for k in dir(real_plat) if not k.startswith("__")},
+                                               **{k: getattr(PinPlat, k) for k in ("mounts", "mount_key", "disk_pools",
+                                                                                   "volume_facts")}))
+    try:
+        outs = []
+        for argv in (["volumes", "watch", LOG], ["volumes", "--json"], ["volumes", "hide", LOG], ["volumes"],
+                     ["volumes", "--all", "--json"], ["volumes", "unwatch", LOG], ["volumes", "unhide", LOG]):
+            buf = io.StringIO()
+            with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+                outs.append((oomph.main(argv), buf.getvalue()))
+        pinned_after = oomph.volume_prefs()
+        lst = json.loads(outs[1][1])
+        allv = json.loads(outs[4][1])
+        check(outs[0][0] == 0 and "pinned" in outs[0][1] and any(e.get("pinned") for e in lst) and outs[2][0] == 0 and
+              "Scratch" not in outs[3][1] and any(e.get("hidden") for e in allv) and outs[5][0] == outs[6][0] == 0 and
+              pinned_after == (set(), set()), "oomph volumes watch / hide / unwatch / unhide: per user, by pool id")
+        with redirect_stderr(io.StringIO()):
+            check(oomph.main(["volumes", "watch", "/nonexistent/x"]) == 1 and oomph.main(["volumes", "watch"]) == 2,
+                  "oomph volumes watch: a path on no recorded volume is refused")
+    finally:
+        oomph._plat = real_plat
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = oomph.main(["volumes", "--all", "--json"])
+    vl = json.loads(buf.getvalue())
+    check(rc == 0 and any(e.get("id") == "data" and e["class"] == "watched" for e in vl) and
+          all(e["class"] in ("watched", "listed", "ignored") and e["why"] for e in vl),
+          "oomph volumes --all on this Mac: %s" % ", ".join("%s %s" % (e["name"], e["class"]) for e in vl
+                                                            if e["class"] != "ignored"))
+else:
+    print("skip  oomph volumes reads the Mac's mount table")
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,
