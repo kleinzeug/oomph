@@ -36,7 +36,7 @@ jobs:
       matrix:
         guest: [ubuntu-24.04, debian-12, rocky-9]
     runs-on: ubuntu-24.04
-    timeout-minutes: 100
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
       - name: boot the guest and run the rows inside

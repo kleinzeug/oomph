@@ -42,17 +42,25 @@ runcmd:
 UD
 genisoimage -quiet -output seed.iso -volid cidata -joliet -rock user-data meta-data
 echo "booting $G at $(date -u +%T)"
-sudo timeout 80m qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -nodefaults -vga std -display none \
+sudo timeout ${GUEST_MINUTES:-55}m qemu-system-x86_64 -enable-kvm -cpu host -m 2048 -smp 2 -nodefaults -vga std -display none \
   -drive file=disk.qcow2,if=virtio,format=qcow2 \
   -drive file=seed.iso,media=cdrom,format=raw \
   -drive if=none,id=in,file=in.tar,format=raw,readonly=on -device virtio-blk-pci,drive=in,serial=spikein \
   -drive if=none,id=out,file=out.raw,format=raw -device virtio-blk-pci,drive=out,serial=spikeout \
   -nic user,model=virtio-net-pci -device virtio-rng-pci \
-  -serial file:console.log -no-reboot
-echo "qemu exited rc=$? at $(date -u +%T)"
+  -serial file:console.log -no-reboot &
+QP=$!; seen=0
+while kill -0 $QP 2>/dev/null; do   # progress: the guest prints one line per row to its serial console
+    sleep 30; n=$(sudo cat console.log 2>/dev/null | tr -d '\r' | grep -aE '^\[spike\]|^===== ROW|^VERDICT' | wc -l)
+    [ "$n" -gt "$seen" ] && sudo cat console.log | tr -d '\r' | grep -aE '^\[spike\]|^===== ROW|^VERDICT' | tail -n $((n-seen)) | cut -c1-200; seen=$n
+    # keep a copy of what the guest has written so far, so a timeout still leaves results
+    mkdir -p "$OUTD/partial"; sudo tar -xf out.raw -C "$OUTD/partial" 2>/dev/null; sudo cp console.log "$OUTD/console.partial.log" 2>/dev/null
+    sudo chown -R "$(id -u)" "$OUTD" 2>/dev/null
+done
+wait $QP; echo "qemu exited rc=$? at $(date -u +%T)"
 sudo chown "$(id -u)" console.log out.raw 2>/dev/null
 mkdir -p "$OUTD/x"; tar -xf out.raw -C "$OUTD/x" 2>&1 | tail -2
-if [ -d "$OUTD/x/spike-out" ]; then cp -r "$OUTD/x/spike-out/." "$OUTD/"; fi
+if [ -d "$OUTD/x/spike-out" ]; then cp -r "$OUTD/x/spike-out/." "$OUTD/"; rm -rf "$OUTD/partial" "$OUTD/console.partial.log"; fi
 rm -rf "$OUTD/x"
 tr -d '\r' < console.log > "$OUTD/console.log"
 ls "$OUTD" "$OUTD/rows" 2>/dev/null | head -50

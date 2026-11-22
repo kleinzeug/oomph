@@ -185,7 +185,7 @@ row8() {
     run "journalctl --no-pager -k -o short-monotonic --after-cursor='$c'"
     run "python3 $PY/patterns.py < $RAW/r8-kernel.json" | tee "$STATE/r8.pat"
     local co; co=$(grep '^COUNTS' "$STATE/r8.pat")
-    if grep -q "SUMMARY .*CONSTRAINT_MEMCG" "$STATE/r8.pat" && grep -q "KILLED .*Memory cgroup out of memory" "$STATE/r8.pat" && [ $((k1-k0)) -eq 1 ] && grep -q 'INVOKED' "$STATE/r8.pat" && grep -q 'UNMATCHED oom-related lines: 0' "$STATE/r8.pat"; then
+    if grep -q "SUMMARY .*CONSTRAINT_MEMCG" "$STATE/r8.pat" && grep -q "KILLED .*Memory cgroup out of memory" "$STATE/r8.pat" && [ $((k1-k0)) -eq 1 ] && grep -q '^INVOKED ' "$STATE/r8.pat" && grep -q 'UNMATCHED oom-related lines: 0' "$STATE/r8.pat"; then
         verdict MATCH "INVOKED, SUMMARY (CONSTRAINT_MEMCG) and prefixed KILLED all matched; oom_kill +1; $co"
     else verdict MISMATCH "oom_kill +$((k1-k0)); $co; $(grep -c UNMATCHED "$STATE/r8.pat") unmatched-related lines"; fi
 }
@@ -304,8 +304,15 @@ row13() {
         [ "$got" = 3 ] || lost=$((lost+1))
     done 2>&1 | tee "$STATE/r13c"
     lost=$(grep -c -v ': 3 of 3 kernel lines after the cursor; -k form: 3 of 3' "$STATE/r13c")
-    if grep -q '^\[exit 0\]' "$STATE/r13a" && grep -q 'rc=124' "$STATE/r13b" && [ "$lost" = 0 ]; then verdict MATCH "accepted on systemd $(journalctl --version | head -1 | awk '{print $2}'); --after-cursor returned every new entry in 5 of 5 rounds"
-    else verdict MISMATCH "systemd $(journalctl --version | head -1 | awk '{print $2}'): options accepted=$(grep -q '^\[exit 0\]' "$STATE/r13a" && echo yes || echo no), -f=$(grep -o 'rc=[0-9]*' "$STATE/r13b"); rounds with lost entries: $lost of 5 ($(grep -o 'round [0-9]: [0-9] of 3[^;]*; -k form: [0-9] of 3' "$STATE/r13c" | tr '\n' ' '))"; fi
+    note "the same with the cursor of a matching (kernel) entry, as the logger stores it"
+    for i in 1 2 3; do
+        echo "spike-r13 anchor-k $i $$" > /dev/kmsg; sleep 0.5; journalctl --sync 2>/dev/null
+        c2=$(journalctl --no-pager -n 1 -o json _TRANSPORT=kernel | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["__CURSOR"])')
+        echo "spike-r13 kmsgk $i a $$" > /dev/kmsg; echo "spike-r13 kmsgk $i b $$" > /dev/kmsg; sleep 1; journalctl --sync 2>/dev/null
+        echo "matching-cursor round $i: $(journalctl --no-pager -o cat --after-cursor="$c2" _TRANSPORT=kernel + _SYSTEMD_UNIT=systemd-oomd.service 2>/dev/null | grep -c "spike-r13 kmsgk $i . $$") of 2"
+    done 2>&1 | tee "$STATE/r13d"
+    if grep -q '^\[exit 0\]' "$STATE/r13a" && grep -q 'rc=124' "$STATE/r13b" && [ "$lost" = 0 ]; then verdict MATCH "accepted on systemd $(journalctl --version | head -1 | awk '{print $2}'); --after-cursor returned every new entry in 5 of 5 rounds; with a matching cursor: $(grep -o '[0-9] of 2' "$STATE/r13d" | tr '\n' ' ')"
+    else verdict MISMATCH "systemd $(journalctl --version | head -1 | awk '{print $2}'): options accepted=$(grep -q '^\[exit 0\]' "$STATE/r13a" && echo yes || echo no), -f=$(grep -o 'rc=[0-9]*' "$STATE/r13b"); rounds with lost entries: $lost of 5 ($(grep -o 'round [0-9]: [0-9] of 3[^;]*; -k form: [0-9] of 3' "$STATE/r13c" | head -2 | tr '\n' ' ')...); with the cursor of a matching kernel entry: $(grep -o '[0-9] of 2' "$STATE/r13d" | tr '\n' ' ')"; fi
 }
 row14() {
     ensure_oomph_accounts

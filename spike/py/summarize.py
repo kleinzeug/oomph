@@ -2,7 +2,7 @@
 """summarize.py OUTDIR LABEL -> markdown table of the rows' verdicts (for $GITHUB_STEP_SUMMARY)."""
 import glob, os, re, sys
 out, label = sys.argv[1], sys.argv[2]
-rows = sorted(glob.glob(os.path.join(out, "rows", "row-*.txt")))
+rows = sorted(glob.glob(os.path.join(out, "rows", "row-*.txt"))) or sorted(glob.glob(os.path.join(out, "partial", "spike-out", "rows", "row-*.txt")))
 print("## %s\n" % label)
 if os.path.exists(os.path.join(out, "SKIPPED")):
     print("Skipped: " + open(os.path.join(out, "SKIPPED")).read()); sys.exit(0)
