@@ -951,8 +951,8 @@ def draw_stats(fr, x, y, w, model, g, rows=2):
     if not c:
         fr.put(x, y, "No readings yet", "dim")
         return
-    idle = c.get("idle") or 0
-    idle_s = "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle
+    idle = c.get("idle")
+    idle_s = g["dash"] if idle is None else "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle  # None: not known
     if rows == 1:
         items = [("%.1fG" % c["app"], "App"), ("%.1fG" % c["comp"], "Compressed"), ("%.1fG" % c["wired"], "Wired"),
                  ("%.0fG" % c["ram"], "RAM"), ("%.1f/%.0fG" % (c["swap"], c["swap_total"]), "swap"),
@@ -1691,14 +1691,14 @@ def draw_right(fr, P, model, caps, g):
     if not c:
         fr.put(x + 2, y + 1, "No readings yet", "dim")
         return
-    idle = c.get("idle") or 0
+    idle = c.get("idle")
     rows = [("App memory", "%.1f GB" % c["app"], "app"), ("Compressed", "%.1f GB" % c["comp"], "comp"),
             ("Wired", "%.1f GB" % c["wired"], "wired"), ("Free", "%.1f of %.0f GB" % (c["free"], c["ram"]), None),
             ("Swap used / size", "%.1f / %.0f GB" % (c["swap"], c["swap_total"]), "swap"),
             ("Free disk", "%.0f GB" % c["disk"], None)]
     if c.get("unowned") is not None:
         rows.append(("Not owned by a process", "%.1f GB" % c["unowned"], None))
-    rows.append(("Idle", ("%d min" % (idle // 60) if idle >= 120 else "%d s" % idle) +
+    rows.append(("Idle", (g["dash"] if idle is None else "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle) +
                  ("" if c.get("display_on") is None else " %s display %s" % (g["mid"], "on" if c["display_on"] else "off")), None))
     meter(fr, x + 2, y + 1, w - 4, [(c["wired"], "wired"), (c["app"], "app"), (c["comp"], "comp"), (c["swap"], "swap")],
           c["ram"] + c["swap"], g, caps)

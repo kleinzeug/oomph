@@ -98,11 +98,12 @@ def _summarize(procs, use=None):
     """summarize_procs, and with `use` (the Meter's rates per pid) the same lists with their rates,
     plus session_of (pid -> the agent session it runs in)."""
     P = oomph.plat()
-    group_key, is_claude = P.group_key, P.is_agent
+    is_claude = P.is_agent
+    group_of = getattr(P, "group_of", None) or (lambda p: P.group_key(p["path"], p["name"]))  # Linux: by cgroup
     use = use or {}
     groups = {}
     for p in procs.values():
-        g = groups.setdefault(group_key(p["path"], p["name"]), [0, 0, 0.0, 0.0])
+        g = groups.setdefault(group_of(p), [0, 0, 0.0, 0.0])
         g[0] += p["fp"]
         g[1] += 1
         u = use.get(p["pid"])
@@ -151,7 +152,7 @@ def _summarize(procs, use=None):
     top = []
     for p in by_fp[:TOP_N]:
         e = {"pid": p["pid"], "ppid": p["ppid"], "name": p["name"], "uid": p["uid"],
-             "mb": round(p["fp"] / MB), "rss_mb": round(p["rss"] / MB), "g": group_key(p["path"], p["name"])}
+             "mb": round(p["fp"] / MB), "rss_mb": round(p["rss"] / MB), "g": group_of(p)}
         if p["ppid"] in procs:
             e["pn"] = procs[p["ppid"]]["name"]
         if p["pid"] in session_of:

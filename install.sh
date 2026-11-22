@@ -16,6 +16,8 @@
 # needed, no launchd, no memwatch migration, files owned by whoever runs it. Run as root, it is
 # honoured only for a directory that root owns all the way up and nobody else can change.
 set -euo pipefail
+# On Linux there is no root install yet: linux/install.sh installs for the user who runs it (1.9.4).
+if [ "$(uname -s)" = Linux ]; then exec "$(dirname "$0")/linux/install.sh" "$@"; fi
 root_only() {  # root_only DIR: DIR and every folder above it root's, not writable by others (sticky is fine)
   local d u m
   d=$(cd "$1" && pwd -P) || return 1
@@ -103,7 +105,7 @@ inst -d -m 755 "$LIBEXEC" "$PFX/usr/local/bin" "$PFX/Library/Logs/oomph"
 # 1. the new version, complete, in a directory of its own
 NEW=$(mktemp -d "$LIBEXEC/.oomph-new.XXXXXX")
 trap 'rm -rf "$NEW"' EXIT
-inst -m 755 "$SRC/oomphd.py" "$SRC/oomph.py" "$SRC/oomph_darwin.py" "$SRC/oomph_ioreport.py" "$SRC/oomph_ai.py" "$SRC/oomph_upgrade.py" \
+inst -m 755 "$SRC/oomphd.py" "$SRC/oomph.py" "$SRC/oomph_darwin.py" "$SRC/oomph_linux.py" "$SRC/oomph_ioreport.py" "$SRC/oomph_ai.py" "$SRC/oomph_upgrade.py" \
   "$SRC/oomph_top.py" "$SRC/oomph_view.py" "$SRC/oomph_net.py" "$SRC/oomph_sync.py" "$NEW/"
 # from a git checkout: stamp the version like build-app.sh does (the app bundle is stamped already)
 if [ -x "$HERE/tools/version.sh" ]; then

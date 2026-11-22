@@ -1,6 +1,6 @@
 ---
 name: oomph
-description: Make a long-running session memory-aware with oomph (macOS), and coordinate memory with the other Claude sessions on the same Mac. Reserve memory before heavy work — builds, test suites, Docker/VMs, browsers, parallel jobs, sub-agents — so sessions take turns instead of competing for RAM; check memory pressure, free memory, swap and disk; back off when memory is tight; find what this session is using; and read oomph incident reports after crashes, killed processes or an "out of application memory" dialog. Use when asked to watch or monitor memory, be "OOM-aware" or coordinate with other sessions, during long autonomous runs, before starting heavy or parallel work, and after unexplained process deaths.
+description: Make a long-running session memory-aware with oomph (macOS and Linux), and coordinate memory with the other Claude sessions on the same machine. Reserve memory before heavy work — builds, test suites, Docker/VMs, browsers, parallel jobs, sub-agents — so sessions take turns instead of competing for RAM; check memory pressure, free memory, swap and disk; back off when memory is tight; find what this session is using; and read oomph incident reports after crashes, killed processes or an "out of application memory" dialog. Use when asked to watch or monitor memory, be "OOM-aware" or coordinate with other sessions, during long autonomous runs, before starting heavy or parallel work, and after unexplained process deaths.
 ---
 
 # oomph — be memory-aware, take turns
@@ -14,17 +14,19 @@ description: Make a long-running session memory-aware with oomph (macOS), and co
 > `~/.claude/skills/oomph/SKILL.md` for every project. Copy it verbatim — never retype or
 > summarize it. If oomph is installed, take the copy installed with it, which matches its
 > commands: `mkdir -p .claude/skills/oomph && cp /usr/local/libexec/oomph/skills/oomph/SKILL.md
-> .claude/skills/oomph/SKILL.md`. Otherwise download it: `mkdir -p .claude/skills/oomph && curl
+> .claude/skills/oomph/SKILL.md` (on Linux the copy is `~/.local/lib/oomph/skills/oomph/SKILL.md`).
+> Otherwise download it: `mkdir -p .claude/skills/oomph && curl
 > -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o
 > .claude/skills/oomph/SKILL.md`. Then follow it for the rest of the session.
 
-[oomph](https://github.com/kleinzeug/oomph) measures this Mac's memory, swap and disk,
-keeps a papertrail of memory incidents, and keeps a shared queue in which Claude
+[oomph](https://github.com/kleinzeug/oomph) measures this machine's memory, swap and disk,
+keeps a papertrail of memory incidents (on a Mac), and keeps a queue in which Claude
 sessions reserve memory before heavy work. This skill makes you use it so a long
-session doesn't push the machine into "Your system has run out of application memory",
-where macOS starts killing processes — possibly yours, another session's or the user's.
+session doesn't push the machine into "Your system has run out of application memory"
+(macOS) or the kernel's OOM killer (Linux), which kill processes — possibly yours,
+another session's or the user's.
 
-Other Claude sessions may be working on this Mac right now. Each one thinking "there's
+Other Claude sessions may be working on this machine right now. Each one thinking "there's
 8 GB free, I'll start my build" at the same moment is exactly how the machine runs out.
 So: **announce heavy work before starting it, and start only when oomph grants it.**
 
@@ -35,16 +37,21 @@ Use the first one that works and remember it as `OOMPH` for the rest of the sess
 1. MCP tools named `memory_check`, `reserve_memory`, `update_reservation`,
    `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `incidents`, `incident`, `memory_status` (server
    `oomph`) — prefer these if present.
-2. `oomph` on the PATH (`command -v oomph`), normally `/usr/local/bin/oomph`.
+2. `oomph` on the PATH (`command -v oomph`), normally `/usr/local/bin/oomph` on a Mac and
+   `~/.local/bin/oomph` on Linux.
 3. A checkout: `/usr/bin/python3 -I <checkout>/daemon/oomph.py`.
 
-If none exists, tell the user oomph isn't installed and offer two options; do neither
-without their OK:
+If none exists, tell the user oomph isn't installed and offer the options for this system
+(`uname -s`); do none without their OK:
 
-- **Full install** (menu-bar app + background logger, recommended):
+- **Linux** (no root, nothing system-wide; checks, reservations, `oomph run`, the MCP server
+  and `oomph top` for this user's sessions): `git clone https://github.com/kleinzeug/oomph.git
+  ~/.oomph-src && ~/.oomph-src/linux/install.sh`. It puts `oomph` in `~/.local/bin` and, when
+  Claude Code is set up, installs this skill and registers the MCP server.
+- **Mac, full install** (menu-bar app + background logger, recommended):
   `git clone https://github.com/kleinzeug/oomph.git && cd oomph && ./build-app.sh`,
   then the user clicks the chip in the menu bar → Activate.
-- **Checks only, nothing installed system-wide:**
+- **Mac, checks only, nothing installed system-wide:**
   `git clone --depth 1 https://github.com/kleinzeug/oomph.git ~/.oomph-src`, then use
   `/usr/bin/python3 -I ~/.oomph-src/daemon/oomph.py` as `OOMPH`. Every command below
   works without the logger, reservations included; it measures live.
@@ -71,7 +78,7 @@ fix. Pass its fix lines on to the user; don't run them yourself (most need `sudo
 | `OOMPH session` | This Claude session's memory: its whole process tree, total, biggest children (pid, name, MB). |
 | `OOMPH wait --timeout 10m [--free 4G]` | Blocks until memory is ok again. Exit 1 on timeout. |
 | `OOMPH status --json` | Full sample: memory breakdown, swap, disk, top processes and apps, all Claude sessions. |
-| `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger) and their summaries; `--html` opens the report. |
+| `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger: a Mac's, for now) and their summaries; `--html` opens the report. |
 
 The MCP tools map one-to-one: `reserve_memory` (gb, purpose, wait_s ≤ 300, ttl_min,
 ticket), `update_reservation` (id, gb?, ttl_min?, purpose?), `release_memory` (id or
@@ -136,7 +143,8 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
 - If you've waited more than ~20 minutes, ask the user whether to keep waiting, run with
   less (lower parallelism, smaller reservation) or skip the step.
 - If the response is `refused` (to a new request, or to a poll with your ticket), the
-  request is larger than this Mac can hold — split the work or lower its parallelism.
+  request is larger than this machine can hold even with nothing else reserved — it will
+  never fit as asked. Lower the parallelism to the size the advice names, or split the work.
 
 **4. Grants and the rest of this skill:** a grant is a turn, not immunity. Still follow
 the levels in §5 while the work runs, and if `memory_check` turns critical, back off
@@ -174,8 +182,8 @@ Checking is cheap (well under a second). Don't check before trivial commands.
 - Start nothing heavy. Pause the plan.
 - Stop memory-heavy processes **this session** started (see `OOMPH session`).
 - `OOMPH wait --timeout 10m`, then check again.
-- Tell the user what you saw and did. If the reason is low disk space, ask them to free
-  some — swap lives on the startup disk and can't grow when it's full.
+- Tell the user what you saw and did. On a Mac, if the reason is low disk space, ask them to
+  free some — swap lives on the startup disk and can't grow when it's full.
 
 Never kill processes this session didn't start (the user's apps, other sessions,
 system daemons) without asking. oomph only reports; acting is your job, within the
@@ -197,6 +205,30 @@ session's own work.
   will. Start nothing heavy, tell the user, and suggest saving work and restarting soon —
   the last time this happened the Mac froze two hours later.
 - **available (reservations)** = free − what grants haven't used yet − a safety margin
-  (5% of RAM, at least 1.5 GB). As a granted job's processes grow, its reservation turns
-  into real usage instead of being counted twice. `check` turns **tight** when other
-  sessions' reservations exceed what's free, even if macOS still looks relaxed.
+  (on a Mac 5% of RAM, at least 1.5 GB). As a granted job's processes grow, its reservation
+  turns into real usage instead of being counted twice. `check` turns **tight** when other
+  sessions' reservations exceed what's free, even if macOS still looks relaxed. In JSON this
+  figure is also `grantable_gb` ("left to grant").
+- **ledger** (`ledger.kind` in `check --json`, `reservations --json` and the MCP answers):
+  `shared` means you coordinate with every session on the machine (a Mac: all accounts);
+  `user` means only with your own user's sessions (Linux until a machine-wide install exists).
+
+**On Linux** the words differ a little; the levels, exit codes and rules above do not:
+
+- **available** is what `free -h` calls available (the kernel's MemAvailable); oomph never
+  means the kernel's "free" there. `check` prints "X available of Y" and no disk figure (a
+  full disk doesn't raise the memory level on Linux: swap there has a fixed size).
+- **pressure** is oomph's reading of the kernel's stall time (PSI: how long tasks waited for
+  memory in the last 10 s) and of what is left (available memory and swap). What is left
+  alone can make it tight, never critical; critical needs measured stall time. Where the
+  kernel has PSI off (the RHEL 9 family by default) it never reads critical, and `check`
+  says so in a note; `doctor` tells the user how to turn PSI on.
+- **in a container or a limited cgroup** (a dev container, a `systemd-run` scope) every
+  figure is about that cgroup: its limit is the RAM, and the level is the worse of its own
+  and the host's. `check` prints a `scope:` line then.
+- The safety margin is 15% of RAM, at most 8 GB, so that work used as reserved never makes
+  the machine tight by itself. A request that cannot fit even alone (more than RAM and swap
+  can hold) is `refused` with the most you can ask for.
+- There is no jetsam and no unowned-memory figure on Linux, and no incidents yet: the
+  kernel's OOM killer is what kills. A process that died with exit 137 / SIGKILL under
+  pressure was most likely killed by it.

@@ -187,6 +187,10 @@ def build(out=STAGING):
 def cmd_upgrade(args):
     sub = args[0] if args else "check"
     js = "--json" in args
+    if sys.platform != "darwin":  # this builds the Mac app; a Linux install is its checkout's (1.9.4)
+        print("oomph upgrade builds the Mac app. On Linux, update the checkout you installed from: "
+              "git pull, then linux/install.sh again.", file=sys.stderr)
+        return 1
     try:
         if sub == "tools":
             r = tools()

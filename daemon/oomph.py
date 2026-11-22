@@ -5,7 +5,7 @@
   oomph report [--last 2h | --since ISO [--until ISO]]
   oomph top [--span inf|24h|6h|1h] [--glyphs unicode|cells|ascii] [--bell]
                                      the popup's dashboard, full screen (? lists its keys)
-  oomph top --ssh [USER@]HOST       the same on another Mac, over ssh
+  oomph top --ssh [USER@]HOST       the same on another Mac or Linux machine, over ssh
   oomph top --once [--size 80x24]   one frame of it, as text
   oomph incidents
   oomph incident <id|latest> [--html]
@@ -53,6 +53,7 @@ another machine (over a pipe for now; the network comes later):
 import datetime
 import functools
 import glob
+import grp
 import gzip
 import heapq
 import html as _html
@@ -118,7 +119,8 @@ PATHS = {
               "ledger": "{state}/ledger/{machine}", "ledger_mode": 0o700,
               "state": "{xdg_state}/oomph",
               "config": "/etc/oomph/config.json",
-              "libexec": "/usr/local/libexec/oomph", "service": "/etc/systemd/system/oomphd.service"},
+              "libexec": "/usr/local/libexec/oomph", "service": "/etc/systemd/system/oomphd.service",
+              "user_lib": "~/.local/lib/oomph", "user_bin": "~/.local/bin/oomph"},  # linux/install.sh (1.9.4)
 }
 PATHS_HERE = PATHS["darwin" if sys.platform == "darwin" else "linux"]
 
@@ -138,14 +140,42 @@ def _linux_machine():
     return "local"
 
 
+def _sudo_home():
+    """Under sudo on Linux, the home folder of the user who ran it: a per-user ledger is theirs (a
+    root caller's ledger operation runs as them, H0), not root's. None otherwise. Only the
+    ledger's path comes from it: root's own state (settings, top's state) stays root's, so root
+    never writes files into the user's folder."""
+    if sys.platform == "darwin" or os.geteuid() != 0:
+        return None
+    try:
+        return pwd.getpwuid(int(os.environ.get("SUDO_UID") or 0)).pw_dir if int(os.environ.get("SUDO_UID") or 0) > 0 else None
+    except (KeyError, ValueError):
+        return None
+
+
+def _sudo_xdg_state(home):
+    """The invoking user's XDG state folder under sudo: XDG_STATE_HOME when sudo kept it, it is
+    absolute and that user owns it (so that `sudo oomph run` meets their sessions' ledger), else
+    the default in their home."""
+    x = os.environ.get("XDG_STATE_HOME") or ""
+    try:
+        if os.path.isabs(x) and os.stat(x).st_uid == int(os.environ.get("SUDO_UID") or -1):
+            return x
+    except (OSError, ValueError):
+        pass
+    return os.path.join(home, ".local", "state")
+
+
 def _path(kind):
-    """A path of the table above, expanded: ~, the XDG state folder, {state} and {machine}."""
+    """A path of the table above, expanded: ~, the XDG state folder, {state} and {machine}. Under
+    sudo, {state} (the ledger's parent) is the invoking user's: their child writes it."""
     v = PATHS_HERE[kind]
     if "{xdg_state}" in v:
         x = os.environ.get("XDG_STATE_HOME") or ""
         v = v.replace("{xdg_state}", x if os.path.isabs(x) else "~/.local/state")  # relative: ignored, as XDG says
     if "{state}" in v:
-        v = v.replace("{state}", STATE_DIR)
+        home = _sudo_home()
+        v = v.replace("{state}", os.path.join(_sudo_xdg_state(home), CMD) if home else STATE_DIR)
     if "{machine}" in v:
         v = v.replace("{machine}", _linux_machine())
     return os.path.expanduser(v)
@@ -308,8 +338,10 @@ SAMPLE_KEYS = dict(
     [(k, "keep") for k in ("t", "iso", "hot", "gap", "stall", "os", "pressure", "free_pct", "ram_gb", "app_gb",
                            "wired_gb", "compressed_gb", "compressor_logical_gb", "cached_gb", "free_gb",
                            "swap_total_gb", "swap_used_gb", "swapfiles", "swapins", "swapouts", "disk_free_gb",
-                           "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident", "cpu", "gpu", "io")]
-    + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu", "top_io", "disks")]
+                           "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident", "cpu", "gpu", "io",
+                           "psi", "scope", "cgroup_kills", "killed")]  # the last four: Linux (03 §6.1), as 01 asked
+    + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu", "top_io", "disks",
+                             "linux")]
     + [("daemon", "full")])
 SLIM_STR = 64        # characters of a string in a slim sample
 AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
@@ -320,7 +352,10 @@ AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
 # the mirrors in use bound a disk's size apart (gb_ok does from 1.9.1), with the remote protocol's next step.
 SLIM_BLOCKS = {"cpu": (None, ("n", "p", "e", "busy", "user", "sys", "p_busy", "e_busy", "therm")),
                "io": (None, ("r_mb_s", "w_mb_s")),
-               "gpu": (4, ("id", "util", "active", "now", "src", "mem_gb", "mem_alloc_gb"))}
+               "gpu": (4, ("id", "util", "active", "now", "src", "mem_gb", "mem_alloc_gb")),
+               "psi": (None, ("mem_some", "mem_full", "mem_some60", "mem_full60", "cpu_some", "io_some", "io_full")),
+               "scope": (None, ("kind", "limit_gb", "by", "host_ram_gb", "host_avail_gb", "host_pressure")),
+               "killed": (3, ("name", "mb", "by"))}
 # ... and in the full current sample with what names and describes them
 FULL_BLOCKS = {"gpu": (4, SLIM_BLOCKS["gpu"][1] + ("name", "unified", "mem_limit_gb", "mem_limit_est"))}
 # The full current sample is rebuilt from these fields only, each list capped (CONTEXT §3.2).
@@ -1474,6 +1509,8 @@ def wrap(text, width=None, first="", indent=2):
 
 def cmd_status():
     p = os.path.join(LOG_DIR, "current.json")
+    if not os.path.exists(p) and sys.platform.startswith("linux"):
+        return cmd_status_live()
     if not os.path.exists(p):
         print("oomph: no data in %s — daemon not installed or not running" % LOG_DIR)
         return 1
@@ -1522,6 +1559,72 @@ def cmd_status():
         print("\nclaude sessions:")
         for s in c["claude"]:
             print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], cut_left(s.get("cwd"), w - 24)))
+    try:
+        leases = ledger_snapshot()
+    except LedgerError:
+        leases = []
+    if leases:
+        print("\nreservations (oomph reservations for details):")
+        for b in leases:
+            print("  " + _fmt_brief(b))
+    return 0
+
+
+def status_lines_linux(c):
+    """The lines of `oomph status` that differ on Linux (03 §3.3, F0, F3): available, stall time,
+    the memory classes in Linux words, swap on disk and in zram, the scope."""
+    lx = c.get("linux") if isinstance(c.get("linux"), dict) else {}
+    psi = c.get("psi") if isinstance(c.get("psi"), dict) else None
+    sc = c.get("scope") if isinstance(c.get("scope"), dict) else {}
+    out = [("pressure", "%s   available %s%%" % (PRESSURE.get(c["pressure"], c["pressure"]), c.get("free_pct")))]
+    if psi:
+        out.append(("stalled", "memory some %.1f%% full %.1f%%%s (10 s)" % (
+            psi.get("mem_some") or 0, psi.get("mem_full") or 0,
+            " · io some %.1f%%" % psi["io_some"] if _num(psi.get("io_some")) else "")))
+        lim = psi.get("limit") if isinstance(psi.get("limit"), dict) else None
+        if lim:
+            out.append(("", "%.0f%% more inside %s, at its own limit" % (
+                lim.get("some") or 0, ", ".join(str(x) for x in (lim.get("cgroups") or [])[:3]))))
+    else:
+        out.append(("stalled", "not measured: PSI is off on this kernel (see `oomph doctor`)"))
+    avail = free_physical_gb(c)
+    out.append(("memory", "RAM %.1f GB · available %.1f · app %.1f · kernel %.1f%s" % (
+        c["ram_gb"], avail, c["app_gb"], c["wired_gb"],
+        " · compressed %.1f" % c["compressed_gb"] if c.get("compressed_gb") else "")))
+    out.append(("", "of the available: file cache %.1f · unused %.1f GB" % (c["cached_gb"], c["free_gb"])))
+    zr = lx.get("zram_disk_gb") or 0
+    if c.get("swap_total_gb"):
+        sw = "%.1f / %.1f GB used on disk (%d swapfile%s)" % (c["swap_used_gb"], c["swap_total_gb"], c.get("swapfiles") or 0,
+                                                            "" if c.get("swapfiles") == 1 else "s")
+    else:
+        sw = "none on disk"
+    if zr and not sc:
+        held = (lx.get("kswap_total_gb") or 0) - (lx.get("kswap_free_gb") or 0) - (c.get("swap_used_gb") or 0)
+        sw += " · zram holds %.1f of %.1f GB in %.1f GB of RAM" % (max(0.0, held), zr, c.get("compressed_gb") or 0)
+    out.append(("swap", sw))
+    if sc.get("kind") == "cgroup":
+        out.append(("scope", "this cgroup's limit, %.1f GB (memory.%s); the host has %.1f GB available of %.0f GB" % (
+            sc.get("limit_gb") or 0, sc.get("by") or "max", sc.get("host_avail_gb") or 0, sc.get("host_ram_gb") or 0)))
+    if c.get("disk_free_gb") is not None:
+        out.append(("disk", "%.0f GB free on /" % c["disk_free_gb"]))
+    return out
+
+
+def cmd_status_live():
+    """`oomph status` without a logger (Linux, L1): a live reading under a one-line banner, exit 0
+    (03 F0)."""
+    c = live_sample()
+    w = max(80, term_width())
+    print("not logged: a live reading (no logger on this machine; see `oomph doctor`)")
+    for label, text in status_lines_linux(c):
+        print(wrap(text, w, "%-11s" % label, 11))
+    print("\ntop groups:")
+    for g in (c.get("groups") or [])[:8]:
+        print("  %6.1f GB  %s (%d)" % (g["mb"] / 1024, fit_group(g["name"], w - 19), g["n"]))
+    if c.get("claude"):
+        print("\nclaude sessions:")
+        for s in c["claude"]:
+            print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], cut_left(s.get("cwd") or "(not yours)", w - 24)))
     try:
         leases = ledger_snapshot()
     except LedgerError:
@@ -1652,7 +1755,7 @@ SKILL_URL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph
 LEVELS = ("ok", "tight", "critical")
 _oomphd = None
 _plat = None
-BACKENDS = {"darwin": "oomph_darwin"}  # sys.platform -> the module that measures it (Linux: 1.9.4)
+BACKENDS = {"darwin": "oomph_darwin", "linux": "oomph_linux"}  # sys.platform -> the module that measures it
 
 
 class Unsupported(Exception):
@@ -1667,7 +1770,7 @@ def plat():
     if _plat is None:
         name = BACKENDS.get(sys.platform)
         if name is None:
-            raise Unsupported("measuring %s is not supported yet: macOS only so far (Linux from 1.9.4)" % sys.platform)
+            raise Unsupported("measuring %s is not supported: macOS and Linux are" % sys.platform)
         if HERE not in sys.path:
             sys.path.insert(0, HERE)
         _plat = __import__(name)
@@ -1730,6 +1833,78 @@ ADVICE = {
                 "(see `oomph session`), then `oomph wait` until it recovers, and tell the user what you did. "
                 "If disk space is the problem, ask the user to free some — swap cannot grow on a full disk.",
 }
+ADVICE_LINUX = dict(ADVICE, critical=ADVICE["critical"].rsplit(" If disk space", 1)[0])  # Linux swap has a fixed size
+
+
+def _linux():
+    """oomph_linux, for its thresholds: pure functions of numbers, so a Linux sample is judged the
+    same on any system. Importing it measures nothing."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import oomph_linux
+    return oomph_linux
+
+
+def _linux_reasons(s, p):
+    """Why a Linux sample's pressure is what it is, in plain words (03 §5.4): stall time, and what is
+    available against the headroom bounds and swap. [(level 1|2, reason)]."""
+    if p < 2:
+        return []
+    L = _linux()
+    psi = s.get("psi") if isinstance(s.get("psi"), dict) else None
+    lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+    sc = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    ram = (s.get("ram_gb") or 0) - (0 if sc else (lx.get("hugetlb_gb") or 0))
+    avail = free_physical_gb(s)
+    upper, _lower = L.bounds(ram)
+    parts = []
+    if psi:
+        some, full = psi.get("mem_some") or 0, psi.get("mem_full") or 0
+        if full >= L.P["full_warn"]:
+            parts.append("every task waited for memory %.0f%% of the last 10 s" % full)
+        elif some >= L.P["some_warn"]:
+            parts.append("tasks waited for memory %.0f%% of the last 10 s" % some)
+    if avail < upper:
+        tot, used = s.get("swap_total_gb") or 0, s.get("swap_used_gb") or 0
+        zram = (lx.get("zram_disk_gb") or 0) > 0 and not sc
+        if zram:
+            kt, kf = lx.get("kswap_total_gb") or 0, lx.get("kswap_free_gb") or 0
+            parts.append("only %.1f GB is available and the compressed swap is %.0f%% full"
+                         % (avail, 100 * (kt - kf) / kt if kt else 0))
+        elif tot < L.P["swap_none"] * max(ram, 0.1):
+            parts.append("only %.1f GB is available and there is no swap" % avail)
+        else:
+            parts.append("only %.1f GB is available and swap is %.0f%% full" % (avail, 100.0 * used / tot))
+    hp = sc.get("host_pressure") if sc.get("kind") == "cgroup" else None
+    if isinstance(hp, int) and hp >= p and not parts:
+        parts.append("the host's memory is under pressure (%s), and it can kill a container within its limit"
+                     % PRESSURE.get(hp, hp))
+    where = " in this cgroup" if sc.get("kind") == "cgroup" else ""
+    return [(2 if p >= 4 else 1, "memory pressure%s is %s%s" % (where, "CRITICAL" if p >= 4 else "WARNING",
+                                                               ": " + "; ".join(parts) if parts else ""))]
+
+
+def margin_for(s):
+    """What the ledger keeps free on top of all reservations, by the sample's system: on a Mac
+    5 % of RAM, at least 1.5 GB; on Linux the upper headroom bound (03 §5.3, D14)."""
+    if s.get("os") == "linux":
+        lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+        m = lx.get("margin_gb")
+        return m if _num(m, 0, 1e6) else _linux().margin(s.get("ram_gb") or 0)
+    return margin_gb(s.get("ram_gb"))
+
+
+def oversize_for(s):
+    """The largest request granted while nothing else is: no bound on a Mac (its swap grows);
+    on Linux what RAM and swap can hold, less the lower bound (03 §5.3)."""
+    if s.get("os") != "linux":
+        return None
+    lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+    m = lx.get("oversize_gb")
+    if _num(m, 0, 1e6):
+        return m
+    room = lx.get("swap_room_gb") if _num(lx.get("swap_room_gb"), 0, 1e6) else lx.get("kswap_free_gb") or 0
+    return _linux().oversize_limit(free_physical_gb(s), room, s.get("ram_gb") or 0)
 
 
 def verdict(s):
@@ -1737,6 +1912,7 @@ def verdict(s):
     without `os` is a Mac's (every sample before 1.8.8). A full disk counts only on a Mac, where
     swap grows on the startup volume (roadmap 03 §5.4)."""
     mac = s.get("os", "macos") == "macos"
+    lin = s.get("os") == "linux"
     ram = s.get("ram_gb") or 0
     free = free_physical_gb(s)
     disk = s.get("disk_free_gb", 999)
@@ -1749,7 +1925,10 @@ def verdict(s):
         reasons.append(why)
 
     p = s.get("pressure", 1)
-    if p >= 4:
+    if lin:
+        for lv, why in _linux_reasons(s, p if isinstance(p, int) else 1):
+            bump(lv, why)
+    elif p >= 4:
         bump(2, "macOS memory pressure is CRITICAL")
     elif p >= 2:
         bump(1, "macOS memory pressure is WARNING")
@@ -1759,8 +1938,11 @@ def verdict(s):
         bump(1, "only %.0f GB disk free — swap may not be able to grow" % disk)
     if mac and swap_full and disk < 20:
         bump(2, "swap is full (%.1f/%.1f GB) and the disk is too full to add more" % (s["swap_used_gb"], s["swap_total_gb"]))
-    if ram and free < 0.05 * ram:
+    if ram and free < 0.05 * ram and not lin:  # on Linux the headroom bounds say it (03 §5.4)
         bump(1, "only %.1f GB physical memory free" % free)
+    lx = s.get("linux") if lin and isinstance(s.get("linux"), dict) else {}
+    if lx.get("overcommit") == 2 and _num(lx.get("commit_pct")) and lx["commit_pct"] >= 95:
+        bump(1, "strict overcommit is at %d%% of its limit: allocations are about to fail" % lx["commit_pct"])
     if s.get("jetsam_kills"):
         bump(1, "macOS just killed %d processes for memory" % s["jetsam_kills"])
     u = s.get("unowned_gb")
@@ -1768,30 +1950,53 @@ def verdict(s):
         bump(1, "%.0f GB of memory is held outside any process (likely a GPU or driver leak) "
                 "and won't come back until the Mac restarts" % u)
     lv = LEVELS[level]
-    return {
-        "level": lv, "exit_code": level, "reasons": reasons, "advice": ADVICE[lv],
+    v = {
+        "level": lv, "exit_code": level, "reasons": reasons, "advice": (ADVICE_LINUX if lin else ADVICE)[lv],
         "free_gb": free, "ram_gb": ram, "pressure": PRESSURE.get(p, p),
         "swap_used_gb": s.get("swap_used_gb"), "swap_total_gb": s.get("swap_total_gb"),
         "disk_free_gb": disk, "unowned_gb": s.get("unowned_gb"), "source": s.get("source", "daemon"), "at": s.get("iso"),
     }
+    if lin:  # Linux words: what is free is "available" there (03 §5.2); the stall time and the scope
+        v.update(os="linux", available_gb=free)
+        for k in ("psi", "scope"):
+            if isinstance(s.get(k), dict):
+                v[k] = s[k]
+        if not isinstance(s.get("psi"), dict) and p >= 2:
+            v["notes"] = ["stall time is not measured on this kernel (PSI is off), so the level cannot go past tight; "
+                          "`oomph doctor` says how to turn it on"]
+    return v
 
 
 def verdict_line(v, width=None, lines=()):
     """The verdict as `oomph check` and the hook print it, wrapped at `width` (the terminal's);
     `lines`: (label, text) of the other resources, which `check` prints before the advice."""
     w = width or term_width()
-    out = [wrap("oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
-        v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
-        v["swap_total_gb"] or 0, v["disk_free_gb"]), w)]
+    lin = v.get("os") == "linux"
+    if lin:  # 03 F5: "available", no disk (it does not enter the Linux verdict)
+        out = [wrap("oomph: %s — %.1fG available of %s · pressure %s · swap %.1f/%.1fG" % (
+            v["level"].upper(), v["free_gb"], ("%.0fG" if v["ram_gb"] >= 10 else "%.1fG") % v["ram_gb"], v["pressure"],
+            v["swap_used_gb"] or 0, v["swap_total_gb"] or 0), w)]
+    else:
+        out = [wrap("oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
+            v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
+            v["swap_total_gb"] or 0, v["disk_free_gb"]), w)]
+    sc = v.get("scope") or {}
+    if sc.get("kind") == "cgroup":
+        out.append(wrap("this cgroup's limit (%.1fG, memory.%s); the host has %.1fG available of %.0fG" % (
+            sc.get("limit_gb") or 0, sc.get("by") or "max", sc.get("host_avail_gb") or 0, sc.get("host_ram_gb") or 0),
+            w, "  scope: "))
     if v["reasons"]:
         out.append(wrap("; ".join(v["reasons"]), w, "  why: "))
     c = v.get("coordination") or {}
     if c.get("others") or c.get("mine"):
         g = [o for o in c["others"] if o["state"] == "granted"]
         q = [o for o in c["others"] if o["state"] == "queued"]
-        out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG available to you"
-                        % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"]),
-                        w, "  reservations: "))
+        out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG %s"
+                        % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"],
+                           "left for you" if lin else "available to you"), w, "  reservations: "))
+    led = c.get("ledger") or {}
+    if lin and led.get("kind") == "user":
+        out.append(wrap("your own sessions only (%s)" % _home_short(led.get("path") or ""), w, "  ledger: "))
     for label, text in lines:
         out.append(wrap(text, w, "  %-6s " % label, 9))
     for n in v.get("notes") or ():
@@ -1901,7 +2106,8 @@ def wait_for_memory(timeout_s=600, min_free_gb=0.0, quiet=False):
             return True, v, round(time.time() - start)
         if not quiet and (last is None or time.time() - last > 60):
             last = time.time()
-            print("oomph: waiting — %s, %.1fG free" % (v["level"], v["free_gb"]), flush=True)
+            print("oomph: waiting — %s, %.1fG %s" % (v["level"], v["free_gb"], "available" if v.get("os") == "linux" else "free"),
+                  flush=True)
         if time.time() - start >= timeout_s:
             return False, v, round(time.time() - start)
         time.sleep(5)
@@ -2096,6 +2302,8 @@ def resource_lines(s, pinned=frozenset(), hidden=frozenset(), io=False):
     out = []
     off = NOT_MEASURED if s.get("source") == "live" else NOT_READ if logger_measures(s) else NOT_LOGGED
     cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else None
+    if s.get("os") == "linux" and s.get("source") == "live":  # no CPU, GPU or disk sources on Linux yet (L2)
+        return out
     if cpu is None:
         out.append(("cpu", off))
     else:
@@ -2355,8 +2563,70 @@ _sample_override = None      # tests: a function returning the sample to decide 
 
 
 def margin_gb(ram):
-    """Memory kept free on top of all reservations."""
+    """Memory kept free on top of all reservations, on a Mac (margin_for: by the sample's system)."""
     return max(1.5, 0.05 * (ram or 0))
+
+
+def _home_short(p):
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if home not in ("", "/") and p.startswith(home + "/") else p
+
+
+def ledger_info():
+    """Which ledger this is, for people and agents (03 §3.5): `kind` shared (every account, or a
+    group, coordinates through it) or user (only this user's own sessions do: Linux without a
+    machine-wide ledger), its path and who shares it. By the folder's mode; lstat only."""
+    try:
+        st = os.lstat(LEDGER_DIR)
+        mode = st.st_mode if stat.S_ISDIR(st.st_mode) else None
+    except OSError:
+        mode = None
+    if mode is None:
+        mode = PATHS_HERE["ledger_mode"] if LEDGER_DIR == _path("ledger") else 0o700
+    if mode & 0o002:
+        kind, members = "shared", "every account on this Mac" if sys.platform == "darwin" else "everyone"
+    elif mode & 0o020:
+        import grp
+        try:
+            members = "group " + grp.getgrgid(st.st_gid).gr_name
+        except (KeyError, NameError):
+            members = "a group"
+        kind = "shared"
+    else:
+        kind, members = "user", "you"
+    return {"kind": kind, "path": LEDGER_DIR, "members": members}
+
+
+def _boot_id():
+    """This boot's id on Linux (a ledger written before the last boot holds no live lease, 03 §7.3);
+    None elsewhere."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        v = plat().boot_id()
+    except Exception:
+        return None
+    return v if isinstance(v, str) and _ID.fullmatch(v) else None
+
+
+def _boot_time():
+    try:
+        return time.time() - time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return None
+
+
+def _scope_id(s):
+    """The scope a request made from this sample belongs to: "host", or its cgroup (03 §7.3)."""
+    sc = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    return str(sc.get("id"))[:200] if sc.get("kind") == "cgroup" and sc.get("id") else "host"
+
+
+def _whoami():
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name[:64]
+    except KeyError:
+        return str(os.getuid())
 
 
 # ----- the shared directory (H0)
@@ -2401,9 +2671,43 @@ class LedgerBusy(LedgerError):
 
 
 def _not_root(what):
-    """The fence: whatever path leads here, a process running as root stops."""
-    if os.geteuid() == 0:
+    """The fence: whatever path leads here, a process running as root stops, unless the ledger is
+    root's own (_root_in_place)."""
+    if os.geteuid() == 0 and not _root_in_place():
         raise LedgerError("%s as root refused: root never opens the shared ledger directory" % what)
+
+
+def _root_in_place():
+    """True for root's own per-user ledger on Linux, which root then uses in place (03 §7.5: "euid
+    0, no shared ledger: root's own per-user ledger, mode 0700, in place"): a root agent in a
+    container, `su -`. Only without sudo (sudo's ledger is the user's, written by their child),
+    only at the default path (not one OOMPH_LEDGER_DIR names), and only when no one but root can
+    have put anything there: every folder from / down to the ledger, as far as it exists, is a
+    real folder owned by root that neither group nor others can write, and the ledger folder
+    itself is root's alone (0700 or less). Anything else goes through the child, as before."""
+    if not sys.platform.startswith("linux") or os.geteuid() != 0 or os.environ.get("OOMPH_LEDGER_DIR"):
+        return False
+    try:
+        if int(os.environ.get("SUDO_UID") or 0) > 0:
+            return False
+    except ValueError:
+        return False
+    if LEDGER_DIR != _path("ledger") or not os.path.isabs(LEDGER_DIR):
+        return False
+    p = "/"
+    for part in [x for x in os.path.normpath(LEDGER_DIR).split("/") if x] + [None]:
+        try:
+            st = os.lstat(p)
+        except FileNotFoundError:
+            return True  # the rest is created by root, 0700
+        except OSError:
+            return False
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != 0 or st.st_mode & 0o022:
+            return False
+        if part is None:
+            return not st.st_mode & 0o077
+        p = os.path.join(p, part)
+    return False
 
 
 def read_bounded(name, cap, dir_fd=None, tail=False, shared=False):
@@ -3293,11 +3597,14 @@ def _tree_gb(procs, children, root):
     return tot / (1024 ** 3)
 
 
-def _retire(L, r, outcome, now):
+def _retire(L, r, outcome, now, at=None):
     """Move a lease into the history, ending it when it really ended: an expired grant at its
-    expiry, a lapsed request when its owner stopped polling, anything else now."""
+    expiry, a lapsed request when its owner stopped polling, one of an earlier boot at the boot
+    (`at`), anything else now. A refused request keeps its arithmetic (`note`)."""
     end = now
-    if outcome == "expired" and r.get("expires"):
+    if at is not None:
+        end = min(now, at)
+    elif outcome == "expired" and r.get("expires"):
         end = min(now, r["expires"])
     elif outcome == "lapsed":
         end = min(now, r["seen"] + QUEUE_STALE_S)
@@ -3313,10 +3620,12 @@ def _retire(L, r, outcome, now):
     if r.get("agent"):
         h["agent"] = r["agent"]
     h.update(_record_vector(r))
+    note = {"note": r["note"][:400]} if outcome == "refused" and isinstance(r.get("note"), str) else {}
+    h.update(note)
     L["history"].append(h)
     L["history"] = L["history"][-HISTORY_KEEP:]
     try:
-        _append_history(L, [_record(r, "end", now, ended=end, outcome=outcome)], now)
+        _append_history(L, [_record(r, "end", now, ended=end, outcome=outcome, **note)], now)
     except OSError:
         pass  # the log is a record, not the ledger: never let it block coordination
 
@@ -3331,6 +3640,14 @@ def _evaluate(L, s, procs, now):
     after an update, or its own writer's next poll) grants it. A request of another scope (a
     cgroup, 03 §7.3) is granted only by a process in it, and does not hold the line here."""
     keep = []
+    bid = _boot_id()
+    if bid and L.get("boot") and L["boot"] != bid:  # written before the last boot: no holder is alive
+        bt = _boot_time()
+        for r in L["leases"]:
+            _retire(L, r, "holder_gone", now, at=bt)
+        L["leases"] = []
+    if bid:
+        L["boot"] = bid
     for r in L["leases"]:
         why = None
         if not r.get("agent"):  # made by a writer older than 1.9.2: its agent, from the holder (D11)
@@ -3367,22 +3684,34 @@ def _evaluate(L, s, procs, now):
             r["peak_gb"] = round(max(r.get("peak_gb", 0), share), 2)
 
     v = verdict(s)
-    ram = s.get("ram_gb") or 0
     free = free_physical_gb(s)
-    outstanding = sum(r["gb"] - r.get("used_gb", 0) for r in L["leases"] if r["state"] == "granted")
-    avail = free - outstanding - margin_gb(ram)
+    margin = margin_for(s)
+    mine = _scope_id(s)
+    granted = lambda: [x for x in L["leases"] if x["state"] == "granted"]
+    out_all = sum(r["gb"] - r.get("used_gb", 0) for r in granted())
+    # Inside a limited cgroup both walls count, each against its own reservations (03 §7.3): the
+    # cgroup's limit against the grants of the same scope, the host's memory against every grant.
+    outstanding = out_all if mine == "host" else sum(r["gb"] - r.get("used_gb", 0) for r in granted()
+                                                     if (r.get("scope") or "host") == mine)
+    avail = free - outstanding - margin
+    sc = s.get("scope") if mine != "host" else {}
+    if mine != "host" and _num(sc.get("host_avail_gb")) and _num(sc.get("host_margin_gb")):
+        avail = min(avail, sc["host_avail_gb"] - out_all - sc["host_margin_gb"])
+    big = oversize_for(s)
     for r in [x for x in L["leases"] if x["state"] == "queued"]:
         if v["level"] == "critical":
             break
-        if r.get("scope", "host") != "host":
+        if (r.get("scope") or "host") != mine:  # granted only by a process that can measure its scope
             continue
         if ledger_version(r) >= 2:
             break
-        alone = not any(x["state"] == "granted" for x in L["leases"])
-        if r["gb"] <= avail or (alone and v["level"] == "ok"):
+        alone = not granted()
+        if r["gb"] <= avail or (alone and v["level"] == "ok" and (big is None or r["gb"] <= big)):
             if r["gb"] > avail:
                 r["note"] = ("larger than the %.1f GB available now; granted because no other work is reserved — "
-                             "expect swapping" % max(0.0, avail))
+                             "expect swapping" % max(0.0, avail)) if big is None else (
+                            "leaves less than the %.1f GB %s keeps free here: expect tight, and swapping"
+                            % (margin, BRAND))
             r["state"], r["granted"] = "granted", round(now, 1)
             r["expires"] = round(now + r["ttl"], 1) if r.get("ttl") else None
             w = r.get("watch")
@@ -3393,9 +3722,18 @@ def _evaluate(L, s, procs, now):
                 r["baseline_gb"] = min(x.get("baseline_gb", 0) for x in same)
             avail -= r["gb"]
             outstanding += r["gb"]
+        elif alone and v["level"] == "ok":  # Linux: even alone it would not fit (03 §5.3, §7.3)
+            lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+            sw = lx.get("swap_room_gb") if _num(lx.get("swap_room_gb"), 0, 1e6) else lx.get("kswap_free_gb") or 0
+            floor = lx.get("floor_gb") if _num(lx.get("floor_gb"), 0, 1e6) else max(0.0, free + sw - big)
+            r["note"] = ("%.1f GB does not fit: %.1f GB is available, %s, and %.1f GB must stay free. Ask for at most "
+                         "%.1f GB." % (r["gb"], free, "swap can take %.1f GB more" % sw if sw >= 0.1 else
+                                       "there is no swap to spare", floor, big))
+            _retire(L, r, "refused", now)
+            L["leases"].remove(r)
         else:
             break
-    L["state"] = {"t": round(now, 1), "level": v["level"], "free_gb": free, "margin_gb": round(margin_gb(ram), 1),
+    L["state"] = {"t": round(now, 1), "level": v["level"], "free_gb": free, "margin_gb": round(margin, 1),
                   "reserved_gb": round(outstanding, 1), "available_gb": round(avail, 1)}
 
 
@@ -3419,10 +3757,34 @@ def _child_user():
     return "nobody", "nobody"
 
 
+def _ids(user, group):
+    """(uid, gid) of user:group, names resolved here: a group that has no such name (Debian and
+    Ubuntu call nobody's group nogroup) is the user's own primary group. Numbers pass through."""
+    pw = None
+    if not isinstance(user, int):
+        try:
+            pw = pwd.getpwnam(user)
+        except KeyError:
+            raise LedgerError("no user named %s on this system" % user)
+        user = pw.pw_uid
+    if not isinstance(group, int):
+        try:
+            group = grp.getgrnam(group).gr_gid
+        except KeyError:
+            try:
+                group = (pw or pwd.getpwuid(user)).pw_gid
+            except KeyError:
+                raise LedgerError("no group named %s on this system" % group)
+    return user, group
+
+
 def _drop_to(user, group):
     """subprocess arguments that run a child as user:group without root's other groups, when we
-    are root; none when we aren't (the child then simply is us)."""
-    return {"user": user, "group": group, "extra_groups": []} if os.geteuid() == 0 else {}
+    are root; none when we aren't (the child then simply is us). The ids are numeric (_ids)."""
+    if os.geteuid() != 0:
+        return {}
+    uid, gid = _ids(user, group)
+    return {"user": uid, "group": gid, "extra_groups": []}
 
 
 def run_bounded(cmd, data, cap, timeout, **kw):
@@ -3488,13 +3850,13 @@ def _unprivileged(inputs=False):
     the user who ran sudo, else as nobody: `oomph _ledger-call <name>` gets the arguments as
     JSON on stdin — with `inputs` also the sample and process table, which only root measures
     whole — and answers with JSON on stdout, at most LIMITS["child"] bytes, within
-    CHILD_TIMEOUT_S. Not root: a plain call."""
+    CHILD_TIMEOUT_S. Not root, or root's own ledger on Linux (_root_in_place): a plain call."""
     def wrap(fn):
         _LEDGER_CALLS[fn.__name__] = fn
 
         @functools.wraps(fn)
         def call(*args, **kw):
-            if os.geteuid() != 0:
+            if os.geteuid() != 0 or _root_in_place():
                 return fn(*args, **kw)
             return _call_as_user(fn.__name__, args, kw, inputs)
         return call
@@ -3519,6 +3881,10 @@ def _call_as_user(name, args, kw, inputs):
         s, procs, _ = _decide_inputs()
         d["s"], d["procs"] = s, list(procs.values())
     user, group = _child_user()
+    if user == "nobody" and sys.platform.startswith("linux") and not os.environ.get("OOMPH_LEDGER_DIR"):
+        raise LedgerError("root's own ledger %s is used only where nobody else can reach it: every folder "
+                          "above it root's and not writable by group or others, the folder itself 0700"
+                          % LEDGER_DIR)  # nobody could not open it in root's home anyway
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-call", name],
                                json.dumps(d, default=str).encode(), LIMITS["child"], CHILD_TIMEOUT_S,
                                **_drop_to(user, group))
@@ -3613,15 +3979,31 @@ def _status(L, rid, now):
     return out
 
 
+def _procs_around(pid):
+    """The process table as far as finding `pid`'s session needs: its ancestors where the backend
+    can read just those (Linux, 03 §4.4: a full scan costs ten times a Mac's), else all."""
+    P = plat()
+    return P.collect_procs(only={pid}) if getattr(P, "OS", "") == "linux" else P.collect_procs()
+
+
 def holder_for(pid=None, kind=None):
     """Who owns a reservation made from here: the Claude session we run in, else our parent process."""
     d = plat()
-    procs = d.collect_procs()
     start_pid = pid or os.getppid()
+    procs = _procs_around(start_pid)
     root = _session_root(procs, start_pid)
     hp = root or start_pid
     return {"pid": hp, "start": procs.get(hp, {}).get("start"), "kind": kind or ("session" if root else "process"),
             "project": d.proc_cwd(hp)}
+
+
+def _on_ram(s):
+    """Where a request is too big, for the refusal: "on a Mac with 16 GB RAM", "on a machine with
+    …", "in a cgroup limited to 2 GB"."""
+    ram = s.get("ram_gb") or 0
+    if s.get("os", "macos") == "macos":
+        return "on a Mac with %.0f GB RAM" % ram
+    return "on a machine with %.0f GB RAM" % ram if _scope_id(s) == "host" else "in a cgroup limited to %.0f GB" % ram
 
 
 @_unprivileged(inputs=True)
@@ -3636,8 +4018,7 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
             ram = s.get("ram_gb") or 0
             if gb <= 0 or (ram and gb > 0.9 * ram):
                 return {"status": "refused", "gb": gb,
-                        "advice": "Can't reserve %.1f GB on a Mac with %.0f GB RAM. Split the work or lower its "
-                                  "parallelism." % (gb, ram)}
+                        "advice": "Can't reserve %.1f GB %s. Split the work or lower its parallelism." % (gb, _on_ram(s))}
             L["seq"] += 1
             r = {"id": "r%d" % L["seq"], "state": "queued", "gb": round(gb, 2), "purpose": (purpose or "?")[:80],
                  "project": holder.get("project"), "holder": {k: holder.get(k) for k in ("pid", "start", "kind")},
@@ -3646,6 +4027,12 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                  "requested": round(now, 1), "seen": round(now, 1),
                  "segments": [{"t": round(now, 1), "gb": round(gb, 2)}]}
             r["key"] = _key(r)
+            r["user"] = _whoami()  # who asked (03 §6.5): shown once several accounts hold reservations
+            r["holder"]["uid"] = os.getuid()
+            if _own_ns():
+                r["holder"]["ns"] = _own_ns()
+            if _scope_id(s) != "host":
+                r["scope"] = _scope_id(s)
             k = holder.get("agent")  # `oomph run` inside a session: the session's (02 §3.8.2)
             k = k if isinstance(k, str) and _AGENT.fullmatch(k) else agent_key(holder.get("pid"), holder.get("start"))
             if k:
@@ -3707,8 +4094,8 @@ def amend(rid, gb=None, ttl_s=None, purpose=None):
         if gb is not None and round(gb, 2) != r["gb"]:
             gb = round(gb, 2)
             if gb <= 0 or (ram and gb > 0.9 * ram):
-                refused = ("Can't reserve %.1f GB on a Mac with %.0f GB RAM. Release the reservation instead "
-                           "(release_memory / `oomph release %s`) if the work is done." % (gb, ram, rid))
+                refused = ("Can't reserve %.1f GB %s. Release the reservation instead "
+                           "(release_memory / `oomph release %s`) if the work is done." % (gb, _on_ram(s), rid))
             elif gb > r["gb"] and r["state"] == "granted":
                 extra, st = gb - r["gb"], L["state"]
                 waiting = [x for x in L["leases"] if x["state"] == "queued"]
@@ -3782,7 +4169,7 @@ def coordination(mine=None, s=None):
         others_out = sum(r["gb"] - r.get("used_gb", 0) for r in others if r["state"] == "granted")
         return {
             "free_gb": st["free_gb"], "margin_gb": st["margin_gb"], "reserved_gb": st["reserved_gb"],
-            "available_gb": st["available_gb"],
+            "available_gb": st["available_gb"], "grantable_gb": st["available_gb"], "ledger": ledger_info(),
             "reserved_by_others_gb": round(others_out, 1),
             "available_to_me_gb": round(st["free_gb"] - others_out - st["margin_gb"], 1),
             "others": [_brief(r, now) for r in others], "mine": [_brief(r, now) for r in own],
@@ -4154,8 +4541,15 @@ def cmd_reservations(args):
     if "--json" in args:
         print(json.dumps(c))
         return 0
-    print(wrap("free %.1fG − reserved %.1fG − margin %.1fG = %.1fG available for new reservations" % (
-        c["free_gb"], c["reserved_gb"], c["margin_gb"], c["available_gb"])))
+    if sys.platform == "darwin":
+        print(wrap("free %.1fG − reserved %.1fG − margin %.1fG = %.1fG available for new reservations" % (
+            c["free_gb"], c["reserved_gb"], c["margin_gb"], c["available_gb"])))
+    else:  # 03 F6: "available" is the kernel's MemAvailable here; what can be reserved is "left to grant"
+        print(wrap("available %.1fG − reserved %.1fG − margin %.1fG = %.1fG left to grant" % (
+            c["free_gb"], c["reserved_gb"], c["margin_gb"], c["available_gb"])))
+        led = c["ledger"]
+        print(wrap("%s · %s" % (_home_short(led["path"]), "yours only" if led["kind"] == "user" else
+                                "shared by " + led["members"]), first="ledger: "))
     rows = [("me", b) for b in c["mine"]] + [("", b) for b in c["others"]]
     if rows:
         print("\nactive:")
@@ -4193,7 +4587,7 @@ def cmd_run(args):
     purpose = opts.get("--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
     wait_s = parse_dur(opts.get("--wait", "30m"))
     ses = holder_for()
-    me = {"pid": os.getpid(), "start": plat().collect_procs().get(os.getpid(), {}).get("start"),
+    me = {"pid": os.getpid(), "start": _procs_around(os.getpid()).get(os.getpid(), {}).get("start"),
           "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd(),
           "agent": agent_key(ses["pid"], ses["start"]) if ses["kind"] == "session" else None}
     last = [0.0]
@@ -4254,6 +4648,62 @@ def _quietly(fn, *a):
         return None
 
 
+def _hook_dir():
+    """Where the hook keeps what it last said, per session: a folder of this user's own, 0700, in
+    $XDG_RUNTIME_DIR (Linux), else in $TMPDIR (per user on a Mac), else in /tmp, named per user
+    there: never the shared /tmp itself, where anyone could plant a state that silences the
+    warnings. None when no such folder can be had (the hook then keeps no state)."""
+    uid = os.getuid()
+    x = os.environ.get("XDG_RUNTIME_DIR")
+    bases = [(x, CMD)] if x and os.path.isabs(x) else []
+    t = os.environ.get("TMPDIR")
+    bases += [(t if t and os.path.isabs(t) else "/tmp", "%s-%d" % (CMD, uid))]
+    for base, name in bases:
+        d = os.path.join(base, name)
+        try:
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        except OSError:
+            continue
+        try:
+            st = os.lstat(d)
+        except OSError:
+            continue
+        if stat.S_ISDIR(st.st_mode) and st.st_uid == uid and not st.st_mode & 0o077:
+            return d
+    return None
+
+
+def _hook_load(path):
+    """The hook's last state, if this user wrote it and its time is not in the future."""
+    try:
+        if os.lstat(path).st_uid != os.getuid():
+            return {}
+        prev = loads_untrusted(read_bounded(path, 4096)) or {}
+    except Exception:
+        return {}
+    if not isinstance(prev, dict) or not _num(prev.get("t"), 0, time.time() + 60):
+        return {}
+    return prev
+
+
+def _hook_save(path, level):
+    """The hook's state, by a new file renamed over the name: never written through a link
+    someone planted there (/tmp is everybody's)."""
+    tmp = "%s.%s.tmp" % (path, secrets.token_hex(6))
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"level": level, "t": time.time()}, f)
+        os.rename(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def cmd_hook(args):
     """PostToolUse hook. Silent (exit 0) when memory is ok. When tight/critical, prints a short
     warning to stderr and exits 2, which Claude Code shows to the model. Warns again only when
@@ -4262,19 +4712,20 @@ def cmd_hook(args):
         sys.stdin.read()  # the hook payload; not needed
     except Exception:
         pass
+    global _lock_wait
+    _lock_wait = 0.25  # after every Bash call: never wait on a held lock (03 §10)
     v = checked_verdict()
-    state = os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-hook-%d.json" % os.getppid())
-    try:
-        prev = json.load(open(state))
-    except Exception:
-        prev = {}
+    hd = _hook_dir()
+    state = os.path.join(hd, "oomph-hook-%d.json" % os.getppid()) if hd else None
+    prev = _hook_load(state) if state else {}
     if v["level"] == "ok":
-        if prev.get("level") not in (None, "ok"):
-            json.dump({"level": "ok", "t": time.time()}, open(state, "w"))
+        if state and prev.get("level") not in (None, "ok"):
+            _hook_save(state, "ok")
         return 0
-    if prev.get("level") == v["level"] and time.time() - prev.get("t", 0) < 600:
+    if prev.get("level") == v["level"] and time.time() - prev["t"] < 600:
         return 0
-    json.dump({"level": v["level"], "t": time.time()}, open(state, "w"))
+    if state:
+        _hook_save(state, v["level"])
     sys.stderr.write(verdict_line(v) + "\n")
     return 2
 
@@ -4438,6 +4889,20 @@ def _mcp_call(name, a):
     raise KeyError(name)
 
 
+def _here_words(x):
+    """MCP texts for the machine this runs on: "this Mac" on a Mac, "this machine" elsewhere."""
+    if sys.platform == "darwin":
+        return x
+    if isinstance(x, str):
+        return x.replace("this Mac's", "this machine's").replace("this Mac", "this machine").replace(
+            "on a Mac", "on this machine")
+    if isinstance(x, list):
+        return [_here_words(v) for v in x]
+    if isinstance(x, dict):
+        return {k: _here_words(v) for k, v in x.items()}
+    return x
+
+
 def cmd_mcp():
     """Minimal MCP server (JSON-RPC 2.0, newline-delimited over stdio)."""
     def send(msg):
@@ -4461,7 +4926,8 @@ def cmd_mcp():
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
                           "serverInfo": {"name": CMD, "title": BRAND, "version": VERSION},
-                          "instructions": BRAND + " reports this Mac's memory, swap and disk, and coordinates memory between "
+                          "instructions": BRAND + " reports %s memory, swap and disk, and coordinates memory between "
+                                          % ("this Mac's" if sys.platform == "darwin" else "this machine's") +
                                           "Claude sessions and other agents. Before memory-heavy work call "
                                           "reserve_memory with the work's estimated peak (reservation_history shows "
                                           "what similar work really needed); start only when granted. Shrink or "
@@ -4471,7 +4937,7 @@ def cmd_mcp():
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": MCP_TOOLS}
+                result = {"tools": _here_words(MCP_TOOLS)}
             elif method == "tools/call":
                 try:
                     data = _mcp_call(params.get("name"), params.get("arguments") or {})
@@ -4563,11 +5029,14 @@ def doctor():
     machine, P = None, None
     try:
         P = plat()
-        machine = P.machine(all_procs=root)
+        machine = P.machine(all_procs=root if mac else None)  # Linux: /proc is world-readable, unless hidepid
         sysm = P.system_memory()
-        add("memory", "ok", "%s · %.0f GB RAM" % ("vm_stat and sysctl" if mac else P.OS, sysm.get("ram_gb") or 0))
         procs = P.collect_procs()
-        add("processes", "ok", "%d visible, %d with a footprint" % (len(procs), sum(1 for p in procs.values() if p.get("fp"))))
+        if mac or P.OS != "linux":
+            add("memory", "ok", "%s · %.0f GB RAM" % ("vm_stat and sysctl" if mac else P.OS, sysm.get("ram_gb") or 0))
+            add("processes", "ok", "%d visible, %d with a footprint" % (len(procs), sum(1 for p in procs.values() if p.get("fp"))))
+        else:
+            _doctor_linux(add, machine, sysm, procs)
     except Unsupported as e:
         add("memory", "fail", str(e))
     except Exception as e:  # noqa: B902  a collector that breaks is a finding, not a crash
@@ -4588,10 +5057,13 @@ def doctor():
         add("logger", "warn", "installed but silent (last sample: %s)" % when,
             "%s; the reason is in %s/daemon.err" % (kick, LOG_DIR) if mac else kick)
     else:
-        add("logger", "note", "not installed: nothing is logged, every reading is live",
+        add("logger", "note", "not installed: nothing is logged, every reading is live%s" % (
+            "" if mac else "; history and incidents need the Linux logger, which comes in a later release"),
             "Activate in the menu-bar app, or sudo ./install.sh from a checkout" if mac else None)
 
     inst = _version_in(os.path.join(PATHS_HERE["libexec"], "oomph.py"))
+    if inst is None and not mac:  # linux/install.sh: the user's own copy
+        inst = _version_in(os.path.join(os.path.expanduser(PATHS_HERE["user_lib"]), "oomph.py"))
     run_v = d.get("version") if fresh else None
     if fresh and inst and run_v != inst:
         add("versions", "warn", "the logger runs %s, the installed copy is %s" % (run_v, inst), kick)
@@ -4627,10 +5099,49 @@ def doctor():
 
     worst = max([DOCTOR_LEVELS.index(x["level"]) for x in checks] + [0])
     code = 2 if worst == 3 else 1 if worst == 2 else 0
-    return {"version": VERSION, "machine": machine,
-            "ledger": {"kind": "shared" if mac else "user", "path": LEDGER_DIR,
-                       "members": "every account on this Mac" if mac else None},
-            "checks": checks, "exit": code}
+    return {"version": VERSION, "machine": machine, "ledger": ledger_info(), "checks": checks, "exit": code}
+
+
+def _doctor_linux(add, m, s, procs):
+    """doctor's lines for what a Linux machine offers (03 §3.2, F0, F2): memory and scope, PSI (off
+    by default on the RHEL 9 family: the level then stops at warning, D15), kills, processes,
+    groups, swap. A note is how this machine is; a warn is what can be fixed where one stands."""
+    ms = m.get("measures") or {}
+    sc = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    if sc.get("kind") == "cgroup":
+        add("memory", "ok", "limit %.1f GB (memory.%s) on a %.1f GB host: %s measures the cgroup" % (
+            sc.get("limit_gb") or 0, sc.get("by") or "max", sc.get("host_ram_gb") or 0, BRAND))
+    else:
+        add("memory", "ok", "/proc/meminfo with MemAvailable · %.1f GB RAM" % (s.get("ram_gb") or 0))
+    if ms.get("psi"):
+        add("pressure", "ok", "PSI at /proc/pressure/memory%s" % (", and of this cgroup" if sc else ""))
+    else:
+        add("pressure", "note", "PSI is off on this kernel: the level comes from what is available and from swap "
+                                "alone, and stops at warning (memory never reads critical here)",
+            "turn it on with psi=1 on the kernel command line and a restart; on the RHEL family: "
+            "sudo grubby --update-kernel=ALL --args=psi=1")
+    add("kills", "note", "not recorded: kernel OOM kills by name need the Linux logger (a later release)")
+    mine = sum(1 for p in procs.values() if p.get("uid") == os.getuid())
+    if ms.get("all_procs") is False:
+        add("processes", "note", "%d visible: /proc is mounted with hidepid, so only your own (%d) count" % (len(procs), mine))
+    else:
+        add("processes", "ok", "%d visible; names from command lines; working directories for your own %d" % (len(procs), mine))
+    cg = ms.get("cgroup")
+    add("groups", "ok" if cg == "v2" else "note", {"v2": "cgroup v2: units and containers become groups",
+                                                   "v1": "cgroup v1: grouped by program name"}.get(
+        cg, "no cgroups: grouped by program name"))
+    tot = s.get("swap_total_gb") or 0
+    lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+    z = ms.get("zswap")
+    add("swap", "ok", "%s · %s · zswap %s" % (
+        "%.1f GB on disk" % tot if tot else "none on disk",
+        "zram %.1f GB" % lx["zram_disk_gb"] if lx.get("zram_disk_gb") else "no zram",
+        {True: "on", False: "off"}.get(z, "not reported by this kernel")))
+    if sc.get("kind") == "cgroup":
+        add("scope", "note", "inside a cgroup limited to %.1f GB: every figure is about it, and its level is the worse of "
+                             "its own and the host's" % (sc.get("limit_gb") or 0))
+    else:
+        add("scope", "note", "not in a limited cgroup: %s measures the whole machine" % BRAND)
 
 
 IOREPORT_OFF = {"crashes": "the IOReport helper crashed four times since the Mac started and stays off until the next "
@@ -4758,12 +5269,26 @@ def _skill_source():
     return None
 
 
+def _registered_path():
+    """The command Claude Code is told to run (03 §10): the first of /usr/local/bin/oomph,
+    /usr/bin/oomph, `oomph` on the PATH (a user install's ~/.local/bin/oomph), each only when it is
+    this oomph, else this script itself. A link that stays put survives updates."""
+    import shutil
+    mine = os.path.realpath(__file__)
+    user_bin = os.path.expanduser(PATHS_HERE.get("user_bin") or "") or None
+    for c in ("/usr/local/bin/oomph", "/usr/bin/oomph", user_bin, shutil.which(CMD)):
+        if c and os.path.exists(c) and (c == "/usr/local/bin/oomph" and sys.platform == "darwin"
+                                        or os.path.realpath(c) == mine):
+            return c
+    return mine
+
+
 def cmd_setup_claude(args):
     import shutil
     home = os.path.expanduser("~")
     dest_dir = os.path.join(home, ".claude", "skills", CMD)
     settings = os.path.join(home, ".claude", "settings.json")
-    me = "/usr/local/bin/oomph" if os.path.exists("/usr/local/bin/oomph") else os.path.realpath(__file__)
+    me = _registered_path()
     claude = shutil.which("claude")
     hook_cmd = me + " hook"
 

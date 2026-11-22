@@ -33,8 +33,9 @@ jobs:
       - name: Lint scripts and plists
         run: |
           bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
+          sh -n linux/install.sh linux/uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/ledgercompat.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
@@ -162,7 +163,7 @@ jobs:
           grep -q "^VERSION = \"$version\"" "$APP/Contents/Resources/oomph.py" || { echo "::error::bundled CLI not stamped"; exit 1; }
 
           # Activate/Deactivate run these from the bundle.
-          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_ioreport.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py local.oomph.daemon.plist; do
+          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_linux.py oomph_ioreport.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py local.oomph.daemon.plist; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }
@@ -203,13 +204,19 @@ jobs:
         run: sudo tools/spike_role_account.sh "$GITHUB_STEP_SUMMARY"
 
   linux:
-    # The portable half on Linux: oomph and oomphd import without macOS's libraries, and the
-    # self-test runs everything that needs no Mac (the logger's bookkeeping, incidents, reports,
-    # the ledger and its hardening, the CLI, oomph top, the AI harness) on a stand-in backend
-    # (tools/fixtureplat.py). What needs macOS or a backend that measures Linux (1.9.4) is
-    # skipped and says so.
-    name: Portable half on Linux
-    runs-on: ubuntu-latest
+    # Linux for agents (1.9.4) on the supported systems (roadmap §10: Ubuntu 22.04+, Debian 12, the
+    # RHEL 9 family): oomph and oomphd import without macOS's libraries; the self-test runs the
+    # portable half on a stand-in for a Mac's backend (tools/fixtureplat.py) and then
+    # tools/linuxtest.py: the Linux backend on recorded machines, the CLI's exit codes on this
+    # system (the same table as on the Mac), the live backend (a child's 200 MB in its footprint),
+    # `oomph top --once`, setup-claude and linux/install.sh into a scratch home. On 24.04 it also
+    # runs in a 2 GB container, where oomph speaks about the container and two sessions take turns.
+    name: Linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
 
     steps:
       - uses: actions/checkout@v4
@@ -220,15 +227,82 @@ jobs:
         run: |
           uname -a
           python3 --version
+          cat /proc/pressure/memory || echo "no PSI"
+          cat /sys/fs/cgroup/cgroup.controllers || echo "no cgroup v2"
 
-      - name: Import without macOS
+      - name: Lint
         run: |
+          sh -n linux/install.sh linux/uninstall.sh
+          bash -n install.sh uninstall.sh
+          shellcheck -S error linux/install.sh linux/uninstall.sh
           python3 -I -m py_compile daemon/*.py tools/*.py
+
+      - name: Import without macOS, doctor
+        run: |
           python3 -I -B -c 'import sys; sys.path.insert(0, "daemon"); import oomph, oomphd, oomph_top, oomph_view, oomph_ai, oomph_upgrade, oomph_net, oomph_sync; assert "ctypes" not in sys.modules and "oomph_darwin" not in sys.modules; print("imported", oomph.VERSION, oomph.LOG_DIR, oomph.LEDGER_DIR)'
           set +e; python3 -I -B daemon/oomph.py doctor; rc=$?; set -e
-          echo "doctor exit $rc"; test "$rc" = 2   # nothing measures Linux yet: it says so, and exits 2
+          echo "doctor exit $rc"; test "$rc" = 0 || test "$rc" = 1   # it measures Linux now: 2 would be "cannot work here"
+          python3 -I -B daemon/oomph.py check || test $? -le 2
 
-      - name: Self-test, portable half
+      - name: Self-test
+        env:
+          OOMPH_LINUXTEST_STRICT: "1"   # a part that cannot run here fails instead of skipping
         run: |
           command -v tmux || { sudo apt-get update -q && sudo apt-get install -y -q tmux; }
           python3 -I -B tools/selftest.py
+
+      - name: A 2 GB container, two sessions taking turns, and root
+        # The CLI inside a container limited to 2 GB measures the container (cgroup scope), and the
+        # exit codes and the turns of tools/linuxtest.py hold there, as an unprivileged user; then
+        # as root without sudo (a root agent in a container): root's own ledger, in place.
+        if: matrix.os == 'ubuntu-24.04'
+        run: |
+          docker run --rm --memory 2g -e DEBIAN_FRONTEND=noninteractive -e TZ=Etc/UTC -e OOMPH_LINUXTEST_STRICT=1 \
+              -v "$PWD:/src:ro" ubuntu:24.04 sh -c '
+            set -e
+            apt-get update -q >/dev/null && apt-get install -y -q python3 procps >/dev/null
+            useradd -m tester
+            runuser -u tester -- env HOME=/home/tester OOMPH_LINUXTEST_STRICT=1 sh -c "cd /tmp && python3 -I -B /src/tools/linuxtest.py live linux"
+            cd /tmp && HOME=/root python3 -I -B /src/tools/linuxtest.py root'
+
+  linux-container:
+    # The same on Debian 12 and Rocky 9 user space (Python 3.11 and 3.9), in containers on an Ubuntu
+    # runner: the runner's kernel, no systemd; the self-test as an unprivileged user, then the
+    # root part (the job's own user is root: root's own ledger in place, install.sh as root).
+    name: Linux (${{ matrix.image }})
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      TZ: Etc/UTC
+      OOMPH_LINUXTEST_STRICT: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:12", "rockylinux:9"]
+
+    steps:
+      - name: Python, git, tmux
+        run: |
+          if command -v apt-get >/dev/null; then
+            apt-get update -q && apt-get install -y -q python3 git tmux procps util-linux ca-certificates
+          else
+            dnf install -y -q python3 git tmux procps-ng diffutils findutils util-linux shadow-utils
+          fi
+          python3 --version
+          useradd -m tester
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Self-test, as an unprivileged user
+        run: |
+          chown -R tester "$GITHUB_WORKSPACE"
+          runuser -u tester -- env HOME=/home/tester OOMPH_LINUXTEST_STRICT=1 sh -c "git config --global --add safe.directory '$GITHUB_WORKSPACE' && python3 -I -B tools/selftest.py"
+          set +e; runuser -u tester -- env HOME=/home/tester python3 -I -B daemon/oomph.py doctor; rc=$?; set -e
+          echo "doctor exit $rc"; test "$rc" = 0 || test "$rc" = 1
+
+      - name: As root, without sudo
+        run: |
+          HOME=$(getent passwd 0 | cut -d: -f6) python3 -I -B tools/linuxtest.py root

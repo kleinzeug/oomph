@@ -5,6 +5,7 @@
 # OOMPH_INSTALL_ROOT=<dir> removes what install.sh put below that directory (tests); as root,
 # only for a directory that root owns all the way up and nobody else can change.
 set -euo pipefail
+if [ "$(uname -s)" = Linux ]; then exec "$(dirname "$0")/linux/uninstall.sh" "$@"; fi
 root_only() {  # root_only DIR: DIR and every folder above it root's, not writable by others (sticky is fine)
   local d u m
   d=$(cd "$1" && pwd -P) || return 1

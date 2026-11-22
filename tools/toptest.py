@@ -22,6 +22,7 @@ import os
 import random
 import re
 import select
+import shlex
 import shutil
 import signal
 import struct
@@ -292,6 +293,9 @@ def tmux_oracle(frames):
              "80x24-cells.golden", "80x24-help.golden", "80x24-hostile.golden", "60x16-apps.golden")
     sock = "oomph-toptest-%d" % os.getpid()
     tmp = tempfile.mkdtemp(prefix="oomph-tmux-")
+    conf = os.path.join(tmp, "tmux.conf")
+    with open(conf, "w") as f:
+        f.write("set -g status off\n")  # no status line to take a row: the pane is the frame's size on every version
     bad = []
     try:
         for name in names:
@@ -303,8 +307,16 @@ def tmux_oracle(frames):
                 f.write(V.diff_ansi(None, fr, caps).encode())
             loc = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
             env = dict(os.environ, LANG=loc, LC_ALL=loc)
-            subprocess.run([tmux, "-L", sock, "-f", "/dev/null", "-u", "new-session", "-d", "-x", str(fr.w), "-y",
-                            str(fr.h), "cat %s; sleep 30" % path], env=env, timeout=20, check=True)
+            # the frame is painted only once the window has its size, which is not always what -x and -y
+            # asked for: on Rocky 9 the pane came out a row short (1.9.4's CI)
+            go = path + ".go"
+            subprocess.run([tmux, "-L", sock, "-f", conf, "-u", "new-session", "-d", "-x", str(fr.w), "-y",
+                            str(fr.h), "until [ -e %s ]; do sleep 0.05; done; cat %s; sleep 30"
+                            % (shlex.quote(go), shlex.quote(path))],
+                           env=env, timeout=20, check=True)
+            subprocess.run([tmux, "-L", sock, "resize-window", "-x", str(fr.w), "-y", str(fr.h)],
+                           capture_output=True, timeout=10, env=env)   # tmux 2.9+; older ones keep -x and -y
+            open(go, "w").close()
             shown = ""
             for _ in range(50):
                 time.sleep(0.1)
@@ -315,13 +327,16 @@ def tmux_oracle(frames):
             time.sleep(0.2)
             shown = subprocess.run([tmux, "-L", sock, "capture-pane", "-p"], capture_output=True, text=True,
                                    timeout=10, env=env).stdout
+            size = subprocess.run([tmux, "-L", sock, "display-message", "-p", "#{pane_width}x#{pane_height}"],
+                                  capture_output=True, text=True, timeout=10, env=env).stdout.strip()
             subprocess.run([tmux, "-L", sock, "kill-server"], capture_output=True, timeout=10)
             want = ["".join(V.paint(c, caps)[0] for c in row if c[0] != "").rstrip() for row in fr.c]
             got = [r.rstrip() for r in shown.rstrip("\n").split("\n")]
             got += [""] * (len(want) - len(got))
             diff = [(i, w, g) for i, (w, g) in enumerate(zip(want, got)) if w != g]
             if diff:
-                bad.append("%s row %d: want %r got %r" % (name, diff[0][0], diff[0][1][:60], diff[0][2][:60]))
+                bad.append("%s row %d: want %r got %r (tmux pane %s)" % (name, diff[0][0], diff[0][1][:60],
+                                                                        diff[0][2][:60], size))
     finally:
         subprocess.run([tmux, "-L", sock, "kill-server"], capture_output=True, timeout=10)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -861,7 +876,7 @@ def test_readonly_ssh(base):
     os.chmod(os.path.join(fake, "ssh"), 0o755)
     env, _, _ = fixture_env(base)
     env["PATH"] = fake + os.pathsep + env.get("PATH", "")
-    for rc_in, want_rc, want in ((122, 127, "1.9.4"), (121, 127, "build-app.sh"), (124, 127, "older than 1.9.0"),
+    for rc_in, want_rc, want in ((122, 127, "linux/install.sh"), (121, 127, "build-app.sh"), (124, 127, "older than 1.9.0"),
                                  (0, 0, None), (255, 255, None)):
         if os.path.exists(rec):
             os.unlink(rec)
@@ -902,6 +917,14 @@ def test_readonly_ssh(base):
                                  capture_output=True, timeout=20).returncode for s in shells}
         check(all(v == want for v in got.values()), "--ssh: on the far side %s %s (%s)" % (
             what, "exits %d (too old)" % want if want == 124 else "is started", got))
+    mine = os.path.join(base, ".local", "bin")        # linux/install.sh's: not on a non-interactive ssh's PATH
+    os.makedirs(mine, exist_ok=True)
+    shutil.copy(os.path.join(far, "oomph"), os.path.join(mine, "oomph"))
+    got = {s: subprocess.run([s, "-c", remote], env={"PATH": "/usr/bin:/bin", "HOME": base}, capture_output=True,
+                             timeout=20).returncode for s in shells}
+    check(all(v == 7 for v in got.values()), "--ssh: on the far side an oomph in ~/.local/bin (linux/install.sh) is "
+                                             "started (%s)" % got)
+    shutil.rmtree(os.path.join(base, ".local", "bin"))
     if os.path.exists(rec):
         os.unlink(rec)
     for args in (["--ssh", "-oProxyCommand=x"], ["--ssh", "x@-y"], ["--ssh", "build-box", "--once"]):

@@ -27,7 +27,7 @@ cp app/Info.plist "$APP/Contents/"
 /usr/bin/plutil -replace CFBundleVersion -string "${COMMIT:0:12}" "$APP/Contents/Info.plist"
 /usr/bin/plutil -replace OOMPHCommit -string "$COMMIT" "$APP/Contents/Info.plist"
 R="$APP/Contents/Resources"
-cp daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py \
+cp daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py \
    daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py daemon/local.oomph.daemon.plist install.sh uninstall.sh \
    "$R/"
 # one version for everything: the bundled CLI and daemon report what the app reports

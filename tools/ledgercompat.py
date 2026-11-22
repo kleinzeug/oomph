@@ -16,7 +16,8 @@ process next to this checkout's, on one ledger directory, in both directions:
      keeps the v2 fields but drops a lease without memory (gb 0) and the `res` of each segment when
      it writes; pinned, for B1. (CI clones have tags up to v1.8.4 only: A2 runs locally.)
   C  1.8.1's own files: this code reads them, makes a memory vector of an old lease without
-     writing one, and writes back what 1.8.1 writes plus `agent` (D11); 1.8.1 reads that back.
+     writing one, and writes back what 1.8.1 writes plus `agent` (D11) and, from 1.9.4 (L1), `user`
+     and the holder's uid (03 §6.5); 1.8.1 reads that back.
 
 Both programs measure nothing here: a fixed sample and process table stand in, so this runs on
 any system. Run: /usr/bin/python3 -I -B tools/ledgercompat.py
@@ -388,16 +389,17 @@ L1 = raw(d)
 ob = lease(L1, b["id"])
 check("res" not in ob and "v" not in ob and ob.get("agent") == {"key": new.agent_key(ME, START)}
       and "v" not in L1, "C this code writes no version 2 into a 1.8.1 ledger, only agent (D11)")
-old_keys = set(lease(L0, b["id"])) | {"agent"}
-check(set(lease(L1, c["id"])) <= old_keys, "C a lease this code makes has 1.8.1's fields and agent (%s)"
-      % sorted(set(lease(L1, c["id"])) - old_keys))
+old_keys = set(lease(L0, b["id"])) | {"agent", "user"}  # user: from 1.9.4 (roadmap §4.4: L1 writes it)
+nc = lease(L1, c["id"])
+check(set(nc) <= old_keys and nc.get("user") and set(nc["holder"]) <= set(lease(L0, b["id"])["holder"]) | {"uid", "ns"},
+      "C a lease this code makes has 1.8.1's fields, agent and user (%s)" % sorted(set(nc) - old_keys))
 new.amend(c["id"], gb=0.25)
 new.release(c["id"])
 recs = log(d)
-old_rec = set(next(x for x in recs if x["id"] == a["id"] and x["event"] == "end")) | {"agent"}
+old_rec = set(next(x for x in recs if x["id"] == a["id"] and x["event"] == "end")) | {"agent", "user"}
 new_recs = [x for x in recs if x["id"] == c["id"]]
 check(new_recs and all(set(x) <= old_rec | {"change", "expires"} for x in new_recs),
-      "C its records have 1.8.1's fields and agent")
+      "C its records have 1.8.1's fields, agent and user")
 oh = old.reservation_history(3600, 500)
 nh = new.reservation_history(3600, 500)
 og = {x["id"]: (x["outcome"], x["gb"], x.get("gb_changes")) for x in oh["reservations"]}

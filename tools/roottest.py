@@ -51,8 +51,8 @@ code, ledgers, victims = (os.path.join(base, x) for x in ("code", "ledgers", "vi
 for d in (code, ledgers, victims):
     os.mkdir(d)
     os.chmod(d, 0o755)
-for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_ioreport.py", "oomph_top.py", "oomph_view.py", "oomph_net.py",
-          "oomph_sync.py"):
+for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_linux.py", "oomph_ioreport.py", "oomph_top.py", "oomph_view.py",
+          "oomph_net.py", "oomph_sync.py"):
     shutil.copy(os.path.join(ROOT, "daemon", f), code)
     os.chmod(os.path.join(code, f), 0o644)
 os.environ["OOMPH_DIR"] = os.path.join(base, "logs")
@@ -207,6 +207,20 @@ with Watch():
         except oomph.LedgerError:
             refused.append(name)
 check(len(refused) == 3, "fence: read_ledger, read_history and Ledger refuse root (%s)" % refused)
+# root's own per-user ledger on Linux is the one place root works in place (03 §7.5): never a
+# shared, group-writable or env-given folder, and never on a Mac
+plat, envd = sys.platform, os.environ.pop("OOMPH_LEDGER_DIR")
+try:
+    inplace = [oomph._root_in_place()]
+    sys.platform = "linux"
+    inplace.append(oomph._root_in_place())          # the 0777 folder of case(), not the default path
+    os.environ["OOMPH_LEDGER_DIR"] = oomph.LEDGER_DIR
+    inplace.append(oomph._root_in_place())          # named by the environment
+finally:
+    sys.platform = plat
+    os.environ["OOMPH_LEDGER_DIR"] = envd
+check(inplace == [False, False, False], "fence: root never works in place on a Mac, nor in a shared or env-given "
+                                        "folder on Linux (%s)" % inplace)
 no_hits("fence")
 
 # 1. the plain path: root reserves through a child as the invoking user

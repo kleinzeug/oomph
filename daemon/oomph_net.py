@@ -775,14 +775,10 @@ def drop_root():
     directory."""
     if os.geteuid() != 0:
         return
-    import grp
-    import pwd
-    user, group = oomph._child_user()
-    uid = user if isinstance(user, int) else pwd.getpwnam(user).pw_uid
     try:
-        gid = group if isinstance(group, int) else grp.getgrnam(group).gr_gid
-    except KeyError:  # no group of that name (Debian calls it nogroup): the user's own
-        gid = pwd.getpwuid(uid).pw_gid
+        uid, gid = oomph._ids(*oomph._child_user())  # nobody's group may be named nogroup (Debian)
+    except oomph.LedgerError as e:
+        raise SystemExit("oomph: serve: could not give up root: %s" % e)
     os.setgroups([])
     os.setgid(gid)
     os.setuid(uid)

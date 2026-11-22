@@ -148,6 +148,28 @@ open ~/Applications/oomph.app
 `./build-app.sh /Applications` installs to `/Applications` instead. The app is
 ad-hoc signed; no Apple account is needed.
 
+### On Linux, for agents
+
+On Ubuntu 22.04 and newer, Debian 12 and the RHEL 9 family (Python 3.9+, cgroup v2),
+`oomph` gives agents the same commands, MCP tools, skill and exit codes as on a Mac:
+`check`, `reserve`, `run`, `mcp`, `hook`, `doctor` and `oomph top`. No root, nothing
+system-wide: it installs into your `~/.local`, every reading is live (there is no Linux
+logger yet, so no history or incidents), and the reservation ledger is your own, shared
+by your own sessions. Inside a container or a limited cgroup it speaks about that cgroup.
+
+```sh
+git clone https://github.com/kleinzeug/oomph.git
+oomph/linux/install.sh       # ~/.local/bin/oomph; the skill and MCP server if Claude Code is set up
+oomph doctor                 # what this machine offers; on RHEL 9 how to turn PSI on
+```
+
+`linux/install.sh` again updates it (after a `git pull`); `linux/uninstall.sh` removes it.
+In a container where the agent is root, run both as root: root gets its own `~/.local` and
+its own ledger, as any user does (under `sudo` they refuse: install as yourself).
+`sudo oomph run …` reserves in the ledger of the user who ran sudo; if your sessions set
+`XDG_STATE_HOME`, keep it for sudo (`sudo --preserve-env=XDG_STATE_HOME`), or it uses the
+default `~/.local/state` and does not meet them.
+
 ### Activating the logger
 
 The menu-bar app is only the viewer. The logging is done by a small daemon that runs as
@@ -484,6 +506,7 @@ local).
 daemon/oomphd.py                  the sampler daemon (root)
 daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon), the path table
 daemon/oomph_darwin.py            everything that measures a Mac (the backend the daemon and CLI call)
+daemon/oomph_linux.py             everything that measures a Linux machine, from /proc and /sys (no root)
 daemon/oomph_ioreport.py          the IOReport helper: the GPU's performance states, as nobody (never root)
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
@@ -494,8 +517,11 @@ app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Cha
 app/Info.plist
 build-app.sh                      builds oomph.app and bundles the daemon + scripts into it
 install.sh / uninstall.sh         install or remove the daemon (run as root)
+linux/install.sh, uninstall.sh    install or remove oomph for one Linux user, in ~/.local (no root)
 skills/oomph/SKILL.md             the Claude skill (raw link above)
 tools/selftest.py                 unprivileged end-to-end check of daemon + CLI (also run by CI)
+tools/linuxtest.py                Linux: the backend on recorded machines, the CLI's exit codes, the installer
+tools/linuxfixture.py             recorded Linux machines (/proc and /sys trees) for those tests
 tools/roottest.py                 the same for what only root can show (CI runs it with sudo)
 tools/brandlint.py                keeps the product's name (BRAND) apart from the command and paths
 tools/chartvectors.py             holds `oomph top`'s chart maths to the app's (tools/vectors/chart.json)

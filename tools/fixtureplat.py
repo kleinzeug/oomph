@@ -1,4 +1,4 @@
-"""A stand-in backend for the self-test, on a system that has no real one yet (Linux until 1.9.4).
+"""A stand-in for a Mac's backend, for the self-test where there is no Mac (CI's Linux jobs).
 
 It keeps the backend contract of daemon/oomph_darwin.py with made-up memory numbers (a calm
 16 GB machine) and the real process table from `ps`, so that the portable half of oomph (the

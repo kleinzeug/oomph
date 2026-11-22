@@ -28,9 +28,10 @@ sys.path.insert(0, os.path.join(ROOT, "daemon"))
 import oomph  # noqa: E402
 import oomphd  # noqa: E402
 
-# On a Mac everything runs. Elsewhere (CI's Linux job) there is no backend yet: the portable half
-# runs on a stand-in for one (tools/fixtureplat.py), and what needs a Mac's tools or a measuring
-# child process is skipped. OOMPH_SELFTEST_PORTABLE=1 tries that run on a Mac.
+# On a Mac everything runs. Elsewhere (CI's Linux jobs) the portable half runs on a stand-in for a
+# Mac's backend (tools/fixtureplat.py), so that its checks keep their macOS meaning, and what needs a
+# Mac's tools or a measuring child process is skipped; the Linux backend and the CLI on it are
+# tools/linuxtest.py's, which runs at the end. OOMPH_SELFTEST_PORTABLE=1 tries that run on a Mac.
 MAC = sys.platform == "darwin" and os.environ.get("OOMPH_SELFTEST_PORTABLE") != "1"
 if not MAC:
     sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -55,7 +56,9 @@ a = P.away_state()
 check("idle_s" in a, "away_state: idle %ss, display_on=%s" % (a["idle_s"], a["display_on"]))
 procs = P.collect_procs()
 top, groups, sessions = oomphd.summarize_procs(procs)
-check(len(procs) > 10 and top and top[0]["mb"] > 0, "collect_procs: %d processes, biggest %s (%d MB)"
+# a Mac runs hundreds; a container (CI's Debian and Rocky jobs, as an unprivileged user) only a handful
+check(len(procs) > (10 if MAC else 2) and os.getpid() in procs and top and top[0]["mb"] > 0,
+      "collect_procs: %d processes, biggest %s (%d MB)"
       % (len(procs), top[0]["name"] if top else "?", top[0]["mb"] if top else 0))
 
 # --- daemon: sample, synthetic storm, incident lifecycle
@@ -1162,23 +1165,28 @@ sys.platform = "linux"   # what imports on a Linux box, here
 sys.path.insert(0, sys.argv[1])
 import oomph, oomphd
 try:
-    oomph.plat()
+    backend = oomph.plat().__name__
     unsupported = None
 except oomph.Unsupported as e:
-    unsupported = str(e)
+    backend, unsupported = None, str(e)
 rc = oomph.main(["check"])
 print(json.dumps({"native": [m for m in ("ctypes", "oomph_darwin") if m in sys.modules], "unsupported": unsupported,
+                  "backend": backend,
                   "rc": rc, "log": oomph.LOG_DIR, "ledger": oomph.LEDGER_DIR, "state": oomph.STATE_DIR,
                   "config": oomph.CONFIG_FILE, "mode": oomph.PATHS_HERE["ledger_mode"]}))
 """
 xdg = tempfile.mkdtemp(prefix="oomph-xdg-")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import linuxfixture  # noqa: E402
+linuxfixture.build(os.path.join(xdg, "root"), "ubuntu-server-idle")
 clean = {k: v for k, v in os.environ.items() if not k.startswith("OOMPH_")}
 r = subprocess.run([sys.executable, "-I", "-B", "-c", probe, os.path.join(ROOT, "daemon")], capture_output=True, text=True,
-                   env=dict(clean, XDG_STATE_HOME=xdg), timeout=60)
+                   env=dict(clean, XDG_STATE_HOME=xdg, OOMPH_SYSROOT=os.path.join(xdg, "root")), timeout=60)
 lx_ = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else {}
-check(lx_.get("native") == [] and lx_.get("unsupported") and lx_.get("rc") == 1 and "not supported" in r.stderr,
-      "on Linux: oomph and oomphd import without native code; measuring says it is not supported yet (%s)"
-      % (lx_.get("unsupported") or r.stderr.strip()[-200:]))
+check(lx_.get("native") == [] and lx_.get("backend") == "oomph_linux" and lx_.get("rc") == 0 and
+      "14.4G available of 16G" in r.stdout,
+      "on Linux: oomph and oomphd import without native code; oomph_linux measures (a recorded Ubuntu here): %s"
+      % ((r.stdout.strip().splitlines() or [""])[0][:80] or r.stderr.strip()[-200:]))
 check(lx_.get("log") == "/var/log/oomph" and lx_.get("state") == os.path.join(xdg, "oomph") and
       re.fullmatch(re.escape(os.path.join(xdg, "oomph", "ledger")) + r"/(m-[0-9a-f]{16}|local)", lx_.get("ledger", "")) and
       lx_.get("config") == "/etc/oomph/config.json" and lx_.get("mode") == 0o700,
@@ -1379,8 +1387,9 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
         """An app bundle's Resources folder, stamped with `version`."""
         d = os.path.join(inst, name)
         os.makedirs(os.path.join(d, "skills", "oomph"))
-        for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_ioreport.py", "oomph_ai.py", "oomph_upgrade.py",
-                  "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py", "local.oomph.daemon.plist"):
+        for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_linux.py", "oomph_ioreport.py", "oomph_ai.py",
+                  "oomph_upgrade.py", "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py",
+                  "local.oomph.daemon.plist"):
             shutil.copy(os.path.join(ROOT, "daemon", f), d)
         for f in ("install.sh", "uninstall.sh"):
             shutil.copy(os.path.join(ROOT, f), d)
@@ -2307,6 +2316,17 @@ for line in r.stdout.splitlines():
         print("      net: " + line)
 check(r.returncode == 0, "the protocol core (tools/nettest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                       + r.stderr[-400:]))
+
+# Linux for agents (1.9.4): the Linux backend on recorded machines, here too; the exit codes of the CLI on this
+# system (the same table on a Mac and on Linux); on Linux the live backend and linux/install.sh (tools/linuxtest.py)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "linuxtest.py")], capture_output=True, text=True,
+                   timeout=900, env={k: v for k, v in os.environ.items()
+                                     if not k.startswith("OOMPH_") or k == "OOMPH_LINUXTEST_STRICT"})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ", "skip  ", "info  ")):
+        print("    linux: " + line)
+check(r.returncode == 0, "Linux for agents (tools/linuxtest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                       + r.stderr[-400:]))
 
 print("\n%s — logs in %s" % ("FAILED (%d)" % len(failures) if failures else "all checks passed", LOG))
 sys.exit(1 if failures else 0)

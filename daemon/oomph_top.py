@@ -183,7 +183,8 @@ def readings(s):
     a = s.get("away") if isinstance(s.get("away"), dict) else {}
     ram, app, wired, comp = (_num(s.get(k)) for k in ("ram_gb", "app_gb", "wired_gb", "compressed_gb"))
     return dict(app=app, comp=comp, wired=wired, swap=_num(s.get("swap_used_gb")), swap_total=_num(s.get("swap_total_gb")),
-                ram=ram, disk=_num(s.get("disk_free_gb")), idle=int(_num(a.get("idle_s"), 0)),
+                ram=ram, disk=_num(s.get("disk_free_gb")),
+                idle=None if _num(a.get("idle_s"), None) is None else int(a["idle_s"]),  # None: not known (Linux)
                 display_on=a.get("display_on") if isinstance(a.get("display_on"), bool) else None,
                 pressure=pressure, free=max(0.0, ram - app - wired - comp),
                 unowned=s.get("unowned_gb") if isinstance(s.get("unowned_gb"), (int, float)) else None,
@@ -579,6 +580,8 @@ def install_hint():
     here = os.path.dirname(os.path.realpath(oomph.__file__))
     if "/Contents/Resources" in here:
         return "Logging is off: click Activate in the app"
+    if sys.platform.startswith("linux"):  # no logger on Linux yet (1.9.4): the readings of this run only.
+        return "Logging is off: live readings only"  # short: at 80 columns a longer status would give way to the keys
     for cand in (os.path.join(here, "install.sh"), os.path.join(os.path.dirname(here), "install.sh")):
         if os.path.isfile(cand):
             home = os.path.expanduser("~")
@@ -1758,8 +1761,10 @@ def ssh_command(target, port, remote_args):
     a, c = " ".join(remote_args), oomph.CMD
     remote = ("exec /bin/sh -c 'if command -v %s >/dev/null 2>&1; then o=%s; "
               "elif [ -x /usr/local/bin/%s ]; then o=/usr/local/bin/%s; "
+              "elif [ -x \"$HOME/.local/bin/%s\" ]; then o=\"$HOME/.local/bin/%s\"; "
               "else case $(uname -s) in Darwin) exit 121;; Linux) exit 122;; esac; exit 123; fi; "
-              "case $($o top --help 2>/dev/null) in *--ssh*) exec $o top %s;; esac; exit %d'" % (c, c, c, c, a, TOO_OLD))
+              "case $(\"$o\" top --help 2>/dev/null) in *--ssh*) exec \"$o\" top %s;; esac; exit %d'"
+              % (c, c, c, c, c, c, a, TOO_OLD))
     return (["ssh", "-t", "-o", "RequestTTY=force", "-o", "RemoteCommand=none", "-o", "ClearAllForwardings=yes",
              "-o", "ForwardAgent=no", "-o", "ControlMaster=no", "-o", "ControlPath=none",
              "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"] + (["-p", str(port)] if port else []) +
@@ -1786,8 +1791,8 @@ def not_installed_text(target, rc):
         return head + ("\nInstall it there: git clone %s && cd %s && ./build-app.sh, then Activate in the app "
                        "(or sudo ./install.sh)." % (repo, oomph.CMD))
     if system == "Linux":
-        return head + ("\n%s for Linux comes with %s 1.9.4 (git clone %s, then linux/install.sh); this version "
-                       "runs on macOS only." % (oomph.BRAND, oomph.BRAND, repo))
+        return head + ("\nInstall it there: git clone %s && %s/linux/install.sh (no root; it puts %s in "
+                       "~/.local/bin)." % (repo, oomph.CMD, oomph.CMD))
     return head + "\n%s does not run on that system yet." % oomph.BRAND
 
 
