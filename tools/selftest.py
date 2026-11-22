@@ -8,6 +8,9 @@ CLI command against the result. Run: /usr/bin/python3 -I tools/selftest.py
 import io
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -44,7 +47,7 @@ check(len(procs) > 10 and top and top[0]["mb"] > 0, "collect_procs: %d processes
 
 # --- daemon: sample, synthetic storm, incident lifecycle
 d = oomphd.Daemon()
-d.notify = lambda title, msg: d.event("notified", title=title, msg=msg)
+d.notify = lambda title, msg, **kw: d.event("notified", title=title, msg=msg, **kw)
 d.evaluate(d.sample())
 for i in range(12):
     d.handle_log({"eventMessage": "[gui/501/com.apple.example [%d]:] exited with exit reason "
@@ -102,7 +105,7 @@ check(isinstance(st.get("unowned_gb"), float) and st["unowned_gb"] < oomph.unown
       % (st.get("unowned_gb") or -1, st.get("procs_gb") or -1, oomph.unowned_limit_gb(st["ram_gb"])))
 evs = []
 d2.event = lambda kind, **kw: evs.append(dict(kw, kind=kind))
-d2.notify = lambda *a: None
+d2.notify = lambda *a, **kw: None
 d2.open_incident = lambda t, reasons: setattr(d2, "incident", {"id": "x", "reasons": list(reasons), "last_trigger": t})
 base = dict(st, pressure=1, unowned_gb=2.0, swap_used_gb=0.0, disk_free_gb=60.0)
 t0 = time.time()
@@ -126,6 +129,132 @@ col = oomph.collapse_pressure_events(old + [{"t": t0 + 999, "iso": "x", "kind": 
 check([e["kind"] for e in col] == ["pressure_flapping", "sleep_gap"] and col[0]["flips"] == 6,
       "report: logged flips collapse into one row")
 
+# --- incidents: headlined by the most severe reason, a kill announced once, the 2-hour limit
+d3 = oomphd.Daemon()
+notes = []
+d3.notify = lambda title, msg, **kw: notes.append(dict(kw, msg=msg))
+t3 = time.time() + 7 * 86400  # ids of their own, after every other incident of this test
+d3.evaluate(dict(base, t=t3, pressure=4))
+id3 = (d3.incident or {}).get("id")
+kill = {"kind": "jetsam_report", "t": t3 + 5, "msg": "Processes killed by jetsam, reason low-swap"}
+d3.pending_triggers.append(kill)
+d3.evaluate(dict(base, t=t3 + 5, pressure=4))
+d3.pending_triggers += [dict(kill, t=t3 + 10), {"kind": "dialog", "t": t3 + 10, "msg": "Your system has run out of "
+                        "application memory"}, {"kind": "jetsam_storm", "t": t3 + 10, "msg": "storm"}]
+d3.evaluate(dict(base, t=t3 + 10, pressure=4))
+inc3 = d3.incident or {}
+disk3 = json.load(open(os.path.join(LOG, "incidents", str(id3), "incident.json")))
+check(inc3.get("id") == id3 and [r["kind"] for r in disk3["reasons"]] == ["jetsam_report", "dialog", "jetsam_storm", "pressure"]
+      and disk3.get("opened_by") == "pressure", "a kill after pressure headlines the incident; id and opened_by stay (%s)"
+      % [r["kind"] for r in disk3.get("reasons", [])])
+check(len(notes) == 2 and notes[1].get("event") == "kill" and kill["msg"] in notes[1]["msg"],
+      "a kill after pressure is notified once, past the cool-down (%s)" % [n.get("event") for n in notes])
+inc3["start"] -= oomphd.INCIDENT_MAX_S
+d3.evaluate(dict(base, t=t3 + 15, pressure=4))
+old3 = json.load(open(os.path.join(LOG, "incidents", str(id3), "incident.json")))
+new3 = d3.incident or {}
+check(old3.get("rolled") and not old3.get("open") and os.path.exists(os.path.join(LOG, "incidents", str(id3), "report.html"))
+      and new3.get("continues") == id3 and new3.get("id") != id3 and len(notes) == 2,
+      "an incident is closed at 2 hours and continued in a new one without a notification")
+new3["last_trigger"] -= oomphd.INCIDENT_CLOSE_AFTER + 60
+d3.evaluate(dict(base, t=t3 + 20, pressure=1))
+check(d3.incident is None, "the continued incident closes when its triggers clear")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    oomph.main(["incidents"])
+check(any(str(id3) in ln and kill["msg"] in ln for ln in buf.getvalue().splitlines()),
+      "oomph incidents shows the kill as the headline")
+
+
+def incident_at(dm, t, **kw):
+    """An open incident as run() resumes it, its folder made."""
+    dm.incident = dict({"id": "%s-%d" % (dm.__class__.__name__, t), "start": t, "start_iso": "", "last_trigger": t,
+                        "open": True, "reasons": [{"kind": "pressure", "t": t, "desc": "x"}]}, **kw)
+    os.makedirs(os.path.join(LOG, "incidents", dm.incident["id"]), exist_ok=True)
+    return dm.incident["id"]
+
+
+d4, notes = oomphd.Daemon(), []
+d4.notify = lambda title, msg, **kw: notes.append(dict(kw, msg=msg))
+t4 = t3 + 86400
+id4 = incident_at(d4, t4 - 5 * 3600, last_trigger=t4 - 4.9 * 3600)
+d4.pending_triggers.append(dict(kill, t=t4))
+d4.evaluate(dict(base, t=t4, pressure=1))
+old4 = json.load(open(os.path.join(LOG, "incidents", id4, "incident.json")))
+new4 = d4.incident or {}
+check(not old4.get("open") and not old4.get("rolled") and new4.get("opened_by") == "jetsam_report"
+      and "continues" not in new4 and d4.rolled is None and len(notes) == 1,
+      "a kill after a sleep or restart opens a new incident and is notified (%d notes)" % len(notes))
+
+d5, notes = oomphd.Daemon(), []
+d5.notify = lambda title, msg, **kw: notes.append(dict(kw, msg=msg))
+t5 = t4 + 86400
+d5.evaluate(dict(base, t=t5, pressure=4))
+d5.incident["start"] -= oomphd.INCIDENT_MAX_S
+d5.evaluate(dict(base, t=t5 + 5, pressure=1))
+rolled5 = d5.incident is None and d5.rolled is not None
+d5.pending_triggers.append(dict(kill, t=t5 + 10))
+d5.evaluate(dict(base, t=t5 + 10, pressure=1))
+new5 = d5.incident or {}
+check(rolled5 and new5.get("continues") and len(notes) == 2 and notes[1].get("event") == "kill",
+      "a kill just after a roll-over opens the continuation and is notified once (%s)" % [n.get("event") for n in notes])
+new5["start"] -= oomphd.INCIDENT_MAX_S
+d5.evaluate(dict(base, t=t5 + 15, pressure=4))
+d5.pending_triggers.append(dict(kill, t=t5 + 20))
+d5.evaluate(dict(base, t=t5 + 20, pressure=4))
+check((d5.incident or {}).get("continues") == new5.get("id") and (d5.incident or {}).get("escalated")
+      and len(notes) == 2, "a kill joining the continuation of an announced kill stays silent (%d notes)" % len(notes))
+
+# --- summaries and reports stream: a day of samples, then a 2-hour incident closed by the logger
+day_dir = tempfile.mkdtemp(prefix="oomph-selftest-day-")
+t_end = (int(time.time()) // 86400 - 3) * 86400 + 0.5  # three days ago, its own files
+tmpl = dict(base, top=[{"pid": 100 + i, "name": "proc%d" % i, "mb": 500 + 40 * i, "ppid": 1, "uid": 501, "g": "app%d" % (i % 15)}
+                       for i in range(25)], groups=[{"name": "app%d" % i, "mb": 900 + 70 * i, "n": 3} for i in range(15)])
+files = {}
+times = [t_end - 86400 + 30 * i for i in range(2880 - 240)] + [t_end - 7200 + 5 * i for i in range(1441)]
+for i, t in enumerate(times):
+    smp = dict(tmpl, t=t, iso=oomphd.now_iso(t), pressure=4 if t >= t_end - 7200 else 1, jetsam_kills=int(i % 97 == 0),
+               swap_used_gb=(i % 300) / 100.0, top=[dict(p, pid=p["pid"] + 1000 * (i // 400), mb=p["mb"] + i % 211)
+                                                    for p in tmpl["top"]])
+    day = oomphd.datetime.date.fromtimestamp(t).isoformat()
+    files.setdefault(day, []).append(json.dumps(smp))
+for day, lines in files.items():
+    open(os.path.join(day_dir, "samples-%s.jsonl" % day), "w").write("\n".join(lines) + "\n")
+probe = r"""
+import json, os, resource, sys
+sys.path.insert(0, sys.argv[1])
+import oomphd
+t = float(sys.argv[2])
+d = oomphd.Daemon()
+d.incident = {"id": "day", "start": t - 7200, "start_iso": "", "last_trigger": t - 180, "open": True,
+              "reasons": [{"kind": "pressure", "t": t - 7200, "desc": "x"}]}
+os.makedirs(os.path.join(oomphd.LOG_DIR, "incidents", "day"), exist_ok=True)
+d.close_incident(t)
+inc = json.load(open(os.path.join(oomphd.LOG_DIR, "incidents", "day", "incident.json")))
+print(json.dumps({"rss_mb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576.0,
+                  "samples": inc.get("summary", {}).get("samples"),
+                  "report": os.path.getsize(os.path.join(oomphd.LOG_DIR, "incidents", "day", "report.html"))}))
+"""
+r = subprocess.run([sys.executable, "-I", "-B", "-c", probe, os.path.join(ROOT, "daemon"), str(t_end)],
+                   env=dict(os.environ, OOMPH_DIR=day_dir), capture_output=True, text=True, timeout=300)
+pr = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 and r.stdout.strip() else {}
+check(pr.get("samples") == 1441 + 30 and pr.get("report", 0) > 100000 and pr.get("rss_mb", 999) < 96,
+      "closing a 2-hour incident on a full day's log stays under 96 MB (%.0f MB, %s samples)%s"
+      % (pr.get("rss_mb", -1), pr.get("samples"), "" if pr else ": " + r.stderr.strip()[-300:]))
+saved_dir = oomph.LOG_DIR
+oomph.LOG_DIR = day_dir
+w = (t_end - 7200, t_end)
+check(oomph.summarize(oomph.iter_samples(*w), []) == oomph.summarize(oomph.load_samples(*w), []),
+      "a summary streamed from the files equals the one from the loaded list")
+sub = oomph.load_samples(t_end - 4 * 3600, t_end)
+views = oomph.report_views(t_end - 4 * 3600, t_end)
+strip = lambda h: re.sub(r"generated [^<]* by|\bnd\d+", "", h)  # noqa: E731
+check(strip(oomph.render_html(sub, [], "r", None, views)) ==
+      strip(oomph.render_html(oomph.SampleWindow(t_end - 4 * 3600, t_end), [], "r", None, views)),
+      "a report from the files read twice equals the one from the loaded list (%d samples)" % len(sub))
+oomph.LOG_DIR = saved_dir
+shutil.rmtree(day_dir, ignore_errors=True)
+
 # --- CLI against the generated data
 for args in (["status"], ["report", "--last", "10m"], ["incidents"], ["incident", "latest"],
              ["html", "--last", "1h", "-o", os.path.join(LOG, "adhoc.html")]):
@@ -137,7 +266,6 @@ html = open(os.path.join(LOG, "adhoc.html")).read()
 check(html.count("<svg") >= 3, "HTML report contains its charts")
 check("by %s %s</p>" % (oomph.BRAND, oomph.VERSION) in html and "id=oomph-data" in html,
       "HTML report: the footer names BRAND, the data element keeps its id")
-import re  # noqa: E402
 blob = re.search(r'<script type="application/json" id=oomph-data>(.*?)</script>', html, re.S)
 rd = json.loads(blob.group(1).replace("<\\/", "</")) if blob else {}
 vw = rd.get("views") or {}
@@ -165,7 +293,6 @@ check(oomph.verdict(dict(fixed, swap_used_gb=7.5, swap_total_gb=8.0, disk_free_g
 ses = oomph.find_session()
 check(ses is None or ses["total_mb"] >= 0, "oomph session: %s" % ("not under Claude" if ses is None else "pid %s" % ses["pid"]))
 
-import subprocess  # noqa: E402
 reqs = [
     {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                                                                   "clientInfo": {"name": "selftest", "version": "0"}}},
@@ -721,7 +848,6 @@ check(oomph.setting("selftest_switch", config={"selftest_switch": False}) == "1"
 os.environ.pop("OOMPH_SELFTEST_SWITCH")
 
 # --- side-by-side installs, into a throwaway prefix (install.sh's test mode: no root, no launchd)
-import shutil  # noqa: E402
 inst = tempfile.mkdtemp(prefix="oomph-install-")
 pfx = os.path.join(inst, "root")
 os.mkdir(pfx)

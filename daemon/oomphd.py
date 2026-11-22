@@ -40,6 +40,7 @@ NOTIFY_COOLDOWN = 15 * 60
 DISK_LOW_GB = 20
 DISK_COOLDOWN = 6 * 3600
 INCIDENT_CLOSE_AFTER = 180
+INCIDENT_MAX_S = 2 * 3600  # a longer incident is closed and, while triggers last, continued in a new one
 INCIDENT_LOOKBACK = 15 * 60
 KERNEL_LINES_PER_MIN = 60
 JETSAM_POLL = 60          # s between `log show` queries for launchd's jetsam exits
@@ -428,6 +429,7 @@ class Daemon:
         self.unowned_flagged = False
         self.swap_hist = []
         self.incident = None
+        self.rolled = None  # (id, t, top rank, escalated) of an incident just closed at INCIDENT_MAX_S
         self.last_notify = 0
         self.last_disk_notify = 0
         self.last_maint = 0
@@ -559,7 +561,7 @@ class Daemon:
         return jet["kills"]
 
     # -- notifications
-    def notify(self, title, msg):
+    def notify(self, title, msg, **kw):
         script = 'display notification "%s" with title "%s" sound name "Basso"' % (
             msg.replace('"', "'"), title.replace('"', "'"))
         try:
@@ -573,23 +575,72 @@ class Daemon:
             else:
                 cmd = ["/usr/bin/osascript", "-e", script]
             subprocess.run(cmd, capture_output=True, timeout=15)
-            self.event("notified", title=title, msg=msg)
+            self.event("notified", title=title, msg=msg, **kw)
         except Exception as e:
             self.event("daemon_error", where="notify", error=str(e))
 
     # -- incidents
     def open_incident(self, t, reasons):
+        """Open an incident headlined by its most severe reason. Right after an incident was
+        closed for its length, the new one continues it: no notification, and the kill it
+        announced stays announced. Only a kill (dialog, low swap) the continued incident had
+        not reached is announced, once, as it would have been there."""
+        reasons = oomph.sort_reasons(reasons)
         iid = datetime.datetime.fromtimestamp(t).strftime("%Y%m%d-%H%M%S")
         d = os.path.join(LOG_DIR, "incidents", iid)
         os.makedirs(d, exist_ok=True)
+        rolled, self.rolled = self.rolled, None
+        cont = rolled if rolled and t - rolled[1] <= INCIDENT_CLOSE_AFTER else None
         self.incident = {"id": iid, "start": t, "start_iso": now_iso(t), "last_trigger": t,
-                         "reasons": reasons, "open": True}
+                         "reasons": reasons, "opened_by": reasons[0]["kind"], "open": True}
+        rank, escalate = oomph.reason_rank(reasons[0]), False
+        if cont:
+            self.incident["continues"] = cont[0]
+            escalate = rank >= oomph.ESCALATE_RANK and rank > cont[2] and not cont[3]
+            if cont[3] or escalate:
+                self.incident["escalated"] = t if escalate else cont[3]
         write_atomic(os.path.join(d, "incident.json"), json.dumps(self.incident, indent=1))
-        self.event("incident_open", id=iid, reasons=reasons)
+        self.event("incident_open", id=iid, reasons=reasons, **({"continues": cont[0]} if cont else {}))
         threading.Thread(target=self.dump_syslog, args=(d,), daemon=True).start()
-        if time.time() - self.last_notify > NOTIFY_COOLDOWN:
+        if escalate:
+            self.last_notify = time.time()
+            self.notify("Memory incident", "%s — papertrail: oomph incident %s" % (reasons[0]["desc"], iid), event="kill")
+        elif not cont and time.time() - self.last_notify > NOTIFY_COOLDOWN:
             self.last_notify = time.time()
             self.notify("Memory incident", "%s — papertrail: oomph incident %s" % (reasons[0]["desc"], iid))
+
+    def join_incident(self, t, reasons):
+        """Add the reasons the open incident doesn't have yet, keeping the most severe first.
+        One that takes over the headline and is a kill, the dialog or low swap is announced
+        once more, past the cool-down: the notification of an incident opened by pressure
+        would otherwise be the only one, and name the lesser cause."""
+        inc = self.incident
+        inc["last_trigger"] = t
+        known = {r["kind"] for r in inc["reasons"]}
+        top = max([oomph.reason_rank(r) for r in inc["reasons"]] + [0])
+        changed = False
+        for r in reasons:
+            if r["kind"] in known or len(inc["reasons"]) >= 20:
+                continue
+            known.add(r["kind"])
+            inc["reasons"] = oomph.sort_reasons(inc["reasons"] + [r])
+            changed = True
+            rank = oomph.reason_rank(r)
+            if rank > top and rank >= oomph.ESCALATE_RANK and not inc.get("escalated"):
+                inc["escalated"] = t
+                self.last_notify = time.time()
+                self.notify("Memory incident", "%s — papertrail: oomph incident %s" % (r["desc"], inc["id"]),
+                            event="kill")
+            elif r["kind"] in ("dialog", "lowmem", "jetsam_storm", "jetsam_report", "unowned", "stall") and \
+                    time.time() - self.last_notify > NOTIFY_COOLDOWN:
+                self.last_notify = time.time()
+                self.notify("Memory incident", r["desc"])
+            top = max(top, rank)
+        if changed:  # readers see the new headline while it is still open
+            try:
+                write_atomic(os.path.join(LOG_DIR, "incidents", inc["id"], "incident.json"), json.dumps(inc, indent=1))
+            except OSError as e:
+                self.event("daemon_error", where="join_incident", error=str(e))
 
     def dump_syslog(self, d):
         out = run(["/usr/bin/log", "show", "--last", "15m", "--style", "compact",
@@ -597,15 +648,19 @@ class Daemon:
         with open(os.path.join(d, "syslog.txt"), "w") as f:
             f.write(out)
 
-    def close_incident(self, t):
+    def close_incident(self, t, rolled=False):
+        """Close, summarise and write the report. Both read the samples one at a time: the
+        report spans the day before, and the logger must not hold that in memory."""
         inc = self.incident
         self.incident = None
         inc["end"] = t
         inc["end_iso"] = now_iso(t)
         inc["open"] = False
+        if rolled:
+            inc["rolled"] = True
         d = os.path.join(LOG_DIR, "incidents", inc["id"])
         try:
-            samples = oomph.load_samples(inc["start"] - INCIDENT_LOOKBACK, t)
+            samples = oomph.iter_samples(inc["start"] - INCIDENT_LOOKBACK, t)
             events = oomph.load_events(inc["start"] - INCIDENT_LOOKBACK, t)
             inc["summary"] = oomph.summarize(samples, events)
             write_atomic(os.path.join(d, "incident.json"), json.dumps(inc, indent=1))
@@ -614,7 +669,7 @@ class Daemon:
         except Exception as e:
             write_atomic(os.path.join(d, "incident.json"), json.dumps(inc, indent=1))
             self.event("daemon_error", where="close_incident", error=repr(e))
-        self.event("incident_close", id=inc["id"], duration_s=round(t - inc["start"]))
+        self.event("incident_close", id=inc["id"], duration_s=round(t - inc["start"]), **({"rolled": True} if rolled else {}))
 
     # -- maintenance
     def maintenance(self):
@@ -760,16 +815,19 @@ class Daemon:
         if pr >= 4:
             reasons.append({"kind": "pressure", "desc": "Memory pressure CRITICAL (swap %.1f GB, disk %.0f GB free)"
                             % (s["swap_used_gb"], s["disk_free_gb"]), "t": t})
+        inc = self.incident
+        if inc and t - inc.get("start", t) >= INCIDENT_MAX_S:
+            if t - inc.get("last_trigger", t) <= INCIDENT_CLOSE_AFTER:  # still going: continued below
+                top = max([oomph.reason_rank(r) for r in inc.get("reasons", [])] + [0])
+                # a kill it opened with was announced then: the continuation doesn't announce it again
+                done = inc.get("escalated") or (inc.get("start") if top >= oomph.ESCALATE_RANK else None)
+                self.rolled = (inc["id"], t, top, done)
+                self.close_incident(t, rolled=True)
+            else:  # left open across a sleep or a restart: it ended, a trigger now opens a new one
+                self.close_incident(t)
         if reasons:
             if self.incident:
-                self.incident["last_trigger"] = t
-                known = {r["kind"] for r in self.incident["reasons"]}
-                for r in reasons:
-                    if r["kind"] not in known and len(self.incident["reasons"]) < 20:
-                        self.incident["reasons"].append(r)
-                        if r["kind"] in ("dialog", "lowmem", "jetsam_storm", "jetsam_report", "unowned", "stall") and time.time() - self.last_notify > NOTIFY_COOLDOWN:
-                            self.last_notify = time.time()
-                            self.notify("Memory incident", r["desc"])
+                self.join_incident(t, reasons)
             else:
                 self.open_incident(t, reasons)
         elif self.incident and t - self.incident["last_trigger"] > INCIDENT_CLOSE_AFTER:

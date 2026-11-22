@@ -37,6 +37,7 @@ import datetime
 import functools
 import glob
 import gzip
+import heapq
 import html as _html
 import json
 import math
@@ -104,6 +105,22 @@ PRESSURE = {0: "?", 1: "normal", 2: "WARN", 4: "CRITICAL"}
 AWAY_IDLE_S = 300
 
 
+# What an incident is headlined by: its highest-ranked reason, ties to the earlier one. The
+# logger keeps `reasons` in this order, so reasons[0] is the headline for every reader;
+# incidents written before 1.8.6 keep arrival order and are shown as they are.
+REASON_RANK = {"jetsam_report": 90, "dialog": 85, "lowmem": 80, "jetsam_storm": 70,
+               "unowned": 60, "stall": 50, "pressure": 40}
+ESCALATE_RANK = 80  # a reason this severe that takes over the headline is announced once more
+
+
+def reason_rank(r):
+    return REASON_RANK.get(r.get("kind"), 0)
+
+
+def sort_reasons(reasons):
+    return sorted(reasons, key=lambda r: (-reason_rank(r), r.get("t", 0)))
+
+
 def unowned_limit_gb(ram_gb):
     """Memory no process owns, above which something outside the process list (a GPU or
     driver leak, typically) holds it. Normally a few GB; only a restart frees a real leak."""
@@ -163,6 +180,39 @@ def load_samples(since, until):
     return out
 
 
+def _samples_in(path, since, until):
+    for line in _read_lines(path):
+        try:
+            s = json.loads(line)
+        except ValueError:
+            continue
+        if since <= s.get("t", 0) <= until:
+            yield s
+
+
+def iter_samples(since, until):
+    """load_samples one sample at a time, for readers that must not hold a day of samples
+    (the logger writing a report). The logger appends each file in time order, so merging
+    the files gives load_samples' order without sorting them all. Only a wall clock set
+    back makes a file go back in time; its samples then come in the order they were
+    written, which moves a summary's from/to and a chart point or two, nothing more."""
+    paths = [p for day in _day_range(since, until)
+             for p in (os.path.join(LOG_DIR, "samples-%s.jsonl.gz" % day), os.path.join(LOG_DIR, "samples-%s.jsonl" % day))
+             if os.path.exists(p)]
+    return heapq.merge(*[_samples_in(p, since, until) for p in paths], key=lambda s: s["t"])
+
+
+class SampleWindow:
+    """The samples of a window, read from the files again on every iteration: what the
+    report code takes instead of a list when a window may be a day or more."""
+
+    def __init__(self, since, until):
+        self.since, self.until = since, until
+
+    def __iter__(self):
+        return iter_samples(self.since, self.until)
+
+
 def load_events(since, until):
     out = []
     for path in (os.path.join(LOG_DIR, "events.jsonl.1"), os.path.join(LOG_DIR, "events.jsonl")):
@@ -184,76 +234,147 @@ def is_away(s):
 
 
 # ---------------------------------------------------------------- summarize
+class _Risers:
+    """First, peak (and when) and last size per app group or process, folded one sample at
+    a time: the state grows with the names seen, not with the samples."""
+
+    def __init__(self, key):
+        self.key, self.rows = key, {}
+
+    def add(self, s):
+        groups = self.key == "groups"
+        for p in s.get(self.key) or []:
+            k = p["name"] if groups else "%s [%s]" % (p["name"], p["pid"])
+            r = self.rows.get(k)
+            if r is None:
+                r = self.rows[k] = [p["mb"], -1, None, None, None]  # first, peak, peak t, last, process
+            r[3] = p["mb"]
+            if not groups:
+                r[4] = (p["pid"], p["name"], p.get("ppid"), p.get("uid"))
+            if p["mb"] > r[1]:
+                r[1], r[2] = p["mb"], s["t"]
+
+    def result(self, limit=10):
+        rows = []
+        for k, (first, peak, peak_t, last, proc) in self.rows.items():
+            if peak_t is None:
+                continue
+            r = {"name": k, "first_mb": first, "peak_mb": peak, "last_mb": last,
+                 "rise_mb": peak - first, "peak_iso": _hm(peak_t)}
+            if proc:
+                r.update(pid=proc[0], proc=proc[1], ppid=proc[2], uid=proc[3])
+            rows.append(r)
+        rows.sort(key=lambda r: (r["rise_mb"], r["peak_mb"]), reverse=True)
+        return rows[:limit] if limit else rows
+
+
 def _risers(samples, key, limit=10):
-    first, peak, peak_t, last, info = {}, {}, {}, {}, {}
+    f = _Risers(key)
     for s in samples:
-        for p in s.get(key) or []:
-            k = p["name"] if key == "groups" else "%s [%s]" % (p["name"], p["pid"])
-            first.setdefault(k, p["mb"])
-            last[k] = p["mb"]
-            info[k] = p
-            if p["mb"] > peak.get(k, -1):
-                peak[k], peak_t[k] = p["mb"], s["t"]
-    rows = [{"name": k, "first_mb": first[k], "peak_mb": peak[k], "last_mb": last[k],
-             "rise_mb": peak[k] - first[k], "peak_iso": _hm(peak_t[k])} for k in peak]
-    if key != "groups":
-        for r in rows:
-            p = info[r["name"]]
-            r.update(pid=p["pid"], proc=p["name"], ppid=p.get("ppid"), uid=p.get("uid"))
-    rows.sort(key=lambda r: (r["rise_mb"], r["peak_mb"]), reverse=True)
-    return rows[:limit] if limit else rows
+        f.add(s)
+    return f.result(limit)
 
 
 def _hm(t):
     return datetime.datetime.fromtimestamp(t).strftime("%H:%M:%S")
 
 
+def _more(a, b):
+    """max() as a fold: the first of equal values wins, as with max() over a list."""
+    return b if a is None or b > a else a
+
+
+def _less(a, b):
+    return b if a is None or b < a else a
+
+
+def _peak_key(s):
+    return (s.get("pressure", 0), s.get("swap_used_gb", 0), s.get("app_gb", 0) + s.get("compressed_gb", 0))
+
+
+class _Summary:
+    """summarize() as a fold over samples: one pass, holding a few numbers, the peak sample
+    and the risers, so a long incident is summarised in bounded memory."""
+
+    def __init__(self):
+        self.n = self.kills = self.away = 0
+        self.first = self.last = self.peak = self.onset = None
+        self.swap = self.swap_total = self.disk = self.used = self.unowned = self.stall = None
+        self.groups, self.top = _Risers("groups"), _Risers("top")
+
+    def add(self, s):
+        self.n += 1
+        if self.first is None:
+            self.first = s
+        self.last = s
+        if self.peak is None or _peak_key(s) > _peak_key(self.peak):
+            self.peak = s
+        if self.onset is None and (s.get("pressure", 0) >= 2 or s.get("jetsam_kills")):
+            self.onset = s
+        self.kills += s.get("jetsam_kills", 0)
+        self.away += is_away(s)
+        self.swap = _more(self.swap, s.get("swap_used_gb", 0))
+        self.swap_total = _more(self.swap_total, s.get("swap_total_gb", 0))
+        self.disk = _less(self.disk, s.get("disk_free_gb", 0))
+        self.used = _more(self.used, s.get("app_gb", 0) + s.get("compressed_gb", 0))
+        u = unowned_gb(s)
+        if u is not None:
+            self.unowned = _more(self.unowned, u)
+        self.stall = _more(self.stall, s.get("stall", 0))
+        self.groups.add(s)
+        self.top.add(s)
+
+    def result(self, events):
+        if not self.n:
+            return {"samples": 0}
+        peak, onset, stall = self.peak, self.onset, self.stall
+        reasons = {}
+        killed = {}
+        for e in events:
+            if e.get("kind") == "jetsam":
+                for r, n in (e.get("reasons") or {}).items():
+                    reasons[r] = reasons.get(r, 0) + n
+                for k, n in (e.get("top") or {}).items():
+                    killed[k] = killed.get(k, 0) + n
+            elif e.get("kind") == "stall":
+                stall = _more(stall, e.get("seconds", 0))
+        return {
+            "samples": self.n,
+            "from": self.first["iso"], "to": self.last["iso"],
+            "peak_pressure": PRESSURE.get(peak.get("pressure", 0), peak.get("pressure")),
+            "peak_at": peak["iso"],
+            "max_swap_used_gb": self.swap,
+            "max_swap_total_gb": self.swap_total,
+            "min_disk_free_gb": self.disk,
+            "max_app_plus_compressed_gb": round(self.used, 1),
+            "ram_gb": self.last.get("ram_gb"),
+            "jetsam_kills": self.kills,
+            "max_unowned_gb": self.unowned,
+            "max_stall_s": stall,
+            "jetsam_reasons": reasons,
+            "most_killed": dict(sorted(killed.items(), key=lambda kv: -kv[1])[:10]),
+            "away_fraction": round(self.away / self.n, 2),
+            "onset": None if not onset else {
+                "at": onset["iso"], "pressure": PRESSURE.get(onset.get("pressure", 0)),
+                "idle_s": (onset.get("away") or {}).get("idle_s"),
+                "display_on": (onset.get("away") or {}).get("display_on"),
+                "locked": (onset.get("away") or {}).get("locked"),
+                "swap_used_gb": onset.get("swap_used_gb"), "disk_free_gb": onset.get("disk_free_gb")},
+            "top_at_peak": (peak.get("top") or [])[:10],
+            "groups_at_peak": (peak.get("groups") or [])[:10],
+            "claude_at_peak": peak.get("claude") or [],
+            "group_risers": self.groups.result(),
+            "process_risers": self.top.result(),
+        }
+
+
 def summarize(samples, events):
-    if not samples:
-        return {"samples": 0}
-    peak = max(samples, key=lambda s: (s.get("pressure", 0), s.get("swap_used_gb", 0),
-                                       s.get("app_gb", 0) + s.get("compressed_gb", 0)))
-    onset = next((s for s in samples if s.get("pressure", 0) >= 2 or s.get("jetsam_kills")), None)
-    kills = sum(s.get("jetsam_kills", 0) for s in samples)
-    reasons = {}
-    killed = {}
-    for e in events:
-        if e.get("kind") == "jetsam":
-            for r, n in (e.get("reasons") or {}).items():
-                reasons[r] = reasons.get(r, 0) + n
-            for k, n in (e.get("top") or {}).items():
-                killed[k] = killed.get(k, 0) + n
-    away = sum(1 for s in samples if is_away(s))
-    unowned = [u for u in (unowned_gb(s) for s in samples) if u is not None]
-    return {
-        "samples": len(samples),
-        "from": samples[0]["iso"], "to": samples[-1]["iso"],
-        "peak_pressure": PRESSURE.get(peak.get("pressure", 0), peak.get("pressure")),
-        "peak_at": peak["iso"],
-        "max_swap_used_gb": max(s.get("swap_used_gb", 0) for s in samples),
-        "max_swap_total_gb": max(s.get("swap_total_gb", 0) for s in samples),
-        "min_disk_free_gb": min(s.get("disk_free_gb", 0) for s in samples),
-        "max_app_plus_compressed_gb": round(max(s.get("app_gb", 0) + s.get("compressed_gb", 0) for s in samples), 1),
-        "ram_gb": samples[-1].get("ram_gb"),
-        "jetsam_kills": kills,
-        "max_unowned_gb": max(unowned) if unowned else None,
-        "max_stall_s": max([s.get("stall", 0) for s in samples] +
-                           [e.get("seconds", 0) for e in events if e.get("kind") == "stall"]),
-        "jetsam_reasons": reasons,
-        "most_killed": dict(sorted(killed.items(), key=lambda kv: -kv[1])[:10]),
-        "away_fraction": round(away / len(samples), 2),
-        "onset": None if not onset else {
-            "at": onset["iso"], "pressure": PRESSURE.get(onset.get("pressure", 0)),
-            "idle_s": (onset.get("away") or {}).get("idle_s"),
-            "display_on": (onset.get("away") or {}).get("display_on"),
-            "locked": (onset.get("away") or {}).get("locked"),
-            "swap_used_gb": onset.get("swap_used_gb"), "disk_free_gb": onset.get("disk_free_gb")},
-        "top_at_peak": (peak.get("top") or [])[:10],
-        "groups_at_peak": (peak.get("groups") or [])[:10],
-        "claude_at_peak": peak.get("claude") or [],
-        "group_risers": _risers(samples, "groups"),
-        "process_risers": _risers(samples, "top"),
-    }
+    """The numbers of a window. `samples` may be any iterable in time order (a list, or
+    iter_samples for a long window); it is read once and not held."""
+    f = _Summary()
+    for s in samples:
+        f.add(s)
+    return f.result(events)
 
 
 # --------------------------------------------------------------------- HTML
@@ -315,19 +436,6 @@ def _scale(v, lo, hi, a, b):
 
 NO_DATA_S = 300
 _chart_n = 0
-
-
-def _critical_spans(samples, gap=120):
-    """Stretches of CRITICAL pressure; flips back within `gap` seconds are bridged so a
-    flapping hour reads as one band."""
-    spans = []
-    for s in samples:
-        if s.get("pressure", 0) >= 4:
-            if spans and s["t"] - spans[-1][1] <= gap:
-                spans[-1][1] = s["t"]
-            else:
-                spans.append([s["t"], s["t"]])
-    return spans
 
 
 def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB", refline=None,
@@ -511,70 +619,127 @@ def report_views(since, until):
     return views
 
 
-def _downsample(samples, n=1200):
-    """At most ~n samples for drawing: per time bucket keep the one using the most memory
-    (spikes survive) and add up the bucket's jetsam kills."""
-    if len(samples) <= n:
-        return samples
-    t0, t1 = samples[0]["t"], samples[-1]["t"]
-    w = (t1 - t0) / n or 1
-
-    def load(s):
-        return s.get("app_gb", 0) + s.get("compressed_gb", 0) + s.get("swap_used_gb", 0)
-    out, cur, key, kills = [], None, None, 0
-    for s in samples:
-        b = int((s["t"] - t0) / w)
-        if b != key:
-            if cur is not None:
-                out.append(dict(cur, jetsam_kills=kills))
-            key, cur, kills = b, s, 0
-        elif load(s) > load(cur):
-            cur = s
-        kills += s.get("jetsam_kills", 0)
-    out.append(dict(cur, jetsam_kills=kills))
-    return out
+DRAW_POINTS = 1200
+_DRAW_KEYS = ("t", "wired_gb", "app_gb", "compressed_gb", "swap_used_gb", "disk_free_gb", "swap_total_gb",
+              "jetsam_kills", "away")
 
 
-def _report_meta(samples):
-    """pid -> name/parent/owner/app/session over the whole report, owner names, session projects."""
-    meta, sessions = {}, {}
-    for s in samples:
+def _load(s):
+    return s.get("app_gb", 0) + s.get("compressed_gb", 0) + s.get("swap_used_gb", 0)
+
+
+class _View:
+    """One time view of a report, prepared from two passes over the samples in bounded
+    state. The first pass counts and finds the five biggest app groups; the second folds
+    the summary, the critical-pressure bands, the risers and the points to draw: at most
+    DRAW_POINTS, per time bucket the one using the most memory (spikes survive) with the
+    bucket's jetsam kills added up, each holding only what the charts draw."""
+
+    def __init__(self, key, a, b):
+        self.key, self.a, self.b = key, a, b
+        self.n, self.t0, self.t1, self.peaks = 0, None, None, {}
+
+    def count(self, s):
+        self.n += 1
+        if self.t0 is None:
+            self.t0 = s["t"]
+        self.t1 = s["t"]
+        for g in s.get("groups") or []:
+            self.peaks[g["name"]] = max(self.peaks.get(g["name"], 0), g["mb"])
+
+    def start(self, meta):
+        self.meta = meta
+        self.top5 = [k for k, _ in sorted(self.peaks.items(), key=lambda kv: -kv[1])[:5]]
+        self.summ, self.bands, self.app_pids, self.draw = _Summary(), [], {}, []
+        self.w = None if self.n <= DRAW_POINTS else ((self.t1 - self.t0) / DRAW_POINTS or 1)
+        self.bucket = self.cur = self.cur_load = None
+        self.kills = 0
+
+    def _point(self, s):
+        p = {k: s[k] for k in _DRAW_KEYS if k in s}
+        groups = s.get("groups") or []
+        p["g"] = [next((g["mb"] / 1024 for g in groups if g["name"] == n), 0) for n in self.top5]
+        p["rest"] = sum(g["mb"] for g in groups if g["name"] not in self.top5) / 1024
+        return p
+
+    def add(self, s):
+        self.summ.add(s)
+        if s.get("pressure", 0) >= 4:  # critical stretches; flips back within 2 min are bridged
+            if self.bands and s["t"] - self.bands[-1][1] <= 120:
+                self.bands[-1][1] = s["t"]
+            else:
+                self.bands.append([s["t"], s["t"]])
+        for p in s.get("top") or []:
+            g = (self.meta.get(p["pid"]) or {}).get("g")
+            if g:
+                d = self.app_pids.setdefault(g, {})
+                d[p["pid"]] = max(d.get(p["pid"], 0), p["mb"])
+        if self.w is None:
+            self.draw.append(self._point(s))
+            return
+        b = int((s["t"] - self.t0) / self.w)
+        if b != self.bucket:
+            self.finish()
+            self.bucket, self.cur, self.cur_load, self.kills = b, self._point(s), _load(s), 0
+        elif _load(s) > self.cur_load:
+            self.cur, self.cur_load = self._point(s), _load(s)
+        self.kills += s.get("jetsam_kills", 0)
+
+    def finish(self):
+        if self.cur is not None:
+            self.cur["jetsam_kills"] = self.kills
+            self.draw.append(self.cur)
+            self.cur = None
+
+
+class _Meta:
+    """pid -> name/parent/owner/app/session over the whole report, folded one sample at a time."""
+
+    def __init__(self):
+        self.meta, self.sessions = {}, {}
+
+    def add(self, s):
+        meta = self.meta
         names = {g["name"] for g in s.get("groups") or []}
         for p in s.get("top") or []:
             meta[p["pid"]] = {"n": p["name"], "pp": p.get("ppid"), "u": p.get("uid"),
                               "g": p.get("g") or _guess_group(p["name"], names), "s": p.get("s"), "pn": p.get("pn")}
         for c in s.get("claude") or []:
-            sessions[c["pid"]] = c.get("cwd") or ""
+            self.sessions[c["pid"]] = c.get("cwd") or ""
             meta.setdefault(c["pid"], {"n": "claude"})
             b = c.get("biggest")
             if b:
                 meta.setdefault(b["pid"], {"n": b["name"]})
                 meta[b["pid"]].setdefault("s", c["pid"])
-    users = {}
-    for m in meta.values():
-        u = m.get("u")
-        if u is not None and u not in users:
-            try:
-                users[u] = pwd.getpwuid(u).pw_name
-            except (KeyError, TypeError):
-                users[u] = "uid %s" % u
-    return meta, users, sessions
+
+    def result(self):
+        """(meta, owner names, session projects)."""
+        users = {}
+        for m in self.meta.values():
+            u = m.get("u")
+            if u is not None and u not in users:
+                try:
+                    users[u] = pwd.getpwuid(u).pw_name
+                except (KeyError, TypeError):
+                    users[u] = "uid %s" % u
+        return self.meta, users, self.sessions
 
 
-def _risers_data(samples, meta):
-    app_pids = {}
+def _report_meta(samples):
+    """pid -> name/parent/owner/app/session over the whole report, owner names, session projects."""
+    f = _Meta()
     for s in samples:
-        for p in s.get("top") or []:
-            g = (meta.get(p["pid"]) or {}).get("g")
-            if g:
-                d = app_pids.setdefault(g, {})
-                d[p["pid"]] = max(d.get(p["pid"], 0), p["mb"])
+        f.add(s)
+    return f.result()
+
+
+def _risers_data(view):
     procs = [{"pid": r["pid"], "name": r["proc"], "first": r["first_mb"], "peak": r["peak_mb"],
               "rise": r["rise_mb"], "at": r["peak_iso"], "ppid": r.get("ppid"), "uid": r.get("uid")}
-             for r in _risers(samples, "top", limit=None)]
+             for r in view.summ.top.result(limit=None)]
     apps = []
-    for r in _risers(samples, "groups", limit=None):
-        pids = sorted(app_pids.get(r["name"], {}).items(), key=lambda kv: -kv[1])
+    for r in view.summ.groups.result(limit=None):
+        pids = sorted(view.app_pids.get(r["name"], {}).items(), key=lambda kv: -kv[1])
         apps.append({"name": r["name"], "first": r["first_mb"], "peak": r["peak_mb"], "rise": r["rise_mb"],
                      "at": r["peak_iso"], "pids": [[p, mb] for p, mb in pids]})
     return procs, apps
@@ -584,37 +749,26 @@ def _when(t):
     return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d %H:%M")
 
 
-def _view_html(samples, events, meta, key, t0, t1):
-    """One time view: (sub line + KPIs + charts, sessions + top processes + kills)."""
+def _view_html(view, events, meta, key, t0, t1):
+    """One time view (a prepared _View): (sub line + KPIs + charts, sessions + top processes + kills)."""
     cls = "v v-%s" % key
-    sub = '<p class="sub %s">%s → %s · %d samples</p>' % (cls, _when(t0), _when(t1), len(samples))
-    if not samples:
+    sub = '<p class="sub %s">%s → %s · %d samples</p>' % (cls, _when(t0), _when(t1), view.n)
+    if not view.n:
         return (sub + '<div class="card %s"><p class=sub>No samples in this window.</p></div>' % cls, "")
-    summ = summarize(samples, events)
+    summ = view.summ.result(events)
     marks = [{"t": e["t"], "label": "%s %s %s" % (e.get("iso", "")[11:19], e["kind"].replace("_", " "), e.get("id", ""))}
              for e in events if e.get("kind") in ("incident_open", "incident_close")]
-    bands = _critical_spans(samples)
-    draw = _downsample(samples)
+    bands = view.bands
+    draw = view.draw
     mem_series = [("wired", lambda s: s.get("wired_gb"), "var(--c-wired)"),
                   ("app memory", lambda s: s.get("app_gb"), "var(--c-app)"),
                   ("compressed", lambda s: s.get("compressed_gb"), "var(--c-comp)"),
                   ("swap used", lambda s: s.get("swap_used_gb"), "var(--c-swap)")]
-    ram = samples[-1].get("ram_gb")
-    peaks = {}
-    for s in samples:
-        for g in s.get("groups") or []:
-            peaks[g["name"]] = max(peaks.get(g["name"], 0), g["mb"])
-    top5 = [k for k, _ in sorted(peaks.items(), key=lambda kv: -kv[1])[:5]]
+    ram = summ["ram_gb"]
     colors = ["var(--k1)", "var(--k2)", "var(--k3)", "var(--k4)", "var(--k5)"]
-
-    def gval(name):
-        return lambda s: next((g["mb"] / 1024 for g in s.get("groups") or [] if g["name"] == name), 0)
-
-    def rest(s):
-        return sum(g["mb"] for g in s.get("groups") or [] if g["name"] not in top5) / 1024
-    grp_series = [(n, gval(n), c) for n, c in zip(top5, colors)]
-    if len(peaks) > len(top5):
-        grp_series.append(("other recorded apps", rest, "var(--k6)"))
+    grp_series = [(n, (lambda s, i=i: s["g"][i]), c) for i, (n, c) in enumerate(zip(view.top5, colors))]
+    if len(view.peaks) > len(view.top5):
+        grp_series.append(("other recorded apps", lambda s: s["rest"], "var(--k6)"))
     disk_series = [("free disk GB", lambda s: s.get("disk_free_gb"), "var(--k3)"),
                    ("swap total GB", lambda s: s.get("swap_total_gb"), "var(--c-swap)")]
     o = summ.get("onset") or {}
@@ -666,19 +820,39 @@ def _view_html(samples, events, meta, key, t0, t1):
 
 def render_html(samples, events, title, incident=None, views=None, extra_css="", intro_html=""):
     """A self-contained report. `views` are the (key, label, from, to) windows the page can
-    switch between (default: 24h / 6h / 1h ending at the last sample); the first is shown."""
+    switch between (default: 24h / 6h / 1h ending at the last sample); the first is shown.
+    `samples` is a list, or anything iterable more than once in time order (SampleWindow):
+    it is read in two passes and not held, so a day of samples needs bounded memory."""
+    if iter(samples) is samples:  # a one-shot iterator would leave the second pass empty
+        samples = list(samples)
     if views is None:
-        views = report_views(samples[0]["t"], samples[-1]["t"]) if samples else [("all", "–", 0, 0)]
-    meta, users, sessions = _report_meta(samples)
+        first = last = None
+        for s in samples:
+            first = s["t"] if first is None else first
+            last = s["t"]
+        views = report_views(first, last) if first is not None else [("all", "–", 0, 0)]
+    prep, fold = [_View(key, a, b) for key, _, a, b in views], _Meta()
+    for s in samples:
+        fold.add(s)
+        for v in prep:
+            if v.a <= s["t"] <= v.b:
+                v.count(s)
+    meta, users, sessions = fold.result()
+    for v in prep:
+        v.start(meta)
+    for s in samples:
+        for v in prep:
+            if v.a <= s["t"] <= v.b:
+                v.add(s)
     heads, tails, vdata = [], [], {}
-    for key, label, a, b in views:
-        vs = [s for s in samples if a <= s["t"] <= b]
-        ve = [e for e in events if a <= e["t"] <= b]
-        h, t = _view_html(vs, ve, meta, key, a, b)
+    for v in prep:
+        v.finish()
+        ve = [e for e in events if v.a <= e["t"] <= v.b]
+        h, t = _view_html(v, ve, meta, v.key, v.a, v.b)
         heads.append(h)
         tails.append(t)
-        procs, apps = _risers_data(vs, meta)
-        vdata[key] = {"procs": procs, "apps": apps, "range": [a, b]}
+        procs, apps = _risers_data(v)
+        vdata[v.key] = {"procs": procs, "apps": apps, "range": [v.a, v.b]}
     evs = [{"t": e["t"], "iso": e.get("iso", ""), "kind": e.get("kind", ""), "d": _event_detail(e),
             "bad": e.get("kind") in BAD_KINDS}
            for e in reversed(collapse_pressure_events([e for e in events if e.get("kind") != "notified"]))]
@@ -691,7 +865,7 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
             '<button data-view="%s"%s>%s</button>' % (k, " class=on" if k == first else "", _e(lab)) for k, lab, *_ in views)
     reasons_html = ""
     if incident:
-        reasons_html = "<h2>Triggers</h2>" + _table(incident.get("reasons", []), [
+        reasons_html = "<h2>Triggers</h2>" + _table(sorted(incident.get("reasons", []), key=lambda r: r.get("t", 0)), [
             ("time", lambda r: _hm(r["t"]), False), ("kind", lambda r: r["kind"], False), ("detail", lambda r: r["desc"], False)])
 
     def seg(target):
@@ -732,7 +906,7 @@ def incident_html(inc):
     end = inc.get("end") or time.time()
     anchor = end if inc.get("open") else min(end, inc.get("last_trigger", end) + 180)
     lo = min(start - 900, anchor - 86400)
-    samples, events = load_samples(lo, end), load_events(lo, end)
+    samples, events = SampleWindow(lo, end), load_events(lo, end)
     views = [("incident", "Incident", start - 900, end)] + [(k, k, anchor - sec, anchor) for k, sec in VIEW_SPANS]
     title = "Memory incident %s%s" % (inc["id"], " (open)" if inc.get("open") else "")
     return render_html(samples, events, title, inc, views)

@@ -88,8 +88,10 @@ An **incident** opens when memory pressure goes critical, when macOS starts kill
 processes for memory (≥ 10 jetsam kills in a minute), when it reports kills for
 `low-swap` or similar reasons, when the out-of-memory dialog appears, when more than
 40 % of RAM (at least 16 GB) belongs to no process for a minute, or when the Mac is
-awake but so starved that oomph itself can't run for a minute. You get one
-notification, and once it is over the incident folder holds:
+awake but so starved that oomph itself can't run for a minute. It is named after its
+most severe cause, so a kill that follows critical pressure becomes the headline. You get
+one notification, and one more if such a kill joins later; an incident longer than two
+hours is closed and continues in a new one. Once it is over the incident folder holds:
 
 - `report.html` — a self-contained page with charts and tables: memory vs. RAM with
   away periods, critical-pressure stretches and kills, the top five apps stacked, free

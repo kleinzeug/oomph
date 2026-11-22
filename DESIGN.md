@@ -158,14 +158,29 @@ latest one plus daemon status.
   `vm-pageshortage`, `vm-thrashing`, `vm-compressor-*`, `fc-thrashing`,
   `zone-map-exhaustion`), the dialog text, unowned memory above max(16 GB, 40 % of RAM)
   for a minute, or a stall of ≥ 60 s. It stays open while a trigger persists
-  and closes 3 minutes after the last one.
+  and closes 3 minutes after the last one, or after 2 hours: then it is closed with
+  `"rolled": true` while triggers still come, and a trigger within the next 3 minutes
+  opens one with `"continues": "<id>"` and no notification (one left open across a
+  sleep or a restart just closes). A continuation keeps the kill notice of the one it
+  continues: a kill it had announced is not announced again.
+- **Headline:** `reasons` is kept sorted by `REASON_RANK` (a jetsam report 90, the dialog
+  85, low swap 80, a storm 70, unowned 60, a stall 50, pressure 40; ties by time), so
+  `reasons[0]` is the most severe cause for every reader. The id, `start` and
+  `opened_by` keep the moment and the kind that opened it. Incidents from before 1.8.6
+  keep their reasons in arrival order.
 - **On open:** notification, hot mode, and `log show --last 15m` with the memory
   predicate saved to `syslog.txt`.
+- **Escalation:** a reason of rank 80 or more that joins later and outranks everything
+  the incident had is notified once more, past the 15-minute cool-down (`notified` with
+  `"event": "kill"`), at most once per incident; `incident.json` is rewritten whenever a
+  reason joins.
 - **On close:** `incident.json` (triggers, start/end, peak values, biggest risers over
   the preceding 15 minutes, away state at onset, agent sessions at the peak) and
   `report.html` — a self-contained page with inline-SVG charts (stacked memory vs. RAM
   with away periods shaded and kill bars, top-5 apps, free disk vs. swap size) and
-  tables.
+  tables. Both read the samples one at a time (`iter_samples`, `summarize` as a fold,
+  the report in two passes that keep at most 1,200 points per view), so closing an
+  incident does not hold a day of samples in the logger's memory.
 
 ## Menu-bar icon
 
