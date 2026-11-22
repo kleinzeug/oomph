@@ -780,22 +780,39 @@ final class Store: ObservableObject {
     var allHistory: Bool { range.isInfinite }
 
 
-    /// The merge behind loadReservations, without files or the kernel: the last record per key of the
-    /// history log (an "end" is never undone by a later "edit"), the ledger's own short history, then
-    /// the live leases. A live lease whose holder is gone, that expired or whose queue place lapsed
-    /// ends there (the logger retires it within a sample; an older logger may not have yet).
+    /// What a later history record's null does not undo (oomph.MERGE_KEEP).
+    static let mergeKeep: Set<String> = ["res", "peak", "v", "agent", "user"]
+
+    /// The merge behind loadReservations, without files or the kernel: the records of the history log
+    /// merged per key (a later record overrides the fields it has, a null not those of mergeKeep; an
+    /// "end" is never undone by a later record of another kind, an "edit" or a newer writer's "grant"),
+    /// the ledger's own short history, then the live leases. A live lease whose holder is gone, that
+    /// expired or whose queue place lapsed ends there (the logger retires it within a sample; an older
+    /// logger may not have yet). A holder in another pid namespace (`holder.ns`, Linux) is not looked
+    /// up: its pid means something else here.
     /// `oomph top` does the same (oomph_view.merge_reservations; tools/vectors/chart.json).
     static func mergeReservations(records: Data?, ledger: [String: Any], now: Double,
                                   holderGone: (Int32) -> Bool) -> [Reservation] {
         var byKey: [String: Reservation] = [:]
         var events: [String: String] = [:]
         if let d = records {
+            var merged: [String: [String: Any]] = [:]
+            var order: [String] = []
             for line in d.split(separator: 0x0A) {
                 guard let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
                       let r = Reservation(o) else { continue }
                 let ev = (o["event"] as? String) ?? "end"
-                if ev == "end" || events[r.id] != "end" { byKey[r.id] = r; events[r.id] = ev }
+                if var m = merged[r.id] {
+                    if ev == "end" || events[r.id] != "end" {
+                        for (f, x) in o where !(x is NSNull && mergeKeep.contains(f)) { m[f] = x }
+                        merged[r.id] = m
+                        events[r.id] = ev
+                    }
+                } else {
+                    merged[r.id] = o; events[r.id] = ev; order.append(r.id)
+                }
             }
+            for k in order { if let o = merged[k], let r = Reservation(o) { byKey[k] = r } }
         }
         for h in (ledger["history"] as? [[String: Any]]) ?? [] {
             if let r = Reservation(h), byKey[r.id] == nil { byKey[r.id] = r }
@@ -804,14 +821,16 @@ final class Store: ObservableObject {
             guard var r = Reservation(l) else { continue }
             r.queue = pos
             let seen = (l["seen"] as? NSNumber)?.doubleValue ?? r.requested
-            let pid = ((l["holder"] as? [String: Any])?["pid"] as? NSNumber)?.int32Value ?? 0
+            let h = l["holder"] as? [String: Any]
+            let ns: Any? = h?["ns"]
+            let pid: Int32 = (ns == nil || ns is NSNull) ? ((h?["pid"] as? NSNumber)?.int32Value ?? 0) : 0
             if let e = r.expires, r.granted != nil, e < now { r.ended = e; r.outcome = "expired" }
             else if r.granted == nil, now - seen > 180 { r.ended = seen + 180; r.outcome = "lapsed" }
             else if pid > 0, holderGone(pid) { r.ended = max(seen, r.granted ?? r.requested); r.outcome = "holder_gone" }
             byKey[r.id] = r
         }
         // an edit record whose reservation neither ended nor is live: the ledger was reset under it
-        for (k, ev) in events where ev == "edit" && byKey[k]?.live == true {
+        for (k, ev) in events where ev != "end" && byKey[k]?.live == true {
             if !((ledger["leases"] as? [[String: Any]]) ?? []).contains(where: { Reservation($0)?.id == k }),
                var r = byKey[k] {
                 r.ended = r.segments.last?.t ?? r.requested; r.outcome = "unknown"

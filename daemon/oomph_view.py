@@ -23,6 +23,7 @@ MIN_AGE = 300.0          # ages below this share the right edge of the log axis 
 GAP_S = 300.0            # longer than this without a sample is a gap (Store.gapSeconds)
 QUEUE_STALE_S = 180.0    # a queue place not polled for this long has lapsed (oomph.QUEUE_STALE_S)
 KEEP_DAYS = 14           # reservations and samples shown (the log keeps 14 days)
+MERGE_KEEP = ("res", "peak", "v", "agent", "user")  # a later record's null does not undo these (oomph.MERGE_KEEP)
 LEVELS = (604800, 86400, 21600, 3600, 900, 300, 60)   # grid levels, coarse first (MemoryChart.levels)
 SERIES = ("wired", "app", "comp", "swap")             # stacked bottom to top
 RES_ROLES = ("r0", "r1", "r2", "r3", "r4", "r5", "r6")  # teal purple pink indigo gold brown green
@@ -604,24 +605,33 @@ def _norm(o):
                 segments=segs or [(o["requested"], o["gb"])])
 
 
-def merge_reservations(records, ledger, now, holder_alive=None):
-    """Store.mergeReservations: the last record per key from the history log (an "end" is never
-    replaced by a later "edit"), then the ledger's own short history, then the live leases. As in
-    the app, a grant past its expiry ends as "expired", a queue place not polled for QUEUE_STALE_S
-    as "lapsed", a lease whose holder is gone as "holder_gone" (only when holder_alive is given: the
-    local machine), and an edit-only record whose lease is no longer in the ledger as "unknown" (the
-    ledger was reset under it). Returns what ended in the last KEEP_DAYS or is live, by request time."""
+def merge_reservations(records, ledger, now, holder_alive=None, own_ns=None):
+    """Store.mergeReservations: the records of the history log merged per key (a later record
+    overrides the fields it has, a null not those of MERGE_KEEP; an "end" is never undone by a
+    later record of another kind, an "edit" or a newer writer's "grant"; oomph.merge_history), then
+    the ledger's own short history, then the live leases. As in the app, a grant past its expiry
+    ends as "expired", a queue place not polled for QUEUE_STALE_S as "lapsed", a lease whose holder
+    is gone as "holder_gone" (only when holder_alive is given: the local machine; and only for a
+    holder without `ns` or with own_ns, the viewer's pid namespace, None on a Mac: another's pid
+    means something else here; oomph._holder_gone), and a
+    reservation whose records end in no "end" and whose lease is no longer in the ledger as
+    "unknown" (the ledger was reset under it). Returns what ended in the last KEEP_DAYS or is
+    live, by request time."""
     def ok(o):
         return (isinstance(o, dict) and isinstance(o.get("id"), str) and isinstance(o.get("requested"), (int, float))
                 and isinstance(o.get("gb"), (int, float)))
-    by, events = {}, {}
+    merged, events = {}, {}
     for o in records:
         if not ok(o):
             continue
         ev = o["event"] if isinstance(o.get("event"), str) else "end"
         k = _key(o)
-        if ev == "end" or events.get(k) != "end":
-            by[k], events[k] = _norm(o), ev
+        if k not in merged:
+            merged[k], events[k] = dict(o), ev
+        elif ev == "end" or events[k] != "end":
+            merged[k].update((f, x) for f, x in o.items() if not (x is None and f in MERGE_KEEP))
+            events[k] = ev
+    by = {k: _norm(o) for k, o in merged.items()}
     ledger = ledger if isinstance(ledger, dict) else {}
     for h in ledger.get("history") or []:
         if ok(h):
@@ -635,7 +645,8 @@ def merge_reservations(records, ledger, now, holder_alive=None):
         live.add(k)
         seen = lease.get("seen") if isinstance(lease.get("seen"), (int, float)) else r["requested"]
         h = lease.get("holder")
-        pid = h.get("pid") if isinstance(h, dict) and isinstance(h.get("pid"), int) else 0
+        pid = h.get("pid") if isinstance(h, dict) and isinstance(h.get("pid"), int) \
+            and h.get("ns") in (None, own_ns) else 0
         if r["expires"] is not None and r["granted"] is not None and r["expires"] < now:
             r.update(ended=r["expires"], outcome="expired")
         elif r["granted"] is None and now - seen > QUEUE_STALE_S:
@@ -644,7 +655,7 @@ def merge_reservations(records, ledger, now, holder_alive=None):
             r.update(ended=max(seen, r["granted"] if r["granted"] is not None else r["requested"]), outcome="holder_gone")
         by[k] = r
     for k, ev in events.items():
-        if ev == "edit" and by[k]["ended"] is None and k not in live:
+        if ev != "end" and by[k]["ended"] is None and k not in live:
             by[k].update(ended=by[k]["segments"][-1][0], outcome="unknown")
     keep = now - KEEP_DAYS * 86400
     return sorted((r for r in by.values() if (r["ended"] if r["ended"] is not None else now) >= keep),

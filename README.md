@@ -401,8 +401,10 @@ session B  → granted r8, tests start
   recorded in `/Users/Shared/oomph/reservations.jsonl` (14 days kept): its span from
   request and grant to its *actual* end — the release, the expiry, the holder's exit —
   its size over time, the peak it really used and how it ended. Ids carry the request
-  time, so they stay unique even if the ledger is reset. `oomph reservations --history`
-  and MCP `reservation_history` read it.
+  time, so they stay unique even if the ledger is reset. From 1.9.2 each reservation and
+  record also carries a short agent key, the same for every reservation of one Claude
+  session, so a session's reservations can later be told apart from another's after it
+  is gone. `oomph reservations --history` and MCP `reservation_history` read it.
 - **Visible everywhere:** `oomph check` turns *tight* when other sessions' reservations
   exceed what's free, and the logger records them in each sample, so an incident report
   shows what was planned at the time. In the menu-bar popup a block chart under the

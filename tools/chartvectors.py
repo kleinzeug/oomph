@@ -113,6 +113,35 @@ def cases():
     queue = [dict(lease("q%d" % i, now - 900, 2.0), holder=holder, state="queued", seen=now - ago)
              for i, ago in enumerate((100, 179, 200, 290))]                       # around QUEUE_STALE_S
     v["merge"].append({"now": now, "records": [], "ledger": {"seq": 4, "leases": queue, "history": []}, "gone": []})
+    # ledger version 2 (1.9.2): a newer writer's "grant" record, then an edit, then the end a 1.8 process
+    # writes without the newer fields (the records merge: the edit's segments stay); a "grant" alone whose
+    # lease is gone ("unknown", like an edit); the outcomes "refused" and "volume_gone"; a lease without
+    # memory (gb 0); holders in another pid namespace, whose pid is not looked up (null is no namespace)
+    agent = {"key": "3f9a0c21", "slot": 0}
+    v2 = [dict(lease("v1", now - 3000, 2.0, now - 2990), event="grant", t=now - 2990, holder="session", v=2,
+               agent=agent, res={"ram": 2.0, "cpu": 6, "disk": 20.0, "disk_pool": "data"}),
+          dict(lease("v1", now - 3000, 3.0, now - 2990, segs=[(now - 2990, 2.0), (now - 2500, 3.0)]), event="edit",
+               t=now - 2500, holder="session", v=2, agent=agent, res={"ram": 3.0, "cpu": 6}),
+          dict(lease("v1", now - 3000, 3.0, now - 2990, now - 2000), event="end", outcome="holder_gone",
+               holder="session", peak_gb=2.5),
+          dict(lease("v2", now - 1800, 0.0, now - 1790), event="grant", t=now - 1790, holder="run", v=2,
+               res={"cpu": 4}),
+          dict(lease("v3", now - 1700, 4.0, None, now - 1650), event="end", outcome="refused", note="8 cores on 6", holder="session"),
+          dict(lease("v4", now - 1600, 0.0, now - 1590, now - 1200), event="end", outcome="volume_gone",
+               holder="process", res={"disk": 30.0, "disk_pool": "vol:0A1B2C3D-0000"}, peak={"disk": 12.0})]
+    elsewhere = dict(gone, ns=4026531836)
+    v2_ledger = {"seq": 9, "v": 2, "boot": "6f1c", "sessions": {"4242@1": {"cwd": "/w", "uid": 501, "seen": now}},
+                 "leases": [dict(lease("v5", now - 500, 0.0, now - 490), holder=dict(holder, uid=501), state="granted",
+                                 seen=now - 5, v=2, res={"cpu": {"ask": 8, "min": 4, "got": 6}}, res_granted=now - 490,
+                                 agent=agent, user="x", scope="host"),
+                            dict(lease("v6", now - 400, 1.0, now - 390), holder=elsewhere, state="granted",
+                                 seen=now - 5),
+                            dict(lease("v7", now - 300, 1.0, now - 290), holder=dict(gone, ns=None), state="granted",
+                                 seen=now - 5, expires=now + 900),
+                            dict(lease("v8", now - 200, 0.0), holder=holder, state="queued", seen=now - 5, v=2,
+                                 waiting_on=["cpu"], hold=["cpu"], res={"cpu": {"ask": 8, "min": 4}})],
+                 "history": []}
+    v["merge"].append({"now": now, "records": v2, "ledger": v2_ledger, "gone": [4343]})
     # the list's order (C13): waiting by request time, then grants by expiry, one without a ttl last; ties by key
     v["order"].append({"now": now, "reservations": [
         lease("o1", now - 900, 2.0, now - 900, expires=now + 600), lease("o2", now - 300, 4.0),

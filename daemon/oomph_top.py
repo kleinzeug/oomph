@@ -346,7 +346,8 @@ def load_reservations(now, with_state=False):
         v = oomph.ledger_view(since=now - view.KEEP_DAYS * 86400)   # the frame's clock, not the wall's
     except oomph.LedgerError as e:
         return ([], "can't read the ledger: %s" % e) + (({},) if with_state else ())
-    res = view.merge_reservations(v.get("records") or [], v.get("ledger") or {}, now, _alive)
+    res = view.merge_reservations(v.get("records") or [], v.get("ledger") or {}, now, _alive,
+                                  own_ns=oomph._own_ns())
     if not with_state:
         return res, None
     st = (v.get("ledger") or {}).get("state")

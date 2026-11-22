@@ -1393,6 +1393,168 @@
     {"ended": 1795179980, "gb": 2, "key": "q2@1795179100", "outcome": "lapsed", "segments": 1},
     {"ended": 1795179890, "gb": 2, "key": "q3@1795179100", "outcome": "lapsed", "segments": 1}
    ]
+  },
+  {
+   "now": 1795180000.0,
+   "records": [
+    {
+     "id": "v1",
+     "key": "v1@1795177000",
+     "gb": 2.0,
+     "purpose": "p v1",
+     "requested": 1795177000.0,
+     "granted": 1795177010.0,
+     "event": "grant",
+     "t": 1795177010.0,
+     "holder": "session",
+     "v": 2,
+     "agent": {"key": "3f9a0c21", "slot": 0},
+     "res": {"ram": 2.0, "cpu": 6, "disk": 20.0, "disk_pool": "data"}
+    },
+    {
+     "id": "v1",
+     "key": "v1@1795177000",
+     "gb": 3.0,
+     "purpose": "p v1",
+     "requested": 1795177000.0,
+     "granted": 1795177010.0,
+     "segments": [{"t": 1795177010.0, "gb": 2.0}, {"t": 1795177500.0, "gb": 3.0}],
+     "event": "edit",
+     "t": 1795177500.0,
+     "holder": "session",
+     "v": 2,
+     "agent": {"key": "3f9a0c21", "slot": 0},
+     "res": {"ram": 3.0, "cpu": 6}
+    },
+    {
+     "id": "v1",
+     "key": "v1@1795177000",
+     "gb": 3.0,
+     "purpose": "p v1",
+     "requested": 1795177000.0,
+     "granted": 1795177010.0,
+     "ended": 1795178000.0,
+     "event": "end",
+     "outcome": "holder_gone",
+     "holder": "session",
+     "peak_gb": 2.5
+    },
+    {
+     "id": "v2",
+     "key": "v2@1795178200",
+     "gb": 0.0,
+     "purpose": "p v2",
+     "requested": 1795178200.0,
+     "granted": 1795178210.0,
+     "event": "grant",
+     "t": 1795178210.0,
+     "holder": "run",
+     "v": 2,
+     "res": {"cpu": 4}
+    },
+    {
+     "id": "v3",
+     "key": "v3@1795178300",
+     "gb": 4.0,
+     "purpose": "p v3",
+     "requested": 1795178300.0,
+     "granted": null,
+     "ended": 1795178350.0,
+     "event": "end",
+     "outcome": "refused",
+     "note": "8 cores on 6",
+     "holder": "session"
+    },
+    {
+     "id": "v4",
+     "key": "v4@1795178400",
+     "gb": 0.0,
+     "purpose": "p v4",
+     "requested": 1795178400.0,
+     "granted": 1795178410.0,
+     "ended": 1795178800.0,
+     "event": "end",
+     "outcome": "volume_gone",
+     "holder": "process",
+     "res": {"disk": 30.0, "disk_pool": "vol:0A1B2C3D-0000"},
+     "peak": {"disk": 12.0}
+    }
+   ],
+   "ledger": {
+    "seq": 9,
+    "v": 2,
+    "boot": "6f1c",
+    "sessions": {"4242@1": {"cwd": "/w", "uid": 501, "seen": 1795180000.0}},
+    "leases": [
+     {
+      "id": "v5",
+      "key": "v5@1795179500",
+      "gb": 0.0,
+      "purpose": "p v5",
+      "requested": 1795179500.0,
+      "granted": 1795179510.0,
+      "holder": {"pid": 4242, "start": 1, "kind": "session", "uid": 501},
+      "state": "granted",
+      "seen": 1795179995.0,
+      "v": 2,
+      "res": {"cpu": {"ask": 8, "min": 4, "got": 6}},
+      "res_granted": 1795179510.0,
+      "agent": {"key": "3f9a0c21", "slot": 0},
+      "user": "x",
+      "scope": "host"
+     },
+     {
+      "id": "v6",
+      "key": "v6@1795179600",
+      "gb": 1.0,
+      "purpose": "p v6",
+      "requested": 1795179600.0,
+      "granted": 1795179610.0,
+      "holder": {"pid": 4343, "start": 1, "kind": "process", "ns": 4026531836},
+      "state": "granted",
+      "seen": 1795179995.0
+     },
+     {
+      "id": "v7",
+      "key": "v7@1795179700",
+      "gb": 1.0,
+      "purpose": "p v7",
+      "requested": 1795179700.0,
+      "granted": 1795179710.0,
+      "holder": {"pid": 4343, "start": 1, "kind": "process", "ns": null},
+      "state": "granted",
+      "seen": 1795179995.0,
+      "expires": 1795180900.0
+     },
+     {
+      "id": "v8",
+      "key": "v8@1795179800",
+      "gb": 0.0,
+      "purpose": "p v8",
+      "requested": 1795179800.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179995.0,
+      "v": 2,
+      "waiting_on": ["cpu"],
+      "hold": ["cpu"],
+      "res": {"cpu": {"ask": 8, "min": 4}}
+     }
+    ],
+    "history": []
+   },
+   "gone": [4343],
+   "out": [
+    {"ended": 1795178000, "gb": 3, "key": "v1@1795177000", "outcome": "holder_gone", "segments": 2},
+    {"ended": 1795178200, "gb": 0, "key": "v2@1795178200", "outcome": "unknown", "segments": 1},
+    {"ended": 1795178350, "gb": 4, "key": "v3@1795178300", "outcome": "refused", "segments": 1},
+    {"ended": 1795178800, "gb": 0, "key": "v4@1795178400", "outcome": "volume_gone", "segments": 1},
+    {"ended": null, "gb": 0, "key": "v5@1795179500", "outcome": null, "segments": 1},
+    {"ended": null, "gb": 1, "key": "v6@1795179600", "outcome": null, "segments": 1},
+    {"ended": 1795179995, "gb": 1, "key": "v7@1795179700", "outcome": "holder_gone", "segments": 1},
+    {"ended": null, "gb": 0, "key": "v8@1795179800", "outcome": null, "segments": 1}
+   ]
   }
  ],
  "order": [

@@ -858,6 +858,21 @@ if MAC and os.path.getsize(os.path.join(old, "oomph.py")) > 1000:  # 1.8.3 measu
 else:
     print("skip  1.8.3 compatibility: %s" % ("tag v1.8.3 not in this clone" if MAC else "1.8.3 needs macOS"))
 
+# ledger version 2 for readers (B0, 1.9.2) and the frozen-1.8.1 test: 1.8.1's ledger code from git and this
+# code on each other's files and on a v2 ledger, both directions; runs anywhere (it measures nothing)
+try:
+    r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "ledgercompat.py")],
+                       capture_output=True, text=True, timeout=120)
+except subprocess.TimeoutExpired:
+    r = subprocess.CompletedProcess([], 1, "", "timed out after 120 s")
+bad = [x for x in r.stdout.splitlines() if x.startswith("FAIL")]
+if r.returncode == 2:
+    print((r.stdout.strip().splitlines() or ["skip  the frozen-1.8.1 test"])[-1])
+else:
+    check(r.returncode == 0, "ledger v2 and the frozen-1.8.1 test: %d checks (%s)" % (
+        sum(1 for x in r.stdout.splitlines() if x.startswith(("ok", "FAIL"))),
+        "; ".join(bad) or (r.stdout.strip().splitlines() or [r.stderr[-300:]])[-1]))
+
 # an install swaps a real /usr/local/libexec/oomph (1.6.0 to 1.8.0 installed one) for a link to
 # this version under a 1.8.4 MCP server that has taken no tool call yet: its first one imports this
 # oomphd, which must still answer the measuring names 1.8.4 calls on it (they moved to the backend)

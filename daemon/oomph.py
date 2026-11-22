@@ -2594,9 +2594,257 @@ def _pid(x):
 
 
 def _segments(x):
-    segs = [{"t": s["t"], "gb": s["gb"]} for s in (x if isinstance(x, list) else [])
-            if isinstance(s, dict) and _t(s.get("t")) and _num(s.get("gb"), 0, 1e6)]
+    """A reservation's spans by size: t and gb, and a newer writer's `res` (amounts by resource,
+    02 §6.2) when it has its type, so that a write here keeps it."""
+    segs = []
+    for s in (x if isinstance(x, list) else []):
+        if isinstance(s, dict) and _t(s.get("t")) and _num(s.get("gb"), 0, 1e6):
+            segs.append({"t": s["t"], "gb": s["gb"]})
+            if "res" in s and _rec_amounts(s["res"], True):
+                segs[-1]["res"] = _rec_amounts(s["res"], True)
     return segs or None
+
+
+# ----- ledger version 2, for readers (B0, 1.9.2; roadmap §4.4, 02 §6.2 and §9, 03 §6.5)
+# What newer writers add to the same two files, all optional. This code reads every field and
+# carries it through its own writes, typed; it writes none of them itself except `agent` (D11)
+# and, when it ends a newer writer's lease, that lease's own fields in the end record:
+#   ledger root: `v` (2 once a vector-aware writer created the ledger), `boot` (the boot id at the
+#     last write, Linux), `sessions` {"<pid>@<start>": {cwd, uid, seen}} (what each agent session
+#     says about itself);
+#   lease: `v` (2 when a vector-aware writer created it: set once, never added later), `res` {ram,
+#     cpu, gpu, vram, disk, mem: {ask, min, got, used, peak, tree, w, dev, pool, unified}} (gb and
+#     used_gb / peak_gb / baseline_gb stay as the memory mirrors 1.8 readers read; gb is 0 for a
+#     lease without memory), `res_granted` (the time a vector-aware evaluator granted it: a v2
+#     lease granted without it was granted by old code), `waiting_on` and `hold` (pool ids),
+#     `base` and `last` (counters), `segments[].res` (amounts), `watch_also` [{pid, start}] and `watch_names` (more trees
+#     charged to it), `holder.uid`, `holder.ns` (the holder's pid namespace: absent = the
+#     reader's), `user` (the account's name), `scope` ("host" or a cgroup), `agent` {key, slot};
+#   history record: `event` "grant", `res` {resource: amount, "disk_pool"} and `peak` {resource:
+#     amount}, `v`, `agent`, `user`, `note`, outcomes "refused" and "volume_gone".
+LEASE_RES = ("ram", "cpu", "gpu", "vram", "disk", "mem")  # a v2 lease's resources (02 §6.2)
+_RES_NAME = re.compile(r"[a-z][a-z0-9_]{0,15}")  # a resource this code does not know: carried through, never used
+RES_MAX = 16                              # resources in one `res`, known ones first
+_RES_NUMS = ("ask", "min", "got", "used", "peak", "tree", "w")
+_COUNTERS = ("t", "cpu_s", "gpu_s", "w_gb", "free_gb", "gpu_mem_gb")
+_ID = re.compile(r"[\x21-\x7e]{1,80}")    # pool and device ids: compared as strings, never opened
+_AGENT = re.compile(r"[0-9a-f]{8}")
+_SESSION = re.compile(r"\d{1,10}@\d{1,15}")
+AGENT_SLOTS = 6                           # the agent palette (02 §3.8.3)
+WATCH_MAX, NAME_MAX = 8, 32               # watch_also / watch_names entries, characters of a name
+MERGE_KEEP = ("res", "peak", "v", "agent", "user")  # what a later history record without them does not undo
+
+
+def _int(x, lo, hi):
+    return isinstance(x, int) and not isinstance(x, bool) and lo <= x <= hi
+
+
+def _ver(x):
+    """A format version (`v`): a small positive integer, else None (absent)."""
+    return x if _int(x, 1, 1000) else None
+
+
+def _str(n, pat=None):
+    """A validator for a string of at most `n` characters (matching `pat`)."""
+    return lambda x: x if isinstance(x, str) and 0 < len(x) <= n and (pat is None or pat.fullmatch(x)) else None
+
+
+def _res_names(x):
+    """The resources of a `res` this code keeps: the six it knows, then up to RES_MAX in all of
+    those a later writer may add (a lowercase name), which are carried through and never counted."""
+    known = [k for k in LEASE_RES if k in x]
+    return known + [k for k in x if k not in LEASE_RES and k != "disk_pool" and isinstance(k, str)
+                    and _RES_NAME.fullmatch(k)][:RES_MAX - len(known)]
+
+
+def _res(x):
+    """A lease's `res`: by resource a dict whose known fields have their types (amounts 0 … 1e6;
+    `dev` an id or, for `mem`, an amount; `pool` an id; `unified` a bool). A mistyped field is
+    dropped, an unknown one carried through like a lease's, and so is a resource added after this
+    code (_res_names): a stale writer must not erase it from a live lease. None if empty."""
+    if not isinstance(x, dict):
+        return None
+    out = {}
+    for k in _res_names(x):
+        e = x.get(k)
+        if not isinstance(e, dict):
+            continue
+        o = dict(e)
+        for f in _RES_NUMS:
+            if f in o and not _num(o[f], 0, 1e6):
+                del o[f]
+        if "dev" in o and not (_num(o["dev"], 0, 1e6) or _str(80, _ID)(o["dev"])):
+            del o["dev"]
+        if "pool" in o and not _str(80, _ID)(o["pool"]):
+            del o["pool"]
+        if "unified" in o and not isinstance(o["unified"], bool):
+            del o["unified"]
+        out[k] = o
+    return out or None
+
+
+def _rec_amounts(x, extra=False):
+    """A history record's or a segment's `res` (with `extra`, also its `disk_pool`) or `peak`:
+    amounts by resource, those added after this code too (_res_names)."""
+    if not isinstance(x, dict):
+        return None
+    out = {k: x[k] for k in _res_names(x) if _num(x.get(k), 0, 1e6)}
+    if extra and _str(80, _ID)(x.get("disk_pool")):
+        out["disk_pool"] = x["disk_pool"]
+    return out or None
+
+
+def _ids(x):
+    """`waiting_on`, `hold`: a list of pool ids (empty is a value: nothing short)."""
+    return x if isinstance(x, list) and len(x) <= 16 and all(_str(80, _ID)(p) for p in x) else None
+
+
+def _counters(x):
+    if not isinstance(x, dict):
+        return None
+    return {k: x[k] for k in _COUNTERS if _num(x.get(k), 0, 1e15)} or None
+
+
+def _watch_also(x):
+    if not (isinstance(x, list) and len(x) <= WATCH_MAX):
+        return None
+    out = [{"pid": w["pid"], "start": w.get("start") if _int(w.get("start"), 0, 1e15) else None}
+           for w in x if isinstance(w, dict) and _pid(w.get("pid"))]
+    return out if len(out) == len(x) else None
+
+
+def _names(x):
+    return x if isinstance(x, list) and len(x) <= WATCH_MAX and all(_str(NAME_MAX)(n) for n in x) else None
+
+
+def _agent(x):
+    """`agent` {key, slot}: an 8-digit hex key and, if any, a palette slot 0–5; anything else is
+    "agent not known" (None). A writer can claim any key: the colour proves nothing (02 §3.8.2)."""
+    if not (isinstance(x, dict) and isinstance(x.get("key"), str) and _AGENT.fullmatch(x["key"])):
+        return None
+    if "slot" in x and not _int(x["slot"], 0, AGENT_SLOTS - 1):
+        return None
+    return {k: x[k] for k in ("key", "slot") if k in x}
+
+
+def _sessions(x):
+    """The ledger root's `sessions`: entries keyed "<pid>@<start>" with a typed cwd, uid and seen."""
+    if not isinstance(x, dict):
+        return None
+    out = {}
+    for k, e in x.items():
+        if _SESSION.fullmatch(k) and isinstance(e, dict):
+            out[k] = {f: e[f] for f, ok in (("cwd", _str(4096)), ("uid", lambda u: _int(u, 0, 2 ** 32 - 1)),
+                                           ("seen", _t)) if f in e and ok(e[f])}
+    return out
+
+
+V2_LEASE = {"v": _ver, "res": _res, "res_granted": lambda x: x if _t(x) else None, "waiting_on": _ids,
+            "hold": _ids, "base": _counters, "last": _counters, "watch_also": _watch_also, "watch_names": _names,
+            "user": _str(64), "scope": _str(200), "agent": _agent}
+V2_RECORD = {"v": _ver, "res": lambda x: _rec_amounts(x, True), "peak": _rec_amounts, "agent": _agent,
+             "user": _str(64), "note": _str(400)}
+V2_ROOT = {"v": _ver, "boot": _str(64, _ID), "sessions": _sessions}
+
+
+def _checked(src, out, checks):
+    """Fields with a validator: replaced by the validated value, or dropped (absent) when it fails."""
+    for k, ok in checks.items():
+        if k in src:
+            v = ok(src[k])
+            if v is None:
+                out.pop(k, None)
+            else:
+                out[k] = v
+    return out
+
+
+def ledger_version(x):
+    """The format version of a ledger, lease or record: 1 when it says none (everything 1.8 wrote)."""
+    return _ver(x.get("v")) or 1
+
+
+def agent_key(pid, start):
+    """The stable key of an agent (D11, 02 §3.8.2): the first 8 hex digits of SHA-256 over
+    "oomph-agent:<pid>:<start>" of the agent's process (a Claude session, also for an `oomph run`
+    inside it, else the holder). The same for every reservation of one session, different after
+    it restarts, and it says nothing the lease does not. None while the start time is unknown."""
+    if not (_pid(pid) and _int(start, 0, 10 ** 15)):
+        return None
+    import hashlib
+    return hashlib.sha256(("oomph-agent:%d:%d" % (pid, start)).encode()).hexdigest()[:8]
+
+
+def _agent_of(r, procs):
+    """The agent key of a lease an older writer made without one: its holder's, or for an
+    `oomph run` still running inside a Claude session (this pid namespace) the session's."""
+    h = r["holder"]
+    p = procs.get(h["pid"])
+    if h.get("kind") == "run" and p and p.get("start") == h.get("start") and _in_own_ns(r):
+        root = _session_root(procs, h["pid"])
+        if root is not None and root != h["pid"]:
+            return agent_key(root, procs[root].get("start"))
+    return agent_key(h["pid"], h.get("start"))
+
+
+def lease_res(r):
+    """A lease's resources as vector-aware code reads them (02 §9.2): a v2 lease's own `res`, its
+    `ram` following `gb` where an old writer's amend changed only the mirror; for a 1.8 lease, a
+    vector of memory only made from gb, used_gb and peak_gb. Made here, never written back: an
+    old lease does not become version 2."""
+    if ledger_version(r) >= 2 and isinstance(r.get("res"), dict):
+        res = {k: dict(x) for k, x in r["res"].items()}
+        mem = res.get("mem", {})
+        if _num(mem.get("got")) and abs(mem["got"] - r["gb"]) > 0.005:
+            v = res.get("vram", {})
+            on_gpu = min(v.get("got", 0), r["gb"]) if v.get("unified") else 0
+            if v.get("unified") and _num(v.get("got")) and v["got"] > r["gb"]:  # unified memory is in gb too
+                res["vram"] = dict(v, got=r["gb"])
+            res["ram"] = dict(res.get("ram", {}), ask=round(max(0.0, r["gb"] - on_gpu), 2))
+            if "got" in res["ram"] or r.get("state") == "granted":
+                res["ram"]["got"] = res["ram"]["ask"]
+            res["mem"] = dict(mem, got=r["gb"])
+        return res
+    granted = r.get("state") == "granted" or (r.get("state") is None and r.get("granted") is not None)
+    ram = {"ask": r["gb"]}
+    mem = {"got": r["gb"]}
+    if granted:
+        ram["got"] = r["gb"]
+    for f, g in (("used", "used_gb"), ("peak", "peak_gb")):
+        if _num(r.get(g)):
+            mem[f] = r[g]
+    return {"ram": ram, "mem": mem}
+
+
+def _record_vector(r):
+    """What an end, edit or history entry carries of a newer writer's lease beyond 1.8.1's fields:
+    its `v`, `user` and, from a v2 lease's `res`, the amounts granted (asked, if never granted) and
+    the peaks by resource. Nothing for a 1.8 lease. A finished entry passes its own on."""
+    out = {k: r[k] for k in ("v", "user") if k in r}
+    res = r.get("res")
+    if not isinstance(res, dict):
+        return out
+    if not any(isinstance(x, dict) for x in res.values()):  # already a record's
+        out.update((k, r[k]) for k in ("res", "peak") if k in r)
+        return out
+    if "gb" in r and ledger_version(r) >= 2:  # a lease: ram follows gb where an old writer's amend moved only the mirror
+        res = lease_res(r)
+    amounts, peak = {}, {}
+    for k, x in res.items():
+        if k == "mem" or not isinstance(x, dict):  # memory is the gb and peak_gb mirrors
+            continue
+        a = x.get("got", x.get("ask"))
+        if _num(a):
+            amounts[k] = a
+        if _num(x.get("peak")):
+            peak[k] = x["peak"]
+        if k == "disk" and isinstance(x.get("pool"), str):
+            amounts["disk_pool"] = x["pool"]
+    if amounts:
+        out["res"] = amounts
+    if peak:
+        out["peak"] = peak
+    return out
 
 
 def _typed(src, out, times=(), nums=(), strs=()):
@@ -2615,18 +2863,24 @@ def _valid_lease(r):
         return None
     h = r.get("holder")
     if not (isinstance(r.get("id"), str) and _RID.fullmatch(r["id"]) and r.get("state") in ("queued", "granted")
-            and _num(r.get("gb"), 0, 1e6) and r["gb"] > 0 and isinstance(r.get("purpose"), str)
+            and _num(r.get("gb"), 0, 1e6) and isinstance(r.get("purpose"), str)
             and isinstance(h, dict) and _pid(h.get("pid")) and _t(r.get("requested"))):
         return None
     if r["state"] == "granted" and not _t(r.get("granted")):
+        return None
+    if r["gb"] == 0 and not ledger_version(r) >= 2:  # only a vector lease may hold no memory
         return None
     out = dict(r)
     start = h.get("start")
     out["holder"] = dict(h, start=start if isinstance(start, int) and not isinstance(start, bool) else None,
                          kind=h["kind"] if isinstance(h.get("kind"), str) else None)
+    for k, lo, hi in (("uid", 0, 2 ** 32 - 1), ("ns", 1, 2 ** 64 - 1)):
+        if k in h and not _int(h[k], lo, hi):
+            del out["holder"][k]
     out["seen"] = r["seen"] if _t(r.get("seen")) else r["requested"]
     _typed(r, out, times=("granted", "expires"), nums=("ttl", "peak_gb", "used_gb", "baseline_gb"),
            strs=("project", "key", "note"))
+    _checked(r, out, V2_LEASE)
     if "watch" in r and not (r["watch"] is None or _pid(r["watch"])):
         out["watch"] = None
     if "segments" in r:
@@ -2649,6 +2903,7 @@ def _valid_finished(h, log=False):
     out = dict(h, purpose=h["purpose"] if isinstance(h.get("purpose"), str) else "?")
     _typed(h, out, times=("granted", "ended", "t", "expires"), nums=("peak_gb", "held_s", "waited_s"),
            strs=("project", "holder", "outcome", "event"))
+    _checked(h, out, V2_RECORD)
     if not isinstance(out.get("key"), str):
         out.pop("key", None)
     if "segments" in h:
@@ -2678,7 +2933,7 @@ def _valid_ledger(L):
         if isinstance(st, dict) else {}
     if "history_pruned" in L and not _num(L["history_pruned"]):
         out.pop("history_pruned")
-    return out
+    return _checked(L, out, V2_ROOT)
 
 
 def _ledger_dir(create=False):
@@ -2825,8 +3080,11 @@ def read_ledger():
 # One JSON object per line, written under the ledger lock:
 #   {"event": "edit" | "end", "t": when written, "key": "r12@1795172655", "id": "r12", "purpose", "project",
 #    "holder": "session" | "process" | "run", "gb": current GB, "segments": [{"t", "gb"}, …] (only once edited),
-#    "requested", "granted", "peak_gb", and for "end": "ended", "outcome"; for "edit": "change", "expires"}
-# The last record per key wins. `key` stays unique across ledger resets: it carries the request time.
+#    "requested", "granted", "peak_gb", and for "end": "ended", "outcome"; for "edit": "change", "expires";
+#    from 1.9.2 "agent" {key} when the holder's start time is known (D11)}
+# Readers merge the records of a key (merge_history): from 1.9.2 on, newer writers add a "grant" record
+# and fields that a 1.8 writer ending the same reservation leaves out. `key` stays unique across ledger
+# resets: it carries the request time.
 def _history_path():
     return os.path.join(LEDGER_DIR, HISTORY_FILE)
 
@@ -2873,6 +3131,24 @@ def read_history(since=None, dfd=None):
     return out
 
 
+def merge_history(recs):
+    """The history log's records merged per key, in the order keys first appear (02 §9.2): a later
+    record overrides the fields it has, an "end" is never undone by a later record that is not
+    one, and `res`, `peak`, `v`, `agent` and `user` stay from an earlier record when a later one
+    lacks them. So a vector reservation stays a vector when a 1.8 process, which knows none of
+    these, writes its end. A record without `event` is an end (as 1.8.1 read it)."""
+    by = {}
+    for rec in recs:
+        ev = rec["event"] if isinstance(rec.get("event"), str) else "end"
+        prev = by.get(rec["key"])
+        if prev is None:
+            by[rec["key"]] = dict(rec, event=ev)
+        elif ev == "end" or prev["event"] != "end":
+            prev.update((k, x) for k, x in rec.items() if not (x is None and k in MERGE_KEEP))
+            prev["event"] = ev
+    return list(by.values())
+
+
 def _record(r, event, t, **extra):
     h = r.get("holder")  # a live lease's holder, or a finished one's holder kind
     rec = {"event": event, "t": round(t, 1), "key": _key(r), "id": r["id"], "purpose": r["purpose"],
@@ -2881,6 +3157,9 @@ def _record(r, event, t, **extra):
            "peak_gb": round(r.get("peak_gb", 0) or 0, 2)}
     if len(r.get("segments") or []) > 1:
         rec["segments"] = r["segments"]
+    if r.get("agent"):
+        rec["agent"] = r["agent"]
+    rec.update(_record_vector(r))
     rec.update(extra)
     return rec
 
@@ -2934,6 +3213,53 @@ def _alive(procs, pid, start):
         return False
 
 
+_NS = []
+
+
+def _own_ns():
+    """The inode of this process's pid namespace (Linux), None where there are none (macOS)."""
+    if not _NS:
+        try:
+            _NS.append(os.stat("/proc/self/ns/pid").st_ino)
+        except OSError:
+            _NS.append(None)
+    return _NS[0]
+
+
+def _in_own_ns(r):
+    """Is a lease's holder in this process's pid namespace (a lease without `holder.ns` is)?"""
+    ns = r["holder"].get("ns")
+    return ns is None or ns == _own_ns()
+
+
+def _held_by(r, pid):
+    """Is a lease held by process `pid` of this pid namespace? The same number in a container is
+    another process (03 §7.3)."""
+    return pid is not None and r["holder"]["pid"] == pid and _in_own_ns(r)
+
+
+TTL_CAP_S = 7 * 86400  # the longest time limit any version may set (MAX_TTL_S is this one's)
+
+
+def _holder_gone(r, procs, now):
+    """Has a lease's holder ended? By its pid and start time, for a holder in this pid namespace
+    (a lease without `holder.ns` is in the reader's). A pid of another namespace means something
+    else here (03 §7.3): such a lease ends by its time limit or, without one, when its owner
+    stops stamping `seen` for QUEUE_STALE_S (`oomph run` does every 5 s). A time limit further off
+    than the lease's own ttl from when it was last granted or renewed (`seen`; TTL_CAP_S at most,
+    so a later version may raise MAX_TTL_S without this one retiring its grants) is not one:
+    anyone can write the ledger, and a lease no pid can end must not outlive what a grant could."""
+    h = r["holder"]
+    if not _in_own_ns(r):
+        if r["state"] != "granted":
+            return False  # a request lapses when its owner stops polling
+        if r.get("expires"):
+            ttl = min(r["ttl"], TTL_CAP_S) if _num(r.get("ttl"), 0) else MAX_TTL_S
+            return r["expires"] > max(r["seen"], r["granted"]) + ttl + 60
+        return now - r["seen"] > QUEUE_STALE_S
+    return not _alive(procs, h["pid"], h.get("start"))
+
+
 def _children(procs):
     ch = {}
     for p in procs.values():
@@ -2970,6 +3296,9 @@ def _retire(L, r, outcome, now):
          "held_s": round(end - r["granted"]) if r.get("granted") else 0}
     if len(r.get("segments") or []) > 1:
         h["segments"] = r["segments"]
+    if r.get("agent"):
+        h["agent"] = r["agent"]
+    h.update(_record_vector(r))
     L["history"].append(h)
     L["history"] = L["history"][-HISTORY_KEEP:]
     try:
@@ -2980,11 +3309,21 @@ def _retire(L, r, outcome, now):
 
 def _evaluate(L, s, procs, now):
     """Drop dead, expired and abandoned entries, account for what grants already use, then grant
-    queued requests strictly in arrival order while they fit."""
+    queued requests strictly in arrival order while they fit.
+
+    Leases of version 2 (newer writers, 02 §9.3) count with their memory mirror (gb) like any
+    other, but this code grants none: it cannot weigh their other resources. A queued one holds
+    the line, as a request that does not fit does, until vector-aware code (the logger's child
+    after an update, or its own writer's next poll) grants it. A request of another scope (a
+    cgroup, 03 §7.3) is granted only by a process in it, and does not hold the line here."""
     keep = []
     for r in L["leases"]:
-        h, why = r["holder"], None
-        if not _alive(procs, h["pid"], h.get("start")):
+        why = None
+        if not r.get("agent"):  # made by a writer older than 1.9.2: its agent, from the holder (D11)
+            k = _agent_of(r, procs)
+            if k:
+                r["agent"] = {"key": k}
+        if _holder_gone(r, procs, now):
             why = "holder_gone"
         elif r["state"] == "granted" and r.get("expires") and now > r["expires"]:
             why = "expired"
@@ -3020,6 +3359,10 @@ def _evaluate(L, s, procs, now):
     avail = free - outstanding - margin_gb(ram)
     for r in [x for x in L["leases"] if x["state"] == "queued"]:
         if v["level"] == "critical":
+            break
+        if r.get("scope", "host") != "host":
+            continue
+        if ledger_version(r) >= 2:
             break
         alone = not any(x["state"] == "granted" for x in L["leases"])
         if r["gb"] <= avail or (alone and v["level"] == "ok"):
@@ -3209,6 +3552,8 @@ def _decide_inputs(s=None):
 def _brief(r, now):
     b = {"id": r["id"], "state": r["state"], "gb": r["gb"], "purpose": r["purpose"],
          "project": os.path.basename(r.get("project") or "") or None, "holder_pid": r["holder"]["pid"]}
+    if r.get("user"):
+        b["user"] = r["user"]
     if r["state"] == "granted":
         b.update(used_gb=r.get("used_gb", 0), for_min=round((now - r["granted"]) / 60, 1))
         if r.get("expires"):
@@ -3223,6 +3568,10 @@ def _status(L, rid, now):
     r = next((x for x in L["leases"] if x["id"] == rid), None)
     if r is None:
         h = next((x for x in reversed(L["history"]) if x["id"] == rid), None)
+        if h and h["outcome"] == "refused":  # a newer evaluator turned it down (03 §6.5)
+            return {"status": "refused", "id": rid, "outcome": "refused", "note": h.get("note"),
+                    "advice": "Turned down: this request cannot fit on this machine even with nothing else reserved"
+                              "%s. Ask for less, or split the work." % (" (%s)" % h["note"] if h.get("note") else "")}
         return {"status": "gone", "id": rid, "outcome": h and h["outcome"],
                 "advice": "This reservation no longer exists (%s). Request a new one if you still need it."
                           % (h["outcome"] if h else "unknown id")}
@@ -3283,11 +3632,16 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                  "requested": round(now, 1), "seen": round(now, 1),
                  "segments": [{"t": round(now, 1), "gb": round(gb, 2)}]}
             r["key"] = _key(r)
+            k = holder.get("agent")  # `oomph run` inside a session: the session's (02 §3.8.2)
+            k = k if isinstance(k, str) and _AGENT.fullmatch(k) else agent_key(holder.get("pid"), holder.get("start"))
+            if k:
+                r["agent"] = {"key": k}
             L["leases"].append(r)
         else:
             r["seen"] = round(now, 1)
             if r["state"] == "granted" and r.get("expires") and ttl_s:  # re-asking extends a grant
-                r["expires"] = round(now + min(max(60, ttl_s), MAX_TTL_S), 1)
+                r["ttl"] = min(max(60, ttl_s), MAX_TTL_S)  # the limit the grant now has (_holder_gone)
+                r["expires"] = round(now + r["ttl"], 1)
         _evaluate(L, s, procs, now)
         return _status(L, r["id"], now)
 
@@ -3308,7 +3662,7 @@ def release(rid, holder_pid=None, outcome="released"):
     """Release one reservation, or with rid='all' every one held by `holder_pid`."""
     s, procs, now = _decide_inputs()
     with Ledger() as L:
-        gone = [r for r in L["leases"] if r["id"] == rid or (rid == "all" and r["holder"]["pid"] == holder_pid)]
+        gone = [r for r in L["leases"] if r["id"] == rid or (rid == "all" and _held_by(r, holder_pid))]
         _evaluate(L, s, procs, now)  # final usage figures, before removing
         gone = [r for r in L["leases"] if r["id"] in {g["id"] for g in gone}]
         for r in gone:
@@ -3409,8 +3763,8 @@ def coordination(mine=None, s=None):
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         st = L["state"]
-        others = [r for r in L["leases"] if r["holder"]["pid"] != mine]
-        own = [r for r in L["leases"] if r["holder"]["pid"] == mine]
+        own = [r for r in L["leases"] if _held_by(r, mine)]
+        others = [r for r in L["leases"] if r not in own]
         others_out = sum(r["gb"] - r.get("used_gb", 0) for r in others if r["state"] == "granted")
         return {
             "free_gb": st["free_gb"], "margin_gb": st["margin_gb"], "reserved_gb": st["reserved_gb"],
@@ -3446,10 +3800,7 @@ def reservation_history(since_s=24 * 3600, limit=50):
     """Finished reservations from the history log (last `since_s` seconds) plus the live ones,
     newest first: what each reserved, what it really used at its peak, and how it ended."""
     now = time.time()
-    last = {}
-    for rec in read_history(now - since_s):
-        if rec.get("event") == "end" or last.get(rec["key"], {}).get("event") != "end":
-            last[rec["key"]] = rec
+    last = {rec["key"]: rec for rec in merge_history(read_history()) if _rec_time(rec) >= now - since_s}
     for h in read_ledger()["history"]:  # finished before the log existed
         if h.get("ended", 0) >= now - since_s:
             last.setdefault(_key(h), h)
@@ -3468,17 +3819,11 @@ VIEW_FIELDS = ("event", "key", "id", "purpose", "project", "holder", "gb", "requ
                "outcome", "peak_gb", "used_gb", "expires", "segments")
 
 
-def _view_records(recs):
-    """The history log's records as a viewer merges them (oomph_view.merge_reservations): the last
-    per key, except that an "end" is never replaced by a later "edit", with only the fields the
-    merge reads. One record per reservation keeps a root caller's answer far below LIMITS["child"]."""
-    by = {}
-    for r in recs:
-        k, ev = r["key"], r.get("event") if isinstance(r.get("event"), str) else "end"
-        prev = by.get(k)
-        if ev == "end" or prev is None or (prev.get("event") if isinstance(prev.get("event"), str) else "end") != "end":
-            by[k] = {f: r[f] for f in VIEW_FIELDS if f in r}
-    return list(by.values())
+def _view_records(recs, since):
+    """The history log's records as a viewer merges them (merge_history, as oomph_view.merge_reservations
+    and the app do), those that end at or after `since`, with only the fields the viewers read. One
+    record per reservation keeps a root caller's answer far below LIMITS["child"]."""
+    return [{f: r[f] for f in VIEW_FIELDS if f in r} for r in merge_history(recs) if _rec_time(r) >= since]
 
 
 @_unprivileged()
@@ -3498,7 +3843,7 @@ def ledger_view(since=None):
         return {"ledger": None, "records": []}
     try:
         L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd, shared=True)))
-        return {"ledger": L, "records": _view_records(read_history(since, dfd))}
+        return {"ledger": L, "records": _view_records(read_history(dfd=dfd), since)}
     finally:
         os.close(dfd)
 
@@ -3580,7 +3925,7 @@ def ledger_snapshot(procs=None):
     now = time.time()
     out = []
     for r in L["leases"]:
-        if procs is not None and not _alive(procs, r["holder"]["pid"], r["holder"].get("start")):
+        if procs is not None and _holder_gone(r, procs, now):
             continue
         if not _live(r, now):
             continue
@@ -3835,7 +4180,8 @@ def cmd_run(args):
     wait_s = parse_dur(opts.get("--wait", "30m"))
     ses = holder_for()
     me = {"pid": os.getpid(), "start": plat().collect_procs().get(os.getpid(), {}).get("start"),
-          "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd()}
+          "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd(),
+          "agent": agent_key(ses["pid"], ses["start"]) if ses["kind"] == "session" else None}
     last = [0.0]
 
     def progress(st):

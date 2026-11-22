@@ -135,8 +135,8 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
   session (IREngine) is running an 8 GB build; I'm next in line."
 - If you've waited more than ~20 minutes, ask the user whether to keep waiting, run with
   less (lower parallelism, smaller reservation) or skip the step.
-- If the response is `refused`, the request is larger than this Mac can hold — split
-  the work or lower its parallelism.
+- If the response is `refused` (to a new request, or to a poll with your ticket), the
+  request is larger than this Mac can hold — split the work or lower its parallelism.
 
 **4. Grants and the rest of this skill:** a grant is a turn, not immunity. Still follow
 the levels in §5 while the work runs, and if `memory_check` turns critical, back off
