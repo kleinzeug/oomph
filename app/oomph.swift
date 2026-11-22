@@ -968,9 +968,37 @@ final class Store: ObservableObject {
     var bundleCommit: String { Bundle.main.object(forInfoDictionaryKey: "OOMPHCommit") as? String ?? "" }
 
     /// A newer version that was found earlier and not skipped (it survives closing the popup).
+    /// Newer than this app, not just different: an app built or installed another way (build-app.sh,
+    /// a copy) must not offer the version an older app had found as an "upgrade".
     var rememberedUpgrade: Bool {
         !availableCommit.isEmpty && availableCommit != defaults.string(forKey: "upgradeSkipped")
             && !bundleCommit.hasPrefix(availableCommit) && availableVersion != bundledVersion
+            && Store.isNewer(availableVersion, than: bundledVersion ?? "")
+    }
+
+    /// "1.9.6" → [1, 9, 6, 0]; "1.9.6-3-gabc1234" → [1, 9, 6, 3]; "-dirty" ignored. nil when it isn't one.
+    static func versionKey(_ v: String) -> [Int]? {
+        var parts: [Substring] = v.split(separator: "-")
+        if parts.last == "dirty" { parts.removeLast() }
+        guard let head = parts.first else { return nil }
+        let nums: [Int] = head.split(separator: ".").compactMap { Int($0) }
+        guard nums.count == 3, nums.count == head.split(separator: ".").count else { return nil }
+        let ahead: Int = parts.count >= 3 ? (Int(parts[1]) ?? 0) : 0
+        return nums + [ahead]
+    }
+
+    /// Whether version `a` comes after `b`; when either isn't a version, whether they differ (as before).
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        guard let x = versionKey(a), let y = versionKey(b) else { return a != b }
+        return x.lexicographicallyPrecedes(y) == false && x != y
+    }
+
+    /// Forget a remembered "upgrade" that isn't newer than this app.
+    private func dropStaleUpgrade() {
+        if !availableCommit.isEmpty && !rememberedUpgrade && availableCommit != defaults.string(forKey: "upgradeSkipped") {
+            defaults.removeObject(forKey: "upgradeAvailable")
+            defaults.removeObject(forKey: "upgradeAvailableCommit")
+        }
     }
 
     /// Every time the popup opens: tools once a day, then the button, then the daily check
@@ -993,7 +1021,10 @@ final class Store: ObservableObject {
 
     private func continueUpgradeSetup() {
         guard defaults.bool(forKey: "upgradeToolsOK") else { upgradeButton = .hidden; return }
-        if upgradeButton == .hidden { upgradeButton = rememberedUpgrade ? .upgrade : .check }
+        dropStaleUpgrade()
+        if upgradeButton == .hidden || (upgradeButton == .upgrade && !rememberedUpgrade) {
+            upgradeButton = rememberedUpgrade ? .upgrade : .check
+        }
         if upgradeAuto && Date().timeIntervalSince1970 - lastUpgradeCheck > 86400 && upgradeButton != .checking && !building {
             checkForUpgrade(manual: false)
         }
@@ -1034,6 +1065,13 @@ final class Store: ObservableObject {
             guard let self else { return }
             self.loadingChangelog = false
             if status == 0, let entries = try? JSONDecoder().decode([ChangelogEntry].self, from: data) {
+                if entries.isEmpty {  // nothing newer after all: say so instead of an empty changelog
+                    self.showChangelog = false
+                    self.defaults.removeObject(forKey: "upgradeAvailable")
+                    self.defaults.removeObject(forKey: "upgradeAvailableCommit")
+                    self.upgradeButton = .upToDate
+                    return
+                }
                 self.changelog = entries
                 if let top = entries.first {  // the newest is what will be installed
                     self.defaults.set(top.version, forKey: "upgradeAvailable")
