@@ -3,7 +3,8 @@
 
 tools/vectors/chart.json holds inputs and the expected answers of the functions both programs
 share: the mapper, thinning, gap finding, band merging, lane stacking, the strip's top, the
-colour index and the reservation merge. The expected answers are the app's: `oomph
+colour index, the reservation merge and the hover card over a column (which `oomph top`'s inspect
+readout shows). The expected answers are the app's: `oomph
 --chart-vectors FILE` runs its own functions over the inputs and prints what they return. A
 change on either side that is not made on the other fails here.
 
@@ -18,14 +19,21 @@ import json
 import os
 import subprocess
 import sys
+import time
 
+# The hover card's words have local times in them: both programs run in one fixed zone (the app reads TZ
+# from the environment it is started with, which is this one).
+os.environ["TZ"] = "Europe/Berlin"
+time.tzset()
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FILE = os.path.join(ROOT, "tools", "vectors", "chart.json")
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import oomph_top  # noqa: E402
 import oomph_view as V  # noqa: E402
 
-GROUPS = ("mapper", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order")
+GROUPS = ("mapper", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order", "hover")
 
 
 def cases():
@@ -157,7 +165,86 @@ def cases():
         dict(lease("r23", now - 300, 2.0), holder=holder, state="queued", seen=now - 5),
         dict(lease("r21", now - 600, 6.0, segs=[(now - 600, 3.0), (now - 120, 6.0)]), holder=holder, state="queued",
              seen=now - 5)]}})
+    # the hover card (T1b: `oomph top`'s inspect readout): two days of thinned points with holes, away stretches,
+    # a sleep; incidents, events of every kind the card groups (and the new resources' kinds), reservations that
+    # waited, were edited and ended; columns at the right edge, inside a gap, over an incident, before history
+    hp, t = [], now - 2 * 86400
+    while t <= now:
+        k = len(hp)
+        if not (now - 30 * 3600 < t < now - 26 * 3600 or now - 7000 < t < now - 6000):      # two holes
+            hp.append(dict(t=t, wired=6.0 + (k % 3) * 0.1, app=9.0 + (k * 7 % 11) / 2.0, comp=5.0 + (k % 5) / 4.0,
+                           swap=(k % 13) / 10.0 if k % 40 > 30 else 0.0, away=(k % 97) < 9, kills=int(k % 211 == 0)))
+        t += 60 if now - t < 3 * 3600 else 900
+    hp = V.multires(hp, now)
+    hgaps = [list(g) for g in V.find_gaps(hp, now)]
+    ev = [dict(t=now - 5000, kind="jetsam", kills=3, top={"mds": 2, "Safari": 1}),
+          dict(t=now - 4990, kind="jetsam", kills=4, top={"mds": 2, "Xcode": 2}),
+          dict(t=now - 4980, kind="pressure_change", old=1, new=2), dict(t=now - 4970, kind="pressure_change", old=2, new=4),
+          dict(t=now - 4960, kind="stall", seconds=75), dict(t=now - 4950, kind="stall", seconds=3700),
+          dict(t=now - 4940, kind="unowned_memory", gb=17), dict(t=now - 4930, kind="daemon_start", version="1.9.5"),
+          dict(t=now - 4920, kind="disk_low", disk_free_gb=12.4, pool="data", name="Data", free_gb=12.4, level="low"),
+          dict(t=now - 4910, kind="disk_filling", pool="data", name="Data", free_gb=30.0, rate_gb_min=2.5, eta_min=10.0),
+          dict(t=now - 4900, kind="volume", pool="vol:X", mount="/Volumes/Scratch", name="Scratch", what="unwatched"),
+          dict(t=now - 4890, kind="thermal", old=0, new=2, busy=12.5),
+          dict(t=now - 4880, kind="cpu_saturated", busy=13.2, n=14, minutes=10, top={"cargo": 9.1}),
+          dict(t=now - 4870, kind="cpu_saturated_cleared", busy=3.0, n=14, minutes=24),
+          dict(t=now - 4860, kind="disk_low", disk_free_gb=19.0), dict(t=now - 4850, kind="incident_open", id="x"),
+          dict(t=now - 4840, kind="sleep_gap", seconds=2100), dict(t=now - 4830, kind="sleep_gap", seconds=20400),
+          dict(t=now - 4820, kind="some_future_kind", x=1), dict(t=now - 600, kind="pressure_flapping", flips=6),
+          dict(t=now - 30, kind="disk_filling", mount="/Volumes/Fast", rate_gb_min=12.25, eta_min=1.5)]
+    incs = [{"id": "20261122-120000", "start": now - 5100, "end": now - 4000, "open": False,
+             "reasons": [{"kind": "jetsam_storm", "desc": "macOS is killing processes for memory (12 jetsam kills in 60 s)"}]},
+            {"id": "20261122-133000", "start": now - 700, "open": True, "reasons": [{"kind": "pressure", "desc": "pressure"}]},
+            {"id": "20261121-090000", "start": now - 100000, "end": now - 99000, "open": False, "reasons": []}]
+    hres = [lease("h1", now - 5200, 4.0, now - 5100, now - 4500, [(now - 5200, 6.0), (now - 4800, 4.0)]),
+            lease("h2", now - 5150, 2.0), lease("h3", now - 5050, 8.0, now - 5000, now - 4950),
+            lease("h4", now - 5040, 1.5, now - 5040), lease("h5", now - 5030, 3.0, now - 5030, now - 3000),
+            lease("h6", now - 400, 2.5, now - 300)]
+    us = [1.0, 0.999, 0.5, 0.0, 0.25, 0.75, 0.97, 0.9]
+    for span in (86400.0, None):                       # (6 h: the fixture's case below)
+        f, _ = V.mapper(now, hp[0]["t"], span)
+        at = sorted(set(us + [round(f(x), 6) for x in (now - 5000, now - 4900, now - 28 * 3600, now - 6500, now - 650)]))
+        v["hover"].append({"now": now, "first": hp[0]["t"], "span": span, "du": 1.0 / 73, "u": [x for x in at if 0 <= x <= 1],
+                           "points": hp, "gaps": hgaps, "events": ev, "incidents": incs, "reservations": hres})
+    v["hover"].append({"now": now, "first": now - 600, "span": 3600.0, "du": 1.0 / 40, "u": [0.0, 0.5, 0.95, 1.0],
+                       "points": [], "gaps": [], "events": [], "incidents": [], "reservations": []})
+    v["hover"] += fixture_hover()
     return v
+
+
+def fixture_hover():
+    """The hover card over every column of the 80 x 24 frame at 6 h (the golden frame 80x24-inspect), on the
+    fixture of the golden frames (tools/topfixture.py), with the points, gaps, events, incidents and
+    reservations `oomph top` loads from it: its inspect readout and the app's card on the same data."""
+    import shutil
+    import tempfile
+    import oomph
+    import topfixture
+    base = tempfile.mkdtemp(prefix="oomph-vectors-")
+    out = []
+    try:
+        log, led = topfixture.write_fixture(os.path.join(base, "fx"), "default")
+        oomph.LEDGER_DIR = led
+        with open(os.path.join(log, "events.jsonl")) as f:
+            events = [json.loads(x) for x in f if x.strip()]
+        incidents = []
+        for iid in sorted(os.listdir(os.path.join(log, "incidents"))):
+            with open(os.path.join(log, "incidents", iid, "incident.json")) as f:
+                incidents.append(json.load(f))
+        for span, every in (("6h", 1),):
+            m = oomph_top.load_model(span, topfixture.NOW, log_dir=log, live=False)
+            W, lo = 73, m["now"] - V.SPANS[span] - 120          # the plot of an 80-column frame; what it can show
+            res = [{"id": r["id"], "key": r["key"], "purpose": r["purpose"], "project": r["project"],
+                    "requested": r["requested"], "granted": r["granted"], "ended": r["ended"], "outcome": r["outcome"],
+                    "gb": r["segments"][-1][1], "segments": [{"t": t, "gb": gb} for t, gb in r["segments"]]}
+                   for r in m["res"] if r["ended"] is None or r["ended"] >= lo]
+            out.append({"now": m["now"], "first": m["first"], "span": V.SPANS[span], "du": 1.0 / W,
+                        "u": [(c + 0.5) / W for c in range(0, W, every)],
+                        "points": [p for p in m["pts"] if p["t"] >= lo], "gaps": [list(g) for g in m["gaps"] if g[1] >= lo],
+                        "events": events, "incidents": incidents, "reservations": res})
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    return out
 
 
 def python_answers(v):
@@ -190,6 +277,21 @@ def python_answers(v):
         rs = V.merge_reservations(c["records"], c["ledger"], c["now"], lambda pid: pid not in gone)
         out["merge"].append([{"key": r["key"], "ended": r["ended"], "outcome": r["outcome"],
                               "gb": r["segments"][-1][1], "segments": len(r["segments"])} for r in rs])
+    for c in v["hover"]:
+        f, _ = V.mapper(c["now"], c["first"], c["span"])
+        evs = sorted((x for x in (oomph_top.chart_event(e) for e in c["events"]) if x), key=lambda e: e.t)
+        incs = [oomph_top.incident_of(i, i["id"]) for i in c["incidents"]]
+        blocks = V.stack_reservations([V._norm(o) for o in c["reservations"]], c["now"])
+        answers = []
+        for u in c["u"]:
+            i = V.hover_info(c["points"], [tuple(g) for g in c["gaps"]], incs, evs, blocks, c["now"], c["first"], f, u,
+                             c["du"])
+            answers.append({"when": i["when"], "ago": i["ago"], "samples": i["samples"], "peak": i["peak"],
+                            "away": i["away"], "readings": [list(r) for r in i["readings"]], "no_data": i["no_data"],
+                            "incidents": i["incidents"], "events": [list(e) for e in i["events"]],
+                            "more_events": i["more_events"], "reserved": [r[0] for r in i["reserved"]],
+                            "more_reserved": i["more_reserved"]})
+        out["hover"].append(answers)
     return out
 
 

@@ -192,6 +192,20 @@ top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb
   count, written once it settles or every 15 min — the freeze logged 637 single flips),
   `sleep_gap` vs. `stall`, `unowned_memory` / `unowned_memory_cleared`, `disk_low`, `incident_open` /
   `incident_close`, `notified`, `daemon_start` / `daemon_stop` / `daemon_error`.
+- **The other resources (1.9.5, roadmap 02 §5.3)**, from the blocks of 1.9.1; a sample without
+  them changes nothing:
+
+  | kind | fields | when |
+  |---|---|---|
+  | `thermal` | `old new busy` (`flips`) | the thermal level changed; batched like pressure flips |
+  | `cpu_saturated` / `cpu_saturated_cleared` | `busy n minutes top{name: cores}` | busy on ≥ 90 % of the cores for 10 minutes; over below 75 %; at most once an hour |
+  | `disk_low` | `disk_free_gb` as before, plus `pool name mount free_gb level` | per watched disk, every 6 hours at most; the startup disk's with the swap notification as before |
+  | `disk_filling` | `pool name mount free_gb rate_gb_min eta_min top{name: MB/s}` | a watched disk lost ≥ 2 GB in two minutes and reaches its critical floor within 30 minutes at that rate; every 30 minutes at most; a notification when that is under 10 minutes away. Sampling is hot while it fills |
+  | `volume` | `pool name mount what` (`mounted unmounted watched unwatched`) | a listed or watched disk came, went, or changed class; not in the first two minutes after a start |
+  | `unowned_memory` | adds `gpu_alloc_gb` | as before |
+
+  Notifications carry names their owners chose (a volume's, a process's): every text goes through
+  `oomph.notify_text`, which removes quotes, backslashes, control and direction characters.
 
 ## Incidents
 
@@ -225,6 +239,18 @@ top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb
   tables. Both read the samples one at a time (`iter_samples`, `summarize` as a fold,
   the report in two passes that keep at most 1,200 points per view), so closing an
   incident does not hold a day of samples in the logger's memory.
+- **The other resources (1.9.5):** the summary adds, only where the samples have them (absent,
+  never zero, for "not recorded"): `max_cpu_busy` `cpu_n` `max_cpu_at` `top_cpu_at_peak`;
+  `max_gpu_util` (the share of the GPU's capacity at full speed, from samples with IOReport's
+  figure) and `max_gpu_busy` (busy time, from the others), each with its time, never averaged or
+  compared; `top_gpu_at_peak`; `max_gpu_mem_gb`; `min_free_gb{pool}`; `writers` (the peak MB/s
+  written per process); `onset` gains `cpu_busy`, `gpu_util` or `gpu_busy`, `gpu_mem_gb`; the
+  risers gain `cpu_peak` and `gpu_peak`. The report adds panels below the memory charts (cores
+  busy against the core count, peak and mean; the GPU at full speed with its busy time, or
+  "GPU busy time" where the speed was not recorded; GPU memory in use and allocated against the
+  working-set limit; the free space of each watched disk with its floors), the busiest
+  processes per resource and the biggest writers, and CPU and GPU columns in the risers. The AI
+  report's `timeline` and `current_status` carry the same, and `top_at` takes `by`.
 
 ## Menu-bar icon
 
@@ -304,6 +330,8 @@ another machine.
 | `--ssh` | The local `oomph top` stays as the parent of `ssh -t` with fixed options (no multiplexing, agent, forwardings or `RemoteCommand` from `~/.ssh/config`; keep-alive ends a dead link in about 15 s). It puts this terminal back when ssh exits; the far side leaves when its terminal hangs up. The far side's shell exits 121/122/123 (no oomph on macOS / Linux / other) or 124 (an oomph without the dashboard); the parent then prints the install line for that system and exits 127. Nothing is copied to the other machine | A far side that dies cannot restore this terminal; no code runs remotely without an install |
 | Budget | Under 1 % of a core and 40 MB resident for a day in a pane, measured in CI (`tools/toptest.py --minute`). The worker reads only what changed (file identities once a second), keeps the history as typed arrays, draws a quiet screen every 10 s and writes nothing when nothing changed. Started as a script, `oomph.py` compiles itself and keeps that resident, so `oomph top` starts again (`execv`, same process and terminal) on the bytecode `install.sh` built. Without a logger it measures itself every 30 s and keeps only the chart's points | A dashboard that watches memory must not be what uses it |
 | The terminal | Raw mode, the alternate screen and bracketed paste, restored on every way out (`q`, an exception, SIGTERM, SIGHUP, a vanished terminal) without waiting on a terminal that stopped reading; ctrl-z stops it where a shell does job control | A broken terminal after a crash is worse than the crash |
+| Inspect (1.9.5) | `i`: a cursor column on the chart and the strip; the readout is docked in the place of the lists (a floating card beside the cursor where a pane has none) and says what the app's hover card says for that column: `oomph_view.hover_info` is a port of `MemoryChart.hoverInfo`, held to it by the `hover` group of `tools/vectors/chart.json`, which includes every column of the golden frame `80x24-inspect`. The cursor keeps its time when the span changes; `enter` selects the incident or reservation under it | One readout, two programs, the same words |
+| Mouse (1.9.5) | Off by default; `ctrl-o` or `--mouse`, remembered in `top.json`. Buttons and the wheel in SGR coordinates (modes 1000 and 1006), no motion: no hover, nothing streams over an SSH link. Clicks choose spans, rows (a second click opens) and the column to inspect; the wheel changes the span or scrolls a list. The leave sequences always turn it off | Mouse reporting takes the terminal's own text selection away, and copying a number is common |
 
 ## Linux for agents (1.9.4)
 

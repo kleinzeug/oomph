@@ -190,10 +190,18 @@ struct ChartEvent {
     var kills = 0
     var top: [String: Int] = [:]
     var seconds = 0.0
-    var alarming: Bool { ["jetsam", "stall", "unowned_memory", "disk_low", "pressure_flapping", "daemon_error"].contains(kind) }
+    var alarming: Bool { ["jetsam", "stall", "unowned_memory", "disk_low", "disk_filling", "pressure_flapping", "daemon_error"].contains(kind) }
+    static let thermal = [0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"]
+    static let volumeWord = ["mounted": "mounted", "unmounted": "unmounted", "watched": "watched", "unwatched": "no longer watched"]
 
     static func pressureName(_ v: Any?) -> String {
         switch (v as? NSNumber)?.intValue { case 1: "normal"; case 2: "warning"; case 4: "critical"; default: "\(v ?? "?")" }
+    }
+
+    /// The disk an event is about: its name, else where it is mounted, else its pool id.
+    static func volume(_ e: [String: Any]) -> String {
+        for k in ["name", "mount", "pool"] { if let v = e[k] as? String, !v.isEmpty { return v } }
+        return "?"
     }
 
     init?(_ e: [String: Any]) {
@@ -210,7 +218,19 @@ struct ChartEvent {
         case "stall": seconds = num("seconds"); text = "system stalled " + MemoryChart.duration(seconds)
         case "unowned_memory": text = String(format: "%.0f GB unowned memory (leak?)", num("gb"))
         case "unowned_memory_cleared": text = "unowned memory cleared"
-        case "disk_low": text = String(format: "disk low: %.1f GB free", num("disk_free_gb"))
+        case "disk_low":
+            if let name = e["name"] as? String, e["free_gb"] is NSNumber {
+                text = "disk low: \(name) " + String(format: "%.1f GB free", num("free_gb"))
+            } else {
+                text = String(format: "disk low: %.1f GB free", num("disk_free_gb"))
+            }
+        case "disk_filling":
+            text = "disk filling: \(ChartEvent.volume(e)), " + String(format: "full in %.0f min at %.1f GB/min", num("eta_min"), num("rate_gb_min"))
+        case "volume": text = "disk \(ChartEvent.volumeWord[e["what"] as? String ?? ""] ?? "changed"): \(ChartEvent.volume(e))"
+        case "thermal":
+            text = "thermal \(ChartEvent.thermal[(e["old"] as? NSNumber)?.intValue ?? -1] ?? "?") → \(ChartEvent.thermal[(e["new"] as? NSNumber)?.intValue ?? -1] ?? "?")"
+        case "cpu_saturated": text = String(format: "cores saturated: %.1f of %.0f busy for %.0f min", num("busy"), num("n"), num("minutes"))
+        case "cpu_saturated_cleared": text = String(format: "cores no longer saturated, after %.0f min", num("minutes"))
         case "daemon_start": text = "logger started" + ((e["version"] as? String).map { " (v\($0))" } ?? "")
         case "daemon_stop": text = "logger stopped"
         case "daemon_error": text = "logger error (\(e["where"] as? String ?? "?"))"
@@ -3922,6 +3942,30 @@ func chartVectors(_ path: String) -> Int32 {
             rs = ((c["reservations"] as? [[String: Any]]) ?? []).compactMap { Reservation($0) }
         }
         return Reservation.listOrder(rs.filter(\.live)).map(\.id)
+    }
+    // the hover card over a column (`oomph top`'s inspect readout must say the same): day names in English,
+    // as the terminal writes them; the time zone is the environment's (TZ), as for both programs
+    MemoryChart.dayFmt.locale = Locale(identifier: "en_US_POSIX")
+    out["hover"] = cases("hover").map { c -> [[String: Any]] in
+        let now = num(c["now"]), span = (c["span"] as? NSNumber)?.doubleValue
+        let rs = ((c["reservations"] as? [[String: Any]]) ?? []).compactMap { Reservation($0) }
+        let incs: [Incident] = ((c["incidents"] as? [[String: Any]]) ?? []).compactMap { d in
+            (try? JSONSerialization.data(withJSONObject: d)).flatMap { try? JSONDecoder().decode(Incident.self, from: $0) }
+        }
+        let evs = ((c["events"] as? [[String: Any]]) ?? []).compactMap { ChartEvent($0) }.sorted { $0.t < $1.t }
+        let chart = MemoryChart(points: points(c["points"]), gaps: spans(c["gaps"]).map { Gap(from: $0.0, to: $0.1) },
+                                now: now, incidents: incs, events: evs, ram: nil,
+                                lgRange: log10(span ?? 86400), blend: span == nil ? 1 : 0,
+                                reservations: ResBlock.stack(rs, now: now), oldest: num(c["first"]))
+        let f = chart.mapper()
+        return ((c["u"] as? [NSNumber]) ?? []).map { u -> [String: Any] in
+            let i = chart.hoverInfo(u: u.doubleValue, du: num(c["du"]), mapper: f)
+            return ["when": i.when, "ago": i.ago, "samples": i.samples, "peak": i.peak, "away": i.away,
+                    "readings": i.readings.map { [$0.name, $0.lo, $0.hi] as [Any] },
+                    "no_data": i.noData.map { $0 as Any } ?? NSNull(), "incidents": i.incidents,
+                    "events": i.events.map { [$0.0, $0.1] as [Any] }, "more_events": i.moreEvents,
+                    "reserved": i.reserved.map { $0.0 }, "more_reserved": i.moreReserved]
+        }
     }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)

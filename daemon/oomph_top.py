@@ -11,6 +11,7 @@ user's own state folder, never as root.
 """
 import array
 import base64
+import collections
 import errno
 import fcntl
 import gzip
@@ -37,6 +38,7 @@ DAY_CAP = 128 << 20         # bytes of one day's samples, inflated (a day at a 5
 CURRENT_CAP = 256 << 10
 INCIDENT_CAP = 256 << 10
 EVENTS_CAP = 1 << 20        # the newest MB of events.jsonl is plenty for one frame
+CHART_EVENTS = 5000         # the inspector keeps the newest this many (the budget: about 1 MB)
 INCIDENTS_SHOWN = 30
 INCIDENT_ID = re.compile(r"\d{8}-\d{6}$")
 CHOICES = {"--color": ("auto", "truecolor", "256", "16", "never"), "--theme": ("auto", "dark", "light"),
@@ -45,7 +47,7 @@ LIVE_S, LIVE_KEEP = 30, 720  # no logger: measure every 30 s as the logger would
 ROOT_LEDGER_S = 30          # under sudo the reservations lag by up to this (04 §4.10)
 CELLS_TERMINALS = ()        # TERM_PROGRAM values that seam at their default profile (04 §8): none so far
 USAGE = ("usage: oomph top [--span inf|24h|6h|1h] [--color auto|truecolor|256|16|never] [--theme auto|dark|light]\n"
-         "                 [--glyphs auto|unicode|cells|ascii] [--bell | --no-bell] [--no-probe]\n"
+         "                 [--glyphs auto|unicode|cells|ascii] [--bell | --no-bell] [--mouse | --no-mouse] [--no-probe]\n"
          "                 [--ssh [USER@]HOST [--ssh-port N]]\n"
          "                 [--once [--size COLSxROWS] [--format text|ansi|golden] [--now UNIXTIME]]")
 
@@ -61,6 +63,19 @@ def _read(path, cap, tail=False):
         return d.decode("utf-8", "replace")
     except Exception:
         return None
+
+
+def _tail_lines(path, cap):
+    """The newest whole lines of a log file within `cap` bytes, as _read reads it, one at a time:
+    neither the whole as text nor a list of its lines is ever held (a MB of events made 3 MB more of
+    peak resident that way, past the dashboard's 40 MB)."""
+    d = oomph.read_bounded(path, cap, tail=True) or b""
+    i = 0
+    while i < len(d):
+        j = d.find(b"\n", i)
+        j = len(d) if j < 0 else j
+        yield d[i:j].decode("utf-8", "replace")
+        i = j + 1
 
 
 def _no_constant(c):
@@ -209,7 +224,29 @@ def _card_summary(summ):
                             lambda x: _num(x.get("rise_mb"), None) and _num(x.get("rise_mb")) / 1024.0, 3),
             "on_top": pairs(summ.get("groups_at_peak"), "name", lambda x: _num(x.get("mb")) / 1024.0, 4),
             "sessions": pairs(summ.get("claude_at_peak"), "cwd", lambda x: _num(x.get("mb")) / 1024.0, 2),
-            "away_fraction": _num(summ.get("away_fraction"), None)}
+            "away_fraction": _num(summ.get("away_fraction"), None),
+            "cpu": _num(summ.get("max_cpu_busy"), None), "cpu_n": _num(summ.get("cpu_n"), None),
+            "gpu_util": _num(summ.get("max_gpu_util"), None), "gpu_busy": _num(summ.get("max_gpu_busy"), None),
+            "data_free": _num((summ.get("min_free_gb") if isinstance(summ.get("min_free_gb"), dict) else {}).get("data"),
+                              None)}
+
+
+def incident_of(inc, iid, d=None):
+    """An incident.json's object as the list, its card and the inspector show it (None: not one)."""
+    if not (isinstance(inc, dict) and isinstance(inc.get("start"), (int, float)) and not isinstance(inc["start"], bool)
+            and math.isfinite(inc["start"])):
+        return None
+    reasons = [str(r.get("desc") or "")[:200] for r in inc.get("reasons") or [] if isinstance(r, dict)] \
+        if isinstance(inc.get("reasons"), list) else []
+    summ = inc.get("summary") if isinstance(inc.get("summary"), dict) else {}
+    rid = str(inc.get("id") or iid)
+    report = os.path.join(d, iid, "report.html") if d else None
+    return dict(id=rid if INCIDENT_ID.match(rid) else iid, start=float(inc["start"]),
+                end=_num(inc.get("end"), None) if isinstance(inc.get("end"), (int, float)) else None,
+                open=inc.get("open") is True, kills=int(_num(summ.get("jetsam_kills"), 0)),
+                desc=reasons[0] if reasons else "", reasons=[r for r in reasons if r][:3], nreasons=len(reasons),
+                summary=_card_summary(summ), dir=os.path.join(d, iid) if d else None,
+                report=report if report and os.path.isfile(report) else None)
 
 
 def _incident(d, iid, cache=None):
@@ -226,19 +263,7 @@ def _incident(d, iid, cache=None):
         hit = cache.get(iid)
         if hit and hit[0] == key:
             return hit[1]
-    inc = oomph.loads_untrusted(_read(path, INCIDENT_CAP))
-    out = None
-    if isinstance(inc, dict) and isinstance(inc.get("start"), (int, float)) and math.isfinite(inc["start"]):
-        reasons = [str(r.get("desc") or "")[:200] for r in inc.get("reasons") or [] if isinstance(r, dict)]
-        summ = inc.get("summary") if isinstance(inc.get("summary"), dict) else {}
-        rid = str(inc.get("id") or iid)
-        report = os.path.join(d, iid, "report.html")
-        out = dict(id=rid if INCIDENT_ID.match(rid) else iid, start=float(inc["start"]),
-                   end=_num(inc.get("end"), None) if isinstance(inc.get("end"), (int, float)) else None,
-                   open=inc.get("open") is True, kills=int(_num(summ.get("jetsam_kills"), 0)),
-                   desc=reasons[0] if reasons else "", reasons=[r for r in reasons if r][:3],
-                   summary=_card_summary(summ), dir=os.path.join(d, iid),
-                   report=report if os.path.isfile(report) else None)
+    out = incident_of(oomph.loads_untrusted(_read(path, INCIDENT_CAP)), iid, d)
     if cache is not None:
         cache[iid] = (key, out)
     return out
@@ -272,7 +297,19 @@ def load_incidents(log_dir, now, cache=None):
 
 
 PRESSURE_WORD = {1: "normal", 2: "warning", 4: "critical"}
-ALARMING = ("jetsam", "stall", "unowned_memory", "disk_low", "pressure_flapping", "daemon_error")
+ALARMING = ("jetsam", "stall", "unowned_memory", "disk_low", "disk_filling", "pressure_flapping", "daemon_error")
+VOLUME_WORD = {"mounted": "mounted", "unmounted": "unmounted", "watched": "watched", "unwatched": "no longer watched"}
+
+
+def _vol_name(e):
+    for k in ("name", "mount", "pool"):
+        if isinstance(e.get(k), str) and e[k]:
+            return e[k]
+    return "?"
+
+
+def _word(words, v, default):
+    return words.get(v, default) if isinstance(v, (str, int, float)) else default   # (a list is no key)
 
 
 def event_text(e):
@@ -282,21 +319,33 @@ def event_text(e):
     def num(key):
         return _num(e.get(key))
     if k == "pressure_change":
-        return "pressure %s → %s" % (PRESSURE_WORD.get(e.get("old"), e.get("old")), PRESSURE_WORD.get(e.get("new"), e.get("new")))
+        return "pressure %s → %s" % (_word(PRESSURE_WORD, e.get("old"), e.get("old")), _word(PRESSURE_WORD, e.get("new"), e.get("new")))
     if k == "pressure_flapping":
         return "pressure flapping, %d flips" % num("flips")
     if k == "jetsam":
         return "%d killed by jetsam" % num("kills") if num("kills") > 0 else "jetsam report"
     if k == "sleep_gap":
-        return "asleep " + view.ago(num("seconds"))
+        return "asleep " + view.duration(num("seconds"))
     if k == "stall":
-        return "system stalled " + view.ago(num("seconds"))
+        return "system stalled " + view.duration(num("seconds"))
     if k == "unowned_memory":
         return "%.0f GB unowned memory (leak?)" % num("gb")
     if k == "unowned_memory_cleared":
         return "unowned memory cleared"
     if k == "disk_low":
+        if isinstance(e.get("name"), str) and _num(e.get("free_gb"), None) is not None:
+            return "disk low: %s %.1f GB free" % (e["name"], num("free_gb"))
         return "disk low: %.1f GB free" % num("disk_free_gb")
+    if k == "disk_filling":
+        return "disk filling: %s, full in %.0f min at %.1f GB/min" % (_vol_name(e), num("eta_min"), num("rate_gb_min"))
+    if k == "volume":
+        return "disk %s: %s" % (_word(VOLUME_WORD, e.get("what"), "changed"), _vol_name(e))
+    if k == "thermal":
+        return "thermal %s → %s" % tuple(oomph.THERMAL.get(int(_num(e.get(x), -1)), "?") for x in ("old", "new"))
+    if k == "cpu_saturated":
+        return "cores saturated: %.1f of %.0f busy for %.0f min" % (num("busy"), num("n"), num("minutes"))
+    if k == "cpu_saturated_cleared":
+        return "cores no longer saturated, after %.0f min" % num("minutes")
     if k == "daemon_start":
         return "logger started" + (" (v%s)" % e["version"] if isinstance(e.get("version"), str) else "")
     if k == "daemon_stop":
@@ -312,21 +361,42 @@ def event_text(e):
     return k.replace("_", " ")
 
 
-def load_events(log_dir, n=40):
-    """The newest events in words, newest first."""
-    out = []
+def chart_event(e, memo=None):
+    """One line of events.jsonl as the app's ChartEvent has it (None: not shown): a view.ChartEv of t,
+    kind, text, alarming, and what the hover card adds up (kills, top, seconds). `memo` shares the
+    strings that repeat (kinds and words) between the events of one load."""
+    if not isinstance(e, dict) or _num(e.get("t"), None) is None:
+        return None
+    try:
+        text = event_text(e)
+    except (TypeError, ValueError, OverflowError):  # (one odd line costs only itself)
+        return None
+    if not text:
+        return None
+    kind = e["kind"][:64]
+    if memo is not None:
+        kind, text = memo.setdefault(kind, kind), memo.setdefault(text, text)
+    top = e.get("top") if kind == "jetsam" and isinstance(e.get("top"), dict) else {}   # (only jetsam's is added up)
+    top = {str(k)[:64]: v for k, v in list(top.items())[:32] if isinstance(v, int) and not isinstance(v, bool)}
+    return view.ChartEv(float(e["t"]), kind, text, kind in ALARMING, int(_num(e.get("kills"))), top or None,
+                        _num(e.get("seconds")) or 0)
+
+
+def load_events(log_dir, n=40, chart=False):
+    """The newest events in words, newest first. With `chart` also the newest CHART_EVENTS read, oldest
+    first, as the inspector aggregates them (view.ChartEv, the app's ChartEvent)."""
+    every, memo = collections.deque(maxlen=CHART_EVENTS), {}
     for name in ("events.jsonl.1", "events.jsonl"):
-        for line in (_read(os.path.join(log_dir, name), EVENTS_CAP, tail=True) or "").splitlines():
+        for line in _tail_lines(os.path.join(log_dir, name), EVENTS_CAP):
             try:
-                e = _loads(line)
+                c = chart_event(_loads(line), memo)
             except ValueError:
                 continue
-            if isinstance(e, dict) and _num(e.get("t"), None) is not None:
-                text = event_text(e)
-                if text:
-                    out.append((float(e["t"]), text, e.get("kind") in ALARMING))
-    out.sort(key=lambda e: -e[0])
-    return out[:n]
+            if c:
+                every.append(c)     # (the files are in time order, near enough: sorted below)
+    out = [(c.t, c.text, c.alarming) for c in sorted(every, key=lambda e: -e.t)[:n]]
+    every = sorted(every, key=lambda e: e.t)
+    return (out, every) if chart else out
 
 
 def _alive(pid):
@@ -394,9 +464,10 @@ def load_model(span="24h", now=None, log_dir=None, live=True):
     cur = readings(s) if s else None
     res, note, lstate = load_reservations(now, with_state=True)
     incidents, n90 = load_incidents(log_dir, now)
+    events, cevents = load_events(log_dir, chart=True)
     model = dict(now=now, brand=oomph.BRAND, host=host_name(), os=os_name(), ram=cur["ram"] if cur else None,
                  pts=view.multires(pts, now), first=first, gaps=gaps, res=res, blocks=view.stack_reservations(res, now),
-                 incidents=incidents, incidents_90d=n90, cur=cur, events=load_events(log_dir),
+                 incidents=incidents, incidents_90d=n90, cur=cur, events=events, cevents=cevents,
                  logger=logger, logger_t=logger_t, interval=interval, ledger_state=lstate)
     if note:
         model.update(status=note, status_role="warntx")
@@ -609,7 +680,7 @@ class Source(threading.Thread):
         self.first, self.points_at, self.points_span = None, 0.0, None
         self.res, self.res_note, self.lstate, self.res_at = [], None, {}, -1e9
         self.incidents, self.n90, self.inc_at = [], 0, -1e9
-        self.events = []
+        self.events, self.cevents = [], []
         self.live, self.live_pts, self.live_at = None, [], -1e9
         self.loaded_all = False
         self.error = None
@@ -695,7 +766,7 @@ class Source(threading.Thread):
             self.incidents, self.n90 = load_incidents(self.log_dir, now, self.incident_cache)
             self.inc_at, changed = now, True
         if self._changed("events", os.path.join(self.log_dir, "events.jsonl")):
-            self.events = load_events(self.log_dir)
+            self.events, self.cevents = load_events(self.log_dir, chart=True)
             changed = True
         if changed:
             self.post(self.model(now))
@@ -721,7 +792,7 @@ class Source(threading.Thread):
         m = dict(now=now, brand=oomph.BRAND, host=host_name(), os=os_name(), ram=cur["ram"] if cur else None, pts=pts,
                  first=first, gaps=gaps, last_t=getattr(self, "last_t", None), res=self.res,
                  blocks=getattr(self, "blocks", []), incidents=self.incidents, incidents_90d=self.n90, cur=cur,
-                 events=self.events, logger=logger, logger_t=logger_t, interval=interval, ledger_state=self.lstate,
+                 events=self.events, cevents=self.cevents, logger=logger, logger_t=logger_t, interval=interval, ledger_state=self.lstate,
                  log_dir=self.log_dir, off_text=install_hint() if logger == "off" else None, pts_v=pv)
         if self.res_note:
             m.update(status=self.res_note, status_role="warntx")
@@ -1195,8 +1266,9 @@ class App:
     nothing."""
 
     def __init__(self, term, caps, auto, span, log_dir, readonly=None, bell=False, fixed_now=None, probe=True,
-                 note=None):
+                 note=None, mouse=False):
         self.term, self.caps, self.auto = term, caps, auto
+        self.mouse = mouse
         self.ui = {"span": span}
         if readonly:
             self.ui["readonly"] = readonly
@@ -1208,7 +1280,7 @@ class App:
         self.src = Source(log_dir, self.post, clock=self.now, root=os.geteuid() == 0)
         self.src.span = span
         ssh = bool(os.environ.get("SSH_CONNECTION"))
-        self.decoder = Decoder(self.on_event, esc_wait=0.15 if ssh else 0.05)
+        self.decoder = Decoder(self.on_event, esc_wait=0.15 if ssh else 0.05, mouse=lambda: self.mouse)
         self.probe_until = (time.monotonic() + (0.5 if ssh else 0.15)) if probe else 0.0
         self.probe = probe
         self.full = self.dirty = True
@@ -1290,7 +1362,7 @@ class App:
             probe = ""
             if self.probe:
                 probe = (PROBE_GLYPH if self.auto.get("glyphs") and self.caps.glyphs != "ascii" else "") + PROBE_REST
-            self.term.enter(probe)
+            self.term.enter(probe + self.mouse_modes())
             self.take_models()
             self.paint()
             self.starting = True
@@ -1382,7 +1454,7 @@ class App:
             self.suspend()
         if "cont" in f:
             f.discard("cont")
-            self.term.enter()                        # a shell may have changed the modes while we were stopped
+            self.term.enter(self.mouse_modes())      # a shell may have changed the modes while we were stopped
             self.size, self.full, self.dirty = self.term.size(), True, True
 
     def suspend(self):
@@ -1401,7 +1473,7 @@ class App:
         signal.signal(signal.SIGTSTP, self._flag("tstp"))
         stopped = "cont" in self.flags
         self.flags.discard("cont")
-        self.term.enter()
+        self.term.enter(self.mouse_modes())
         self.size, self.full, self.dirty = self.term.size(), True, True
         if not stopped:
             self.no_stop()
@@ -1492,6 +1564,17 @@ class App:
         self.dirty = False
 
     # ---- input
+    def mouse_modes(self):
+        """What turns mouse reporting on: buttons and the wheel in SGR coordinates, no motion (04 §3.10)."""
+        return "\x1b[?1000h\x1b[?1006h" if self.mouse else ""
+
+    def toggle_mouse(self):
+        """ctrl-o (04 §3.10, the owner's key): mouse on or off. Off by default, since reporting takes the
+        terminal's own text selection away (it then needs shift or option)."""
+        self.mouse = not self.mouse
+        self.pending += "\x1b[?1000h\x1b[?1006h" if self.mouse else "\x1b[?1000l\x1b[?1006l"
+        self.note("mouse on · shift-drag selects text" if self.mouse else "mouse off", "dim", 6.0 if self.mouse else 3.0)
+
     def on_event(self, ev):
         kind = ev[0]
         if kind == "reply":
@@ -1499,6 +1582,18 @@ class App:
             return
         if kind in ("paste", "paste-too-long"):
             self.note("pasted text ignored")
+            return
+        if kind == "mouse":
+            if self.mouse and ev[4]:
+                self.dirty = True
+                try:
+                    self.click(ev[1], ev[2] - 1, ev[3] - 1)
+                except (Leave, Gone):
+                    raise
+                except Exception:
+                    if not self.readonly:
+                        write_crash(state_dir(), traceback.format_exc())
+                    self.note("that click failed; the details are in top-crash.log", "warntx")
             return
         if kind != "key":
             return
@@ -1538,6 +1633,29 @@ class App:
     def model_now(self):
         return at(self.model, self.now()) if self.model else None
 
+    def keep_note(self):
+        """A note the view left in `ui` ("nothing to select there") stays its few seconds."""
+        n = self.ui.get("note")
+        if n and time.monotonic() >= self.note_until:
+            self.note(*n)
+
+    def click(self, button, x, y):
+        """A mouse button pressed at the 0-based cell (x, y)."""
+        m, ui = self.model_now(), self.ui
+        if m is None or self.size[0] < 40 or self.size[1] < 10:
+            return
+        if ui.get("overlay"):                        # a click closes a dialog, as esc does
+            if not button & 64:
+                ui.pop("overlay")
+            return
+        P = view.layout(m, *self.size)
+        act = view.mouse(ui, m, P, view.GLYPHS[self.caps.glyphs], button, x, y)
+        self.keep_note()
+        if act and act[0] == "span":
+            self.set_span(act[1])
+        elif act and act[0] == "card":
+            self.open_card(m)
+
     def key(self, k):
         ui, m = self.ui, self.model_now()
         k = {"j": "down", "k": "up", "f1": "?"}.get(k, k)
@@ -1550,6 +1668,9 @@ class App:
         if k == "ctrl-z":
             self.suspend()
             return
+        if k == "ctrl-o":
+            self.toggle_mouse()
+            return
         if m is None:
             if k == "q":
                 self.quit = True
@@ -1559,6 +1680,24 @@ class App:
         ov = ui.get("overlay")
         if ov:
             self.key_overlay(k, ov, m, P)
+            return
+        if ui.get("inspect") and W >= 40 and H >= 10:
+            if k in ("t", "T"):                      # the span changes; the cursor keeps its time
+                i = (view.SPAN_ORDER.index(ui["span"]) + (1 if k == "t" else -1)) % len(view.SPAN_ORDER)
+                self.set_span(view.SPAN_ORDER[i])
+                return
+            if k in ("q", "?") or not view.inspect_key(ui, k, m, P):
+                if k in ("a", "s", "e"):             # a panel takes the readout's place
+                    ui.pop("inspect", None)
+                elif k not in ("q", "?"):
+                    return
+            else:
+                self.keep_note()
+                return
+        if k == "i" and W >= 40 and H >= 10:
+            if ui.get("panel"):
+                view.press(ui, "esc", m, P)
+            view.inspect_at(ui, m, P, P["plot_w"] - 1)
             return
         if k == "q":
             self.quit = True
@@ -1932,7 +2071,7 @@ def cmd_top(args, out=None, env=None):
                     return 2
                 val, i = args[i + 1], i + 1
             opts[name] = val
-        elif a in ("--once", "--no-probe", "--no-connect", "--bell", "--no-bell", "--from-ssh"):
+        elif a in ("--once", "--no-probe", "--no-connect", "--bell", "--no-bell", "--from-ssh", "--mouse", "--no-mouse"):
             opts[a] = True
         elif a == "--ascii":
             opts["--glyphs"] = "ascii"
@@ -2020,16 +2159,21 @@ def cmd_top(args, out=None, env=None):
     bell = settings.get("bell") is True
     if "--bell" in opts or "--no-bell" in opts:
         bell = "--bell" in opts
+    mouse = settings.get("mouse") is True and "--from-ssh" not in opts    # (over --ssh: the near side's choice)
+    if "--mouse" in opts or "--no-mouse" in opts:
+        mouse = "--mouse" in opts
 
     def remember(**more):
         """top.json (04 §5.1): where this run left off, --bell, and a --color, --theme or --glyphs given
-        by hand (`auto` forgets it). Choices that --ssh passed from the other side (the bell too) are
+        by hand (`auto` forgets it), --mouse or --no-mouse (and ctrl-o's last word, in `more`). Choices that --ssh passed from the other side (the bell too) are
         not hand-given: the far side keeps its own."""
         if not cfg or readonly:
             return
         want = dict(settings, v=1, **more)
         if "--from-ssh" not in opts:
             want["bell"] = bell
+            if ("--mouse" in opts or "--no-mouse" in opts) and "mouse" not in more:
+                want["mouse"] = mouse
             for o in ("--color", "--theme", "--glyphs"):
                 if o in opts:
                     if opts[o] == "auto":
@@ -2056,13 +2200,15 @@ def cmd_top(args, out=None, env=None):
                   "--color", detect_color(color if color != "auto" else found.get("color", "auto"), True, env),
                   "--theme", detect_theme(theme if theme != "auto" else found.get("theme", "auto"), env),
                   "--glyphs", detect_glyphs(glyphs, env), "--no-probe", "--from-ssh", "--bell" if bell else "--no-bell"]
+        if mouse:                                    # (a far side older than 1.9.5 names it as ignored)
+            remote.append("--mouse")
         remember()
         return run_ssh(target, port, [x if x != "none" else "never" for x in remote], sys.stdin.fileno())
     probe = "--no-probe" not in opts and term_name not in ("linux", "vt100", "vt220", "ansi")
     caps = view.Caps(detect_color(color, True, env), detect_glyphs(glyphs, env), detect_theme(theme, env))
     auto = {"color": color == "auto", "theme": theme == "auto", "glyphs": glyphs == "auto"}
     app = App(Term(sys.stdin.fileno(), out.fileno()), caps, auto, span, oomph.LOG_DIR, readonly, bell, now, probe,
-              note="ignored: %s" % " ".join(ignored)[:60] if ignored else None)
+              note="ignored: %s" % " ".join(ignored)[:60] if ignored else None, mouse=mouse)
     rc = app.run()
-    remember(span=app.ui["span"])
+    remember(span=app.ui["span"], **({} if "--from-ssh" in opts else {"mouse": app.mouse}))
     return rc

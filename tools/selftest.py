@@ -516,6 +516,25 @@ check(oomph.read_bounded(under, oomph.LIMITS["ledger"]) is None, "read_bounded: 
 tail = oomph.read_bounded(lines, 4096, tail=True)
 check(tail and tail.endswith(b'{"n": 199999}\n') and tail.startswith(b'{"n": ') and len(tail) <= 4096,
       "read_bounded tail: the newest whole lines of a bigger file")
+odd = os.path.join(scratch, "odd")       # the tail as the cut of a copy gave it, at every boundary
+
+
+def cut_tail(whole, cap):
+    if len(whole) <= cap:
+        return whole
+    d = whole[-cap:]
+    return d[d.find(b"\n") + 1:] if b"\n" in d else b""
+
+
+bad_tail = []
+for whole in (b"".join(b'{"n": %d}\n' % i for i in range(300)), b"a\n" + b"b" * 5000, b"x" * 9000 + b"\n",
+              b"\n" * 50, b"ab\ncd\nef", b"", b"q" * 70000 + b"\n" + b"r" * 100 + b"\n"):
+    open(odd, "wb").write(whole)
+    for cap in (1, 2, 3, 9, 10, 11, 100, 2999, 3000, 5001, 5002, 9001, 65536, 70102, 1 << 20):
+        if oomph.read_bounded(odd, cap, tail=True) != cut_tail(whole, cap):
+            bad_tail.append((len(whole), cap))
+check(not bad_tail, "read_bounded tail: the fragment skipped before the read gives what cutting a copy gave, at "
+      "every boundary (%s)" % (bad_tail[:3] or "none differ"))
 got, dt = timed(oomph.read_bounded, sparse, oomph.LIMITS["history"], tail=True)
 check(isinstance(got, bytes) and len(got) == 0 and dt < 2, "read_bounded tail: 1 GB sparse file → nothing, %.2f s" % dt)
 U = oomph.loads_untrusted
@@ -1256,21 +1275,69 @@ for label, cv in (("old", older), ("new", newer)):
     with open(os.path.join(vdir, label, "samples-%s.jsonl" % oomphd.datetime.date.fromtimestamp(t_v).isoformat()), "w") as f:
         f.write("".join(json.dumps(x) + "\n" for x in rows))
     json.dump(dict(cv, t=t_v), open(os.path.join(vdir, label, "current.json"), "w"))
+    # the events and an incident of each version: the new resources' kinds and summary fields (1.9.5, 02 §5.3)
+    evl = [{"t": t_v - 900, "kind": "disk_low", "disk_free_gb": 12.0}, {"t": t_v - 800, "kind": "pressure_change", "old": 1,
+                                                                         "new": 2}]
+    if label == "new":
+        evl += [{"t": t_v - 700, "kind": "thermal", "old": 0, "new": 2, "busy": 9.1},
+                {"t": t_v - 650, "kind": "cpu_saturated", "busy": 13.1, "n": 14, "minutes": 10, "top": {"cargo": 9.0}},
+                {"t": t_v - 600, "kind": "cpu_saturated_cleared", "busy": 2.0, "n": 14, "minutes": 14},
+                {"t": t_v - 550, "kind": "disk_low", "disk_free_gb": 12.0, "pool": "data", "name": "Data", "mount": "/",
+                 "free_gb": 12.0, "level": "low"},
+                {"t": t_v - 500, "kind": "disk_filling", "pool": "data", "name": "Data", "free_gb": 30.0, "rate_gb_min": 2.5,
+                 "eta_min": 10.0, "top": {"dd": 900.0}},
+                {"t": t_v - 450, "kind": "volume", "pool": "vol:X", "name": "Scratch", "mount": "/Volumes/Scratch",
+                 "what": "mounted"},
+                {"t": t_v - 400, "kind": "unowned_memory", "gb": 20.0, "gpu_alloc_gb": 11.7},
+                {"t": t_v - 350, "kind": "a_kind_of_1_10", "x": [1]}]
+    for e in evl:
+        e["iso"] = oomphd.now_iso(e["t"])
+    with open(os.path.join(vdir, label, "events.jsonl"), "w") as f:
+        f.write("".join(json.dumps(e) + "\n" for e in evl))
+    iid = time.strftime("%Y%m%d-%H%M%S", time.localtime(t_v - 1200))
+    os.makedirs(os.path.join(vdir, label, "incidents", iid))
+    with open(os.path.join(vdir, label, "incidents", iid, "incident.json"), "w") as f:
+        json.dump({"id": iid, "start": t_v - 1200, "end": t_v - 300, "open": False,
+                   "reasons": [{"kind": "pressure", "desc": "Memory pressure CRITICAL", "t": t_v - 1200}],
+                   "summary": oomph.summarize(rows, evl)}, f)
     oomph.LOG_DIR = os.path.join(vdir, label)
     try:
         with redirect_stdout(io.StringIO()):
-            for args in (["status"], ["report", "--last", "1h"], ["html", "--last", "1h", "-o", os.path.join(vdir, "r.html")]):
+            for args in (["status"], ["report", "--last", "1h"], ["html", "--last", "1h", "-o", os.path.join(vdir, "r.html")],
+                         ["incidents"], ["incident", "latest"]):
                 if oomph.main(args) != 0:
                     bad_reads.append("%s: oomph %s" % (label, args[0]))
+        html_v = oomph.incident_html(oomph.list_incidents()[-1])
+        if ("Cores busy" in html_v) != (label == "new"):
+            bad_reads.append("%s: the incident report's CPU panel" % label)
         m = oomph_top.load_model("1h", t_v, log_dir=oomph.LOG_DIR, live=False)
-        view.render(m, 80, 24, view.Caps("none", "unicode", "dark"), {"span": "1h"})
+        texts = [e[1] for e in m["events"]]
+        if label == "new" and not ("disk low: Data 12.0 GB free" in texts and "disk mounted: Scratch" in texts and
+                                   "cores saturated: 13.1 of 14 busy for 10 min" in texts and "thermal nominal → heavy" in texts
+                                   and "a kind of 1 10" in texts):
+            bad_reads.append("new: event words in oomph top %s" % texts)
+        for ui in ({"span": "1h"}, {"span": "1h", "panel": "e"}, {"span": "1h", "overlay": {"kind": "inc", "id": iid}}):
+            view.render(m, 80, 24, view.Caps("none", "unicode", "dark"), ui)
+        lay = view.layout(m, 100, 30)
+        for c in range(0, lay["plot_w"], 7):
+            ui = {"span": "1h"}
+            view.inspect_at(ui, m, lay, c)
+            view.render(m, 100, 30, view.Caps("256", "unicode", "dark"), ui)
         import oomph_ai  # noqa: E402
-        oomph_ai.briefing(oomph_ai.Logs(t_v - 3600, t_v))
+        lg = oomph_ai.Logs(t_v - 3600, t_v)
+        oomph_ai.briefing(lg)
+        tl = lg.timeline({"step_minutes": 10})
+        if ("cores_busy" in tl["rows"][-1]) != (label == "new"):
+            bad_reads.append("%s: AI timeline rows %s" % (label, sorted(tl["rows"][-1])))
+        for by in ("memory", "cpu", "gpu", "writes"):
+            lg.top_at({"by": by})
+        lg.events({"kind": "disk_filling"})
     except Exception as e:  # noqa: B902
         bad_reads.append("%s: %r" % (label, e))
 oomph.LOG_DIR = saved_log
 shutil.rmtree(vdir, ignore_errors=True)
-check(not bad_reads, "old and newer samples through status, report, html, oomph top and the AI briefing (%s)"
+check(not bad_reads, "old and newer samples, events and incidents through status, report, html, incidents, the incident "
+      "report, oomph top (events, the incident card, inspect at every 7th column) and the AI tools (%s)"
       % ("; ".join(bad_reads) or "all read"))
 
 # 80 columns: long names are cut by rule, prose is wrapped, headlines continue under their column
@@ -2307,6 +2374,199 @@ if MAC:
                                                             if e["class"] != "ignored"))
 else:
     print("skip  oomph volumes reads the Mac's mount table")
+
+# --- M3 (1.9.5): events, incident fields and report panels for the other resources (roadmap 02 §5.3)
+dm = oomphd.Daemon()
+ev3, notes3 = [], []
+dm.event = lambda kind, **kw: ev3.append(dict(kw, kind=kind))
+dm.notify = lambda title, msg, **kw: notes3.append((title, msg))
+dm.started -= 1000
+t3 = time.time()
+DATA = {"id": "data", "name": "Data", "mount": "/System/Volumes/Data", "free_gb": 60.0, "watch": True, "low_gb": 20,
+        "crit_gb": 5, "level": "ok"}
+EXT = {"id": "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10", "name": "Scratch", "mount": "/Volumes/Scratch", "free_gb": 900.0,
+       "watch": False}
+
+
+def s3(t, busy=2.0, therm=0, pools=(DATA,), **kw):
+    x = dict(t=t, iso=oomphd.now_iso(t), pressure=1, swap_used_gb=0.0, disk_free_gb=pools[0]["free_gb"] if pools else 60.0,
+             ram_gb=36.0, unowned_gb=1.0, compressor_logical_gb=1.0, away={"idle_s": 0}, os="macos",
+             cpu={"n": 14, "busy": busy, "therm": therm},
+             top_cpu=[{"pid": 1, "name": "cargo", "cpu": 6.0}, {"pid": 2, "name": "cargo", "cpu": 3.0}],
+             top_io=[{"pid": 3, "name": "dd", "w": 900.0}], disks=[dict(p) for p in pools])
+    x.update(kw)
+    return x
+
+
+def kinds3(*k):
+    return [e for e in ev3 if e["kind"] in k]
+
+
+for i, th in enumerate([0, 2, 3, 2, 2, 2, 2, 2]):      # a change, then two more within the minute: batched
+    dm.evaluate(s3(t3 + 30 * i, therm=th))
+th_ev = kinds3("thermal")
+check(len(th_ev) == 2 and (th_ev[0]["old"], th_ev[0]["new"]) == (0, 2) and th_ev[1].get("flips") == 2 and
+      th_ev[1]["new"] == 2, "events: the thermal level, a change at once and the flips after it in one event (%s)"
+      % [(e["old"], e["new"], e.get("flips")) for e in th_ev])
+for i in range(25):                                   # 12.5 minutes at 13 of 14 cores, a pause, then again within the hour
+    dm.evaluate(s3(t3 + 600 + 30 * i, busy=13.0))
+dm.evaluate(s3(t3 + 600 + 30 * 25, busy=2.0))
+for i in range(25):
+    dm.evaluate(s3(t3 + 1500 + 30 * i, busy=13.5))
+sat = kinds3("cpu_saturated", "cpu_saturated_cleared")
+check([e["kind"] for e in sat] == ["cpu_saturated", "cpu_saturated_cleared"] and sat[0]["minutes"] == 10 and
+      sat[0]["top"] == {"cargo": 9.0} and sat[0]["n"] == 14, "events: cores saturated after ten minutes at 90 %%, cleared "
+      "below 75 %%, and not again within the hour (%s)" % [(e["kind"], e.get("minutes"), e.get("top")) for e in sat])
+dz = oomphd.Daemon()
+ev_z = []
+dz.event = lambda kind, **kw: ev_z.append(dict(kw, kind=kind))
+dz.notify = lambda *a, **kw: None
+for i in range(9):                                    # 4.5 minutes busy, a sleep of eight hours, busy again
+    dz.evaluate(s3(t3 + 30 * i, busy=13.3))
+dz.evaluate(dict(s3(t3 + 8 * 3600, busy=13.3), cpu={"n": 14, "therm": 0}))     # (no rates after the gap)
+for i in range(1, 12):
+    dz.evaluate(s3(t3 + 8 * 3600 + 30 * i, busy=13.3))
+sat_z = [(e["kind"], e.get("minutes")) for e in ev_z if e["kind"].startswith("cpu_sat")]
+for i in range(22):                                   # saturated for real, then the lid closes: over where last seen
+    dz.evaluate(s3(t3 + 9 * 3600 + 30 * i, busy=13.3))
+dz.evaluate(s3(t3 + 12 * 3600, busy=13.3))
+sat_z2 = [(e["kind"], e.get("minutes"), e.get("gap")) for e in ev_z if e["kind"].startswith("cpu_sat")]
+check(sat_z == [] and sat_z2[0] == ("cpu_saturated", 10, None) and sat_z2[1:] == [("cpu_saturated_cleared", 10, 10170)],
+      "events: a sleep starts the saturation clock again and ends an episode where it was last seen (%s, %s)"
+      % (sat_z, sat_z2))
+del ev3[:]
+dm.prev_pools = None
+for i in range(8):                                    # 2.5 GB less every 30 s: full in minutes
+    dm.evaluate(s3(t3 + 3000 + 30 * i, pools=(dict(DATA, free_gb=40.0 - 2.5 * i),)))
+fill = kinds3("disk_filling")
+hot_filling = dm.hot
+dm.evaluate(s3(t3 + 3300, pools=(dict(DATA, free_gb=22.0),)))
+dm.evaluate(s3(t3 + 3600, pools=(dict(DATA, free_gb=22.0),)))
+check(len(fill) == 1 and fill[0]["pool"] == "data" and fill[0]["rate_gb_min"] == 5.0 and fill[0]["top"] == {"dd": 900.0}
+      and hot_filling and not dm.hot and sum(1 for n in notes3 if n[0] == "Disk filling up") == 1,
+      "events: a watched disk filling (5 GB a minute, full in minutes): one event with the writers, one notification, "
+      "hot sampling while it fills (%s)" % [(e["rate_gb_min"], e["eta_min"]) for e in fill])
+del ev3[:], notes3[:]
+low_ext = dict(EXT, watch=True, low_gb=20, crit_gb=5, level="low", free_gb=12.0)
+for i in range(3):
+    dm.evaluate(s3(t3 + 4000 + 30 * i, pools=(dict(DATA, free_gb=15.0, level="low"), low_ext)))
+low = kinds3("disk_low")
+check(len(low) == 2 and {e["pool"] for e in low} == {"data", EXT["id"]} and
+      next(e for e in low if e["pool"] == "data").get("disk_free_gb") == 15.0 and
+      [n[0] for n in notes3] == ["Disk space low", "Disk space low"] and "on Scratch" in notes3[1][1],
+      "events: disk_low per watched disk, the startup disk's as before (disk_free_gb, the swap warning), each once in "
+      "six hours (%s)" % [(e["pool"], e.get("free_gb")) for e in low])
+del ev3[:]
+dm.prev_pools, dm.started = None, t3 + 4500
+dm.evaluate(s3(t3 + 4600, pools=(DATA, EXT)))        # within the first two minutes after a start: what is there
+dm.evaluate(s3(t3 + 4610, pools=(DATA,)))
+dm.started = t3
+dm.evaluate(s3(t3 + 4700, pools=(DATA, EXT)))
+dm.evaluate(s3(t3 + 5100, pools=(DATA, dict(EXT, watch=True))))
+dm.evaluate(s3(t3 + 5500, pools=(DATA,)))
+dm.evaluate(s3(t3 + 5530))                           # a sample without its disks block: no news
+for i, there in enumerate([1, 0, 1, 0, 0, 0]):       # a mount that flaps: told at once, then once after a quiet time
+    dm.evaluate(s3(t3 + 5900 + 30 * i if i < 5 else t3 + 6250, pools=(DATA, EXT) if there else (DATA,)))
+del dm.prev_pools["data"]
+vol = [(e["what"], e["name"], e.get("changes")) for e in kinds3("volume")]
+check(vol == [("mounted", "Scratch", None), ("watched", "Scratch", None), ("unmounted", "Scratch", None),
+              ("mounted", "Scratch", None), ("unmounted", "Scratch", 3)],
+      "events: a disk mounted, watched and gone; none in the first minutes after a start; a flapping mount in one "
+      "event after five quiet minutes (%s)" % vol)
+del ev3[:]
+dm2 = oomphd.Daemon()
+dm2.event = lambda kind, **kw: ev3.append(dict(kw, kind=kind))
+dm2.notify = lambda *a, **kw: None
+for i in range(15):                                   # a 1.9.0 sample: no cpu, gpu or disks block
+    old3 = {k: v for k, v in s3(t3 + 5000 + 30 * i, disk_free_gb=12.0, unowned_gb=140.0, procs_gb=10.0).items()
+            if k not in ("cpu", "disks", "top_cpu", "top_io")}
+    dm2.evaluate(old3)
+dm2.evaluate(dict(s3(t3 + 5500, unowned_gb=140.0, procs_gb=10.0),
+                  gpu=[{"id": "gpu0", "util": 4.0, "src": "clients", "mem_gb": 3.0, "mem_alloc_gb": 11.68}]))
+old_low = kinds3("disk_low")
+un = kinds3("unowned_memory")
+dm2.evaluate(s3(t3 + 5530, pools=(dict(DATA, free_gb=12.0, level="low"),)))    # the disks block back: no second warning
+check(len(kinds3("disk_low")) == 1 and len(old_low) == 1 and set(old_low[0]) == {"disk_free_gb", "kind"} and
+      not kinds3("thermal", "cpu_saturated", "disk_filling", "volume") and un and "gpu_alloc_gb" not in un[0],
+      "events: samples without the new blocks keep the events of 1.9.4, the startup disk's disk_low too (%s)"
+      % [e["kind"] for e in ev3])
+dm3 = oomphd.Daemon()
+dm3.event = lambda kind, **kw: ev3.append(dict(kw, kind=kind))
+dm3.notify = lambda *a, **kw: None
+del ev3[:]
+for i in range(15):
+    dm3.evaluate(dict(s3(t3 + 6000 + 30 * i, unowned_gb=140.0, procs_gb=10.0),
+                      gpu=[{"id": "gpu0", "util": 4.0, "src": "clients", "mem_gb": 3.0, "mem_alloc_gb": 11.68}]))
+un = kinds3("unowned_memory")
+check(un and un[0].get("gpu_alloc_gb") == 11.68, "events: unowned memory says how much the GPU has allocated (%s)"
+      % (un[0].get("gpu_alloc_gb") if un else None))
+check(oomph.notify_text('Vol"ume\\\\ \x1b[2J‮evil\nname', 30) == "Vol ume    [2J evil name" and
+      len(oomph.notify_text("x" * 500)) == 200, "notifications: names their owners chose lose quotes, backslashes, control "
+      "and direction characters, and are cut (%r)" % oomph.notify_text('Vol"ume\\\\ \x1b[2J‮evil\nname', 30))
+# the summary and the report: the GPU's two kinds of figure apart, nothing for samples before 1.9.1
+seq3 = []
+for i in range(60):
+    t = t3 - 3600 + 60 * i
+    x = s3(t, busy=2.0 + (i % 10), pools=(dict(DATA, free_gb=60.0 - i / 10.0), EXT))
+    x.update(app_gb=10.0, wired_gb=5.0, compressed_gb=3.0, swap_total_gb=0.0, jetsam_kills=0,
+             top=[{"pid": 1, "name": "cargo", "mb": 500 + i, "cpu": 6.0, "gpu": 0.5}],
+             groups=[{"name": "iTerm2", "mb": 900, "n": 3, "cpu": 6.5}],
+             gpu=[{"id": "gpu0", "util": 30.0 + i % 7 if i >= 30 else 80.0 + i % 5, "active": 70.0,
+                   "src": "ioreport" if i >= 30 else "clients", "mem_gb": 4.0 + i / 100.0, "mem_alloc_gb": 11.0,
+                   "mem_limit_gb": 27.0}],
+             top_gpu=[{"pid": 2, "name": "WindowServer", "gpu": 5.0}])
+    seq3.append(x)
+sm = oomph.summarize(seq3, [])
+olds = [{k: v for k, v in x.items() if k not in ("cpu", "gpu", "disks", "top_cpu", "top_gpu", "top_io")} for x in seq3]
+so = oomph.summarize(olds, [])
+check(sm["max_cpu_busy"] == 11.0 and sm["cpu_n"] == 14 and sm["max_gpu_busy"] == 84.0 and sm["max_gpu_util"] == 36.0 and
+      sm["max_gpu_mem_gb"] == 4.59 and sm["min_free_gb"] == {"data": 54.1, EXT["id"]: 900.0} and
+      sm["writers"][0]["name"] == "dd" and sm["top_cpu_at_peak"][0]["name"] == "cargo" and
+      sm["top_gpu_at_peak"][0]["name"] == "WindowServer" and sm["process_risers"][0].get("cpu_peak") == 6.0 and
+      not {"max_cpu_busy", "max_gpu_util", "max_gpu_busy", "max_gpu_mem_gb", "min_free_gb", "writers"} & set(so) and
+      "cpu_peak" not in so["process_risers"][0],
+      "summary: the CPU's, the GPU's (busy time and full speed apart, across the change), GPU memory's peaks, the least "
+      "free space per disk and the writers; absent, not zero, for older samples")
+h_mixed = oomph.render_html(seq3, [], "r")
+h_busy = oomph.render_html(seq3[:30], [], "r")
+h_old = oomph.render_html(olds, [], "r")
+check("<h2>GPU at full speed and busy time (%)" in h_mixed and "<h2>GPU busy time (%)" in h_busy and
+      "full speed" not in h_busy.split("Biggest risers")[0] and "Cores busy (of 14)" in h_mixed and
+      "GPU memory (GB)" in h_mixed and "working-set limit 27" in h_mixed and "Free space on Data (GB)" in h_mixed and
+      "Busiest on the CPU at its peak" in h_mixed and "Writing to disk, peak" in h_mixed and '"cpu":6.0' in h_mixed and
+      not any(w in h_old for w in ("Cores busy", "GPU busy", "GPU at full", "Free space on", "Busiest on", '"cpu":')),
+      "report: panels for the cores, the GPU in its two wordings, GPU memory against its limit, each watched disk with "
+      "its floors; the busiest per resource; CPU and GPU columns in the risers; none of it for older samples")
+lines3 = oomph.resource_summary_lines(sm, {"data": "Data"})
+check(any(x.startswith("cores: at most 11.0 of 14 busy") for x in lines3) and
+      any("% of full speed" in x for x in lines3) and any("speed not reported" in x for x in lines3) and
+      any("Data 54.1 GB" in x for x in lines3) and not oomph.resource_summary_lines(so),
+      "oomph report: the other resources in words, the GPU's two figures named apart (%s)" % lines3[:2])
+ing3 = oomph_sync.Ingest({"now": time.time(), "ram_gb": 8.0})
+check(ing3.row(json.dumps({"t": time.time() - 60, "kind": "disk_low", "pool": "vol:x", "free_gb": 900.0}), "events") and
+      ing3.row(json.dumps({"t": time.time() - 60, "ram_gb": 8.0, "free_gb": 4.0}), "samples") and
+      not ing3.row(json.dumps({"t": time.time() - 60, "ram_gb": 8.0, "free_gb": 900.0}), "samples"),
+      "a mirror lets in a disk's event with 900 GB free on an 8 GB machine; a sample's free memory stays bounded")
+import oomph_top as _ot  # noqa: E402
+words = {k: _ot.event_text(dict(e, kind=k)) for k, e in (
+    ("thermal", {"old": 2, "new": 0}), ("cpu_saturated", {"busy": 13.25, "n": 14, "minutes": 12}),
+    ("cpu_saturated_cleared", {"minutes": 30}), ("disk_filling", {"mount": "/Volumes/X", "eta_min": 7.4, "rate_gb_min": 3}),
+    ("volume", {"pool": "vol:Y", "what": "unwatched"}), ("disk_low", {"disk_free_gb": 3.0}))}
+check(words == {"thermal": "thermal heavy → nominal", "cpu_saturated": "cores saturated: 13.2 of 14 busy for 12 min",
+                "cpu_saturated_cleared": "cores no longer saturated, after 30 min",
+                "disk_filling": "disk filling: /Volumes/X, full in 7 min at 3.0 GB/min", "volume": "disk no longer watched: vol:Y",
+                "disk_low": "disk low: 3.0 GB free"} and "disk_filling" in _ot.ALARMING,
+      "event words (the app's ChartEvent says the same; the chart vectors hold them together): %s" % words)
+odd = os.path.join(tempfile.mkdtemp(prefix="oomph-odd-"), "events.jsonl")
+with open(odd, "w") as f:       # odd values in a line cost that line at most, never the list
+    for e in ({"kind": "volume", "what": ["x"]}, {"kind": "pressure_change", "old": [1], "new": {}},
+              {"kind": "thermal", "old": 1e308, "new": 2}, {"kind": "jetsam", "kills": 2}):
+        f.write(json.dumps(dict(e, t=time.time() - 60)) + "\n")
+odd_ev, odd_c = _ot.load_events(os.path.dirname(odd), chart=True)
+check(len(odd_c) >= 1 and any(t == "2 killed by jetsam" for _, t, _ in odd_ev) and
+      _ot.event_text({"kind": "volume", "what": ["x"]}) == "disk changed: ?",
+      "event words: a line with odd values (a list for a word) does not take the other events with it (%s)"
+      % [x[1] for x in odd_ev])
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,

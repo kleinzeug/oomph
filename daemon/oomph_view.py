@@ -13,6 +13,8 @@ cell rules) is the terminal's own and is tested by the golden frames.
 
 Standard library only, Python 3.9.
 """
+import bisect
+import collections
 import math
 import time
 import unicodedata
@@ -1807,11 +1809,11 @@ def _kv(k, v, role="fg", kw=11):
 
 
 def help_pages(g, model):
-    """The help (04 §3.10), built from what this build has: the keys of T1, no machines, no
-    inspect, no mouse. Returns (left column, right column, 'what you see' rows)."""
+    """The help (04 §3.10), built from what this build has: the keys of T1, inspect and the mouse
+    (T1b), no machines. Returns (left column, right column, 'what you see' rows)."""
     A, U = g["arrows"], g["updown"]
     left = [("Chart", None), ("%s %s" % (A[0], A[1]), "longer %s shorter" % g["mid"]),
-            ("t  T", "cycle spans %s back" % g["mid"]), ("", ""),
+            ("t  T", "cycle spans %s back" % g["mid"]), ("i", "inspect a moment"), ("", ""),
             ("Panels", None), ("a", "top apps"), ("s", "Claude sessions"), ("e", "events"),
             ("enter", "its processes"), ("", ""),
             ("General", None), ("?  F1", "help %s next page" % g["mid"]), ("esc", "close %s back" % g["mid"]),
@@ -1819,8 +1821,8 @@ def help_pages(g, model):
     right = [("Lists", None), (U[1], "into Reservations"), (U[0], "into Incidents"),
              ("%s %s  j k" % (U[0], U[1]), "move in the list"), ("space", "the other list"),
              ("pgup pgdn", "a page"), ("home end", "first %s last row" % g["mid"]), ("enter", "details"),
-             ("o", "open the report"), ("y", "copy its path"), ("", ""),
-             ("Terminal", None), ("ctrl-l", "redraw"), ("ctrl-z", "suspend")]
+             ("o", "open the report"), ("y", "copy its path"),
+             ("Terminal", None), ("ctrl-o", "mouse on %s off" % g["mid"]), ("ctrl-l", "redraw"), ("ctrl-z", "suspend")]
     away = model.get("os", "").startswith("macOS") or "os" not in model
     see = [("Chart", None),
            ([(g["sw"], role) for _, role in SERIES_WORDS], "%s, stacked; %s is the RAM" % (
@@ -2001,6 +2003,17 @@ def card_inc(fr, caps, g, model, inc):
         lines.append((2, _kv("On top", (" %s " % g["mid"]).join("%s %.1fG" % kv for kv in s["on_top"][:4]))))
     if s.get("sessions"):
         lines.append((3, _kv("Sessions", (" %s " % g["mid"]).join("%s %.1fG" % kv for kv in s["sessions"][:2]))))
+    res = []                                    # the other resources' peaks (1.9.5): only where recorded
+    if s.get("cpu") is not None:
+        res.append("cores %.1f%s" % (s["cpu"], " of %d" % s["cpu_n"] if s.get("cpu_n") else ""))
+    if s.get("gpu_util") is not None:
+        res.append("GPU %.0f %% of full speed" % s["gpu_util"])
+    elif s.get("gpu_busy") is not None:
+        res.append("GPU busy %.0f %%" % s["gpu_busy"])
+    if s.get("data_free") is not None:
+        res.append("Data %.1f GB free" % s["data_free"])
+    if res:
+        lines.append((3, _kv("Resources", (" %s " % g["mid"]).join(res))))
     if isinstance(s.get("away_fraction"), (int, float)):
         lines.append((4, _kv("Away", "%d %% of the time" % round(100 * s["away_fraction"]))))
     if inc.get("report"):
@@ -2042,6 +2055,416 @@ def card_procs(fr, caps, g, model, kind, item):
                   [("esc", "close"), (g["updown"], "previous %s next" % g["mid"])])
 
 
+# ------------------------------------------------------------------ inspect: the keyboard's hover card (04 §3.9)
+# The readout is the app's hover card (MemoryChart.hoverInfo), held to it by the "hover" group of
+# tools/vectors/chart.json: the same column of time, the same readings, words and caps.
+def duration(sec):
+    """MemoryChart.duration: '45 s', '12 min', '3 h 20 min', '11 h', '2 d 4 h'."""
+    s_ = int(math.floor(sec + 0.5)) if sec >= 0 else -int(math.floor(-sec + 0.5))   # Swift's rounded(): half away from 0
+    if s_ < 90:
+        return "%d s" % s_
+    if s_ < 3600:
+        return "%d min" % (s_ // 60)
+    if s_ < 86400:
+        return "%d h" % (s_ // 3600) if s_ % 3600 // 60 == 0 or s_ >= 36000 else "%d h %d min" % (s_ // 3600, s_ % 3600 // 60)
+    d, h = s_ // 86400, s_ % 86400 // 3600
+    return "%d d" % d if h == 0 else "%d d %d h" % (d, h)
+
+
+def time_at(u, f, first, now):
+    """MemoryChart.time(at:): the time at x = u, by bisection over [first - 1, now] (the mapper is
+    monotonic), clamped to that range."""
+    lo, hi = first - 1, now
+    if u >= f(hi):
+        return hi
+    if u <= f(lo):
+        return lo
+    for _ in range(50):
+        mid = (lo + hi) / 2
+        if f(mid) < u:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def _between(a, lo, hi, key):
+    """The elements of a sorted list with key in lo...hi (MemoryChart.slice)."""
+    i = bisect.bisect_left([key(x) for x in a], lo) if a else 0
+    out = []
+    for x in a[i:]:
+        if key(x) > hi:
+            break
+        out.append(x)
+    return out
+
+
+ChartEv = collections.namedtuple("ChartEv", "t kind text alarming kills top seconds")
+ChartEv.__doc__ = """One line of events.jsonl as the app's ChartEvent has it (a tuple: the inspector keeps thousands)."""
+HOVER_SERIES = (("App", "app"), ("Compressed", "comp"), ("Wired", "wired"), ("Swap", "swap"))
+
+
+def hover_info(pts, gaps, incidents, events, blocks, now, first, f, u, du, max_res=4, max_ev=6):
+    """MemoryChart.hoverInfo: everything under one column of the plot (u: its middle, du: its width,
+    both in 0…1), aggregated, since on the log axis one column can hold hours. pts: the thinned points;
+    gaps: (from, to); incidents: as load_incidents gives them; events: ChartEv, oldest first; blocks: stack_reservations' output."""
+    t0, t1 = time_at(max(u - du / 2, 0), f, first, now), time_at(min(u + du / 2, 1), f, first, now)
+    tc = (t0 + t1) / 2
+    info = {"t0": t0, "t1": t1, "tc": tc}
+    if t1 - t0 < 90:
+        info["when"] = "%s %s" % (day_label(tc), hhmm(tc))
+    elif _lt(t0)[:3] == _lt(t1)[:3]:
+        info["when"] = "%s %s–%s" % (day_label(t0), hhmm(t0), hhmm(t1))
+    else:
+        info["when"] = "%s %s – %s %s" % (day_label(t0), hhmm(t0), day_label(t1), hhmm(t1))
+    info["ago"] = "now" if now - tc < 90 else duration(now - tc) + " ago"
+    gap_here = next((g for g in gaps if g[0] < tc < g[1]), None)
+    here = _between(pts, t0, t1, lambda p: p["t"])
+    if not here and gap_here is None and pts:
+        i = bisect.bisect_left([p["t"] for p in pts], tc)
+        cand = [pts[k] for k in (i - 1, i) if 0 <= k < len(pts)]
+        if cand:
+            before = [p for p in cand if p["t"] < tc]
+            after = [p for p in cand if p["t"] >= tc]
+            near = (before[-1] if before and (not after or tc - before[-1]["t"] <= after[0]["t"] - tc)
+                    else after[0] if after else before[-1])
+            if abs(near["t"] - tc) <= 60:
+                here = [near]
+    info["samples"] = len(here)
+    info["readings"], info["away"], info["peak"] = [], False, 0.0
+    if here:
+        info["readings"] = [(name, min(p[k] for p in here), max(p[k] for p in here)) for name, k in HOVER_SERIES]
+        info["away"] = any(p["away"] for p in here)
+        info["peak"] = max(p["wired"] + p["app"] + p["comp"] + p["swap"] for p in here)
+    over = [g for g in gaps if g[0] < t1 and g[1] > t0]
+    info["no_data"] = None
+    if len(over) == 1:
+        info["no_data"] = "no data %s–%s (%s)" % (hhmm(over[0][0]), hhmm(over[0][1]), duration(over[0][1] - over[0][0]))
+    elif len(over) > 1:
+        info["no_data"] = "%d stretches without data, %s in all" % (len(over), duration(sum(b - a for a, b in over)))
+    e0, e1 = time_at(max(u - 3 * du, 0), f, first, now), time_at(min(u + 3 * du, 1), f, first, now)
+    info["incidents"] = ["incident " + hhmm(i["start"]) + (": " + i.get("desc", "") if i.get("nreasons", 1 if i.get("desc")
+                                                                                              else 0) else "")
+                         for i in incidents if i["start"] <= e1 and (i["end"] if i.get("end") is not None else now) >= e0]
+    lines, order, by = [], [], {}
+    for e in _between(events, e0, e1, lambda e: e.t):
+        if e.kind not in by:
+            order.append(e.kind)
+        by.setdefault(e.kind, []).append(e)
+    for k in order:
+        es = by[k]
+        if len(es) == 1:
+            lines.append((es[0].text, es[0].alarming))
+        elif k == "jetsam":
+            kills, top = sum(e.kills for e in es), {}
+            for e in es:
+                for name, n in (e.top or {}).items():
+                    top[name] = top.get(name, 0) + n
+            names = ", ".join("%s ×%d" % kv for kv in sorted(top.items(), key=lambda kv: -kv[1])[:2])
+            lines.append(("%d killed by jetsam" % kills + (" · " + names if names else "") if kills > 0 else
+                          "%d jetsam reports" % len(es), True))
+        elif k == "pressure_change":
+            lines.append(("pressure changed %d× · last: " % len(es) + es[-1].text.replace("pressure ", ""), False))
+        elif k in ("sleep_gap", "stall"):
+            lines.append(("%s %d×, %s in all" % ("system stalled" if k == "stall" else "asleep", len(es),
+                                                duration(sum(e.seconds for e in es))), es[0].alarming))
+        else:
+            lines.append(("%s ×%d" % (es[-1].text, len(es)), es[0].alarming))
+    info["events"], info["more_events"] = lines[:max_ev], max(len(lines) - max_ev, 0)
+    res = [b for b in blocks if b["res"]["requested"] <= t1 and b["end"] >= t0]
+    info["reserved"] = []
+    for b in res[:max_res]:
+        r = b["res"]
+        queued = (r["granted"] if r.get("granted") is not None else float("inf")) > tc
+        info["reserved"].append(("%.1f GB " % gb_at(r, min(max(tc, r["requested"]), b["end"])) + r["purpose"] +
+                                 (" (queued)" if queued else ""), res_color(r["purpose"])))
+    info["more_reserved"] = max(len(res) - max_res, 0)
+    return info
+
+
+def inspect_geometry(model, ui, P):
+    """(mapper, its inverse, first, plot width, the cursor's column) while inspecting."""
+    now = model["now"]
+    first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
+    f, finv = mapper(now, first, SPANS[ui["span"]])
+    W = P["plot_w"]
+    t = (ui.get("inspect") or {}).get("t", now)
+    col = max(0, min(W - 1, int(f(t) * W))) if f(t) < 1 else W - 1
+    return f, finv, first, W, col
+
+
+def inspect_info(model, ui, P, max_res=6):
+    f, finv, first, W, col = inspect_geometry(model, ui, P)
+    return hover_info(model["pts"], model["gaps"], model["incidents"], model.get("cevents") or [], model.get("blocks") or [],
+                      model["now"], first, f, (col + 0.5) / W, 1.0 / W, max_res=max_res), col
+
+
+def inspect_at(ui, model, P, col):
+    """The cursor to column `col` (clamped); it remembers the time in the middle of that column, so it
+    stays on that time when the span changes."""
+    f, finv, first, W, _ = inspect_geometry(model, ui, P)
+    col = max(0, min(W - 1, col))
+    ui["inspect"] = {"t": model["now"] if col == W - 1 else finv((col + 0.5) / W)}
+    return ui
+
+
+def inspect_key(ui, key, model, P):
+    """A key while inspecting (04 §3.9): ← → by a column, shift-← → (or < >) by ten, home / end the oldest
+    column and now, enter selects the incident or reservation under the cursor and leaves, esc (or i)
+    leaves. Returns True when the key was the inspector's."""
+    col = inspect_geometry(model, ui, P)[4]
+    step = {"left": -1, "right": 1, "shift-left": -10, "shift-right": 10, "<": -10, ">": 10}
+    if key in step:
+        inspect_at(ui, model, P, col + step[key])
+    elif key in ("home", "end"):
+        inspect_at(ui, model, P, 0 if key == "home" else P["plot_w"] - 1)
+    elif key in ("esc", "i"):
+        ui.pop("inspect", None)
+    elif key == "enter":
+        info, _ = inspect_info(model, ui, P)
+        ui.pop("inspect", None)
+        return inspect_select(ui, model, P, info)
+    else:
+        return False
+    return True
+
+
+def inspect_select(ui, model, P, info):
+    """enter: the incident under the cursor (the newest), else the reservation, selected in its list."""
+    e0, e1 = info["t0"], info["t1"]
+    for i, inc in enumerate(model["incidents"]):
+        if inc["start"] <= e1 and (inc["end"] if inc.get("end") is not None else model["now"]) >= e0 and P["I"]:
+            ui.update(focus="inc", inc_sel=i)
+            press(ui, "noop", model, P)
+            return True
+    seq = res_seq(model)[0]
+    for i, r in enumerate(seq):
+        end = r["ended"] if r.get("ended") is not None else model["now"]
+        if r["requested"] <= e1 and end >= e0 and P["R"]:
+            ui.update(focus="res", res_sel=i)
+            press(ui, "noop", model, P)
+            return True
+    ui["note"] = ("nothing to select there", "dim")
+    return True
+
+
+def _readout_lines(info, model, g, caps, nw=11):
+    """The readout as two groups of (priority, [(text, role)] parts), the lower the number the longer a
+    line stays: the readings (one series a line, the peak against the RAM, away, no data), and what
+    happened (incidents, reservations, events). nw: the width of the series' names."""
+    mono = caps.color == "none"
+    left, right = [], []
+    for k, (name, lo, hi) in enumerate(info["readings"]):
+        role = {"App": "app", "Compressed": "comp", "Wired": "wired", "Swap": "swap"}[name]
+        a, b = "%.1f" % lo, "%.1f" % hi
+        left.append((1 + k + (3 if name == "Swap" and hi == 0 else 0),
+                     [(g["sw"] + " ", None if mono else role), (name.ljust(nw), "fg"),
+                      ("%s GB" % (b if a == b else "%s to %s" % (a, b)), "fg")]))
+    if info["readings"]:
+        ram = model.get("ram") or 0
+        left.append((5, [("%s %.1f%s GB" % ("peak" if info["samples"] > 1 else "all four", info["peak"],
+                                            " of %.0f" % ram if ram else ""),
+                          "crit" if ram and info["peak"] > ram else "dim")] +
+                     ([(" %s away" % g["mid"], "dim")] if info["away"] else [])))
+    if info["no_data"]:
+        left.append((2, [(info["no_data"], "dim")]))
+    if not info["readings"] and not info["no_data"]:
+        left.append((2, [("no readings here", "dim")]))
+    for t in info["incidents"][:2]:
+        right.append((1, [(g["dot"] + " ", "incident"), (t, "incident")]))
+    for i, (r, color) in enumerate(info["reserved"]):
+        right.append((3 + i, [(g["sw"] + " ", None if mono else color), (r, "fg")]))
+    if info["more_reserved"]:
+        right.append((9, [("+ %d more reserved" % info["more_reserved"], "faint")]))
+    for i, (t, alarm) in enumerate(info["events"]):
+        right.append((4 + i, [(g["mid"] + " ", "faint"), (t, "incident" if alarm else "fg")]))
+    if info["more_events"]:
+        right.append((10, [("+ %d more kinds of events" % info["more_events"], "faint")]))
+    return left, right
+
+
+def _fit_lines(lines, n):
+    """At most n lines, the highest priorities giving way first (the last of equals first); the order kept."""
+    lines = list(lines)
+    while len(lines) > max(n, 0):
+        worst = max(range(len(lines)), key=lambda i: (lines[i][0], i))
+        del lines[worst]
+    return [parts for _, parts in lines]
+
+
+def _draw_parts(fr, x, y, w, parts, g, bg=KEEP):
+    end = x + w
+    for text, role in parts:
+        if x >= end:
+            break
+        x = fr.put(x, y, fit(text, end - x, g), role, bg)
+    return x
+
+
+def _readings_count(info):
+    return "%d readings in this column" % info["samples"] if info["samples"] > 1 else \
+        "1 reading" if info["samples"] == 1 else "no reading"
+
+
+def draw_inspect(fr, model, ui, P, caps, g):
+    """The cursor on the plot and the strip, and the readout: docked where the lists are, so the chart,
+    its time axis and the strip stay in view (from 72 columns in two columns: the readings, and what
+    happened); a floating card on the side away from the cursor where the pane has no list area. The
+    readout is hover_info's, the app's hover card."""
+    info, col = inspect_info(model, ui, P)
+    x0 = P["plot_x"]
+    fr.flag(x0 + col, P["plot_y"], 1, P["plot_h"], REV)
+    if P["S"]:
+        fr.flag(x0 + col, P["strip_y"], 1, P["S"], REV)
+    fr.put(x0 + col, P["axis_y"], g["up"], "accent", KEEP, BOLD)
+    y0, rows, where = panel_area(P)
+    lw = P["lw"]
+    if where == "lists":
+        fr.fill(1, y0 + 1, lw - 2, rows, " ", None, None)
+        for yy in range(y0 + 1, y0 + 1 + rows):
+            fr.put(0, yy, g["v"], "line")
+            fr.put(lw - 1, yy, g["v"], "line")
+        right = "%s %s %s" % (info["ago"], g["mid"], _readings_count(info))
+        if tw(right) + tw(info["when"]) + 20 > lw:
+            right = info["ago"]
+        section(fr, 0, y0, lw, g, "Inspect %s %s" % (g["mid"], info["when"]) if lw >= 64 else info["when"], right)
+        left, rest = _readout_lines(info, model, g, caps)
+        if lw >= 72:
+            lw_ = min(36, (lw - 4) // 2)
+            for i, parts in enumerate(_fit_lines(left, rows)):
+                _draw_parts(fr, 2, y0 + 1 + i, lw_, parts, g)
+            for i, parts in enumerate(_fit_lines(rest, rows)):
+                _draw_parts(fr, 2 + lw_ + 2, y0 + 1 + i, lw - 6 - lw_, parts, g)
+        else:
+            for i, parts in enumerate(_fit_lines(left + [(p + 0.5, x) for p, x in rest], rows)):
+                _draw_parts(fr, 2, y0 + 1 + i, lw - 4, parts, g)
+        return info
+    left, rest = _readout_lines(info, model, g, caps, nw=11)
+    right_side = col < P["plot_w"] // 2                 # the app's card changes sides at the middle
+    side = (lw - 1) - (x0 + col + 2) if right_side else (x0 + col - 1) - 1
+    cw = max(20, min(40, side))
+    room = P["axis_y"] - P["plot_y"] + 1                # from the plot's top to the time axis: the strip stays
+    body = _fit_lines([(0, [(_readings_count(info) + " %s " % g["mid"] + info["ago"], "dim")])] + left +
+                      [(p + 0.5, x) for p, x in rest], room - 2)
+    ch = len(body) + 2
+    cx = x0 + col + 2 if right_side else x0 + col - 1 - cw
+    cx, cy = max(1, min(cx, lw - 1 - cw)), P["plot_y"]
+    fr.fill(cx, cy, cw, ch, " ", None, "bar")
+    fr.box(cx, cy, cw, ch, g, "dim")
+    fr.bg(cx, cy, cw, ch, "bar")
+    fr.put(cx + 2, cy, " %s " % fit(info["when"], cw - 6, g), "fg", "bar", BOLD)
+    for i, parts in enumerate(body):
+        _draw_parts(fr, cx + 2, cy + 1 + i, cw - 4, parts, g, "bar")
+    return info
+
+
+# ------------------------------------------------------------------ the mouse (04 §3.10): buttons and the wheel, no motion
+def span_hits(P, ui, g, w=None):
+    """[(span key, first column, last column)] of the span selector in the chart's top edge."""
+    x, w = 0, P["lw"] if w is None else w
+    cx = x + 2
+    if w >= 100:
+        cx += tw(" Memory ") + 1
+    labels = [(k, " %s " % (g["inf"] if k == "inf" else k)) for k in SPAN_ORDER]
+    if cx + sum(len(lab) for _, lab in labels) > x + w - 2:
+        labels = [(k, "%s%s%s" % (g["more_l"], lab.strip(), g["more_r"])) for k, lab in labels if k == ui["span"]]
+    out = []
+    for key, lab in labels:
+        out.append((key, cx, cx + tw(lab) - 1))
+        cx += tw(lab)
+    return out
+
+
+def mouse(ui, model, P, g, button, x, y):
+    """A button pressed at cell (x, y), 0-based. Returns what the program must do beyond `ui`:
+    ("span", key), ("card",) or None. Left button: a span in the chart's edge chooses it; the plot, the
+    strip or the time axis inspects that column; a row of a list or a panel selects it, and a click
+    on the selected row opens it; a list's caption moves into it. The wheel over the chart changes the
+    span (up: shorter), over a list or a panel scrolls it."""
+    wheel = button & 64
+    if button & 32:                                  # motion: never asked for
+        return None
+    px, pw = P["plot_x"], P["plot_w"]
+    in_chart_cols = px <= x < px + pw
+    chart_rows = [P["box_y"], P["axis_y"]] + list(range(P["plot_y"], P["plot_y"] + P["plot_h"])) + \
+        (list(range(P["strip_y"], P["strip_y"] + P["S"])) if P["S"] else [])
+    if x >= P["lw"]:
+        return None
+    if wheel:
+        up = button & 1 == 0
+        if y in chart_rows or (y == P["cap_y"] and P["S"]):
+            i = SPAN_ORDER.index(ui["span"]) + (1 if up else -1)
+            if 0 <= i < len(SPAN_ORDER):
+                return ("span", SPAN_ORDER[i])
+            return None
+        key = "up" if up else "down"
+        if ui.get("panel"):
+            press(ui, key, model, P)
+        elif P["R"] and P["list_y"] <= y < P["list_y"] + P["R"]:
+            ui["focus"] = "res"
+            ui.setdefault("res_sel", 0)
+            press(ui, key, model, P)
+        elif P["I"] and P["inc_y"] <= y < P["inc_y"] + P["I"]:
+            ui["focus"] = "inc"
+            ui.setdefault("inc_sel", 0)
+            press(ui, key, model, P)
+        return None
+    if button & 3 != 0:                              # the middle and right buttons do nothing
+        return None
+    if y == P["box_y"]:
+        for key, a, b in span_hits(P, ui, g):
+            if a <= x <= b:
+                return ("span", key)
+        return None
+    if y in chart_rows and in_chart_cols:
+        if ui.get("panel"):                          # the readout takes the panel's place
+            press(ui, "esc", model, P)
+        inspect_at(ui, model, P, x - px)
+        return None
+    ui.pop("inspect", None)
+    if ui.get("panel"):
+        y0, rows, _ = panel_area(P)
+        if ui["panel"] in ("a", "s") and y0 < y <= y0 + rows:
+            items = panel_items(model, ui["panel"])
+            body, ncol, per = panel_page(P, model, ui["panel"])
+            cw = (P["lw"] - 2) // ncol
+            i = ui.get("panel_off", 0) + (y - y0 - 1) + body * min(ncol - 1, max(0, (x - 1) // max(cw, 1)))
+            if (y - y0 - 1) < body and 0 <= i < len(items):
+                again = ui.get("focus") == "panel" and ui.get("panel_sel") == i
+                ui.update(focus="panel", panel_sel=i)
+                return ("card",) if again else None
+        return None
+    if P["R"] and P["list_y"] <= y < P["list_y"] + P["R"]:
+        rows = list_rows(model, P["R"], ui)[0]
+        k = y - P["list_y"]
+        if k < len(rows):
+            row = rows[k]
+            if row[0] == "res":
+                again = ui.get("focus") == "res" and ui.get("res_sel") == row[2]
+                ui.update(focus="res", res_sel=row[2])
+                return ("card",) if again else None
+            ui["focus"] = "res"                       # "n more": into the list, at the first not shown
+            ui["res_sel"] = row[1] + len(rows) - 1
+            press(ui, "noop", model, P)
+        return None
+    if P["I"] and P["inc_y"] <= y < P["inc_y"] + P["I"]:
+        off = min(ui.get("inc_off", 0), max(len(model["incidents"]) - P["I"], 0))
+        i = off + y - P["inc_y"]
+        if i < len(model["incidents"]):
+            again = ui.get("focus") == "inc" and ui.get("inc_sel") == i
+            ui.update(focus="inc", inc_sel=i, inc_off=off)
+            return ("card",) if again else None
+        return None
+    for cap, want in ((P["cap_y"], "res"), (P["inc_cap_y"], "inc")):
+        if cap is not None and y == cap:
+            press(ui, "esc", model, P)
+            press(ui, "down" if want == "res" else "up", model, P)
+            if ui.get("focus") != want:
+                press(ui, "space", model, P)
+            return None
+    return None
+
+
 # ------------------------------------------------------------------ the frame
 def keys_main(g, model):
     """The hints of the key line, most useful first. While pressure is not normal or an incident is
@@ -2054,13 +2477,17 @@ def keys_main(g, model):
     k += [(g["arrows"], "span"), (g["updown"], "select")]
     if not hot:
         k.append(("s", "sessions"))
-    k.append(("e", "events"))
+    k += [("e", "events"), ("i", "inspect")]
     return k
 
 
 def keys_of(g, model, ui, P):
     """The key line of the mode the dashboard is in; every mode but the plain view starts with esc
     and where it leads."""
+    if ui.get("inspect"):
+        A = g["arrows"]
+        return [("esc", "back"), (A, "move"), ("shift-" + A, "by 10"), ("home end", "oldest %s now" % g["mid"]),
+                ("t", "span"), ("enter", "select"), ("q", "quit")]
     if ui.get("panel"):
         where = panel_area(P)[2]
         k = [("esc", where)]
@@ -2155,6 +2582,8 @@ def render(model, W, H, caps, ui):
         if model.get("logger") == "silent":     # readings that are not live any more stay, greyed
             fr.restyle(0, P["stats_y"], W, P["stats"], "off")
     draw_body(fr, P, model, ui, caps, g)
+    if ui.get("inspect"):
+        draw_inspect(fr, model, ui, P, caps, g)
     if P["wide"]:
         draw_right(fr, P, model, caps, g)
     status, srole = status_of(model, g, ui)
@@ -2232,7 +2661,7 @@ def draw_body(fr, P, model, ui, caps, g):
             right = "%d%s%d of %s %s" % (off + 1, g["dash"], last, right, g["down"] if last < n else g["up"])
         section(fr, 0, P["inc_cap_y"], lw, g, "Incidents", right)
         draw_incident_rows(fr, 1, P["inc_y"], lw - 2, incs[off:off + P["I"]], model, caps, g, ui, off)
-    if ui.get("panel"):
+    if ui.get("panel") and not ui.get("inspect"):
         draw_panel(fr, model, ui, P, caps, g)
 
 

@@ -65,6 +65,19 @@ STALL_TRIGGER_S = 60      # the daemon not running this long while the Mac is aw
 UNOWNED_SUSTAIN_S = 60    # unowned memory must stay above the limit this long to count
 FLAP_WINDOW = 60          # pressure changes closer than this are batched into one event
 FLAP_REPORT_EVERY = 15 * 60
+# events of the other resources (roadmap 02 §5.3)
+CPU_SAT = 0.9             # busy on this share of the cores ...
+CPU_SAT_S = 600           # ... for this long is saturated
+CPU_SAT_CLEAR = 0.75      # and below this share it is over (a margin, so that it does not flap)
+CPU_SAT_COOLDOWN = 3600
+CPU_SAT_GAP = 3 * INTERVAL  # a longer gap between two samples (a sleep) starts the clock again
+DISK_FILL_GB = 2.0        # a watched disk whose free space fell this much ...
+DISK_FILL_S = 120         # ... within this long ...
+DISK_FILL_ETA_MIN = 30    # ... and that reaches its critical floor within this, at that rate, is filling
+DISK_FILL_NOTIFY_MIN = 10 # a notification when that is this close
+DISK_FILL_COOLDOWN = 1800
+VOLUME_SETTLE_S = 120     # the disks the first minutes after a start find are what was there, not news
+VOLUME_QUIET_S = 300      # a disk's changes within this long of its last event are told once, after it (a flapping mount)
 
 MB = 1024 * 1024
 GB = 1024 * MB
@@ -593,6 +606,16 @@ def full_speed_rung(P, log_dir=None):
         if cmd else None
 
 
+def _by_name(rows, field, n=5):
+    """{name: amount} of the first n of a top_cpu / top_io list, a name's processes added up."""
+    out = {}
+    for x in (rows if isinstance(rows, list) else [])[:8]:
+        if isinstance(x, dict) and isinstance(x.get(field), (int, float)):
+            k = str(x.get("name") or "?")[:64]
+            out[k] = round(out.get(k, 0) + x[field], 2)
+    return dict(sorted(out.items(), key=lambda kv: -kv[1])[:n])
+
+
 def rate_lists(procs, use, session_of, group_key, n=None):
     """top_cpu (8), top_gpu (5), top_io (5): the biggest consumers of each, in cores, percent of the
     GPU and MB/s written (`n` of each instead, for `oomph ps`)."""
@@ -848,6 +871,16 @@ class Daemon:
         self.full_off = None  # why it is missing although switched on: "missing" (no helper), "failed"
         self.soft_at = {}  # where -> when a failed reading was last reported
         self.clamp_told = False
+        self.prev_therm = self.therm_batch = None
+        self.last_therm_event = 0
+        self.sat_since, self.sat_on, self.last_sat = None, False, -1e18
+        self.sat_last, self.sat_n = 0.0, 0  # the last sample with a busy figure, while the cores are busy
+        self.disk_low_at = {}      # pool id -> when its disk_low was last told
+        self.free_hist = {}        # pool id -> [(t, free GB)] of the last minutes
+        self.filling = {}          # pool id -> when its disk_filling was last told (while it fills)
+        self.fill_at, self.fill_told = {}, {}
+        self.prev_pools = None     # pool id -> (watched, mount, name), for the volume events
+        self.vol_at, self.vol_held = {}, {}   # pool id -> its last volume event; -> [state told, changes held]
 
     # -- events
     def event(self, kind, **kw):
@@ -1020,6 +1053,7 @@ class Daemon:
 
     # -- notifications
     def notify(self, title, msg, **kw):
+        title, msg = oomph.notify_text(title, 80), oomph.notify_text(msg, 300)
         try:
             if oomph.plat().notify(title, msg, self.console):
                 self.event("notified", title=title, msg=msg, **kw)
@@ -1260,8 +1294,11 @@ class Daemon:
             if t - self.unowned_since >= UNOWNED_SUSTAIN_S:
                 if not self.unowned_flagged:
                     self.unowned_flagged = True
+                    gpu = [g.get("mem_alloc_gb") for g in s.get("gpu") or () if isinstance(g, dict)]
+                    gpu = [x for x in gpu if isinstance(x, (int, float))]
                     self.event("unowned_memory", gb=u, procs_gb=s.get("procs_gb"),
-                               compressor_logical_gb=s["compressor_logical_gb"])
+                               compressor_logical_gb=s["compressor_logical_gb"],
+                               **({"gpu_alloc_gb": round(sum(gpu), 2)} if gpu else {}))
                 reasons.append({"kind": "unowned", "t": t, "desc": "%.0f GB of memory belongs to no process — likely a GPU "
                                 "or driver leak; save your work and restart before the Mac freezes" % u})
         else:
@@ -1292,13 +1329,134 @@ class Daemon:
 
         # swap grows on the startup disk of a Mac: there a full disk is a memory problem (roadmap 03 §5.4)
         mac = s.get("os", "macos") == "macos"
-        if mac and s["disk_free_gb"] < DISK_LOW_GB and time.time() - self.last_disk_notify > DISK_COOLDOWN:
-            self.last_disk_notify = time.time()
+        pools = [p for p in s.get("disks") or () if isinstance(p, dict) and isinstance(p.get("id"), str)] \
+            if isinstance(s.get("disks"), list) else None
+        if not any(p["id"] == "data" and p.get("watch") for p in pools or ()) and mac and \
+                s["disk_free_gb"] < DISK_LOW_GB and time.time() - self.last_disk_notify > DISK_COOLDOWN:
+            self.last_disk_notify = time.time()     # a logger without the disks block: the startup disk as before
+            self.disk_low_at["data"] = t            # (one cooldown for both ways, whichever told it)
             self.event("disk_low", disk_free_gb=s["disk_free_gb"])
             self.notify("Disk space low", "Only %.0f GB free — swap can't grow, risk of memory kills."
                         % s["disk_free_gb"])
+        try:
+            self.resource_events(s, t, pools, mac)
+        except Exception as e:  # an event lost costs no sample
+            self.soft_error("resource_events", repr(e))
 
-        self.hot = bool(pr >= 2 or swap_jump or s.get("jetsam_kills") or (mac and s["disk_free_gb"] < 5) or self.incident)
+        self.hot = bool(pr >= 2 or swap_jump or s.get("jetsam_kills") or (mac and s["disk_free_gb"] < 5) or self.incident
+                        or self.filling)
+
+    def resource_events(self, s, t, pools, mac):
+        """The events of the other resources (roadmap 02 §5.3): the thermal level changed (batched like
+        pressure flips), the cores saturated for ten minutes and when that is over, a watched disk low
+        (per disk) or filling fast, a disk that came or went. Times are the sample's."""
+        cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
+        busy, n = cpu.get("busy"), cpu.get("n")
+        th = cpu.get("therm")
+        if isinstance(th, int) and not isinstance(th, bool):
+            if self.prev_therm is not None and th != self.prev_therm:
+                if self.therm_batch is None and t - self.last_therm_event > FLAP_WINDOW:
+                    self.event("thermal", old=self.prev_therm, new=th, busy=busy)
+                    self.last_therm_event = t
+                else:
+                    b = self.therm_batch = self.therm_batch or {"old": self.prev_therm, "flips": 0, "since": t}
+                    b["flips"], b["last"] = b["flips"] + 1, t
+            self.prev_therm = th
+            b = self.therm_batch
+            if b and (t - b["last"] > FLAP_WINDOW or t - b["since"] >= FLAP_REPORT_EVERY):
+                self.therm_batch = None
+                self.event("thermal", old=b["old"], new=th, busy=busy, flips=b["flips"])
+                self.last_therm_event = t
+        ok = isinstance(busy, (int, float)) and not isinstance(busy, bool) and isinstance(n, int) and n > 0
+        if self.sat_since is not None and (not ok or t - self.sat_last > CPU_SAT_GAP):
+            if self.sat_on:     # a sleep or a logger gap (no rates after one) ends the episode where it was last seen
+                self.event("cpu_saturated_cleared", n=self.sat_n, minutes=round((self.sat_last - self.sat_since) / 60),
+                           gap=round(t - self.sat_last))
+            self.sat_since, self.sat_on = None, False
+        if ok:
+            if busy >= CPU_SAT * n:
+                self.sat_since = self.sat_since or t
+                if not self.sat_on and t - self.sat_since >= CPU_SAT_S and t - self.last_sat >= CPU_SAT_COOLDOWN:
+                    self.sat_on, self.last_sat = True, t
+                    self.event("cpu_saturated", busy=busy, n=n, minutes=round((t - self.sat_since) / 60),
+                               top=_by_name(s.get("top_cpu"), "cpu"))
+            elif busy < CPU_SAT_CLEAR * n or not self.sat_on:   # once saturated, over only below the lower mark
+                if self.sat_on:
+                    self.event("cpu_saturated_cleared", busy=busy, n=n, minutes=round((t - self.sat_since) / 60))
+                self.sat_since, self.sat_on = None, False
+            self.sat_last, self.sat_n = t, n
+        if pools is None:
+            return
+        for p in pools:
+            if not p.get("watch") or not isinstance(p.get("free_gb"), (int, float)):
+                continue
+            pid, free = p["id"], p["free_gb"]
+            what = dict(pool=pid, mount=p.get("mount"), name=p.get("name"), free_gb=free)
+            crit = p["crit_gb"] if isinstance(p.get("crit_gb"), (int, float)) else 5
+            if pid == "data" and not mac:
+                pass                                    # Linux: no swap on it, no memory problem (03 §5.4)
+            elif p.get("level") in ("low", "critical") and t - self.disk_low_at.get(pid, -1e18) > DISK_COOLDOWN:
+                self.disk_low_at[pid] = t
+                if pid == "data":
+                    self.last_disk_notify = time.time()
+                    self.event("disk_low", disk_free_gb=s.get("disk_free_gb", free), level=p["level"], **what)
+                    self.notify("Disk space low", "Only %.0f GB free — swap can't grow, risk of memory kills." % free)
+                else:
+                    self.event("disk_low", level=p["level"], **what)
+                    self.notify("Disk space low", "Only %.0f GB free on %s." % (free, oomph.notify_text(p.get("name"), 40)))
+            hist = [x for x in self.free_hist.get(pid, ()) if t - 600 <= x[0] < t] + [(t, free)]
+            self.free_hist[pid] = hist
+            back = [x for x in hist if t - x[0] >= DISK_FILL_S]
+            filling = None
+            if back and t - back[-1][0] <= 2.5 * DISK_FILL_S:
+                t0, f0 = back[-1]
+                rate = (f0 - free) / ((t - t0) / 60.0)
+                if f0 - free >= DISK_FILL_GB and rate > 0:
+                    eta = max(0.0, (free - crit) / rate)
+                    if eta <= DISK_FILL_ETA_MIN:
+                        filling = (round(rate, 2), round(eta, 1))
+            if filling is None:
+                self.filling.pop(pid, None)
+                continue
+            self.filling[pid] = t
+            if t - self.fill_at.get(pid, -1e18) > DISK_FILL_COOLDOWN:
+                self.fill_at[pid] = t
+                self.event("disk_filling", rate_gb_min=filling[0], eta_min=filling[1], top=_by_name(s.get("top_io"), "w"),
+                           **what)
+            if filling[1] < DISK_FILL_NOTIFY_MIN and t - self.fill_told.get(pid, -1e18) > DISK_FILL_COOLDOWN:
+                self.fill_told[pid] = t
+                self.notify("Disk filling up", "%s: %.0f GB free, full in about %d min at %.1f GB a minute." % (
+                    oomph.notify_text(p.get("name") or pid, 40), free, max(1, round(filling[1])), filling[0]),
+                    event="disk_filling")
+        cur = {p["id"]: (bool(p.get("watch")), p.get("mount"), p.get("name")) for p in pools}
+        for d in (self.filling, self.free_hist):        # a disk that went is neither filling nor remembered
+            for pid in [k for k in d if k not in cur or not cur[k][0]]:
+                del d[pid]
+        prev, self.prev_pools = self.prev_pools, cur
+        if prev is None or t - self.started < VOLUME_SETTLE_S:
+            return
+        def what(a, b):
+            return None if a is None and b is None else "mounted" if a is None else "unmounted" if b is None else \
+                ("watched" if b[0] else "unwatched") if a[0] != b[0] else None
+
+        for pid in [k for k, w in self.vol_at.items() if t - w > VOLUME_QUIET_S and k not in self.vol_held]:
+            del self.vol_at[pid]                        # (only the recent ones are kept)
+        for pid in sorted(set(cur) | set(prev) | set(self.vol_held)):
+            a, b, held = prev.get(pid), cur.get(pid), self.vol_held.get(pid)
+            if what(a, b):
+                if held is None and t - self.vol_at.get(pid, -1e18) > VOLUME_QUIET_S:
+                    x = b or a
+                    self.event("volume", pool=pid, mount=x[1], name=x[2], what=what(a, b))
+                    self.vol_at[pid] = t
+                    continue
+                held = self.vol_held.setdefault(pid, [a, 0, None])
+                held[1], held[2] = held[1] + 1, b or a
+            if held and t - self.vol_at.get(pid, -1e18) > VOLUME_QUIET_S:
+                del self.vol_held[pid]                  # the quiet time is over: how it is now against what was told
+                if what(held[0], b):
+                    x = b or held[2]
+                    self.event("volume", pool=pid, mount=x[1], name=x[2], what=what(held[0], b), changes=held[1])
+                    self.vol_at[pid] = t
 
     def run(self):
         signal.signal(signal.SIGTERM, self.stop)

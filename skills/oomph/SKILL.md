@@ -78,7 +78,7 @@ fix. Pass its fix lines on to the user; don't run them yourself (most need `sudo
 | `OOMPH session` | This Claude session's memory: its whole process tree, total, biggest children (pid, name, MB). |
 | `OOMPH wait --timeout 10m [--free 4G]` | Blocks until memory is ok again. Exit 1 on timeout. |
 | `OOMPH status --json` | Full sample: memory breakdown, swap, disk, top processes and apps, all Claude sessions. |
-| `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger: a Mac's, for now) and their summaries; `--html` opens the report. |
+| `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger: a Mac's, for now) and their summaries; `--html` opens the report. Summaries also carry the CPU, GPU and disk peaks where recorded (`max_cpu_busy`, `max_gpu_*`, `min_free_gb`). |
 
 The MCP tools map one-to-one: `reserve_memory` (gb, purpose, wait_s ≤ 300, ttl_min,
 ticket), `update_reservation` (id, gb?, ttl_min?, purpose?), `release_memory` (id or

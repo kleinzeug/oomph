@@ -240,6 +240,16 @@ def unowned_gb(s):
 
 
 # ------------------------------------------------------------------ loading
+_NOTIFY_BAD = re.compile("[\x00-\x1f\x7f-\x9f\"\\\\\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+
+
+def notify_text(x, n=200):
+    """Text for a notification, which now carries names that their owners chose (a volume's, a
+    process's): control and direction characters, quotes and backslashes become spaces, at most n
+    characters (roadmap 02 §10.5). The one escaping function every notification goes through."""
+    return _NOTIFY_BAD.sub(" ", str(x if x is not None else ""))[:n]
+
+
 def _day_range(since, until):
     d = datetime.date.fromtimestamp(since)
     end = datetime.date.fromtimestamp(until)
@@ -488,23 +498,31 @@ class _Risers:
         for p in s.get(self.key) or []:
             k = p["name"] if groups else "%s [%s]" % (p["name"], p["pid"])
             r = self.rows.get(k)
-            if r is None:
-                r = self.rows[k] = [p["mb"], -1, None, None, None]  # first, peak, peak t, last, process
+            if r is None:   # first, peak, peak t, last, process, peak cores, peak % of the GPU
+                r = self.rows[k] = [p["mb"], -1, None, None, None, None, None]
             r[3] = p["mb"]
             if not groups:
                 r[4] = (p["pid"], p["name"], p.get("ppid"), p.get("uid"))
             if p["mb"] > r[1]:
                 r[1], r[2] = p["mb"], s["t"]
+            if s.get("cpu") is not None:        # a sample of 1.9.1 or newer: a rate it omits is zero
+                r[5] = _more(r[5], p["cpu"] if _fin(p.get("cpu")) else 0.0)
+            if s.get("gpu"):
+                r[6] = _more(r[6], p["gpu"] if _fin(p.get("gpu")) else 0.0)
 
     def result(self, limit=10):
         rows = []
-        for k, (first, peak, peak_t, last, proc) in self.rows.items():
+        for k, (first, peak, peak_t, last, proc, cpu, gpu) in self.rows.items():
             if peak_t is None:
                 continue
             r = {"name": k, "first_mb": first, "peak_mb": peak, "last_mb": last,
                  "rise_mb": peak - first, "peak_iso": _hm(peak_t)}
             if proc:
                 r.update(pid=proc[0], proc=proc[1], ppid=proc[2], uid=proc[3])
+            if cpu is not None:
+                r["cpu_peak"] = round(cpu, 2)
+            if gpu is not None:
+                r["gpu_peak"] = round(gpu, 1)
             rows.append(r)
         rows.sort(key=lambda r: (r["rise_mb"], r["peak_mb"]), reverse=True)
         return rows[:limit] if limit else rows
@@ -534,6 +552,45 @@ def _peak_key(s):
     return (s.get("pressure", 0), s.get("swap_used_gb", 0), s.get("app_gb", 0) + s.get("compressed_gb", 0))
 
 
+def _fin(x):
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+
+
+def cpu_busy(s):
+    """(cores busy, cores) of a sample, or None: a sample before 1.9.1, or the first after a gap."""
+    c = s.get("cpu")
+    if isinstance(c, dict) and _fin(c.get("busy")):
+        return c["busy"], c.get("n") if isinstance(c.get("n"), int) and not isinstance(c.get("n"), bool) else None
+    return None
+
+
+def gpu_reading(s):
+    """The GPU's figure of a sample as (kind, %, GPU memory in use GB or None): kind "util" where the
+    figure is the share of the GPU's capacity at full speed (src ioreport), "busy" where it is the share
+    of the time it was busy at any speed. The two are never averaged or compared (roadmap 02 §3.4.11).
+    The first GPU is the one charted (the built-in one on Apple silicon). None without a reading."""
+    g = s.get("gpu")
+    g = g[0] if isinstance(g, list) and g and isinstance(g[0], dict) else None
+    if g is None:
+        return None
+    mem = g.get("mem_gb") if _fin(g.get("mem_gb")) else None
+    if not _fin(g.get("util")):
+        return (None, None, mem) if mem is not None else None
+    return ("util" if g.get("src") == "ioreport" else "busy", g["util"], mem)
+
+
+def disk_pools_of(s):
+    """The pools of a sample's disks block that have an id and a free space."""
+    d = s.get("disks")
+    return [p for p in d if isinstance(p, dict) and isinstance(p.get("id"), str) and _fin(p.get("free_gb"))] \
+        if isinstance(d, list) else []
+
+
+def _rows(x, n, keep):
+    """The first n rows of a top_cpu / top_gpu / top_io list, with the named fields only."""
+    return [{k: r[k] for k in keep if k in r} for r in (x if isinstance(x, list) else [])[:n] if isinstance(r, dict)]
+
+
 class _Summary:
     """summarize() as a fold over samples: one pass, holding a few numbers, the peak sample
     and the risers, so a long incident is summarised in bounded memory."""
@@ -543,6 +600,10 @@ class _Summary:
         self.first = self.last = self.peak = self.onset = None
         self.swap = self.swap_total = self.disk = self.used = self.unowned = self.stall = None
         self.groups, self.top = _Risers("groups"), _Risers("top")
+        self.cpu = self.gpu_util = self.gpu_busy = None   # (value, sample) of each peak
+        self.cpu_n = self.gpu_mem = None
+        self.free = {}       # pool id -> lowest free GB
+        self.writers = {}    # process name -> [peak MB/s written, when]
 
     def add(self, s):
         self.n += 1
@@ -565,6 +626,29 @@ class _Summary:
         self.stall = _more(self.stall, s.get("stall", 0))
         self.groups.add(s)
         self.top.add(s)
+        c = cpu_busy(s)
+        if c:
+            if self.cpu is None or c[0] > self.cpu[0]:
+                self.cpu = (c[0], s)
+            self.cpu_n = c[1] or self.cpu_n
+        g = gpu_reading(s)
+        if g:
+            if g[0] == "util" and (self.gpu_util is None or g[1] > self.gpu_util[0]):
+                self.gpu_util = (g[1], s)
+            elif g[0] == "busy" and (self.gpu_busy is None or g[1] > self.gpu_busy[0]):
+                self.gpu_busy = (g[1], s)
+            if g[2] is not None:
+                self.gpu_mem = _more(self.gpu_mem, g[2])
+        for p in disk_pools_of(s):
+            if p["id"] in self.free or len(self.free) < 32:      # (bounded: a mirror's odd ids add no more)
+                self.free[p["id"]] = _less(self.free.get(p["id"]), p["free_gb"])
+        for w in s.get("top_io") or () if isinstance(s.get("top_io"), list) else ():
+            if isinstance(w, dict) and _fin(w.get("w")) and isinstance(w.get("name"), str):
+                k = w["name"][:64]
+                if k in self.writers or len(self.writers) < 500:
+                    r = self.writers.setdefault(k, [0.0, s["t"]])
+                    if w["w"] > r[0]:
+                        r[0], r[1] = w["w"], s["t"]
 
     def result(self, events):
         if not self.n:
@@ -596,18 +680,55 @@ class _Summary:
             "jetsam_reasons": reasons,
             "most_killed": dict(sorted(killed.items(), key=lambda kv: -kv[1])[:10]),
             "away_fraction": round(self.away / self.n, 2),
-            "onset": None if not onset else {
-                "at": onset["iso"], "pressure": PRESSURE.get(onset.get("pressure", 0)),
-                "idle_s": (onset.get("away") or {}).get("idle_s"),
-                "display_on": (onset.get("away") or {}).get("display_on"),
-                "locked": (onset.get("away") or {}).get("locked"),
-                "swap_used_gb": onset.get("swap_used_gb"), "disk_free_gb": onset.get("disk_free_gb")},
+            "onset": None if not onset else self._onset(onset),
             "top_at_peak": (peak.get("top") or [])[:10],
             "groups_at_peak": (peak.get("groups") or [])[:10],
             "claude_at_peak": peak.get("claude") or [],
             "group_risers": self.groups.result(),
             "process_risers": self.top.result(),
+            **self._resources()
         }
+
+    @staticmethod
+    def _onset(onset):
+        o = {"at": onset["iso"], "pressure": PRESSURE.get(onset.get("pressure", 0)),
+             "idle_s": (onset.get("away") or {}).get("idle_s"),
+             "display_on": (onset.get("away") or {}).get("display_on"),
+             "locked": (onset.get("away") or {}).get("locked"),
+             "swap_used_gb": onset.get("swap_used_gb"), "disk_free_gb": onset.get("disk_free_gb")}
+        c, g = cpu_busy(onset), gpu_reading(onset)
+        if c:
+            o["cpu_busy"] = c[0]
+        if g and g[0]:
+            o["gpu_" + g[0]] = g[1]
+        if g and g[2] is not None:
+            o["gpu_mem_gb"] = g[2]
+        return o
+
+    def _resources(self):
+        """The other resources (roadmap 02 §5.3), each only where the samples have it: absent, never
+        zero, for "not recorded". The GPU's two kinds of figure stay apart."""
+        out = {}
+        if self.cpu:
+            out.update(max_cpu_busy=self.cpu[0], max_cpu_at=self.cpu[1]["iso"],
+                       top_cpu_at_peak=_rows(self.cpu[1].get("top_cpu"), 8, ("pid", "name", "g", "cpu")))
+            if self.cpu_n:
+                out["cpu_n"] = self.cpu_n
+        for kind, pk in (("util", self.gpu_util), ("busy", self.gpu_busy)):
+            if pk:
+                out["max_gpu_" + kind] = pk[0]
+                out["max_gpu_%s_at" % kind] = pk[1]["iso"]
+        pk = self.gpu_util or self.gpu_busy
+        if pk:
+            out["top_gpu_at_peak"] = _rows(pk[1].get("top_gpu"), 5, ("pid", "name", "g", "gpu"))
+        if self.gpu_mem is not None:
+            out["max_gpu_mem_gb"] = self.gpu_mem
+        if self.free:
+            out["min_free_gb"] = dict(sorted(self.free.items()))
+        if self.writers:
+            out["writers"] = [{"name": k, "peak_mb_s": v[0], "at": _hm(v[1])}
+                              for k, v in sorted(self.writers.items(), key=lambda kv: -kv[1][0])[:8]]
+        return out
 
 
 def summarize(samples, events):
@@ -665,7 +786,7 @@ input[type=datetime-local]:disabled{opacity:.45}
 td.kind{white-space:nowrap}td.time{white-space:nowrap;color:var(--muted)}
 """
 
-BAD_KINDS = ("incident_open", "stall", "unowned_memory", "jetsam", "disk_low", "daemon_error", "log")
+BAD_KINDS = ("incident_open", "stall", "unowned_memory", "jetsam", "disk_low", "disk_filling", "daemon_error", "log")
 
 
 def _e(x):
@@ -681,7 +802,10 @@ _chart_n = 0
 
 
 def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB", refline=None,
-               height=220, bars=None, t0=None, t1=None):
+               height=220, bars=None, t0=None, t1=None, refs=(), reflabel="RAM"):
+    """An SVG chart of `series` (label, value of a point, colour) over the points. A line (not
+    stacked) breaks where its value is None: a sample without that reading. `refline`: the dashed line
+    named `reflabel` (the RAM); `refs`: more dashed lines, (value, label)."""
     W, H, L, R, T, B = 960, height, 48, 10, 10, 26
     if not samples:
         return "<p class=sub>No samples.</p>"
@@ -690,7 +814,8 @@ def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB
     if t1 == t0:
         t1 = t0 + 1
     xs = [_scale(s["t"], t0, t1, L, W - R) for s in samples]
-    vals = [[f(s) or 0 for s in samples] for _, f, _ in series]
+    vals = [[f(s) for s in samples] for _, f, _ in series]
+    vals = [[x or 0 for x in v] if stacked else [x if x is None else float(x) for x in v] for v in vals]
     if stacked:
         cum = [0.0] * len(samples)
         tops = []
@@ -699,8 +824,8 @@ def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB
             tops.append(cum[:])
         top_max = max(max(t) for t in tops)
     else:
-        top_max = max((max(v) for v in vals), default=1)
-    ymax = ymax or max(top_max, refline or 0) * 1.08 or 1
+        top_max = max((x for v in vals for x in v if x is not None), default=1)
+    ymax = ymax or max([top_max, refline or 0] + [r[0] for r in refs]) * 1.08 or 1
     y = lambda v: _scale(v, 0, ymax, H - B, T)  # noqa: E731
     X = lambda t: _scale(t, t0, t1, L, W - R)  # noqa: E731
     # runs of samples without a hole (asleep, frozen, logger down) longer than NO_DATA_S
@@ -774,8 +899,18 @@ def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB
     else:
         for (label, _, color), v in zip(series, vals):
             for a, b in segs:
-                pts = " ".join("%.1f,%.1f" % (x, y(vv)) for x, vv in zip(xs[a:b], v[a:b]))
-                out.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.8"/>' % (pts, color))
+                run = []
+                for x, vv in list(zip(xs[a:b], v[a:b])) + [(None, None)]:
+                    if vv is not None:
+                        run.append("%.1f,%.1f" % (x, y(vv)))
+                        continue
+                    if len(run) > 1:
+                        out.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="1.8"><title>%s</title>'
+                                   '</polyline>' % (" ".join(run), color, _e(label)))
+                    elif run:
+                        xx, yy = run[0].split(",")
+                        out.append('<circle cx="%s" cy="%s" r="1.6" fill="%s"/>' % (xx, yy, color))
+                    run = []
     if bars:
         f, color = bars
         bmax = max((f(s) or 0) for s in samples) or 1
@@ -786,7 +921,12 @@ def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB
                 out.append('<rect x="%.1f" y="%.1f" width="2" height="%.1f" fill="%s" opacity=".8"/>' % (xx - 1, H - B - h, h, color))
     if refline:
         out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--c-ram)" stroke-dasharray="5 4"/>' % (L, W - R, y(refline), y(refline)))
-        out.append('<text x="%d" y="%.1f" font-size="11" fill="var(--fg)" text-anchor="end">RAM %s %s</text>' % (W - R - 4, y(refline) - 4, _fmt(refline), unit))
+        out.append('<text x="%d" y="%.1f" font-size="11" fill="var(--fg)" text-anchor="end">%s %s %s</text>'
+                   % (W - R - 4, y(refline) - 4, _e(reflabel), _fmt(refline), unit))
+    for v, label in refs:
+        out.append('<line x1="%d" x2="%d" y1="%.1f" y2="%.1f" stroke="var(--muted)" stroke-dasharray="2 4"/>' % (L, W - R, y(v), y(v)))
+        out.append('<text x="%d" y="%.1f" font-size="11" fill="var(--muted)" text-anchor="start">%s %s %s</text>'
+                   % (L + 4, y(v) - 4, _e(label), _fmt(v), unit))
     out.append("</svg>")
     leg = "".join('<span><i class=sw style="background:%s"></i>%s</span>' % (c, _e(l)) for l, _, c in series)
     leg += '<span><i class=sw style="background:var(--away)"></i>away (idle ≥5 min / locked / display off)</span>'
@@ -896,6 +1036,7 @@ class _View:
         self.w = None if self.n <= DRAW_POINTS else ((self.t1 - self.t0) / DRAW_POINTS or 1)
         self.bucket = self.cur = self.cur_load = None
         self.kills = 0
+        self.racc, self.res, self.pools = {}, {}, {}   # this bucket's resources; what the view has; its disks
 
     def _point(self, s):
         p = {k: s[k] for k in _DRAW_KEYS if k in s}
@@ -903,6 +1044,44 @@ class _View:
         p["g"] = [next((g["mb"] / 1024 for g in groups if g["name"] == n), 0) for n in self.top5]
         p["rest"] = sum(g["mb"] for g in groups if g["name"] not in self.top5) / 1024
         return p
+
+    def _fold(self, s):
+        """The other resources of one sample into the bucket's: peaks, the mean of the cores busy, the
+        lowest free space per disk. Each kind of GPU figure apart (02 §3.4.11)."""
+        a = self.racc
+        c = cpu_busy(s)
+        if c:
+            a["cpu"] = _more(a.get("cpu"), c[0])
+            a["cpu_sum"], a["cpu_k"] = a.get("cpu_sum", 0.0) + c[0], a.get("cpu_k", 0) + 1
+            if c[1]:
+                self.res["n"] = _more(self.res.get("n"), c[1])
+        g = gpu_reading(s)
+        if g:
+            g0 = s["gpu"][0]
+            if g[0]:
+                a[g[0]] = _more(a.get(g[0]), g[1])
+                self.res[g[0]] = True
+            if g[0] == "util" and _fin(g0.get("active")):
+                a["busy"] = _more(a.get("busy"), g0["active"])
+                self.res["busy"] = True
+            for k, src in (("gmem", "mem_gb"), ("galloc", "mem_alloc_gb")):
+                if _fin(g0.get(src)):
+                    a[k] = _more(a.get(k), g0[src])
+                    self.res["gmem"] = True
+            if _fin(g0.get("mem_limit_gb")):
+                self.res["glim"] = _more(self.res.get("glim"), g0["mem_limit_gb"])
+        for p in disk_pools_of(s):
+            if p.get("watch") and len(self.pools) < 8 or p["id"] in self.pools:
+                f = a.setdefault("free", {})
+                f[p["id"]] = _less(f.get(p["id"]), p["free_gb"])
+                self.pools[p["id"]] = (str(p.get("name") or p["id"])[:64], p.get("low_gb"), p.get("crit_gb"))
+
+    def _flush_res(self, point):
+        a, self.racc = self.racc, {}
+        if "cpu_k" in a:
+            a["cpu_mean"] = a.pop("cpu_sum") / a.pop("cpu_k")
+        point.update(a)
+        return point
 
     def add(self, s):
         self.summ.add(s)
@@ -917,7 +1096,8 @@ class _View:
                 d = self.app_pids.setdefault(g, {})
                 d[p["pid"]] = max(d.get(p["pid"], 0), p["mb"])
         if self.w is None:
-            self.draw.append(self._point(s))
+            self._fold(s)
+            self.draw.append(self._flush_res(self._point(s)))
             return
         b = int((s["t"] - self.t0) / self.w)
         if b != self.bucket:
@@ -925,12 +1105,13 @@ class _View:
             self.bucket, self.cur, self.cur_load, self.kills = b, self._point(s), _load(s), 0
         elif _load(s) > self.cur_load:
             self.cur, self.cur_load = self._point(s), _load(s)
+        self._fold(s)
         self.kills += s.get("jetsam_kills", 0)
 
     def finish(self):
         if self.cur is not None:
             self.cur["jetsam_kills"] = self.kills
-            self.draw.append(self.cur)
+            self.draw.append(self._flush_res(self.cur))
             self.cur = None
 
 
@@ -976,14 +1157,20 @@ def _report_meta(samples):
 
 
 def _risers_data(view):
-    procs = [{"pid": r["pid"], "name": r["proc"], "first": r["first_mb"], "peak": r["peak_mb"],
-              "rise": r["rise_mb"], "at": r["peak_iso"], "ppid": r.get("ppid"), "uid": r.get("uid")}
+    def res(d, r):   # CPU and GPU columns of the risers (roadmap 02 §5.3), where the samples have them
+        if "cpu_peak" in r:
+            d["cpu"] = r["cpu_peak"]
+        if "gpu_peak" in r:
+            d["gpu"] = r["gpu_peak"]
+        return d
+    procs = [res({"pid": r["pid"], "name": r["proc"], "first": r["first_mb"], "peak": r["peak_mb"],
+                  "rise": r["rise_mb"], "at": r["peak_iso"], "ppid": r.get("ppid"), "uid": r.get("uid")}, r)
              for r in view.summ.top.result(limit=None)]
     apps = []
     for r in view.summ.groups.result(limit=None):
         pids = sorted(view.app_pids.get(r["name"], {}).items(), key=lambda kv: -kv[1])
-        apps.append({"name": r["name"], "first": r["first_mb"], "peak": r["peak_mb"], "rise": r["rise_mb"],
-                     "at": r["peak_iso"], "pids": [[p, mb] for p, mb in pids]})
+        apps.append(res({"name": r["name"], "first": r["first_mb"], "peak": r["peak_mb"], "rise": r["rise_mb"],
+                         "at": r["peak_iso"], "pids": [[p, mb] for p, mb in pids]}, r))
     return procs, apps
 
 
@@ -1024,6 +1211,16 @@ def _view_html(view, events, meta, key, t0, t1):
          ("Idle at onset", ("%d min" % (o["idle_s"] // 60)) if o.get("idle_s") is not None else "–", False)]
     if summ.get("max_stall_s"):
         k.append(("Longest stall (awake)", "%d s" % summ["max_stall_s"], summ["max_stall_s"] >= 60))
+    if summ.get("max_cpu_busy") is not None:
+        n = summ.get("cpu_n")
+        k.append(("Most cores busy", "%.1f%s" % (summ["max_cpu_busy"], " of %d" % n if n else ""),
+                  bool(n) and summ["max_cpu_busy"] >= 0.9 * n))
+    if summ.get("max_gpu_util") is not None:
+        k.append(("GPU at full speed, peak", "%.0f %%" % summ["max_gpu_util"], False))
+    elif summ.get("max_gpu_busy") is not None:
+        k.append(("GPU busy, peak (speed not reported)", "%.0f %%" % summ["max_gpu_busy"], False))
+    if summ.get("max_gpu_mem_gb") is not None:
+        k.append(("GPU memory, peak", "%.1f GB" % summ["max_gpu_mem_gb"], False))
     kpis = "".join('<div class="card kpi"><div class="v %s">%s</div><div class=l>%s</div></div>'
                    % ("bad" if bad else "", _e(v), _e(l)) for l, v, bad in k)
     rng = dict(t0=t0, t1=t1)
@@ -1034,8 +1231,10 @@ def _view_html(view, events, meta, key, t0, t1):
             draw, mem_series, True, marks, bands, refline=ram, bars=(lambda s: s.get("jetsam_kills"), "var(--bad)"), **rng)),
         "<h2>Top 5 apps / process groups (GB, stacked)</h2><div class=card>%s</div>" % _svg_chart(
             draw, grp_series, True, marks, bands, **rng),
-        "<h2>Free disk and swap size (GB)</h2><div class=card>%s</div></div>" % _svg_chart(
+        "<h2>Free disk and swap size (GB)</h2><div class=card>%s</div>" % _svg_chart(
             draw, disk_series, False, marks, bands, height=160, **rng),
+        _resource_panels(view, draw, marks, bands, rng),
+        "</div>",
     ])
 
     def sess_pids(c):
@@ -1052,12 +1251,77 @@ def _view_html(view, events, meta, key, t0, t1):
         "<h2>Top processes at peak</h2><div class=card>%s</div>" % _table(summ.get("top_at_peak", []), [
             ("pid", lambda r: r["pid"], True, "pid"), ("name", lambda r: r["name"], False), ("MB", lambda r: r["mb"], True)],
             attrs=lambda r: _row_attrs("p:%s" % r["pid"], [r["pid"]], (meta.get(r["pid"]) or {}).get("g"))),
-        "<h2>Most-killed by jetsam</h2><div class=card>%s<p class=sub>reasons: %s</p></div></div>" % (
+        "<h2>Most-killed by jetsam</h2><div class=card>%s<p class=sub>reasons: %s</p></div>" % (
             _table([{"n": k2, "c": v2} for k2, v2 in (summ.get("most_killed") or {}).items()],
                    [("service", lambda r: r["n"], False), ("kills", lambda r: r["c"], True)]),
             _e(", ".join("%s × %d" % kv for kv in (summ.get("jetsam_reasons") or {}).items()) or "–")),
+        _busiest_html(summ, meta),
+        "</div>",
     ])
     return head, tail
+
+
+def _resource_panels(view, draw, marks, bands, rng):
+    """The charts of the other resources (roadmap 02 §5.3), each only where the view's samples have
+    it: cores busy against the core count (the peak and, where points stand for several samples, the
+    mean); the GPU at full speed with its busy time, or, without the full-speed figure, its busy time
+    under that name; GPU memory in use and allocated against the working-set limit; the free space of
+    each watched disk with its floors."""
+    res, out = view.res, []
+    if any("cpu" in p for p in draw):
+        series = [("cores busy, peak" if view.w else "cores busy", lambda p: p.get("cpu"), "var(--k1)")]
+        if view.w:
+            series.append(("mean", lambda p: p.get("cpu_mean"), "var(--k6)"))
+        n = res.get("n")
+        out.append("<h2>Cores busy%s</h2><div class=card>%s</div>" % (
+            " (of %d)" % n if n else "", _svg_chart(draw, series, False, marks, bands, unit="cores", refline=n,
+                                                     reflabel="cores", height=160, **rng)))
+    if res.get("util"):
+        out.append("<h2>GPU at full speed and busy time (%%)</h2><div class=card>%s<p class=sub>Full speed: the share "
+                   "of the GPU's capacity used. Busy: the share of the time it worked, at any speed.</p></div>" % _svg_chart(
+                       draw, [("at full speed", lambda p: p.get("util"), "var(--k4)"),
+                              ("busy time", lambda p: p.get("busy"), "var(--k6)")], False, marks, bands, ymax=100,
+                       unit="%", height=160, **rng))
+    elif res.get("busy"):
+        out.append("<h2>GPU busy time (%%)</h2><div class=card>%s<p class=sub>The share of the time the GPU was working, "
+                   "at any speed. This Mac did not report how fast it ran, so light work reads higher here than it "
+                   "weighs.</p></div>" % _svg_chart(draw, [("busy time", lambda p: p.get("busy"), "var(--k6)")], False,
+                                                   marks, bands, ymax=100, unit="%", height=160, **rng))
+    if res.get("gmem"):
+        out.append("<h2>GPU memory (GB)</h2><div class=card>%s</div>" % _svg_chart(
+            draw, [("in use", lambda p: p.get("gmem"), "var(--k4)"), ("allocated", lambda p: p.get("galloc"), "var(--k5)")],
+            False, marks, bands, refline=res.get("glim"), reflabel="working-set limit", height=160, **rng))
+    for pid, (name, low, crit) in list(view.pools.items())[:4]:
+        refs = [(v, lab) for v, lab in ((low, "low"), (crit, "critical")) if _fin(v)]
+        out.append("<h2>Free space on %s (GB)</h2><div class=card>%s</div>" % (_e(name), _svg_chart(
+            draw, [("free", (lambda p, pid=pid: (p.get("free") or {}).get(pid)), "var(--k3)")], False, marks, bands,
+            refs=refs, height=140, **rng)))
+    return "".join(out)
+
+
+def _busiest_html(summ, meta):
+    """The busiest processes per resource at that resource's peak, and the biggest writers."""
+    out = []
+    if summ.get("top_cpu_at_peak"):
+        out.append("<h2>Busiest on the CPU at its peak (%s)</h2><div class=card>%s</div>" % (
+            _e((summ.get("max_cpu_at") or "")[11:19]), _table(summ["top_cpu_at_peak"], [
+                ("pid", lambda r: r.get("pid", ""), True, "pid"), ("name", lambda r: r.get("name", "?"), False),
+                ("app", lambda r: r.get("g") or "", False), ("cores", lambda r: "%.2f" % r.get("cpu", 0), True)],
+                attrs=lambda r: _row_attrs("p:%s" % r.get("pid"), [r.get("pid")], (meta.get(r.get("pid")) or {}).get("g")))))
+    if summ.get("top_gpu_at_peak"):
+        full = summ.get("max_gpu_util") is not None
+        at = summ.get("max_gpu_util_at" if full else "max_gpu_busy_at") or ""
+        out.append("<h2>Busiest on the GPU at its peak (%s)</h2><div class=card>%s</div>" % (_e(at[11:19]), _table(
+            summ["top_gpu_at_peak"], [
+                ("pid", lambda r: r.get("pid", ""), True, "pid"), ("name", lambda r: r.get("name", "?"), False),
+                ("app", lambda r: r.get("g") or "", False),
+                ("% of full speed" if full else "% busy", lambda r: "%.1f" % r.get("gpu", 0), True)],
+            attrs=lambda r: _row_attrs("p:%s" % r.get("pid"), [r.get("pid")], (meta.get(r.get("pid")) or {}).get("g")))))
+    if summ.get("writers"):
+        out.append("<h2>Writing to disk, peak</h2><div class=card>%s</div>" % _table(summ["writers"], [
+            ("name", lambda r: r["name"], False), ("MB/s", lambda r: "%.1f" % r["peak_mb_s"], True),
+            ("at", lambda r: r["at"], False)]))
+    return "".join(out)
 
 
 def render_html(samples, events, title, incident=None, views=None, extra_css="", intro_html=""):
@@ -1222,12 +1486,18 @@ function pidCell(pids){
   const more = pids.length > 1 ? ' <span class=more>+' + (pids.length - 1) + '</span>' : '';
   return '<td class=pid title="' + esc(pids.join(', ')) + '">' + esc(pids[0]) + more + '</td>';
 }
+// the CPU and GPU columns, where the view's samples have them (1.9.1 and newer): once per view, not per row
+const resOf = {};
+const RES = () => resOf[view] || (resOf[view] = (() => { const v = V(), x = {cpu: false, gpu: false};
+  for (const rows of [v.procs, v.apps]) for (const r of rows) { x.cpu = x.cpu || r.cpu != null; x.gpu = x.gpu || r.gpu != null; if (x.cpu && x.gpu) return x; }
+  return x; })());
+function resCells(r){ const x = RES(); return (x.cpu ? '<td class=n>' + esc(r && r.cpu != null ? r.cpu : '') + '</td>' : '') + (x.gpu ? '<td class=n>' + esc(r && r.gpu != null ? r.gpu : '') + '</td>' : ''); }
 function nums(r, agg){
-  if (r) return '<td class=n>' + esc(r.first ?? '') + '</td><td class=n>' + esc(r.peak ?? '') + '</td><td class=n>' + esc(r.rise ?? '') + '</td><td>' + esc(r.at ?? '') + '</td>';
-  if (agg) return '<td class=n></td><td class=n></td><td class="n agg" title="sum of the rises below">Σ ' + esc(agg) + '</td><td></td>';
-  return '<td></td><td></td><td></td><td></td>';
+  if (r) return '<td class=n>' + esc(r.first ?? '') + '</td><td class=n>' + esc(r.peak ?? '') + '</td><td class=n>' + esc(r.rise ?? '') + '</td><td>' + esc(r.at ?? '') + '</td>' + resCells(r);
+  if (agg) return '<td class=n></td><td class=n></td><td class="n agg" title="sum of the rises below">Σ ' + esc(agg) + '</td><td></td>' + resCells(null);
+  return '<td></td><td></td><td></td><td></td>' + resCells(null);
 }
-const HEAD = (first) => '<tr><th class="pid">pid</th><th>' + first + '</th><th class=n>first MB</th><th class=n>peak MB</th><th class=n>rise MB</th><th>peak at</th></tr>';
+const HEAD = (first) => { const x = RES(); return '<tr><th class="pid">pid</th><th>' + first + '</th><th class=n>first MB</th><th class=n>peak MB</th><th class=n>rise MB</th><th>peak at</th>' + (x.cpu ? '<th class=n title="the most cores it kept busy">peak cores</th>' : '') + (x.gpu ? '<th class=n title="its largest share of the GPU">peak GPU %</th>' : '') + '</tr>'; };
 const appPids = a => a.pids.map(p => String(p[0]));
 
 function node(key, o){ return Object.assign({key: key, kids: new Map()}, o || {}); }
@@ -1292,7 +1562,7 @@ function treeRows(root, collapsed, opened, showAll){
       if (has && !closed) walk(c, depth + 1);
     }
     if (all.length > kids.length)
-      out.push('<tr><td class=pid></td><td colspan=5 style="padding-left:' + (22 + depth * 16) + 'px"><button type=button class=linkbtn data-all="' +
+      out.push('<tr><td class=pid></td><td colspan=' + (5 + RES().cpu + RES().gpu) + ' style="padding-left:' + (22 + depth * 16) + 'px"><button type=button class=linkbtn data-all="' +
                esc(n.key) + '">… ' + (all.length - kids.length) + ' more</button></td></tr>');
   })(root, 0);
   return out.join('');
@@ -1669,6 +1939,15 @@ def cmd_report(args):
         for x in summ[key][:8]:
             print("  +%6d MB  %-*s peak %d MB at %s" % (x["rise_mb"], w - 56, fit_group(x["name"], w - 56), x["peak_mb"],
                                                       x["peak_iso"]))
+    names = {}
+    for x in samples:
+        for d in disk_pools_of(x):
+            names[d["id"]] = str(d.get("name") or d["id"])
+    res = resource_summary_lines(summ, names)
+    if res:
+        print("\nother resources:")
+        for line in res:
+            print("  " + cut_end(line, w - 2))
     notable = [e for e in events if e.get("kind") not in ("jetsam", "notified")]
     if summ["jetsam_kills"]:
         print("\njetsam kills: %d   reasons: %s" % (summ["jetsam_kills"], summ["jetsam_reasons"]))
@@ -1677,6 +1956,36 @@ def cmd_report(args):
         for e in notable[-30:]:
             print("  %s  %-16s %s" % (e["iso"][11:19], e["kind"], cut_end(_event_detail(e), w - 29)))
     return 0
+
+
+def resource_summary_lines(summ, names=None):
+    """The summary's other resources in words (roadmap 02 §5.3): the CPU's and the GPU's peaks with
+    who was busiest then, GPU memory, the least free space per disk, the biggest writers. Nothing for
+    samples before 1.9.1. The GPU's figure is named as what it is (full speed, or busy time)."""
+    out = []
+    if summ.get("max_cpu_busy") is not None:
+        top = ", ".join("%s %.1f" % (r.get("name", "?"), r.get("cpu", 0)) for r in (summ.get("top_cpu_at_peak") or [])[:3])
+        out.append("cores: at most %.1f%s busy, at %s%s" % (
+            summ["max_cpu_busy"], " of %d" % summ["cpu_n"] if summ.get("cpu_n") else "",
+            (summ.get("max_cpu_at") or "")[11:16], " (%s)" % top if top else ""))
+    top = ", ".join("%s %.0f %%" % (r.get("name", "?"), r.get("gpu", 0)) for r in (summ.get("top_gpu_at_peak") or [])[:3])
+    if summ.get("max_gpu_util") is not None:
+        out.append("gpu: at most %.0f %% of full speed, at %s%s" % (summ["max_gpu_util"],
+                                                                    (summ.get("max_gpu_util_at") or "")[11:16],
+                                                                    " (%s)" % top if top else ""))
+    if summ.get("max_gpu_busy") is not None:
+        out.append("gpu: busy at most %.0f %% of the time (speed not reported), at %s%s" % (
+            summ["max_gpu_busy"], (summ.get("max_gpu_busy_at") or "")[11:16],
+            " (%s)" % top if top and summ.get("max_gpu_util") is None else ""))
+    if summ.get("max_gpu_mem_gb") is not None:
+        out.append("gpu memory: at most %.1f GB" % summ["max_gpu_mem_gb"])
+    if summ.get("min_free_gb"):
+        out.append("disks, least free: " + " · ".join("%s %.1f GB" % ((names or {}).get(k, k), v)
+                                                      for k, v in summ["min_free_gb"].items()))
+    if summ.get("writers"):
+        out.append("writing to disk, peak: " + ", ".join("%s %.1f MB/s at %s" % (r["name"], r["peak_mb_s"], r["at"][:5])
+                                                          for r in summ["writers"][:3]))
+    return out
 
 
 def list_incidents():
@@ -2736,6 +3045,21 @@ def read_bounded(name, cap, dir_fd=None, tail=False, shared=False):
 _MOVED = object()
 
 
+def _line_start(fd, pos, cap):
+    """Where the first whole line at or after `pos` starts (just past a newline), looked for within
+    `cap` bytes; None without one."""
+    end = pos + cap
+    while pos < end:
+        b = os.pread(fd, min(1 << 16, end - pos), pos)
+        if not b:
+            return None
+        k = b.find(b"\n")
+        if k >= 0:
+            return pos + k + 1
+        pos += len(b)
+    return None
+
+
 def _read_once(name, cap, dir_fd, tail, shared):
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
@@ -2747,14 +3071,19 @@ def _read_once(name, cap, dir_fd, tail, shared):
             return _MOVED
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (shared and st.st_mode & 0o444 != 0o444):
             return None
-        cut = st.st_size > cap
-        if cut:
+        start = 0
+        if st.st_size > cap:
             if not tail:
                 return None
-            os.lseek(fd, st.st_size - cap, os.SEEK_SET)
-        parts, n = [], 0
+            start = _line_start(fd, st.st_size - cap, cap)   # the fragment skipped here, not cut from a copy
+            if start is None:
+                return b""
+            os.lseek(fd, start, os.SEEK_SET)
+        # what the file holds in one read and one byte more to see it grow; past that 64 KB at a time.
+        # One part is joined without a copy: a MB of tail costs a MB, not the three of chunks, join and cut.
+        parts, n, cut = [], 0, False
         while n <= cap:
-            b = os.read(fd, min(1 << 16, cap + 1 - n))
+            b = os.read(fd, min(max(st.st_size - start, 0) + 1 if not parts else 1 << 16, cap + 1 - n))
             if not b:
                 break
             parts.append(b)

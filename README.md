@@ -97,13 +97,23 @@ hours is closed and continues in a new one. Once it is over the incident folder 
   away periods, critical-pressure stretches and kills, the top five apps stacked, free
   disk vs. swap size (gaps without data are hatched), the biggest risers as a list or a
   tree by owner, parent process and app, the agent sessions at the peak, the most-killed
-  services, and the events newest-first with a text and time filter. Click any row to
-  highlight that process (or app) in every table;
+  services, and the events newest-first with a text and time filter. Where the samples
+  have them (logger 1.9.1 and newer) it also charts the cores busy, the GPU (at full speed
+  or busy time), GPU memory and the free space of each recorded disk, lists who was busiest
+  on the CPU and the GPU at their peaks and who wrote most to disk, and adds peak-cores and
+  peak-GPU columns to the risers. Click any row to highlight that process (or app) in every
+  table;
 - `incident.json` — the same summary as data;
 - `syslog.txt` — the relevant 15 minutes of the system log.
 
 ***oomph*** also warns you once (every six hours at most) when free disk space drops
-below **20 GB** — see below for why that matters.
+below **20 GB** — see below for why that matters — and, per disk, when a disk it watches
+(`oomph volumes`) runs low. When a watched disk is **filling up** (2 GB or more gone within
+two minutes, at a rate that reaches its critical floor within 30 minutes) the logger records
+it with the processes writing most, and notifies you (once in 30 minutes) when that is less
+than ten minutes away. It also records when the thermal level changes, when the cores stay
+90 % busy for ten minutes (and when that is over), and when a disk is mounted, unmounted,
+watched or no longer watched.
 
 It never kills, pauses or throttles anything. It only keeps the record.
 
@@ -234,7 +244,7 @@ Everything the app shows is also available in the terminal, without `sudo`:
 
 ```sh
 oomph status                    # current memory, swap, disk, idle state, top apps, agent sessions
-oomph report --last 2h          # timeline, biggest risers, kills and events
+oomph report --last 2h          # timeline, biggest risers, other resources (cores, GPU, disks, writers), kills and events
 oomph report --since 2026-11-13T18:00 --until 2026-11-13T20:00
 oomph incidents                 # list of incidents
 oomph incident latest --html    # open the latest incident's report
@@ -271,8 +281,16 @@ keyboard and only reads: `←` `→` change the span (∞, 24 h, 6 h, 1 h), `↓
 reservations and `↑` into the incidents (`space` switches between the two lists, `enter` shows
 a row's details, `esc` lets go), `a` `s` `e` show the biggest apps, the Claude sessions and the
 events in place of the lists, `o` opens the report, `?` lists every key and explains every mark,
-`q` quits. It fits 80 × 24 and uses the room of a bigger window; it works in tmux, and
-`--bell` rings the terminal's bell when an incident opens, at most every 15 minutes.
+`q` quits. `i` inspects a moment: a cursor on the chart and the strip, moved with `←` `→` (ten
+columns with `shift`, `home` and `end` for the oldest and now), and in the place of the lists
+everything in that column, as the popup's hover card has it: the readings, their peak against
+the RAM, stretches without data, incidents, events and reservations; `enter` selects the
+incident or reservation there, `esc` goes back. `ctrl-o` (or `--mouse`) turns the mouse on: a
+click in the chart inspects that column, a click on a span or a row chooses it (a second click
+opens the row), and the wheel changes the span over the chart and scrolls a list; while it is on,
+the terminal selects text with `shift` (iTerm2: `option`). It fits 80 × 24 and uses the room of a
+bigger window; it works in tmux, and `--bell` rings the terminal's bell when an incident opens,
+at most every 15 minutes.
 
 ```sh
 oomph top                       # this Mac
@@ -282,7 +300,7 @@ oomph top --once                # one frame as text (--span, --size 100x30, --gl
 ```
 
 `--glyphs cells` draws the chart with whole cells only, for a font or line spacing that shows thin
-lines between block characters; `--glyphs ascii` uses no Unicode at all. The span, `--bell` and
+lines between block characters; `--glyphs ascii` uses no Unicode at all. The span, `--bell`, the mouse and
 a `--glyphs`, `--color` or `--theme` you give are remembered in
 `~/Library/Application Support/oomph/top.json` (`--glyphs auto` forgets the glyph set); under
 `sudo` the dashboard writes nothing, its reservations lag by up to 30 seconds, and it refuses
@@ -462,7 +480,7 @@ session B  → granted r8, tests start
 |---|---|
 | `/Library/Logs/oomph/current.json` | the latest sample plus daemon status |
 | `/Library/Logs/oomph/samples-YYYY-MM-DD.jsonl[.gz]` | one sample per line; older days compressed; kept 14 days |
-| `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications |
+| `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications; since 1.9.5 also `thermal`, `cpu_saturated` (and `_cleared`), `disk_low` per disk, `disk_filling` and `volume` |
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
 | `/Library/Logs/oomph/ioreport.json` | how often the IOReport helper crashed since the Mac started (only when it is switched on) |
 | `/usr/local/libexec/oomph/` | a link to the installed daemon and CLI, `/usr/local/libexec/oomph-<version>/` |

@@ -447,6 +447,165 @@ def test_selection():
                    "name esc (%s)" % bad[:2])
 
 
+# ------------------------------------------------------------------ inspect and the mouse (T1b)
+def test_inspect_mouse():
+    base = tempfile.mkdtemp(prefix="oomph-toptest-insp-")
+    try:
+        log, led = topfixture.write_fixture(os.path.join(base, "d"), "default")
+        oomph.LEDGER_DIR = led
+        model = T.load_model("6h", NOW, log_dir=log, live=False)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    model.update(host="studio", os="macOS 27.2")
+    caps = V.Caps("256", "unicode", "dark")
+    g = V.GLYPHS["unicode"]
+    P = V.layout(model, 80, 24)
+    W = P["plot_w"]
+    ui = {"span": "6h"}
+    V.inspect_at(ui, model, P, W - 1)
+    cols = [V.inspect_geometry(model, ui, P)[4]]
+    for k in ("left", "shift-left", "<", "home", "end", ">", "right", "shift-right"):
+        V.inspect_key(ui, k, model, P)
+        cols.append(V.inspect_geometry(model, ui, P)[4])
+    check(cols == [W - 1, W - 2, W - 12, W - 22, 0, W - 1, W - 1, W - 1, W - 1],
+          "inspect: ← → move a column, shift-← → and < > ten, home and end the oldest column and now; the cursor "
+          "stays in the plot (%s)" % cols)
+    inc = model["incidents"][0]                       # 10:29 on Friday: inside the 6 h view
+    f, finv, first, _, _ = V.inspect_geometry(model, ui, P)
+    c_inc = int(f(inc["start"]) * W)
+    V.inspect_at(ui, model, P, c_inc)
+    info, col = V.inspect_info(model, ui, P)
+    t_kept = ui["inspect"]["t"]
+    ui24 = dict(ui, span="24h")
+    f24, _, _, _, c24 = V.inspect_geometry(model, ui24, P)
+    i24, _ = V.inspect_info(model, ui24, P)
+    check(col == c_inc and info["incidents"] and info["incidents"][0].startswith("incident 10:29") and
+          i24["t0"] <= t_kept <= i24["t1"], "inspect: the column of an incident names it; at another span the cursor "
+          "is on the column that holds the same time (%s, %s)" % (info["incidents"][:1], i24["when"]))
+    fr = V.render(model, 80, 24, caps, dict(ui))
+    text = fr.text()
+    want = ["Inspect %s %s" % (g["mid"], info["when"])] + [r[0] for r in info["readings"]] + info["incidents"][:1]
+    check(all(w[:30] in text for w in want) and text.rstrip("\n").split("\n")[-1].startswith(" esc back"),
+          "inspect: the readout docked under the strip says what hover_info says (the app's hover card, held to it by "
+          "the chart vectors); the key line starts with the way out")
+    ui2 = dict(ui)
+    V.inspect_key(ui2, "enter", model, P)
+    sel = V.selected(model, ui2)
+    ui3 = {"span": "6h"}
+    V.inspect_at(ui3, model, P, 0)
+    for _ in range(3):
+        V.inspect_key(ui3, "right", model, P)
+    i3, _ = V.inspect_info(model, ui3, P)
+    V.inspect_key(ui3, "enter", model, P)
+    check("inspect" not in ui2 and sel[0] == "inc" and sel[1]["id"] == inc["id"] and "inspect" not in ui3 and
+          (ui3.get("focus") in ("inc", "res") or ui3.get("note")),
+          "inspect: enter selects the incident under the cursor in its list and leaves inspect (%s)" % (sel[0],))
+    bad = []
+    rnd = random.Random(5)
+    for Wd in range(40, 161, 8):
+        for H in (10, 12, 16, 24, 40):
+            for span in ("inf", "24h", "1h"):
+                u = {"span": span}
+                PP = V.layout(model, Wd, H)
+                V.inspect_at(u, model, PP, rnd.randrange(PP["plot_w"]))
+                try:
+                    fr = V.render(dict(model), Wd, H, caps, u)
+                except Exception as e:
+                    bad.append("%dx%d %s: %r" % (Wd, H, span, e))
+                    continue
+                rows = fr.text().rstrip("\n").split("\n")
+                if len(rows) != H or any(V.tw(r) != Wd for r in rows) or V.lint_pairing(fr):
+                    bad.append("%dx%d %s: shape or colour rule" % (Wd, H, span))
+                elif not rows[-1].startswith(" esc"):
+                    bad.append("%dx%d %s: the key line does not start with esc" % (Wd, H, span))
+    check(not bad, "inspect: the readout draws at every size from 40 x 10 (docked, or floating where there is no list "
+                   "area), rows as wide as the frame (%s)" % bad[:3])
+    # the mouse: what a press at a cell does
+    P = V.layout(model, 80, 24)
+    hits = V.span_hits(P, {"span": "6h"}, g)
+    k1 = [h for h in hits if h[0] == "1h"][0]
+    u = {"span": "6h"}
+    acts = [V.mouse(u, model, P, g, 0, k1[1] + 1, P["box_y"]), V.mouse(u, model, P, g, 64, P["plot_x"] + 5, P["plot_y"]),
+            V.mouse(u, model, P, g, 65, P["plot_x"] + 5, P["plot_y"])]
+    V.mouse(u, model, P, g, 0, P["plot_x"] + 9, P["plot_y"] + 2)
+    c_click = V.inspect_geometry(model, u, P)[4]
+    V.mouse(u, model, P, g, 32, P["plot_x"] + 30, P["plot_y"] + 2)      # motion: never acted on
+    V.mouse(u, model, P, g, 2, P["plot_x"] + 30, P["plot_y"] + 2)       # the right button: nothing
+    c_after = V.inspect_geometry(model, u, P)[4]
+    rows = V.list_rows(model, P["R"], {})[0]
+    first = V.mouse(u, model, P, g, 0, 10, P["list_y"])
+    in_res = u.get("focus") == "res" and u.get("res_sel") == rows[0][2] and "inspect" not in u
+    again = V.mouse(u, model, P, g, 0, 10, P["list_y"])
+    V.mouse(u, model, P, g, 0, 10, P["inc_y"] + 1)
+    in_inc = (u.get("focus"), u.get("inc_sel"))
+    V.mouse(u, model, P, g, 65, 10, P["list_y"] + 1)
+    wheel = (u.get("focus"), u.get("res_sel"))
+    u2 = {"span": "6h"}
+    V.mouse(u2, model, P, g, 0, 10, P["inc_cap_y"])
+    check(acts == [("span", "1h"), ("span", "1h"), ("span", "24h")] and c_click == 9 and c_after == 9 and first is None
+          and in_res and again == ("card",) and in_inc == ("inc", 1) and wheel == ("res", 1) and u2.get("focus") == "inc",
+          "mouse: a span in the chart's edge chooses it, the wheel over the chart changes it; a click in the plot "
+          "inspects that column; motion and the right button do nothing; a row is selected, clicked again it opens; "
+          "the wheel over a list scrolls it; a caption moves into its list (%s)" % [acts, c_click, c_after, first, again,
+                                                                                    in_inc, wheel, u2.get("focus")])
+    evs = []
+    d = T.Decoder(evs.append, mouse=lambda: True)
+    d.feed(b"\x1b[<0;12;8M\x1b[<0;12;8m\x1b[<65;3;4M", 0.0)
+    check(evs == [("mouse", 0, 12, 8, True), ("mouse", 0, 12, 8, False), ("mouse", 65, 3, 4, True)],
+          "mouse: SGR reports decode to presses and releases (%s)" % evs)
+
+
+def test_pty_inspect(base):
+    """i, the arrows and esc in a terminal; ctrl-o turns the mouse on and off, a click inspects; --mouse."""
+    env, log, led = fixture_env(base)
+    oomph.LEDGER_DIR = led
+    model = T.load_model("24h", NOW, log_dir=log, live=False)
+    P = V.layout(model, 80, 24)
+
+    def screen(p):
+        vt = MiniVT(80, 24)
+        vt.feed(p.text())
+        return "\n".join("".join(c[0] for c in row) for row in vt.cells)
+    p = Pty(top(), env)
+    try:
+        p.pump(5, until=b"Logging every")
+        p.send("i", "left", "left", wait=0.3)
+        insp = "Inspect" in screen(p) and "esc back" in screen(p)
+        p.send("esc", wait=0.3)
+        back = "Inspect" not in screen(p) and "a apps" in screen(p)
+        n1 = len(p.out)
+        p.send(b"\x0f", wait=0.4)
+        on = b"\x1b[?1000h\x1b[?1006h" in p.out[n1:] and "mouse on" in screen(p)
+        p.send(b"\x1b[<0;%d;%dM\x1b[<0;%d;%dm" % ((P["plot_x"] + 11, P["plot_y"] + 2) * 2), wait=0.4)
+        clicked = "Inspect" in screen(p)
+        n3 = len(p.out)
+        p.send(b"\x0f", wait=0.3)
+        off = b"\x1b[?1000l\x1b[?1006l" in p.out[n3:]
+        p.send("q", wait=0.1)
+        rc = p.wait(5)
+        restored = p.restored()
+    finally:
+        p.close()
+    saved = json.load(open(os.path.join(env["OOMPH_STATE_DIR"], "top.json")))
+    check(insp and back and on and clicked and off and rc == 0 and restored and saved.get("mouse") is False,
+          "pty: i inspects and esc leaves; ctrl-o turns mouse reporting on (buttons and the wheel, SGR) and off; a "
+          "click in the plot inspects that column; top.json remembers the mouse off (%s)"
+          % [insp, back, on, clicked, off, rc, saved.get("mouse")])
+    p = Pty(top("--mouse"), env)
+    try:
+        p.pump(5, until=b"Logging every")
+        started = b"\x1b[?1000h\x1b[?1006h" in p.out
+        p.send("q", wait=0.1)
+        rc = p.wait(5)
+        left = p.out.endswith(T.LEAVE.encode()) and b"\x1b[?1000l" in T.LEAVE.encode()
+    finally:
+        p.close()
+    saved = json.load(open(os.path.join(env["OOMPH_STATE_DIR"], "top.json")))
+    check(started and left and rc == 0 and saved.get("mouse") is True,
+          "pty: --mouse turns reporting on from the start, the leave sequences turn it off, and it is remembered (%s)"
+          % [started, left, rc, saved.get("mouse")])
+
+
 # ------------------------------------------------------------------ history as typed arrays
 def test_arrays():
     rnd = random.Random(7)
@@ -1034,7 +1193,8 @@ def test_children(base):
 
 def budget_fixture(base):
     """The budget's data (04 §4.9): 14 days at a 30 s interval ending at the real clock, each line
-    carrying a process list as a real sample does (about 1.5 KB), today's file plain, the rest .gz.
+    carrying a process list as a real sample does (about 1.5 KB), today's file plain, the rest .gz, and
+    events.jsonl and .1 past the MB of each that top reads, of all kinds.
     Returns (env, log directory, a function that appends one sample now, as the logger would)."""
     env, log, _ = fixture_env(base)
     for n in os.listdir(log):
@@ -1063,6 +1223,26 @@ def budget_fixture(base):
                 f.write(text)
         last = ps[-1]
     cur = json.load(open(os.path.join(log, "current.json")))
+    ev = os.path.join(log, "events.jsonl")
+    with open(ev) as f:
+        kept = f.read()
+    kinds = [lambda i: dict(kind="pressure_change", old=1 + (i % 2), new=2 - (i % 2)),
+             lambda i: dict(kind="sleep_gap", seconds=600 + 37 * i % 30000),
+             lambda i: dict(kind="jetsam", kills=1 + i % 3, top={"process number %d" % (i % 9): 1 + i % 3}),
+             lambda i: dict(kind="thermal", old=i % 3, new=(i + 1) % 3, busy=11.5),
+             lambda i: dict(kind="volume", pool="vol:%d" % (i % 5), mount="/Volumes/Disk %d" % (i % 5),
+                            name="Disk %d" % (i % 5), what=("mounted", "unmounted")[i % 2]),
+             lambda i: dict(kind="cpu_saturated", busy=13.1, n=14, minutes=10 + i % 50, top={"cargo": 9}),
+             lambda i: dict(kind="notified", title="Memory pressure high", event="pressure")]
+    i = 0
+    for name, t0 in (("events.jsonl.1", time.time() - 14 * 86400), ("events.jsonl", time.time() - 7 * 86400)):
+        with open(os.path.join(log, name), "w") as f:      # a long-running install's: the newest MB of each read
+            while f.tell() < (1 << 20) + 4096:
+                i += 1
+                e = dict(kinds[i % len(kinds)](i), t=t0 + 25 * i % (6 * 86400), iso="2026-11-20T10:00:00+0100")
+                f.write(json.dumps(e) + "\n")
+            if name == "events.jsonl":
+                f.write(kept)
 
     def append():
         p = dict(last, t=time.time())
@@ -1150,11 +1330,13 @@ def main():
     test_writer(frames)
     tmux_oracle(frames)
     test_selection()
+    test_inspect_mouse()
     test_arrays()
     base = tempfile.mkdtemp(prefix="oomph-toptest-")
     try:
         test_pty(os.path.join(base, "pty"))
         test_bell_settings_nologger(os.path.join(base, "settings"))
+        test_pty_inspect(os.path.join(base, "inspect"))
         test_budget(os.path.join(base, "budget"))
         test_readonly_ssh(os.path.join(base, "ssh"))
         test_crash(os.path.join(base, "crash"))

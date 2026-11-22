@@ -283,6 +283,10 @@ FRAMES = [
     ("80x24-help", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "?"),
     ("80x24-reservation-card", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "down enter"),
     ("80x24-incident-card", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "up down enter"),
+    # T1b: inspect, the readout docked in the place of the lists, and floating where a pane has no list area
+    ("80x24-inspect", "default", 80, 24, "6h", "256", "unicode", "dark", "golden",
+     "i shift-left shift-left shift-left left left left left left left"),
+    ("60x16-inspect", "default", 60, 16, "24h", "256", "unicode", "dark", "golden", "i shift-left shift-left shift-left"),
 ]
 
 
@@ -295,7 +299,11 @@ def press_keys(model, w, h, span, keys):
         ui["detected"] = oomph_top.detected_text(view.Caps("256", "unicode", "dark"), {"theme": True}, (w, h))
     for k in (keys or "").split():
         P = view.layout(model, w, h)
-        if k == "?":
+        if k == "i":
+            view.inspect_at(ui, model, P, P["plot_w"] - 1)
+        elif ui.get("inspect"):
+            view.inspect_key(ui, k, model, P)
+        elif k == "?":
             ui["overlay"] = {"kind": "help", "page": 1, "off": 0}
         elif k in ("a", "s", "e"):
             ui["panel"] = k

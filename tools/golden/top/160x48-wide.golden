@@ -47,7 +47,7 @@
 │                                                                                                              ││                                              │
 │                                                                                                              ││                                              │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────╯╰──────────────────────────────────────────────╯
- q quit  ? help  a apps  ←→ span  ↑↓ select  s sessions  e events                                                                            Logging every 30 s 
+ q quit  ? help  a apps  ←→ span  ↑↓ select  s sessions  e events  i inspect                                                                 Logging every 30 s 
 --- fg
 .......ssssssss........................................................................................................................ddddddddd.kkkkkkkk.ddddd.
 ll........ldddsssssddddddddlllllllllllllllllllllllllll.wddddd.addd.cdddddddddd.pdddd.ddddd.hddddddd.idddddddd.llll.....lllllllllllllllllllllllllllddddddddddddll
@@ -96,7 +96,7 @@ l...............................................................................
 l..............................................................................................................ll..............................................l
 l..............................................................................................................ll..............................................l
 llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll
-...dddd....dddd....dddd.....dddd.....dddddd....dddddddd....dddddd............................................................................ffffffffffffffffff.
+...dddd....dddd....dddd.....dddd.....dddddd....dddddddd....dddddd....ddddddd.................................................................ffffffffffffffffff.
 --- bg
 BBBBBBBSSSSSSSSBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBooooooooBBBBBBB
 ...........TTTSSSSSTTTTTTTT.....................................................................................................................................
@@ -194,6 +194,6 @@ BBBBBBBSSSSSSSSBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
 ................................................................................................................................................................
 ................................................................................................................................................................
 ................................................................................................................................................................
-.1.......1.......1.......11.......11.........1...........1......................................................................................................
+.1.......1.......1.......11.......11.........1...........1.........1............................................................................................
 --- roles
 . = primary text (fg plane) / not painted (bg plane)  a=app  y=away  B=bar  c=comp  d=dim  f=faint  g=grid  h=hatch  i=incident  l=line  o=ok  k=onblock  0=r0  1=r1  2=r2  3=r3  6=r6  S=sel  s=selfg  p=swap  T=trough  x=warntx  w=wired

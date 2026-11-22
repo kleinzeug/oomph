@@ -110,13 +110,15 @@ class Logs:
                 return
             w = max(bucket, key=lambda x: (x.get("pressure", 0), x.get("app_gb", 0) + x.get("compressed_gb", 0)))
             g = (w.get("groups") or [{}])[0]
-            rows.append({"t": _hm(bucket[0]["t"]), "pressure": oomph.PRESSURE.get(w.get("pressure"), w.get("pressure")),
-                         "app": w.get("app_gb"), "wired": w.get("wired_gb"), "compressed": w.get("compressed_gb"),
-                         "compressor_logical": w.get("compressor_logical_gb"), "swap": w.get("swap_used_gb"),
-                         "swap_size": w.get("swap_total_gb"), "free_disk": w.get("disk_free_gb"),
-                         "unowned": oomph.unowned_gb(w), "kills": sum(x.get("jetsam_kills", 0) for x in bucket),
-                         "away": any(oomph.is_away(x) for x in bucket), "stall_s": max(x.get("stall", 0) for x in bucket),
-                         "top_app": "%s %.1fG" % (g.get("name", "?"), (g.get("mb") or 0) / 1024)})
+            row = {"t": _hm(bucket[0]["t"]), "pressure": oomph.PRESSURE.get(w.get("pressure"), w.get("pressure")),
+                   "app": w.get("app_gb"), "wired": w.get("wired_gb"), "compressed": w.get("compressed_gb"),
+                   "compressor_logical": w.get("compressor_logical_gb"), "swap": w.get("swap_used_gb"),
+                   "swap_size": w.get("swap_total_gb"), "free_disk": w.get("disk_free_gb"),
+                   "unowned": oomph.unowned_gb(w), "kills": sum(x.get("jetsam_kills", 0) for x in bucket),
+                   "away": any(oomph.is_away(x) for x in bucket), "stall_s": max(x.get("stall", 0) for x in bucket),
+                   "top_app": "%s %.1fG" % (g.get("name", "?"), (g.get("mb") or 0) / 1024)}
+            row.update(_resource_row(bucket))
+            rows.append(row)
         for x in s:
             k = int((x["t"] - a) // step)
             if k != key:
@@ -128,10 +130,30 @@ class Logs:
 
     def top_at(self, args):
         t = _parse_t(args.get("time"), self.until, self.now)
+        by = args.get("by") or "memory"
+        if by not in TOP_BY:
+            raise AIError("'by' is one of %s" % ", ".join(TOP_BY))
         s = self.samples(t - 900, t + 900) or self.samples(t - 7200, t + 7200)
         if not s:
             return {"note": "no sample near %s" % _iso(t)}
         x = min(s, key=lambda y: abs(y["t"] - t))
+        if by != "memory":
+            key, field = TOP_BY[by]
+            out = {"sample_at": x["iso"], "by": by, "top_processes": (x.get(key) or [])[:15]}
+            if by == "cpu":
+                out["cpu"] = x.get("cpu")
+                out["top_apps"] = sorted([gr for gr in x.get("groups") or [] if gr.get("cpu")], key=lambda gr: -gr["cpu"])[:10]
+            elif by == "gpu":
+                out["gpu"] = x.get("gpu")
+                out["note"] = ("gpu is the share of the GPU's capacity at full speed" if oomph.gpu_reading(x) and
+                               oomph.gpu_reading(x)[0] == "util" else "gpu is the share of the time it was busy, at any "
+                               "speed (this sample has no full-speed figure)")
+            else:
+                out["io"] = x.get("io")
+            if x.get(key) is None:
+                out["note"] = "this sample has no %s figures (a logger older than 1.9.1, or the first sample after a " \
+                              "gap)" % by
+            return out
         return {"sample_at": x["iso"], "pressure": oomph.PRESSURE.get(x.get("pressure")),
                 "top_processes": (x.get("top") or [])[:15], "top_apps": (x.get("groups") or [])[:10],
                 "claude_sessions": x.get("claude") or [], "gone_since_previous": x.get("gone") or [],
@@ -220,7 +242,12 @@ class Logs:
 
     def current_status(self, args):
         v = oomph.checked_verdict()
-        return {"verdict": v, "reservations": oomph.ledger_snapshot()}
+        out = {"verdict": v, "reservations": oomph.ledger_snapshot()}
+        try:
+            out["resources"] = oomph._resources(oomph.resource_sample())
+        except Exception as e:  # the memory verdict stands without them
+            out["resources"] = {"error": str(e)[:200]}
+        return out
 
     def claude_sessions(self, args):
         a, b = self.window(args)
@@ -245,34 +272,69 @@ class Logs:
         return {"sessions": out[:15]}
 
 
+TOP_BY = {"memory": ("top", "mb"), "cpu": ("top_cpu", "cpu"), "gpu": ("top_gpu", "gpu"), "writes": ("top_io", "w")}
+
+
+def _resource_row(bucket):
+    """A timeline step's other resources (roadmap 02 §5.3), each the peak of the step and only where the
+    samples have it: cores busy, the GPU's figure under the name of its kind, GPU memory, MB/s written,
+    the least free space on a watched disk."""
+    row = {}
+    for x in bucket:
+        c, g = oomph.cpu_busy(x), oomph.gpu_reading(x)
+        if c:
+            row["cores_busy"] = max(row.get("cores_busy", 0), c[0])
+            if c[1]:
+                row["cores"] = c[1]
+        if g and g[0]:
+            k = "gpu_full_speed_pct" if g[0] == "util" else "gpu_busy_pct"
+            row[k] = max(row.get(k, 0), g[1])
+        if g and g[2] is not None:
+            row["gpu_mem_gb"] = max(row.get("gpu_mem_gb", 0), g[2])
+        io = x.get("io") if isinstance(x.get("io"), dict) else {}
+        if isinstance(io.get("w_mb_s"), (int, float)):
+            row["write_mb_s"] = max(row.get("write_mb_s", 0), io["w_mb_s"])
+        for p in oomph.disk_pools_of(x):
+            if p.get("watch"):
+                k = "free_gb_" + str(p.get("name") or p["id"])[:32]
+                row[k] = min(row.get(k, p["free_gb"]), p["free_gb"])
+    return row
+
+
 TOOLS = [
     ("overview", "Summary of a time window: peak pressure, swap, free disk, jetsam kills, unowned memory "
                  "(memory no process owns — a leak sign), away share, onset, biggest risers, gaps without data.",
      {"since": "str", "until": "str"}),
     ("timeline", "Memory over time in steps (worst sample per step): pressure, app/wired/compressed GB, "
-                 "compressor logical size, swap, free disk, unowned GB, kills, away, stalls, top app.",
+                 "compressor logical size, swap, free disk, unowned GB, kills, away, stalls, top app; where "
+                 "recorded also the peak of the step's cores busy, GPU (at full speed or busy time, named as such), "
+                 "GPU memory, MB/s written and the least free space per watched disk.",
      {"since": "str", "until": "str", "step_minutes": "int"}),
     ("top_at", "Biggest processes, apps and Claude sessions at the sample nearest a time, plus processes "
-               "≥300 MB that had just disappeared.", {"time": "str"}),
+               "≥300 MB that had just disappeared; with by=cpu|gpu|writes the busiest processes of that resource "
+               "instead.", {"time": "str", "by": "str"}),
     ("process_history", "Footprint over time of processes matching a name substring or a pid: parent, app, "
                         "Claude session, first/peak/last MB, series.",
      {"name": "str", "pid": "int", "since": "str", "until": "str"}),
     ("events", "Logged events (pressure changes, flapping, jetsam kills, stalls, sleep gaps, unowned memory, "
-               "incidents, daemon restarts), optionally filtered by kind or text.",
+               "incidents, daemon restarts; the cores saturated, the thermal level, a disk low or filling, a disk "
+               "mounted or gone), optionally filtered by kind or text.",
      {"since": "str", "until": "str", "kind": "str", "contains": "str", "limit": "int"}),
     ("incidents", "All recorded incidents with their triggers and summary numbers.", {}),
     ("incident", "One incident's full record (triggers, summary, top processes at peak).", {"id": "str"}),
     ("syslog", "The system-log excerpt saved when an incident opened: jetsam exits per service, matching lines.",
      {"id": "str", "contains": "str", "limit": "int"}),
-    ("current_status", "Memory right now: %s's verdict (ok/tight/critical with reasons) and reservations." % oomph.BRAND,
-     {}),
+    ("current_status", "Right now: %s's memory verdict (ok/tight/critical with reasons), reservations, and the "
+                       "cores, GPU and disks." % oomph.BRAND, {}),
     ("claude_sessions", "Claude Code sessions seen in a window: project, peak memory, biggest child processes.",
      {"since": "str", "until": "str"}),
 ]
 ARG_DOC = {"since": "start, ISO local time (2026-11-19T03:40) or relative (-6h); default: report start",
            "until": "end, ISO or relative; default: report end", "step_minutes": "step size, default 10",
            "time": "ISO local time or relative", "name": "case-insensitive substring of the process name",
-           "pid": "process id", "kind": "event kind, e.g. jetsam, stall, pressure_flapping, incident_open",
+           "pid": "process id", "kind": "event kind, e.g. jetsam, stall, pressure_flapping, incident_open, "
+                                        "cpu_saturated, thermal, disk_low, disk_filling, volume",
+           "by": "memory (default), cpu, gpu or writes",
            "contains": "text to search for", "limit": "max rows", "id": "incident id like 20261119-035310"}
 
 
@@ -317,7 +379,9 @@ def run_tool(logs, name, args):
 SYSTEM = """You are a memory forensics analyst for a Mac. %s, a memory monitor, has logged this Mac's \
 memory every 5–30 seconds (pressure level, app/wired/compressed memory, the compressor's logical size, swap, free \
 disk, the 25 biggest processes with parent, app and Claude Code session, jetsam kills, away state) plus events and \
-incidents. Investigate the report window with the tools and explain to the Mac's owner what went on with memory.
+incidents. Newer samples also hold the cores busy, the GPU (as the share of its capacity at full speed, or as the share \
+of the time it was busy where the speed was not recorded: never compare or average the two), GPU memory, disk writes \
+and the free space of each disk; use them where they explain the memory story. Investigate the report window with the tools and explain to the Mac's owner what went on with memory.
 
 How macOS memory works, briefly: app memory is compressed before it is swapped; swap lives on the startup disk and \
 can only grow while there is free disk; macOS pressure goes normal -> WARN -> CRITICAL; under shortage jetsam kills \

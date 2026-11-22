@@ -157,11 +157,12 @@ def clean(v, cut=200, depth=16):
 DISK_GB = float(1 << 20)  # a disk's size or free space: up to a pebibyte, whatever the RAM
 
 
-def gb_ok(row, ram):
+def gb_ok(row, ram, disk_keys=("disk_free_gb",)):
     """Every gb and *_gb number of a row (and of the dicts in it) finite and between 0 and 16 times the
     machine's RAM, at most 65,536 (roadmap 01 §4.3: what the chart can be handed is bounded); the
-    sizes of disks (`disk_free_gb`, anything in a `disks` block) up to DISK_GB instead, since a disk
-    is bigger than 16 times the RAM of most Macs."""
+    sizes of disks (`disk_free_gb`, anything in a `disks` block, and in an event the `free_gb` of the
+    disk it is about: `disk_keys`) up to DISK_GB instead, since a disk is bigger than 16 times the
+    RAM of most Macs."""
     top = min(16 * ram, 65536.0) if oomph._num(ram, 0.1, 65536) else 65536.0
     stack = [(row, top)]
     while stack:
@@ -169,7 +170,7 @@ def gb_ok(row, ram):
         if isinstance(x, dict):
             for k, v in x.items():
                 if isinstance(k, str) and (k == "gb" or k.endswith("_gb")) and v is not None and \
-                        not oomph._num(v, 0, DISK_GB if k == "disk_free_gb" else lim):
+                        not oomph._num(v, 0, DISK_GB if k in disk_keys else lim):
                     return False
                 if isinstance(v, (dict, list)):
                     stack.append((v, DISK_GB if k == "disks" else lim))
@@ -205,7 +206,8 @@ class Ingest:
             ok = gb_ok(v, v.get("ram_gb") if oomph._num(v.get("ram_gb"), 0.1, 65536) else self.ram)
         elif ok:
             segs = v.get("segments") if isinstance(v.get("segments"), list) else []
-            ok = gb_ok(v, self.ram) and all(self.time_ok(x.get("t"), back) for x in segs if isinstance(x, dict))
+            ok = gb_ok(v, self.ram, ("disk_free_gb", "free_gb") if kind == "events" else ("disk_free_gb",)) and \
+                all(self.time_ok(x.get("t"), back) for x in segs if isinstance(x, dict))
         if not ok:
             self.dropped["samples" if kind == "samples" else "records"] += 1
             return None
