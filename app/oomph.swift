@@ -2,6 +2,7 @@
 // Build: ../build-app.sh
 import AppKit
 import Charts
+import Combine
 import Security
 import SwiftUI
 
@@ -162,7 +163,12 @@ struct Sample: Decodable {
     }
 }
 
-struct Gap { let from, to: Double }
+/// What a stretch without samples is: the machine logged nothing (hatched), or, for another
+/// machine's mirror, this dashboard has not received it (dotted), not since the link dropped, or
+/// never will (that machine keeps 14 days).
+enum GapKind { case noData, notReceived, notConnected, gone }
+
+struct Gap { let from, to: Double; var kind: GapKind = .noData }
 
 /// Just the fields the chart needs: decoding a whole Sample (process groups, sessions…) for two
 /// weeks of history is most of the loading time.
@@ -348,16 +354,62 @@ enum Pressure: Int { case unknown = 0, normal = 1, warn = 2, critical = 4
     var color: Color { switch self { case .warn: .yellow; case .critical: .red; default: .green } }
 }
 
-// MARK: - Store
+// MARK: - One machine
 
-final class Store: ObservableObject {
+/// A mirror's status.json: the state of the link to that machine (roadmap 01 §5.7).
+struct LinkStatus: Decodable {
+    var state: String?
+    var was: String?
+    var since: Double?
+    var last_contact: Double?
+    var error: String?
+    var pid: Int32?
+    var updated: Double?
+}
+
+/// A mirror's sync.json: the coverage map (`have`: stretches of the remote's time received whole,
+/// `gone`: stretches it no longer keeps), which lists have had their first sync, the clock offset.
+struct SyncState: Decodable {
+    struct Synced: Decodable { var ledger: Bool?; var reservations: Bool?; var incidents: Bool? }
+    var have: [[Double]]?
+    var gone: [[Double]]?
+    var synced: Synced?
+    var offset_s: Double?
+    var spans: [(Double, Double)] { (have ?? []).compactMap { $0.count == 2 && $0[0] <= $0[1] ? ($0[0], $0[1]) : nil } }
+    var goneSpans: [(Double, Double)] { (gone ?? []).compactMap { $0.count == 2 && $0[0] <= $0[1] ? ($0[0], $0[1]) : nil } }
+}
+
+/// A mirror's machine.json: what the machine said about itself when it was last reached.
+struct MachineInfo: Decodable {
+    var id: String?
+    var name: String?
+    var os: String?
+    var os_version: String?
+    var kind: String?
+    var version: String?
+    var oldest: Double?
+}
+
+/// One machine's data, as the popup draws it: this Mac from its own directories, or another
+/// machine from its mirror (…/machines/<mid>/: log/, ledger/, status.json, sync.json,
+/// machine.json, written by `oomph remote sync`). Everything per machine lives here; the app's
+/// own state (AI, upgrades, the range) stays in Store. Until tabs exist the popup shows This
+/// Mac; `--render-popup … --mirror DIR` draws a mirror.
+final class MachineStore: ObservableObject {
+    let logDir: String
+    let ledgerDir: String
+    /// The mirror's directory; nil for this Mac.
+    let mirror: String?
+    var isLocal: Bool { mirror == nil }
+
     @Published var current: Sample?
     @Published var currentAge: Double = .infinity
     /// All logged history, oldest first, finer near now (see Store.multires): every range draws from it.
     @Published var history: [Point] = []
-    /// When `history` was loaded: the chart measures ages from here.
+    /// When `history` was loaded: the chart measures ages from here (for a mirror, on its clock).
     @Published var historyNow = Date().timeIntervalSince1970
-    /// Stretches without samples (asleep, off, logger stopped), found in the raw samples.
+    /// Stretches without samples (asleep, off, logger stopped), found in the raw samples; for a
+    /// mirror also the stretches it has not received (Gap.kind).
     @Published var gaps: [Gap] = []
     /// events.jsonl(.1), oldest first, for the hover tooltip.
     @Published var events: [ChartEvent] = []
@@ -368,10 +420,303 @@ final class Store: ObservableObject {
     }
     private var eventsStamp = ""
     @Published var incidents: [Incident] = []
+    /// A mirror's link, coverage and machine (nil for this Mac).
+    @Published var link: LinkStatus?
+    @Published var sync: SyncState?
+    @Published var info: MachineInfo?
+
+    // history loading runs on its own queue; the cache and its decoder belong to that queue
+    private let loadQueue = DispatchQueue(label: "local.oomph.history", qos: .userInitiated)
+    /// Per file: its identity (a mirror replaces whole files by renaming), how far it was read, its points.
+    private var cache: [String: (ino: UInt64, offset: UInt64, pts: [Point])] = [:]
+    private let loadDecoder = JSONDecoder()
+    private var loading = false, loadAgain = false
+    /// False until the history has been loaded once: the chart shows a spinner meanwhile.
+    @Published var historyLoaded = false
+    private let decoder = JSONDecoder()
+
+    init(logDir: String, ledgerDir: String, mirror: String? = nil) {
+        self.logDir = logDir; self.ledgerDir = ledgerDir; self.mirror = mirror
+    }
+
+    convenience init(mirror dir: String) {
+        self.init(logDir: dir + "/log", ledgerDir: dir + "/ledger", mirror: dir)
+    }
+
+    var daemonRunning: Bool {
+        guard let c = current else { return false }
+        return currentAge < 3 * (c.daemon?.interval ?? 30) + 15
+    }
+
+    /// The machine's clock: a mirror's times are the remote's own, corrected by the offset measured
+    /// at the handshake (roadmap 01 §4.6).
+    var now: Double { Date().timeIntervalSince1970 + (isLocal ? 0 : sync?.offset_s ?? 0) }
+
+    /// A mirror is live while its engine says so and has rewritten status.json within the last 10 s
+    /// from a process that still exists; in every other case it is drawn stale, so a crashed engine
+    /// can never leave a pane looking live (roadmap 01 §4.4).
+    var linkLive: Bool {
+        guard let l = link, l.state == "live" || l.state == "catching_up", let u = l.updated, let pid = l.pid, pid > 0
+        else { return false }
+        return Date().timeIntervalSince1970 - u < 10 && (kill(pid, 0) == 0 || errno == EPERM)
+    }
+    /// Another machine that is not live: what claims to be now is drawn grey (roadmap 01 §3.5).
+    var stale: Bool { !isLocal && !linkLive }
+    /// Where this dashboard's knowledge of the machine ends: the end of a mirror's coverage.
+    var knownUntil: Double? { sync?.spans.last?.1 ?? history.last?.id }
+    /// The stat tiles: this Mac's while its logger reports; a mirror's whenever it has a reading.
+    var showsStats: Bool { isLocal ? daemonRunning : current != nil }
+    /// A mirror's list that has not had its first sync says "fetching…", never "nothing".
+    var fetchingLedger: Bool { !isLocal && sync?.synced?.ledger != true }
+    var fetchingIncidents: Bool { !isLocal && sync?.synced?.incidents != true }
+
+    var lastSeenKey: String { isLocal ? "lastSeenIncident" : "lastSeenIncident." + (info?.id ?? (mirror! as NSString).lastPathComponent) }
+    var lastSeenIncident: String {
+        get { UserDefaults.standard.string(forKey: lastSeenKey) ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: lastSeenKey); objectWillChange.send() }
+    }
+    var hasUnseen: Bool { (incidents.first?.id ?? "") > lastSeenIncident }
+
+    func refreshCurrent() {
+        if let m = mirror {
+            link = FileManager.default.contents(atPath: m + "/status.json").flatMap { try? decoder.decode(LinkStatus.self, from: $0) }
+            info = FileManager.default.contents(atPath: m + "/machine.json").flatMap { try? decoder.decode(MachineInfo.self, from: $0) }
+            sync = FileManager.default.contents(atPath: m + "/sync.json").flatMap { try? decoder.decode(SyncState.self, from: $0) }
+        }
+        let p = logDir + "/current.json"
+        guard let d = FileManager.default.contents(atPath: p), let s = try? decoder.decode(Sample.self, from: d) else {
+            current = nil; currentAge = .infinity; return
+        }
+        current = s
+        currentAge = now - s.t
+    }
+
+    func refreshAll() {
+        refreshCurrent()
+        reloadPoints()
+        loadIncidents()
+    }
+
+    /// Loads every samples file (14 days are kept), so switching ranges never waits for data.
+    /// In the background: the popup opens at once and keeps showing the previous history
+    /// until the new one is ready (or a spinner, the first time). `sync` is for renders.
+    func reloadPoints(sync: Bool = false) {
+        let state = self.sync, down = stale, oldest = info?.oldest
+        if sync {
+            let r = loadQueue.sync { loadHistory(state, down: down, oldest: oldest) }
+            apply(r); historyLoaded = true
+            return
+        }
+        if loading { loadAgain = true; return }
+        loading = true
+        loadQueue.async { [weak self] in
+            guard let self else { return }
+            let r = self.loadHistory(state, down: down, oldest: oldest)
+            DispatchQueue.main.async {
+                self.apply(r)
+                if !self.historyLoaded { withAnimation(.easeIn(duration: 0.33)) { self.historyLoaded = true } }
+                self.loading = false
+                if self.loadAgain { self.loadAgain = false; self.reloadPoints() }
+            }
+        }
+    }
+
+    private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]?
+                            let reservations: [ResBlock] }
+
+    private func apply(_ r: Loaded) {
+        history = r.history
+        gaps = r.gaps
+        historyNow = r.now
+        if let e = r.events { events = e }
+        reservations = r.reservations
+    }
+
+    /// Finished reservations from the history log and the ledger's own short history, plus the live
+    /// ones, stacked for the strip. On loadQueue only. A mirror's pids are another machine's: its
+    /// logger retires leases itself, and while it is not connected the blocks end where knowledge
+    /// ends instead of running on to now.
+    private func loadReservations(now: Double) -> [ResBlock] {
+        let records = readShared(ledgerDir + "/reservations.jsonl", cap: historyCap, tail: true)
+        let ledger = readShared(ledgerDir + "/ledger.json", cap: ledgerCap)
+            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+        let local = isLocal
+        let rs = Store.mergeReservations(records: records, ledger: ledger, now: now,
+                                         holderGone: { pid in local && kill(pid, 0) != 0 && errno == ESRCH })
+        return ResBlock.stack(rs, now: now)
+    }
+
+    /// On loadQueue only. For a mirror: its coverage, whether its link is down, its oldest sample.
+    private func loadHistory(_ state: SyncState?, down: Bool, oldest: Double?) -> Loaded {
+        let now = Date().timeIntervalSince1970 + (isLocal ? 0 : state?.offset_s ?? 0)
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
+        let today = fmt.string(from: Date())
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: logDir)) ?? []
+        var days = Set(files.compactMap { f -> String? in
+            guard f.hasPrefix("samples-"), f.hasSuffix(".jsonl") || f.hasSuffix(".jsonl.gz") else { return nil }
+            return String(f.dropFirst("samples-".count).prefix(10))
+        })
+        days.insert(today)
+        var all: [Point] = []
+        for day in days.sorted() { all += loadDay(day, isToday: day == today) }
+        all.sort { $0.id < $1.id }
+        var gaps = Store.findGaps(all, now: now)
+        var known = now
+        if !isLocal, let st = state {
+            gaps = MachineStore.mirrorGaps(gaps, have: st.spans, gone: st.goneSpans, oldest: oldest, now: now, down: down)
+            if down { known = st.spans.last?.1 ?? all.last?.id ?? now }
+        }
+        // drop cached files that are gone (a day's plain file once it is gzipped)
+        let present = Set(files.map { "\(logDir)/\($0)" })
+        for k in cache.keys where !present.contains(k) { cache[k] = nil }
+        return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents(),
+                      reservations: loadReservations(now: known))
+    }
+
+    /// A mirror's gaps (roadmap 01 §3.5, §5.7): inside the coverage map, the stretches without
+    /// samples stay *no data* (the machine logged nothing); outside it, from the remote's oldest
+    /// sample (or the first covered moment) to now, a stretch the remote no longer keeps is
+    /// *gone*, the one that reaches now while the link is down is *not connected*, every other one
+    /// *not received*. While the link is up, the youngest stretch is not drawn until it is longer
+    /// than a local chart's gap (the remote's logger vouches for its samples a little later).
+    static func mirrorGaps(_ noData: [Gap], have: [(Double, Double)], gone: [(Double, Double)], oldest: Double?,
+                           now: Double, down: Bool) -> [Gap] {
+        var out: [Gap] = []
+        for g in noData {
+            for (a, b) in have where b > g.from && a < g.to {
+                out.append(Gap(from: max(a, g.from), to: min(b, g.to), kind: .noData))
+            }
+        }
+        guard let first = (have.first?.0).map({ min($0, gone.first?.0 ?? $0, oldest ?? $0) }) else {
+            return [Gap(from: oldest ?? now - 14 * 86400, to: now, kind: down ? .notConnected : .notReceived)]
+        }
+        var at = first
+        var holes: [(Double, Double)] = []
+        for (a, b) in have {
+            if a > at { holes.append((at, a)) }
+            at = max(at, b)
+        }
+        if now - at > (down ? 0 : Store.gapSeconds) { holes.append((at, now)) }
+        for (a, b) in holes {
+            var x = a
+            for (ga, gb) in gone where gb > x && ga < b {
+                if ga > x { out.append(Gap(from: x, to: ga, kind: .notReceived)) }
+                out.append(Gap(from: max(ga, x), to: min(gb, b), kind: .gone))
+                x = min(gb, b)
+            }
+            if b > x { out.append(Gap(from: x, to: b, kind: down && b >= now - 1 ? .notConnected : .notReceived)) }
+        }
+        return out.sorted { $0.from < $1.from }
+    }
+
+    /// The events, or nil when the files haven't changed since the last load. On loadQueue only.
+    private func loadEvents() -> [ChartEvent]? {
+        let paths = ["events.jsonl.1", "events.jsonl"].map { "\(logDir)/\($0)" }
+        let stamp = paths.map { p -> String in
+            let a = try? FileManager.default.attributesOfItem(atPath: p)
+            return "\(a?[.size] ?? 0)/\((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)/\(a?[.systemFileNumber] ?? 0)"
+        }.joined(separator: ",")
+        guard stamp != eventsStamp else { return nil }
+        eventsStamp = stamp
+        var out: [ChartEvent] = []
+        for p in paths {
+            guard let d = FileManager.default.contents(atPath: p) else { continue }
+            for line in d.split(separator: 0x0A) {
+                if let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any], let e = ChartEvent(o) {
+                    out.append(e)
+                }
+            }
+        }
+        return out.sorted { $0.t < $1.t }
+    }
+
+    /// A file's identity: the cache keys on it, because a mirror replaces whole files by renaming.
+    private func inode(_ path: String) -> UInt64 {
+        var st = stat()
+        return lstat(path, &st) == 0 ? UInt64(st.st_ino) : 0
+    }
+
+    private func loadDay(_ day: String, isToday: Bool) -> [Point] {
+        let plain = "\(logDir)/samples-\(day).jsonl"
+        let gz = plain + ".gz"
+        let fm = FileManager.default
+        if fm.fileExists(atPath: plain) {
+            let ino = inode(plain)
+            var entry = cache[plain] ?? (ino, 0, [])
+            if entry.ino != ino { entry = (ino, 0, []) }
+            guard let fh = FileHandle(forReadingAtPath: plain) else { return entry.pts }
+            defer { try? fh.close() }
+            let size = (try? fh.seekToEnd()) ?? 0
+            if size < entry.offset { entry = (ino, 0, []) }
+            try? fh.seek(toOffset: entry.offset)
+            let data = fh.readDataToEndOfFile()
+            if let lastNL = data.lastIndex(of: 0x0A) {
+                let chunk = data[data.startIndex...lastNL]
+                entry.pts += parse(chunk)
+                entry.offset += UInt64(chunk.count)
+            }
+            cache[plain] = entry
+            return entry.pts
+        } else if fm.fileExists(atPath: gz) {
+            let ino = inode(gz)
+            if let c = cache[gz], c.ino == ino { return c.pts }
+            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/gzip"); p.arguments = ["-dc", gz]
+            let pipe = Pipe(); p.standardOutput = pipe
+            do { try p.run() } catch { return [] }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let pts = parse(data[...])
+            cache[gz] = (ino, 0, pts)
+            return pts
+        }
+        return []
+    }
+
+    private func parse(_ data: Data.SubSequence) -> [Point] {
+        var out: [Point] = []
+        for line in data.split(separator: 0x0A) {
+            guard let s = try? loadDecoder.decode(ChartSample.self, from: Data(line)) else { continue }
+            let away = s.away.map { ($0.idle_s ?? 0) >= 300 || ($0.locked ?? false) || $0.display_on == false } ?? false
+            out.append(Point(id: s.t, date: Date(timeIntervalSince1970: s.t), wired: s.wired_gb, app: s.app_gb,
+                             comp: s.compressed_gb, swap: s.swap_used_gb, away: away, kills: s.jetsam_kills ?? 0))
+        }
+        return out
+    }
+
+    func loadIncidents() {
+        let dir = logDir + "/incidents"
+        let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >).prefix(30)
+        incidents = ids.compactMap { id in
+            let p = "\(dir)/\(id)/incident.json"
+            guard let d = FileManager.default.contents(atPath: p), var inc = try? decoder.decode(Incident.self, from: d) else { return nil }
+            inc.dir = "\(dir)/\(id)"
+            return inc
+        }
+    }
+}
+
+// MARK: - Store
+
+final class Store: ObservableObject {
     /// The chart's range in seconds; .infinity = all history on a log time axis.
     @Published var range: Double = 24 * 3600
     @Published var launchAtLogin = FileManager.default.fileExists(atPath: agentPlist)
     @Published var busy = false
+
+    /// The machines: This Mac first. Mirrors join with tabs (roadmap 01, R1a); until then only a
+    /// render shows one. The popup draws `machine`, the menu-bar chip is always `local`.
+    @Published var machines: [MachineStore] = [MachineStore(logDir: logDir, ledgerDir: ledgerDir)] { didSet { watchMachines() } }
+    @Published var selected = 0
+    var machine: MachineStore { machines[min(max(selected, 0), machines.count - 1)] }
+    var local: MachineStore { machines[0] }
+    private var watching: [AnyCancellable] = []
+
+    init() { watchMachines() }
+
+    /// A change in a machine is a change of the popup.
+    private func watchMachines() {
+        watching = machines.map { m in m.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() } }
+    }
 
     // AI reports
     @Published var aiOn = UserDefaults.standard.bool(forKey: "aiOn") { didSet { UserDefaults.standard.set(aiOn, forKey: "aiOn") } }
@@ -402,19 +747,6 @@ final class Store: ObservableObject {
     private var aiStarted = Date()
     private var aiAborted = false
 
-    // history loading runs on its own queue; the cache and its decoder belong to that queue
-    private let loadQueue = DispatchQueue(label: "local.oomph.history", qos: .userInitiated)
-    private var cache: [String: (offset: UInt64, pts: [Point])] = [:]
-    private let loadDecoder = JSONDecoder()
-    private var loading = false, loadAgain = false
-    /// False until the history has been loaded once: the chart shows a spinner meanwhile.
-    @Published var historyLoaded = false
-    private let decoder = JSONDecoder()
-
-    var daemonRunning: Bool {
-        guard let c = current else { return false }
-        return currentAge < 3 * (c.daemon?.interval ?? 30) + 15
-    }
     var installed: Bool { FileManager.default.fileExists(atPath: "/Library/LaunchDaemons/local.oomph.daemon.plist") }
 
     static func version(at path: String) -> String? {
@@ -426,73 +758,9 @@ final class Store: ObservableObject {
     var bundledVersion: String? { Store.version(at: (Bundle.main.resourcePath ?? "") + "/oomph.py") }
     var needsUpdate: Bool { installed && installedVersion != nil && bundledVersion != nil && installedVersion != bundledVersion }
 
-    var lastSeenIncident: String {
-        get { UserDefaults.standard.string(forKey: "lastSeenIncident") ?? "" }
-        set { UserDefaults.standard.set(newValue, forKey: "lastSeenIncident"); objectWillChange.send() }
-    }
-    var hasUnseen: Bool { (incidents.first?.id ?? "") > lastSeenIncident }
-
-    func refreshCurrent() {
-        let p = logDir + "/current.json"
-        guard let d = FileManager.default.contents(atPath: p), let s = try? decoder.decode(Sample.self, from: d) else {
-            current = nil; currentAge = .infinity; return
-        }
-        current = s
-        currentAge = Date().timeIntervalSince1970 - s.t
-    }
-
-    func refreshAll() {
-        refreshCurrent()
-        reloadPoints()
-        loadIncidents()
-    }
 
     var allHistory: Bool { range.isInfinite }
 
-    /// Loads every samples file (14 days are kept), so switching ranges never waits for data.
-    /// In the background: the popup opens at once and keeps showing the previous history
-    /// until the new one is ready (or a spinner, the first time). `sync` is for renders.
-    func reloadPoints(sync: Bool = false) {
-        if sync {
-            let r = loadQueue.sync { loadHistory() }
-            apply(r); historyLoaded = true
-            return
-        }
-        if loading { loadAgain = true; return }
-        loading = true
-        loadQueue.async { [weak self] in
-            guard let self else { return }
-            let r = self.loadHistory()
-            DispatchQueue.main.async {
-                self.apply(r)
-                if !self.historyLoaded { withAnimation(.easeIn(duration: 0.33)) { self.historyLoaded = true } }
-                self.loading = false
-                if self.loadAgain { self.loadAgain = false; self.reloadPoints() }
-            }
-        }
-    }
-
-    private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]?
-                            let reservations: [ResBlock] }
-
-    private func apply(_ r: Loaded) {
-        history = r.history
-        gaps = r.gaps
-        historyNow = r.now
-        if let e = r.events { events = e }
-        reservations = r.reservations
-    }
-
-    /// Finished reservations from the history log and the ledger's own short history, plus the live
-    /// ones, stacked for the strip. On loadQueue only.
-    private func loadReservations(now: Double) -> [ResBlock] {
-        let records = readShared(ledgerDir + "/reservations.jsonl", cap: historyCap, tail: true)
-        let ledger = readShared(ledgerDir + "/ledger.json", cap: ledgerCap)
-            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
-        let rs = Store.mergeReservations(records: records, ledger: ledger, now: now,
-                                         holderGone: { pid in kill(pid, 0) != 0 && errno == ESRCH })
-        return ResBlock.stack(rs, now: now)
-    }
 
     /// The merge behind loadReservations, without files or the kernel: the last record per key of the
     /// history log (an "end" is never undone by a later "edit"), the ledger's own short history, then
@@ -535,92 +803,6 @@ final class Store: ObservableObject {
         return byKey.values.filter { ($0.ended ?? now) >= keep }
     }
 
-    /// On loadQueue only.
-    private func loadHistory() -> Loaded {
-        let now = Date().timeIntervalSince1970
-        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        let today = fmt.string(from: Date())
-        let files = (try? FileManager.default.contentsOfDirectory(atPath: logDir)) ?? []
-        var days = Set(files.compactMap { f -> String? in
-            guard f.hasPrefix("samples-"), f.hasSuffix(".jsonl") || f.hasSuffix(".jsonl.gz") else { return nil }
-            return String(f.dropFirst("samples-".count).prefix(10))
-        })
-        days.insert(today)
-        var all: [Point] = []
-        for day in days.sorted() { all += loadDay(day, isToday: day == today) }
-        all.sort { $0.id < $1.id }
-        let gaps = Store.findGaps(all, now: now)
-        // drop cached files that are gone (a day's plain file once it is gzipped)
-        let present = Set(files.map { "\(logDir)/\($0)" })
-        for k in cache.keys where !present.contains(k) { cache[k] = nil }
-        return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents(),
-                      reservations: loadReservations(now: now))
-    }
-
-    /// The events, or nil when the files haven't changed since the last load. On loadQueue only.
-    private func loadEvents() -> [ChartEvent]? {
-        let paths = ["events.jsonl.1", "events.jsonl"].map { "\(logDir)/\($0)" }
-        let stamp = paths.map { p -> String in
-            let a = try? FileManager.default.attributesOfItem(atPath: p)
-            return "\(a?[.size] ?? 0)/\((a?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0)"
-        }.joined(separator: ",")
-        guard stamp != eventsStamp else { return nil }
-        eventsStamp = stamp
-        var out: [ChartEvent] = []
-        for p in paths {
-            guard let d = FileManager.default.contents(atPath: p) else { continue }
-            for line in d.split(separator: 0x0A) {
-                if let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any], let e = ChartEvent(o) {
-                    out.append(e)
-                }
-            }
-        }
-        return out.sorted { $0.t < $1.t }
-    }
-
-    private func loadDay(_ day: String, isToday: Bool) -> [Point] {
-        let plain = "\(logDir)/samples-\(day).jsonl"
-        let gz = plain + ".gz"
-        let fm = FileManager.default
-        if fm.fileExists(atPath: plain) {
-            var entry = cache[plain] ?? (0, [])
-            guard let fh = FileHandle(forReadingAtPath: plain) else { return entry.pts }
-            defer { try? fh.close() }
-            let size = (try? fh.seekToEnd()) ?? 0
-            if size < entry.offset { entry = (0, []) }
-            try? fh.seek(toOffset: entry.offset)
-            let data = fh.readDataToEndOfFile()
-            if let lastNL = data.lastIndex(of: 0x0A) {
-                let chunk = data[data.startIndex...lastNL]
-                entry.pts += parse(chunk)
-                entry.offset += UInt64(chunk.count)
-            }
-            cache[plain] = entry
-            return entry.pts
-        } else if fm.fileExists(atPath: gz) {
-            if let c = cache[gz] { return c.pts }
-            let p = Process(); p.executableURL = URL(fileURLWithPath: "/usr/bin/gzip"); p.arguments = ["-dc", gz]
-            let pipe = Pipe(); p.standardOutput = pipe
-            do { try p.run() } catch { return [] }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            p.waitUntilExit()
-            let pts = parse(data[...])
-            cache[gz] = (0, pts)
-            return pts
-        }
-        return []
-    }
-
-    private func parse(_ data: Data.SubSequence) -> [Point] {
-        var out: [Point] = []
-        for line in data.split(separator: 0x0A) {
-            guard let s = try? loadDecoder.decode(ChartSample.self, from: Data(line)) else { continue }
-            let away = s.away.map { ($0.idle_s ?? 0) >= 300 || ($0.locked ?? false) || $0.display_on == false } ?? false
-            out.append(Point(id: s.t, date: Date(timeIntervalSince1970: s.t), wired: s.wired_gb, app: s.app_gb,
-                             comp: s.compressed_gb, swap: s.swap_used_gb, away: away, kills: s.jetsam_kills ?? 0))
-        }
-        return out
-    }
 
     /// Thins the history so its resolution falls with age: buckets max(30 s, age/720) wide, each
     /// keeping its worst point (spikes survive). Fine enough for any linear range at 720 px and
@@ -662,16 +844,6 @@ final class Store: ObservableObject {
                      swap: w.swap, away: slice.contains { $0.away }, kills: slice.reduce(0) { $0 + $1.kills })
     }
 
-    func loadIncidents() {
-        let dir = logDir + "/incidents"
-        let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >).prefix(30)
-        incidents = ids.compactMap { id in
-            let p = "\(dir)/\(id)/incident.json"
-            guard let d = FileManager.default.contents(atPath: p), var inc = try? decoder.decode(Incident.self, from: d) else { return nil }
-            inc.dir = "\(dir)/\(id)"
-            return inc
-        }
-    }
 
     // MARK: actions
     func runPrivileged(_ script: String, completion: @escaping (String?) -> Void) {
@@ -688,7 +860,7 @@ final class Store: ObservableObject {
                     completion((e[NSAppleScript.errorMessage] as? String) ?? "failed")
                 } else { completion(nil) }
                 _ = out
-                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.refreshAll() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 3) { self.local.refreshAll() }
             }
         }
     }
@@ -1104,6 +1276,9 @@ struct MemoryChart: View, Animatable {
     /// The agents' reservations, drawn as a strip of blocks under the chart on the same time axis.
     var reservations: [ResBlock] = []
     var stripHeight: CGFloat = 0 // 0 = no strip
+    /// Another machine's oldest sample as it reported it: the ∞ axis spans back to it, so it does
+    /// not rescale while history arrives (roadmap 01 §3.5). nil: from the oldest point loaded.
+    var oldest: Double? = nil
     /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
     @State private var hoverX: CGFloat? = renderHoverX
     /// The pointer over the reservation strip (strip coordinates).
@@ -1127,7 +1302,13 @@ struct MemoryChart: View, Animatable {
 
     /// Time → x in 0…1 (1 = now) for the current blend.
     func mapper() -> (Double) -> Double {
-        MemoryChart.mapper(now: now, first: points.first?.id ?? now, lgRange: lgRange, blend: blend)
+        MemoryChart.mapper(now: now, first: firstT, lgRange: lgRange, blend: blend)
+    }
+
+    /// Where the ∞ axis begins.
+    var firstT: Double {
+        guard let o = oldest else { return points.first?.id ?? now }
+        return min(o, points.first?.id ?? o)
     }
 
     /// Linear: the last 10^lgRange s. Log: all history, ages under minAge at the right edge.
@@ -1147,6 +1328,7 @@ struct MemoryChart: View, Animatable {
             let plotW = max(geo.size.width - 30, 50)
             let (entries, away) = columns(f)
             let gaps = gapBands(f)
+            let missing = gapBands(f, missing: true)
             let grid = gridLines(f, plotW: plotW)
             let labels = axisLabels(f, plotW: plotW)
             VStack(spacing: MemoryChart.stripGap) {
@@ -1169,7 +1351,7 @@ struct MemoryChart: View, Animatable {
                 .chartForegroundStyleScale(domain: MemoryChart.series, range: MemoryChart.seriesColors)
                 .chartLegend(.hidden)  // the compact legend sits in the header row (ChartLegend)
                 .transaction { $0.animation = nil }  // this view animates itself, frame by frame
-                .chartBackground { proxy in bandLayer(proxy, away: away, gaps: gaps) }
+                .chartBackground { proxy in bandLayer(proxy, away: away, gaps: gaps, missing: missing) }
                 .chartOverlay { proxy in
                     ZStack(alignment: .topLeading) {
                         axisLabelLayer(proxy, labels: labels)
@@ -1185,7 +1367,7 @@ struct MemoryChart: View, Animatable {
             .overlayPreferenceValue(PlotRectKey.self) { plot in
                 ZStack(alignment: .topLeading) {
                     if let plot {
-                        if stripHeight > 0 { stripLayer(plot: plot, top: geo.size.height - stripHeight, mapper: f, grid: grid) }
+                        if stripHeight > 0 { stripLayer(plot: plot, top: geo.size.height - stripHeight, mapper: f, grid: grid, missing: missing) }
                         hoverLayer(plot: plot, mapper: f, stripTop: geo.size.height - stripHeight)
                         if stripHeight > 0 { stripCard(plot: plot, top: geo.size.height - stripHeight, width: geo.size.width, mapper: f) }
                     }
@@ -1203,7 +1385,7 @@ struct MemoryChart: View, Animatable {
     /// Away bands and no-data stretches, drawn behind the series in one Canvas: stretches closer
     /// than 2 px merge (a Mac that keeps dozing off reads as one calm band, not a grey comb), and
     /// one hatch pattern, anchored to the plot, shows through all no-data stretches.
-    func bandLayer(_ proxy: ChartProxy, away: [Band], gaps: [Band]) -> some View {
+    func bandLayer(_ proxy: ChartProxy, away: [Band], gaps: [Band], missing: [Band]) -> some View {
         GeometryReader { g in
             let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
             Canvas { ctx, size in
@@ -1218,6 +1400,7 @@ struct MemoryChart: View, Animatable {
                 var c = ctx
                 c.clip(to: hatchPath)
                 c.stroke(MemoryChart.hatchLines(in: CGRect(origin: .zero, size: size)), with: .color(.gray.opacity(0.45)), lineWidth: 1)
+                if !missing.isEmpty { MemoryChart.drawMissing(ctx, missing.map { ($0.from * W, $0.to * W) }, height: size.height) }
             }
             .frame(width: plot.width, height: plot.height)
             .offset(x: plot.minX, y: plot.minY)
@@ -1243,6 +1426,38 @@ struct MemoryChart: View, Animatable {
         }
         let grey = merge(away.map { ($0.0, $0.1, true) } + gaps.map { ($0.0, $0.1, false) }).filter(\.2).map { ($0.0, $0.1) }
         return (grey, merge(gaps.map { ($0.0, $0.1, true) }).map { ($0.0, $0.1) })
+    }
+
+    /// Stretches this dashboard has not received from another machine: a dotted field between
+    /// dashed edges, distinct from the hatch of *no data* (roadmap 01 §3.5).
+    static func drawMissing(_ ctx: GraphicsContext, _ spans: [(Double, Double)], height: CGFloat) {
+        var field = Path(), edges = Path()
+        for (a, b) in spans where b > a {
+            let x0 = CGFloat(a), x1 = CGFloat(b)
+            field.addRect(CGRect(x: x0, y: 0, width: max(x1 - x0, 1), height: height))
+            for x in [x0, x1] { edges.move(to: CGPoint(x: x, y: 0)); edges.addLine(to: CGPoint(x: x, y: height)) }
+        }
+        ctx.fill(field, with: .color(.gray.opacity(0.05)))
+        var c = ctx
+        c.clip(to: field)
+        c.fill(MemoryChart.dots(in: field.boundingRect, spacing: 4), with: .color(.gray.opacity(0.55)))
+        ctx.stroke(edges, with: .color(.gray.opacity(0.5)), style: StrokeStyle(lineWidth: 0.75, dash: [2, 2]))
+    }
+
+    /// Small dots on a grid anchored at the origin, over `r`.
+    static func dots(in r: CGRect, spacing: CGFloat) -> Path {
+        var p = Path()
+        let d: CGFloat = spacing > 3.5 ? 1.2 : 1.0
+        var y: CGFloat = (r.minY / spacing).rounded(.down) * spacing + spacing / 2
+        while y < r.maxY {
+            var x: CGFloat = (r.minX / spacing).rounded(.down) * spacing + spacing / 2
+            while x < r.maxX {
+                p.addEllipse(in: CGRect(x: x - d / 2, y: y - d / 2, width: d, height: d))
+                x += spacing
+            }
+            y += spacing
+        }
+        return p
     }
 
     /// Diagonal hatch lines over `r`, on a grid anchored at the origin: clipped to several shapes,
@@ -1293,7 +1508,8 @@ struct MemoryChart: View, Animatable {
         [2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256].first { $0 >= vis } ?? vis
     }
 
-    func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [GridLine]) -> some View {
+    func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [GridLine],
+                    missing: [Band] = []) -> some View {
         let W = plot.width, H = stripHeight
         let (rects, scaleTop) = stripRects(f, W: W, H: H)
         let blocks = reservations, now = now
@@ -1309,6 +1525,10 @@ struct MemoryChart: View, Animatable {
                 ctx.stroke(topLine, with: .color(.primary.opacity(0.12)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
                 var plotCtx = ctx
                 plotCtx.clip(to: Path(CGRect(x: 0, y: 0, width: W, height: H)))
+                if !missing.isEmpty {
+                    let w = Double(W)
+                    MemoryChart.drawMissing(plotCtx, missing.map { ($0.from * w, $0.to * w) }, height: H)
+                }
                 var solid: [Int: Path] = [:], waiting: [Int: Path] = [:]
                 for x in rects {
                     if x.queued { waiting[x.i, default: Path()].addRect(x.r) } else { solid[x.i, default: Path()].addRect(x.r) }
@@ -1462,6 +1682,7 @@ struct MemoryChart: View, Animatable {
         var readings: [Reading] = []
         var away = false
         var noData: String?
+        var noDataIcon = "slash.circle"
         var incidents: [String] = []
         var events: [(String, Bool)] = []   // text, alarming
         var moreEvents = 0
@@ -1471,7 +1692,7 @@ struct MemoryChart: View, Animatable {
 
     /// Time for x (the mapper is monotonic, so bisection inverts it).
     func time(at u: Double, _ f: (Double) -> Double) -> Double {
-        var lo = (points.first?.id ?? now) - 1, hi = now
+        var lo = firstT - 1, hi = now
         if u >= f(hi) { return hi }
         if u <= f(lo) { return lo }
         for _ in 0..<50 {
@@ -1511,7 +1732,17 @@ struct MemoryChart: View, Animatable {
             info.peak = pts.map { $0.wired + $0.app + $0.comp + $0.swap }.max() ?? 0
         }
         let overlapping = gaps.filter { $0.from < t1 && $0.to > t0 }
-        if overlapping.count == 1, let g = overlapping.first {
+        let kinds = Set(overlapping.map(\.kind))
+        if kinds.count == 1, let g = overlapping.first, g.kind != .noData {
+            // another machine's stretch this dashboard has not received: which kind, and whether it fills in
+            let span = "\(MemoryChart.when(overlapping.map(\.from).min()!))–\(clock.string(from: Date(timeIntervalSince1970: overlapping.map(\.to).max()!)))"
+            info.noDataIcon = "circle.dotted"
+            switch g.kind {
+            case .notConnected: info.noData = "not connected since \(MemoryChart.when(g.from)): nothing is known after that; this fills in when the machine is back"
+            case .gone: info.noData = "no longer available, before \(MemoryChart.when(g.to)): never received, and that machine keeps 14 days"
+            default: info.noData = "not received \(span): not connected then and not fetched yet; it fills in when the machine is back"
+            }
+        } else if overlapping.count == 1, let g = overlapping.first {
             info.noData = "no data \(clock.string(from: Date(timeIntervalSince1970: g.from)))–\(clock.string(from: Date(timeIntervalSince1970: g.to))) (\(MemoryChart.duration(g.to - g.from)))"
         } else if overlapping.count > 1 {
             info.noData = "\(overlapping.count) stretches without data, \(MemoryChart.duration(overlapping.reduce(0) { $0 + $1.to - $1.from })) in all"
@@ -1625,7 +1856,7 @@ struct MemoryChart: View, Animatable {
                     }
                 }
                 if let n = info.noData {
-                    SwiftUI.Label(n, systemImage: "slash.circle").font(.system(size: 10)).foregroundStyle(.secondary)
+                    SwiftUI.Label(n, systemImage: info.noDataIcon).font(.system(size: 10)).foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if !info.incidents.isEmpty || !info.events.isEmpty { Divider().padding(.vertical, 1) }
@@ -1720,9 +1951,10 @@ struct MemoryChart: View, Animatable {
         return (entries, away)
     }
 
-    func gapBands(_ f: (Double) -> Double) -> [Band] {
+    /// The no-data stretches on screen, or with `missing` the ones not received from another machine.
+    func gapBands(_ f: (Double) -> Double, missing: Bool = false) -> [Band] {
         var out: [Band] = []
-        for g in gaps {
+        for g in gaps where (g.kind != .noData) == missing {
             let a = max(f(g.from), 0), b = min(f(g.to), 1)
             if b > a { out.append(Band(id: out.count, from: a, to: b)) }
         }
@@ -1778,6 +2010,13 @@ struct MemoryChart: View, Animatable {
 
     static let dayFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d"; return f }()
     static let timeFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+    /// "06:36" today, "Tue 4 Nov 06:36" before.
+    static func when(_ t: Double) -> String {
+        let d = Date(timeIntervalSince1970: t)
+        if Calendar.current.isDateInToday(d) { return timeFmt.string(from: d) }
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM HH:mm"
+        return f.string(from: d)
+    }
     static func label(_ t: Double, unit: Double) -> String {
         let d = Date(timeIntervalSince1970: t)
         return unit >= 86400 ? dayFmt.string(from: d) : timeFmt.string(from: d)
@@ -1886,7 +2125,9 @@ struct ReservationCard: View {
 
 /// The chart's legend, two tiny rows next to the range buttons; every entry explains itself on hover.
 struct ChartLegend: View {
-    struct Item { let name: String; let help: String; let kind: Int }  // 0 swatch, 1 away, 2 hatch, 3 incident
+    /// Another machine's chart with a stretch it has not received in view: the dots get an entry.
+    var missing = false
+    struct Item { let name: String; let help: String; let kind: Int }  // 0 swatch, 1 away, 2 hatch, 3 incident, 4 dots
     static let rows: [[Item]] = [
         [Item(name: "Wired", help: "Wired: memory the kernel and drivers hold in RAM. It is never compressed or swapped out.", kind: 0),
          Item(name: "App", help: "App memory: what apps and processes use — Activity Monitor's App Memory.", kind: 0),
@@ -1909,13 +2150,22 @@ struct ChartLegend: View {
                 ctx.stroke(MemoryChart.hatchLines(in: r, spacing: 3.5), with: .color(.gray.opacity(0.75)), lineWidth: 1)
             }
             .frame(width: 9, height: 7)
+        case 4:
+            Canvas { ctx, size in
+                let r = CGRect(origin: .zero, size: size)
+                ctx.fill(Path(r), with: .color(.gray.opacity(0.06)))
+                ctx.fill(MemoryChart.dots(in: r, spacing: 3), with: .color(.gray.opacity(0.75)))
+            }
+            .frame(width: 9, height: 7)
         default: Rectangle().fill(Color.red).frame(width: 1.5, height: 8).frame(width: 5)
         }
     }
 
+    static let notReceived = Item(name: "not received", help: "Dotted: this Mac has not received this stretch from that machine — it was not connected then. It fills in when the machine is back; a stretch older than what it keeps never will.", kind: 4)
+
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(Array(ChartLegend.rows.enumerated()), id: \.offset) { r, row in
+            ForEach(Array((missing ? [ChartLegend.rows[0], ChartLegend.rows[1] + [ChartLegend.notReceived]] : ChartLegend.rows).enumerated()), id: \.offset) { r, row in
                 HStack(spacing: 7) {
                     ForEach(Array(row.enumerated()), id: \.offset) { i, it in
                         HStack(spacing: 3) {
@@ -1947,20 +2197,25 @@ struct PopoverView: View {
     @State private var draftModel = ""
     @State private var draftURL = ""
     @State private var ollamaModels: [String] = []
+    @State var showAllReservations = false  // the callout behind "+N more"
     private let series = ["Wired", "App", "Compressed", "Swap"]
+    /// The machine on screen.
+    var m: MachineStore { store.machine }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            header
+            SwiftUI.Group { if m.isLocal { header } else { mirrorHeader } }
                 .padding(.horizontal, 14).padding(.vertical, 11)
                 .frame(maxWidth: .infinity)
                 .background(Color.primary.opacity(0.045))
                 .tourAnchor("header")
             Divider()
             VStack(alignment: .leading, spacing: 10) {
-                if let c = store.current, store.daemonRunning { stats(c).tourAnchor("stats") }
+                if let c = m.current, m.showsStats {
+                    if m.stale { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") } else { stats(c).tourAnchor("stats") }
+                }
                 chart.tourAnchor("chart").zIndex(1)
-                if !store.reservations.isEmpty { reservedList(store.liveReservations).tourAnchor("leases") }
+                if !m.reservations.isEmpty || m.fetchingLedger { reservedList(m.liveReservations).tourAnchor("leases") }
                 incidentsList.tourAnchor("incidents")
                 Divider()
                 footer.tourAnchor("footer")
@@ -2002,6 +2257,25 @@ struct PopoverView: View {
                 }
             }
         }
+        .overlayPreferenceValue(MoreAnchorKey.self) { anchor in
+            GeometryReader { geo in
+                if showAllReservations, let anchor {
+                    let r = geo[anchor]
+                    let w: CGFloat = 360
+                    let left = min(max(8, r.minX + 40 - w / 2), geo.size.width - w - 8)
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.001)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showAllReservations = false } }
+                        allReservationsCallout(arrowX: r.minX + 40 - left)
+                            .frame(width: w)
+                            .padding(.leading, left)
+                            .padding(.bottom, geo.size.height - r.minY + 2)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .bottom)))
+                    }
+                }
+            }
+        }
         .overlayPreferenceValue(TourAnchorKey.self) { anchors in
             GeometryReader { geo in
                 if let step = tourStep {
@@ -2016,7 +2290,7 @@ struct PopoverView: View {
         }
         .animation(.easeOut(duration: 0.2), value: store.showChangelog)
         .animation(.easeOut(duration: 0.25), value: store.building)
-        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false; tourStep = nil } }
+        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false; showAllReservations = false; tourStep = nil } }
         .onChange(of: store.alertText) { _, e in
             if let e { error = e; store.alertText = nil }
         }
@@ -2029,8 +2303,8 @@ struct PopoverView: View {
     }
 
     var header: some View {
-        let live = store.current != nil && store.daemonRunning
-        let p = live ? (Pressure(rawValue: store.current!.pressure) ?? .unknown) : .unknown
+        let live = m.current != nil && m.daemonRunning
+        let p = live ? (Pressure(rawValue: m.current!.pressure) ?? .unknown) : .unknown
         let tint: Color = live ? p.color : .secondary
         return HStack(alignment: .center, spacing: 10) {
             // hover: the chip turns into a ?, a click starts the guided tour
@@ -2069,10 +2343,75 @@ struct PopoverView: View {
         }
     }
 
+    /// The header of another machine (roadmap 01 §3.3, §3.5): its name, its kind's tile tinted by
+    /// its pressure, its state in the status line and the capsule. Not connected: the tile and
+    /// the capsule's fill are grey, the capsule's words stay in the primary colour.
+    var mirrorHeader: some View {
+        let live = !m.stale && m.current != nil
+        let p = live ? (Pressure(rawValue: m.current!.pressure) ?? .unknown) : .unknown
+        let tint: Color = live ? p.color : .secondary
+        let icon = ["laptop": "laptopcomputer", "server": "server.rack", "container": "shippingbox"][m.info?.kind ?? ""] ?? "desktopcomputer"
+        let attention = m.link?.state == "needs_attention" || m.link?.was == "needs_attention"
+        return HStack(alignment: .center, spacing: 10) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(tint)
+                .frame(width: 32, height: 32)
+                .background(tint.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .tourAnchor("chip")
+            VStack(alignment: .leading, spacing: 2) {
+                (Text(brand).fontWeight(.bold) + Text(": " + (m.info?.name ?? m.info?.id ?? "another machine")).fontWeight(.medium))
+                    .font(.system(size: 14)).lineLimit(1).truncationMode(.tail)
+                Text(mirrorStatusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            SwiftUI.Group {
+                if live {
+                    Text(p.label).background(p.color.opacity(0.2), in: Capsule()).foregroundStyle(p == .normal ? .primary : p.color)
+                } else if attention {
+                    Text("Needs attention").background(Color.orange.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
+                } else {
+                    Text("Not connected").background(Color.gray.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
+                }
+            }
+            .font(.system(size: 11, weight: .semibold))
+            .padding(.horizontal, 10).padding(.vertical, 4)
+            .fixedSize()
+        }
+    }
+
+    var mirrorStatusLine: String {
+        let last = m.knownUntil.map { MemoryChart.when($0) } ?? "never"
+        if !m.stale {
+            if m.link?.state == "catching_up" { return "Catching up: fetching missed history…" }
+            var s = "Logging every \(Int(m.current?.daemon?.interval ?? 30)) s"
+            if let i = m.current?.daemon?.incident { s += " · incident \(i) open" }
+            return s
+        }
+        let was = m.link?.state == "idle" ? m.link?.was : m.link?.state
+        if was == "catching_up" { return "Fetching history…" }
+        var s: String
+        switch was {
+        case "offline": s = "No answer since " + MemoryChart.when(m.link?.last_contact ?? m.knownUntil ?? 0)
+        case "needs_attention": s = (m.link?.error ?? "Needs attention") + " · last data " + last
+        default: s = "Last data " + last
+        }
+        if let c = m.current, c.pressure != 1, let p = Pressure(rawValue: c.pressure) { s += " · pressure was " + p.label.lowercased() }
+        return s
+    }
+
+    /// Whether the visible range holds a stretch this dashboard has not received: the legend
+    /// then explains the dots (only then: it adds no row).
+    var missingInView: Bool {
+        guard !m.isLocal else { return false }
+        let from = store.allHistory ? -Double.infinity : m.historyNow - store.range
+        return m.gaps.contains { $0.kind != .noData && $0.to > from }
+    }
+
     var statusLine: String {
         if !store.installed { return "Logging is off — click Activate" }
-        if !store.daemonRunning { return "Daemon installed but not reporting" }
-        let d = store.current?.daemon
+        if !m.daemonRunning { return "Daemon installed but not reporting" }
+        let d = m.current?.daemon
         var s = "Logging every \(Int(d?.interval ?? 30)) s"
         if let i = d?.incident { s += " · incident \(i) open" }
         return s
@@ -2098,44 +2437,123 @@ struct PopoverView: View {
 
     // Memory Claude sessions and other agents reserved through `oomph reserve` / `oomph run` / the
     // MCP server, in the colours of their blocks on the strip above.
+    /// The height contract for one machine (roadmap 01 §3.11): at most this many lines of
+    /// reservations; with more, the last line is "+N more", which lists them all in a callout.
+    static let reservationLines = 5
+
     func reservedList(_ live: [Reservation]) -> some View {
-        let now = Date().timeIntervalSince1970
-        let day = store.reservations.filter { ($0.res.ended ?? now) >= now - 86400 }.count
+        // a machine that is not connected is shown as of the moment knowledge of it ends
+        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale ? (m.knownUntil ?? m.now) : m.now
+        let day = m.reservations.filter { ($0.res.ended ?? now) >= now - 86400 }.count
+        let capped = live.count > PopoverView.reservationLines
+        let shown = capped ? Array(live.prefix(PopoverView.reservationLines - 1)) : live
+        let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
+        var summary = live.isEmpty ? "\(day) in the last 24 h" : String(format: "%.1f GB reserved · %d in the last 24 h", reserved, day)
+        if m.stale && !live.isEmpty { summary = "as of " + MemoryChart.when(now) + String(format: ": %.1f GB reserved", reserved) }
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Reserved by agents").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text(live.isEmpty ? "\(day) in the last 24 h"
-                     : String(format: "%.1f GB reserved · %d in the last 24 h", live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }, day))
-                    .font(.system(size: 10)).foregroundStyle(.tertiary)
+                if !m.fetchingLedger {
+                    Text(summary)
+                        .font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
             }
-            if live.isEmpty {
+            if m.fetchingLedger {
+                Text("fetching…").font(.caption).foregroundStyle(.tertiary)
+            } else if live.isEmpty {
                 Text("Nothing reserved right now").font(.caption).foregroundStyle(.tertiary)
             }
-            ForEach(live) { (r: Reservation) in
-                HStack(spacing: 6) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 2).fill(r.color.opacity(r.granted == nil ? 0.15 : 0.8))
-                        if r.granted == nil {
-                            RoundedRectangle(cornerRadius: 2).strokeBorder(r.color.opacity(0.8), lineWidth: 1)
-                        }
-                    }
-                    .frame(width: 8, height: 8)
-                    Text(String(format: "%.1fG", r.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
-                        .frame(width: 40, alignment: .trailing)
-                    Text(r.purpose).font(.system(size: 11)).lineLimit(1)
-                    if let p = r.projectName { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
-                    Spacer(minLength: 4)
-                    Text(reservationTail(r, now: now)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
-                        .lineLimit(1).fixedSize()
-                }
-                .help("\(r.rid): \(r.purpose)" + (r.project.map { " — " + $0 } ?? "")
-                      + String(format: " · reserved %.1f GB, peak %.1f GB so far", r.gb, r.peak))
+            ForEach(shown) { (r: Reservation) in
+                if m.stale { reservationRow(r, now: now).grayscale(1).opacity(0.6) } else { reservationRow(r, now: now) }
             }
+            if capped { moreLine(Array(live.dropFirst(shown.count))) }
         }
     }
 
+    func reservationRow(_ r: Reservation, now: Double) -> some View {
+        HStack(spacing: 6) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 2).fill(r.color.opacity(r.granted == nil ? 0.15 : 0.8))
+                if r.granted == nil {
+                    RoundedRectangle(cornerRadius: 2).strokeBorder(r.color.opacity(0.8), lineWidth: 1)
+                }
+            }
+            .frame(width: 8, height: 8)
+            Text(String(format: "%.1fG", r.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                .frame(width: 40, alignment: .trailing)
+            Text(r.purpose).font(.system(size: 11)).lineLimit(1)
+            if let p = r.projectName { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
+            Spacer(minLength: 4)
+            Text(reservationTail(r, now: now)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                .lineLimit(1).fixedSize()
+        }
+        .help("\(r.rid): \(r.purpose)" + (r.project.map { " — " + $0 } ?? "")
+              + String(format: " · reserved %.1f GB, peak %.1f GB so far", r.gb, r.peak))
+    }
+
+    /// The fifth line when there are more: "+3 more · 5.0 GB reserved · 1 waiting" (of the ones
+    /// not listed); a click lists them all.
+    func moreLine(_ rest: [Reservation]) -> some View {
+        let gb = rest.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
+        let waiting = rest.filter { $0.granted == nil }.count
+        var text = "+\(rest.count) more"
+        if gb > 0 { text += String(format: " · %.1f GB reserved", gb) }
+        if waiting > 0 { text += " · \(waiting) waiting" }
+        return Button {
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            withAnimation(.easeOut(duration: 0.15)) { showAllReservations.toggle(); showTopApps = false; showAI = false }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "ellipsis").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
+                    .frame(width: 8, height: 8)
+                Text(text).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Image(systemName: showAllReservations ? "chevron.down" : "chevron.up").font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).focusable(false).focusEffectDisabled()
+        .help("Every reservation, in a list")
+        .anchorPreference(key: MoreAnchorKey.self, value: .bounds) { $0 }
+    }
+
+    /// Every live reservation, above the "+N more" line.
+    func allReservationsCallout(arrowX: CGFloat) -> some View {
+        let live = m.liveReservations
+        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale ? (m.knownUntil ?? m.now) : m.now
+        let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
+        let rows = renderMode ? Array(live.prefix(14)) : live
+        return VStack(spacing: 0) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Reserved by agents").font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text(String(format: "%d · %.1f GB reserved", live.count, reserved)).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                .padding(.bottom, 3)
+                if rows.count > 14 {
+                    ScrollView { VStack(alignment: .leading, spacing: 3) { ForEach(rows) { reservationRow($0, now: now) } } }
+                        .frame(maxHeight: 14 * 17)
+                } else {
+                    ForEach(rows) { reservationRow($0, now: now) }
+                }
+            }
+            .padding(12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+            CalloutArrow()
+                .fill(.regularMaterial)
+                .overlay(CalloutArrow().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: 16, height: 8)
+                .offset(x: arrowX - 180)  // centre of a 360-wide bubble
+        }
+        .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
+    }
+
     func reservationTail(_ r: Reservation, now: Double) -> String {
+        if m.stale { return r.granted == nil ? "was waiting" : String(format: "was using %.1fG", r.used ?? 0) }
         guard r.granted != nil else { return "waiting " + MemoryChart.duration(now - r.requested) }
         return String(format: "using %.1fG", r.used ?? 0) + (r.expires.map { " · " + MemoryChart.shortDuration($0 - now) + " left" } ?? "")
     }
@@ -2179,7 +2597,7 @@ struct PopoverView: View {
     }
 
     func topAppsCallout(arrowX: CGFloat) -> some View {
-        let gs = Array((store.current?.groups ?? []).prefix(12))
+        let gs = Array((m.current?.groups ?? []).prefix(12))
         let maxMB = Double(gs.first?.mb ?? 1)
         let total = Double(gs.reduce(0) { $0 + $1.mb }) / 1024
         return VStack(spacing: 0) {
@@ -2239,7 +2657,7 @@ struct PopoverView: View {
                     withAnimation(.easeInOut(duration: 0.5)) { store.range = v }
                 }))
                 .tourAnchor("picker")
-                if store.needsUpdate {  // the logger is a different version than the one this app ships
+                if store.needsUpdate && m.isLocal {  // the logger is a different version than the one this app ships
                     if store.busy {
                         ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 16, height: 16)
                     } else {
@@ -2252,26 +2670,27 @@ struct PopoverView: View {
                     }
                 }
                 Spacer(minLength: 6)
-                ChartLegend()
+                ChartLegend(missing: missingInView)
                 Text("GB").font(.caption).foregroundStyle(.secondary)
                     .help("Memory in GB; the dashed line is the Mac's RAM. " + (store.allHistory
                           ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
                           : "Time runs left to right up to now."))
             }
             ZStack {
-                if !store.historyLoaded {
+                if !m.historyLoaded {
                     VStack(spacing: 6) {
                         ProgressView().controlSize(.small)
                         Text("Loading history…").font(.caption).foregroundStyle(.secondary)
                     }
-                } else if store.history.isEmpty {
+                } else if m.history.isEmpty && m.isLocal {
                     Text("No samples yet").font(.caption).foregroundStyle(.secondary)
                 } else {
-                    MemoryChart(points: store.history, gaps: store.gaps, now: store.historyNow,
-                                incidents: store.incidents, events: store.events, ram: store.current?.ram_gb,
+                    MemoryChart(points: m.history, gaps: m.gaps, now: m.historyNow,
+                                incidents: m.incidents, events: m.events, ram: m.current?.ram_gb,
                                 lgRange: log10(store.allHistory ? 24 * 3600 : store.range),
                                 blend: renderBlend ?? (store.allHistory ? 1 : 0),
-                                reservations: store.reservations, stripHeight: stripHeight)
+                                reservations: m.reservations, stripHeight: stripHeight,
+                                oldest: m.isLocal ? nil : m.info?.oldest)
                         .transition(.opacity)  // fades in (0.33 s) once the history has loaded
                 }
             }
@@ -2284,22 +2703,25 @@ struct PopoverView: View {
 
     /// The reservation strip under the chart: there once any agent reserved memory (14 days kept).
     var stripHeight: CGFloat {
-        store.historyLoaded && !store.history.isEmpty && !store.reservations.isEmpty ? 46 : 0
+        m.historyLoaded && (!m.history.isEmpty || !m.isLocal) && !m.reservations.isEmpty ? 46 : 0
     }
 
     var incidentsList: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Incidents").font(.caption).foregroundStyle(.secondary)
-            if store.incidents.isEmpty {
+            if m.fetchingIncidents {
+                Text("fetching…").font(.caption).foregroundStyle(.tertiary)
+            } else if m.incidents.isEmpty {
                 Text("None recorded").font(.caption).foregroundStyle(.tertiary)
             } else {
                 ScrollView {
                     VStack(spacing: 2) {
-                        ForEach(store.incidents) { inc in
-                            Button { store.open(inc) } label: { row(inc) }
+                        ForEach(m.incidents) { inc in
+                            // another machine's report is rendered there, not here (R2): no click yet
+                            Button { if m.isLocal { store.open(inc) } } label: { row(inc) }
                                 .buttonStyle(.plain)
                                 .contextMenu {
-                                    Button("Open report") { store.open(inc) }
+                                    if m.isLocal { Button("Open report") { store.open(inc) } }
                                     Button("Copy path") {
                                         NSPasteboard.general.clearContents()
                                         NSPasteboard.general.setString(inc.dir, forType: .string)
@@ -2317,7 +2739,7 @@ struct PopoverView: View {
         let f = DateFormatter(); f.dateFormat = "EEE d MMM HH:mm"
         let kills = inc.summary?.jetsam_kills
         return HStack(alignment: .top, spacing: 6) {
-            Circle().fill(inc.open == true ? Color.red : (inc.id > store.lastSeenIncident ? Color.orange : Color.secondary.opacity(0.4)))
+            Circle().fill(inc.open == true ? Color.red : (inc.id > m.lastSeenIncident ? Color.orange : Color.secondary.opacity(0.4)))
                 .frame(width: 6, height: 6).padding(.top, 5)
             VStack(alignment: .leading, spacing: 0) {
                 Text(f.string(from: Date(timeIntervalSince1970: inc.start)) + (inc.open == true ? " · open" : ""))
@@ -2943,6 +3365,13 @@ struct PopoverView: View {
 
     var footer: some View {
         HStack {
+            if !m.isLocal {
+                // another machine's pane: read-only, its own version and system, nothing of this Mac's
+                Text(["Read-only", m.info?.version.map { brand + " " + $0 }, m.info?.os_version].compactMap { $0 }.joined(separator: " · "))
+                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                    .tourAnchor("actions")
+                upgradeButtonView
+            } else {
             HStack {
                 if store.installed {
                     Button("Deactivate") {
@@ -2958,6 +3387,7 @@ struct PopoverView: View {
                 upgradeButtonView
             }.tourAnchor("actions")
             reportPair.tourAnchor("report")
+            }
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
                 .toggleStyle(.checkbox).font(.caption).lineLimit(1).fixedSize()
@@ -3007,6 +3437,11 @@ struct ClaudeBurst: Shape {
         p.addEllipse(in: CGRect(x: c.x - R * 0.3, y: c.y - R * 0.3, width: R * 0.6, height: R * 0.6))
         return p
     }
+}
+
+struct MoreAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
 }
 
 struct TopAppAnchorKey: PreferenceKey {
@@ -3133,7 +3568,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        store.reloadPoints()  // in the background: the first popup then opens with its chart ready
+        store.machine.reloadPoints()  // in the background: the first popup then opens with its chart ready
         item.button?.target = self
         item.button?.action = #selector(toggle)
         item.button?.imageScaling = .scaleNone
@@ -3162,8 +3597,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             hosting.topAnchor.constraint(equalTo: fx.topAnchor), hosting.bottomAnchor.constraint(equalTo: fx.bottomAnchor)])
         panel.contentView = fx
 
-        store.refreshCurrent()
-        store.loadIncidents()
+        store.local.refreshCurrent()
+        store.local.loadIncidents()
         updateIcon()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
 
@@ -3184,9 +3619,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func tick() {
-        store.refreshCurrent()
-        store.loadIncidents()
-        if isShown { store.reloadPoints(); DispatchQueue.main.async { self.position() } }
+        store.local.refreshCurrent()
+        store.local.loadIncidents()
+        if isShown { store.machine.reloadPoints(); DispatchQueue.main.async { self.position() } }
         updateIcon()
     }
 
@@ -3194,7 +3629,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if isShown { close(); return }
         // clicking the icon first makes the panel resign key (which closes it); don't reopen on that same click
         if Date().timeIntervalSince(lastClose) < 0.35 { return }
-        store.refreshAll()
+        store.machine.refreshAll()
         store.popupOpened()
         position()
         panel.makeKeyAndOrderFront(nil)
@@ -3227,7 +3662,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.orderOut(nil)
         lastClose = Date()
         if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
-        if let first = store.incidents.first?.id { store.lastSeenIncident = first }
+        if let first = store.machine.incidents.first?.id { store.machine.lastSeenIncident = first }
         updateIcon()
     }
 
@@ -3237,8 +3672,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func updateIcon() {
-        let running = store.daemonRunning
-        let c = store.current
+        let running = store.local.daemonRunning
+        let c = store.local.current
         let p = Pressure(rawValue: c?.pressure ?? 0) ?? .unknown
         // free physical memory as Activity Monitor shows it: Physical Memory - Memory Used,
         // where Memory Used = App Memory + Wired + Compressed
@@ -3322,11 +3757,14 @@ enum ChipIcon {
 }
 
 @MainActor
-func renderPopup(to path: String, dark: Bool, ai: String = "") {
+func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? = nil) {
     renderMode = true
     let store = Store()
-    store.refreshAll()
-    if ai != "loading" { store.reloadPoints(sync: true) }  // `--ai loading` draws the spinner
+    // `--mirror DIR` draws another machine's mirror (…/machines/<mid>/, as `oomph remote sync` writes it)
+    if let dir = mirror { store.machines.append(MachineStore(mirror: dir)); store.selected = 1 }
+    store.machine.refreshCurrent()
+    store.machine.loadIncidents()
+    if ai != "loading" { store.machine.reloadPoints(sync: true) }  // `--ai loading` draws the spinner
     // `--ai callout|on|running` draws the AI states (render only; nothing is saved)
     if ai == "on" || ai == "running" { store.aiOn = true; store.aiProvider = .ollama }
     // `--ai connected:claude|openai|ollama`, `connecting`, `dialog-connected`, `dialog-error` (render only)
@@ -3369,7 +3807,8 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
     }
     // `--ai tour:N` draws step N of the guided tour (1-based)
     let tour = ai.hasPrefix("tour:") ? Int(ai.dropFirst(5)).map { $0 - 1 } : nil
-    let view = PopoverView(store: store, showAI: ["callout", "dialog-connected", "dialog-error"].contains(ai), showTopApps: ai == "top", tourStep: tour)
+    let view = PopoverView(store: store, showAI: ["callout", "dialog-connected", "dialog-error"].contains(ai), showTopApps: ai == "top",
+                           tourStep: tour, showAllReservations: ai == "resmore")
         .background(Color(nsColor: .windowBackgroundColor))
         .environment(\.colorScheme, dark ? .dark : .light)
     let r = ImageRenderer(content: view)
@@ -3453,7 +3892,8 @@ struct Main {
         }
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
             let ai = args.firstIndex(of: "--ai").map { args.count > $0 + 1 ? args[$0 + 1] : "" } ?? ""
-            MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark"), ai: ai) }
+            let mirror = args.firstIndex(of: "--mirror").flatMap { args.count > $0 + 1 ? args[$0 + 1] : nil }
+            MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark"), ai: ai, mirror: mirror) }
             return
         }
         // One menu-bar icon only: the newest launch wins, so a rebuilt or relaunched app

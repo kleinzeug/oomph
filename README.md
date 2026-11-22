@@ -226,6 +226,12 @@ For scripts and agents there are also `oomph check`, `oomph session`, `oomph wai
 `oomph status --json`, `oomph hook` and `oomph mcp` — see
 [Making Claude sessions oom-aware](#making-claude-sessions-oom-aware).
 
+Groundwork for watching other machines: `oomph serve --stdio` answers for this machine on its
+standard streams (read only), and `oomph remote sync --once [--into DIR] -- COMMAND` mirrors the
+machine whose `serve --stdio` COMMAND starts (for instance through `ssh`) into a directory that
+every reader understands (a logger older than 1.8.8 names no machine id: give such a machine
+a mirror with `--into`). Nothing listens on the network.
+
 ### AI analysis
 
 Click the **✦** next to **Report** in the popup, pick **Claude**, **OpenAI Codex** or a
@@ -365,7 +371,8 @@ session B  → granted r8, tests start
   memory chart shows every reservation over time — one block per reservation, its
   height the GB reserved, stacked when they overlap, hatched while queued, aligned with
   the memory chart in every range — and the **Reserved by agents** list below it shows
-  the active ones in the same colours.
+  the active ones in the same colours (up to five lines; with more, the last one reads
+  "+N more" and opens the full list).
 - **Advisory:** ***oomph*** still never stops or kills anything. Taking turns is
   something the sessions agree on through the skill.
 - **Nothing in the shared folder is trusted:** every user can write to
@@ -420,6 +427,8 @@ daemon/oomph.py                   CLI, summaries and HTML reports (shared with t
 daemon/oomph_darwin.py            everything that measures a Mac (the backend the daemon and CLI call)
 daemon/oomph_top.py               `oomph top`: reads the files and prints the frame
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
+daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)
+daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer
 daemon/local.oomph.daemon.plist   the LaunchDaemon job
 app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Charts)
 app/Info.plist
@@ -431,6 +440,9 @@ tools/roottest.py                 the same for what only root can show (CI runs 
 tools/brandlint.py                keeps the product's name (BRAND) apart from the command and paths
 tools/chartvectors.py             holds `oomph top`'s chart maths to the app's (tools/vectors/chart.json)
 tools/topfixture.py               the golden frames of `oomph top` (tools/golden/top), from fixed data
+tools/nettest.py                  the protocol's tests: serve, sync through a pipe, coverage, hostile input
+tools/mirrorfixture.py            another machine's mirror, for `oomph.app --render-popup … --mirror DIR`
+tools/spike_role_account.sh       a CI spike: a launchd job under a role account, time to first frame
 DESIGN.md                         the investigation and the design decisions
 docs/index.html                   the website (GitHub Pages, served from /docs)
 ```

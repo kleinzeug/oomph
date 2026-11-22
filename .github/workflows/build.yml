@@ -32,9 +32,9 @@ jobs:
 
       - name: Lint scripts and plists
         run: |
-          bash -n build-app.sh install.sh uninstall.sh
+          bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py tools/selftest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/fixtureplat.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/fixtureplat.py tools/mirrorfixture.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
@@ -120,6 +120,17 @@ jobs:
           /usr/bin/python3 -I -B tools/chartvectors.py
           /usr/bin/python3 -I -B tools/chartvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
 
+      - name: The popup draws a mirror
+        # Another machine's mirror, made through a pipe by the real `oomph remote sync --once`
+        # (tools/mirrorfixture.py) and drawn by the app: not connected, a stretch not received.
+        # Not a gate yet: the runner's ability to render is untried.
+        continue-on-error: true
+        run: |
+          /usr/bin/python3 -I -B tools/mirrorfixture.py "$RUNNER_TEMP/mirror" offline
+          "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" --render-popup "$RUNNER_TEMP/mirror.png" \
+            --mirror "$RUNNER_TEMP/mirror/mirror" -aiOn NO
+          test -s "$RUNNER_TEMP/mirror.png" && sips -g pixelWidth -g pixelHeight "$RUNNER_TEMP/mirror.png"
+
       - name: Verify app bundle
         run: |
           APP="$RUNNER_TEMP/dist/oomph.app"
@@ -138,7 +149,7 @@ jobs:
           grep -q "^VERSION = \"$version\"" "$APP/Contents/Resources/oomph.py" || { echo "::error::bundled CLI not stamped"; exit 1; }
 
           # Activate/Deactivate run these from the bundle.
-          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py local.oomph.daemon.plist; do
+          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py local.oomph.daemon.plist; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }
@@ -158,6 +169,25 @@ jobs:
           path: ${{ runner.temp }}/dist/oomph.zip
           retention-days: 14
           if-no-files-found: error
+
+  spike-role-account:
+    # A spike for remote machines (roadmap 01 §12), not a gate: a LaunchDaemon under a role account
+    # and group of its own, started per connection on a loopback port, serving this commit's
+    # `oomph serve --stdio` through /usr/bin/python3 with /var/empty as its home; how long a
+    # connection takes to its first frame, cold, warm and under memory pressure. The results are
+    # in the job's summary. The runner is thrown away afterwards; the script cleans up anyway.
+    # On demand only (once per runner image is enough): `gh workflow run build.yml --ref main`.
+    name: Spike, role account and first frame
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-15
+    continue-on-error: true
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Role account, launchd job, first frame
+        run: sudo tools/spike_role_account.sh "$GITHUB_STEP_SUMMARY"
 
   linux:
     # The portable half on Linux: oomph and oomphd import without macOS's libraries, and the
@@ -181,7 +211,7 @@ jobs:
       - name: Import without macOS
         run: |
           python3 -I -m py_compile daemon/*.py tools/*.py
-          python3 -I -B -c 'import sys; sys.path.insert(0, "daemon"); import oomph, oomphd, oomph_top, oomph_view, oomph_ai, oomph_upgrade; assert "ctypes" not in sys.modules and "oomph_darwin" not in sys.modules; print("imported", oomph.VERSION, oomph.LOG_DIR, oomph.LEDGER_DIR)'
+          python3 -I -B -c 'import sys; sys.path.insert(0, "daemon"); import oomph, oomphd, oomph_top, oomph_view, oomph_ai, oomph_upgrade, oomph_net, oomph_sync; assert "ctypes" not in sys.modules and "oomph_darwin" not in sys.modules; print("imported", oomph.VERSION, oomph.LOG_DIR, oomph.LEDGER_DIR)'
           set +e; python3 -I -B daemon/oomph.py doctor; rc=$?; set -e
           echo "doctor exit $rc"; test "$rc" = 2   # nothing measures Linux yet: it says so, and exits 2
 

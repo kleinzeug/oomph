@@ -1047,6 +1047,10 @@ check({"id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "meas
       "current.json: daemon.machine %s, %s, %s, measures %s" % (mach.get("id"), mach.get("os_version"), mach.get("kind"),
                                                                sorted(mach.get("measures") or {})))
 check(oomph.live_sample(with_procs=False).get("os") == P.OS, "a live reading carries os too")
+unclassified = sorted((set(last) | set(cur)) - set(oomph.SAMPLE_KEYS))
+check(not unclassified and oomph.SAMPLE_KEYS["daemon"] == "full" and "top" not in oomph.slim_sample(cur),
+      "every key the logger writes is classified for the wire (keep, drop, full)%s"
+      % (": not " + ", ".join(unclassified) if unclassified else ""))
 check(oomph.verdict(dict(fixed, disk_free_gb=3.0))["level"] == "critical" and
       oomph.verdict(dict(fixed, os="macos", disk_free_gb=3.0))["level"] == "critical" and
       oomph.verdict(dict(fixed, os="linux", disk_free_gb=3.0))["level"] == "ok",
@@ -1192,7 +1196,7 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
         d = os.path.join(inst, name)
         os.makedirs(os.path.join(d, "skills", "oomph"))
         for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_ai.py", "oomph_upgrade.py", "oomph_top.py",
-                  "oomph_view.py", "local.oomph.daemon.plist"):
+                  "oomph_view.py", "oomph_net.py", "oomph_sync.py", "local.oomph.daemon.plist"):
             shutil.copy(os.path.join(ROOT, "daemon", f), d)
         for f in ("install.sh", "uninstall.sh"):
             shutil.copy(os.path.join(ROOT, f), d)
@@ -1421,6 +1425,15 @@ if MAC:  # upgrades need macOS (xcrun git, the app build)
         os.environ.pop(k)
 else:
     print("skip  upgrades need macOS (xcrun git, the app build)")
+
+# the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,
+                   timeout=600, env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("      net: " + line)
+check(r.returncode == 0, "the protocol core (tools/nettest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                      + r.stderr[-400:]))
 
 print("\n%s — logs in %s" % ("FAILED (%d)" % len(failures) if failures else "all checks passed", LOG))
 sys.exit(1 if failures else 0)

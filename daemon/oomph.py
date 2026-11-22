@@ -36,6 +36,12 @@ coordinating memory between sessions (a shared first-come-first-served ledger):
   oomph setup-claude [--hook] [--remove]   install the skill + register the MCP server for Claude Code
   oomph doctor [--json]             what works on this machine and what to fix; exit 0 fine, 1 something to
                                     fix, 2 it cannot work here
+
+another machine (over a pipe for now; the network comes later):
+  oomph serve --stdio               answer for this machine on stdin/stdout, read only (what the
+                                    other end runs, e.g. through ssh)
+  oomph remote sync --once [--into DIR] [-- COMMAND…]   mirror the machine whose `serve --stdio`
+                                    COMMAND starts (default: this one) into a directory of logs
 """
 import datetime
 import functools
@@ -284,6 +290,112 @@ def load_events(since, until):
 def is_away(s):
     a = s.get("away") or {}
     return bool((a.get("idle_s") or 0) >= AWAY_IDLE_S or a.get("locked") or a.get("display_on") is False)
+
+
+# ----- what of a sample leaves the machine (roadmap 01 §4.2, §5)
+# Every key a sampler writes, classified once: "keep" travels in slim samples (the history another
+# machine mirrors), "drop" stays home (per-process lists: big, and named by local users), "full"
+# exists in current.json only. The self-test fails on a key that is not here, so a new block cannot
+# silently miss the wire or ride along unchecked.
+SAMPLE_KEYS = dict(
+    [(k, "keep") for k in ("t", "iso", "hot", "gap", "stall", "os", "pressure", "free_pct", "ram_gb", "app_gb",
+                           "wired_gb", "compressed_gb", "compressor_logical_gb", "cached_gb", "free_gb",
+                           "swap_total_gb", "swap_used_gb", "swapfiles", "swapins", "swapouts", "disk_free_gb",
+                           "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident")]
+    + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases")]
+    + [("daemon", "full")])
+SLIM_STR = 64        # characters of a string in a slim sample
+AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
+# The full current sample is rebuilt from these fields only, each list capped (CONTEXT §3.2).
+FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "pn", "s")),
+              "groups": (15, ("name", "mb", "n")),
+              "claude": (64, ("pid", "cwd", "mb", "own_mb", "n", "biggest")),
+              "gone": (64, ("pid", "name", "mb")),
+              "leases": (64, ("id", "state", "gb", "purpose", "project", "used_gb", "for_min", "expires_in_min",
+                              "waiting_min"))}
+FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root")
+FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
+
+
+def _scalar(v, cut):
+    """v if it is a scalar oomph could have written (a finite number, a bool, None, a string cut to
+    `cut` characters), else the marker _NOT."""
+    if v is None or isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v if _num(v, -1e18, 1e18) else _NOT
+    if isinstance(v, str):
+        return v[:cut]
+    return _NOT
+
+
+_NOT = object()
+
+
+def _fields(src, keys, cut, nested=None):
+    """The named fields of a dict that are scalars (or, for the names in `nested`, a dict of
+    scalars), nothing else."""
+    out = {}
+    if not isinstance(src, dict):
+        return out
+    for k in keys:
+        if k not in src:
+            continue
+        v = src[k]
+        if nested and k in nested:
+            if isinstance(v, dict):
+                out[k] = _fields(v, nested[k], cut)
+            continue
+        v = _scalar(v, cut)
+        if v is not _NOT:
+            out[k] = v
+    return out
+
+
+def slim_sample(s):
+    """What of a sample goes on the wire as history: its top-level scalars (finite numbers, bools,
+    strings cut to SLIM_STR) and the four known fields of `away`; every list and every other
+    object stays home. Keys SAMPLE_KEYS drops never travel; a scalar key it does not know yet does
+    (a newer logger's series reach an older protocol)."""
+    out = {}
+    for k, v in s.items():
+        if not isinstance(k, str) or SAMPLE_KEYS.get(k, "keep") != "keep" or len(k) > SLIM_STR:
+            continue
+        if k == "away":
+            if isinstance(v, dict):
+                a = _fields(v, AWAY_KEYS[:3], SLIM_STR)
+                sp = v.get("sleep_preventers")
+                if isinstance(sp, list):
+                    a["sleep_preventers"] = [x[:SLIM_STR] for x in sp[:16] if isinstance(x, str)]
+                out[k] = a
+            continue
+        v = _scalar(v, SLIM_STR)
+        if v is not _NOT:
+            out[k] = v
+    return out
+
+
+def full_sample(s):
+    """The latest sample as it may leave the machine whole (current.json, for the stat tiles):
+    what slim_sample keeps, plus the per-process lists and the daemon block rebuilt from the
+    fields of FULL_LISTS, FULL_DAEMON and FULL_MACHINE with their types, strings cut to
+    LIMITS["str"] characters, lists to their caps."""
+    out = slim_sample(s)
+    n = LIMITS["str"]
+    for k, (cap, keys) in FULL_LISTS.items():
+        if isinstance(s.get(k), list):
+            out[k] = [_fields(x, keys, n, {"biggest": ("name", "pid", "mb")}) for x in s[k][:cap] if isinstance(x, dict)]
+    d = s.get("daemon")
+    if isinstance(d, dict):
+        out["daemon"] = _fields(d, FULL_DAEMON, n)
+        m = d.get("machine")
+        if isinstance(m, dict):
+            mm = _fields(m, FULL_MACHINE, n)
+            if isinstance(m.get("measures"), dict):
+                mm["measures"] = {k[:SLIM_STR]: _scalar(v, SLIM_STR) for k, v in list(m["measures"].items())[:32]
+                                  if isinstance(k, str) and _scalar(v, SLIM_STR) is not _NOT}
+            out["daemon"]["machine"] = mm
+    return out
 
 
 # ---------------------------------------------------------------- summarize
@@ -3824,6 +3936,14 @@ def _main(argv):
             sys.path.insert(0, HERE)
         import oomph_ai
         return oomph_ai.cmd_ai_report(rest)
+    if c in ("serve", "remote"):
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        if c == "serve":
+            import oomph_net
+            return oomph_net.cmd_serve(rest)
+        import oomph_sync
+        return oomph_sync.cmd_remote(rest)
     if c == "hook":
         return cmd_hook(rest)
     if c == "mcp":

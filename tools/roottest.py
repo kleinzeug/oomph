@@ -8,12 +8,13 @@ directory, to read or to write, by any route, and root never waits on it. Used b
 
 Copies daemon/ into a root-owned 0755 directory (the unprivileged children must read it),
 points OOMPH_DIR and OOMPH_LEDGER_DIR at temporary directories, and runs the daemon's
-sampling and `oomph reserve` / `reservations` / `release` / `top` / `doctor` against a planted symbolic link, a
+sampling and `oomph reserve` / `reservations` / `release` / `top` / `doctor` / `serve --stdio` against a planted symbolic link, a
 FIFO, endless and sparse files, a held lock, malformed leases, a hard link and a directory
 replaced by a link. An audit hook records every file this (root) process opens, renames,
 removes or creates: anything inside the ledger directories fails the test, as does a changed
 link target, an operation past its deadline, or a sample that waited for the ledger.
 """
+import base64
 import hashlib
 import io
 import json
@@ -26,6 +27,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -38,7 +40,7 @@ code, ledgers, victims = (os.path.join(base, x) for x in ("code", "ledgers", "vi
 for d in (code, ledgers, victims):
     os.mkdir(d)
     os.chmod(d, 0o755)
-for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_top.py", "oomph_view.py"):
+for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py"):
     shutil.copy(os.path.join(ROOT, "daemon", f), code)
     os.chmod(os.path.join(code, f), 0o644)
 os.environ["OOMPH_DIR"] = os.path.join(base, "logs")
@@ -423,6 +425,37 @@ if REAL:
     cases.append(oomph.read_config(cfg))  # a FIFO
     check(cases == [{}] * 5 and time.time() - t < 2,
           "config: ignored when group-writable, someone else's, in a folder others can write, a link or a FIFO")
+
+# 11. `oomph serve --stdio` as root gives up root for good before it reads anything, and what is
+#     planted in the ledger directory (a link to root's file, a FIFO) is absent to it, without a wait
+p = case("serve")
+v = victim("serve-ledger.json", json.dumps({"seq": 1, "leases": [{"id": "r1", "state": "granted", "gb": 1.0,
+                                                                   "purpose": "root's secret", "requested": time.time(),
+                                                                   "granted": time.time(), "holder": {"pid": 1}}]}),
+           mode=0o644)  # readable by all: only not following the link keeps it out of the answer
+os.symlink(v, os.path.join(p, "ledger.json"))
+os.mkfifo(os.path.join(p, "reservations.jsonl"), 0o666)
+srv = subprocess.Popen([sys.executable, "-I", "-B", os.path.join(code, "oomph.py"), "serve", "--stdio"],
+                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=dict(os.environ, OOMPH_LEDGER_DIR=p))
+t = time.time()
+answers = []
+try:
+    for i, m in enumerate(("hello", "ledger", "reservations")):
+        srv.stdin.write((json.dumps({"jsonrpc": "2.0", "id": i, "method": m, "params": {"proto": [1, 1]}}) + "\n").encode())
+        srv.stdin.flush()
+        answers.append(json.loads(srv.stdout.readline() or "{}"))
+        if i == 0:
+            uid = subprocess.run(["/bin/ps", "-o", "uid=", "-p", str(srv.pid)], capture_output=True, text=True).stdout.strip()
+finally:
+    srv.stdin.close()
+    srv.wait(10)
+    srv.stdout.close()
+want = str(USER or NOBODY) if REAL else str(os.getuid())
+snap = json.loads(zlib.decompress(base64.b64decode(answers[1].get("result", {}).get("data", ""))) or b"{}") \
+    if len(answers) > 1 and "result" in answers[1] else {}
+check(uid == want and snap.get("leases") == [] and answers[2].get("result", {}).get("n") == 0 and time.time() - t < 10,
+      "serve --stdio as root runs as uid %s (want %s); a link to root's file and a FIFO are absent (%.1f s)"
+      % (uid, want, time.time() - t))
 
 # 10. install.sh as root into a throwaway prefix: everything root's, the old layout migrated
 #     (the real one, with launchd, runs in CI's "Install over 1.8.4" step)
