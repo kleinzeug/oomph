@@ -21,6 +21,7 @@ esac
 systemctl disable --now earlyoom >/dev/null 2>&1
 con "packages done: $(command -v earlyoom) $(command -v setfacl)"
 ROWS="1 2 3 4 5 6 7 8 9 11 12 13 14 15 16 17 18 19 21 23 24 25 26 27 28 29 30 31 32 10 33 35 34"
+[ -f /spike/spike/guest/rows.override ] && ROWS=$(cat /spike/spike/guest/rows.override)
 bash /spike/spike/facts.sh all "$ROWS" 2>&1 | tee $OUT/guest-run.log | grep -E '^(===== ROW|VERDICT)' > /dev/ttyS0
 journalctl -b --no-pager -o short-monotonic > $OUT/raw/guest-journal.txt 2>&1
 tail -c 3000000 $OUT/raw/guest-journal.txt > $OUT/raw/guest-journal.tail.txt; rm -f $OUT/raw/guest-journal.txt

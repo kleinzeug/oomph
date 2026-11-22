@@ -223,7 +223,7 @@ PYEOF
 row10() {
     [ "$MODE" = guest ] || { notrun "a machine-wide OOM would take the runner down; this row runs in the QEMU guests"; return; }
     run "swapoff -a; swapon --show; free -m"
-    run "systemctl is-active earlyoom systemd-oomd"
+    run "systemctl is-active earlyoom systemd-oomd; cat /proc/self/oom_score_adj"
     local c k0 k1; c=$(cursor_now); k0=$(vmstat_oom)
     T=240 run "OOM_ADJ=1000 systemd-run --quiet --scope --unit spike-r10 python3 $PY/alloc.py grow 32 0.02 | tail -3"
     sleep 3; k1=$(vmstat_oom)
@@ -237,7 +237,10 @@ row10() {
 }
 row11() {
     local how
-    if ensure_zram || [ -n "$(swapon --show --noheadings)" ]; then how=anon; else how=file; fi
+    if ! ensure_zram && [ -z "$(swapon --show --noheadings)" ]; then
+        dd if=/dev/zero of=/var/tmp/spike-swap11 bs=1M count=1024 status=none && chmod 600 /var/tmp/spike-swap11 && mkswap /var/tmp/spike-swap11 >/dev/null && swapon /var/tmp/spike-swap11 && echo "(no zram: a 1 GB swap file was added for this row)"
+    fi
+    if [ -n "$(swapon --show --noheadings)" ]; then how=anon; else how=file; fi
     run "swapon --show"
     local cgpath=system.slice/spike-r11.scope
     note "baseline 4 s, then a cgroup thrashing at its own limit for 25 s ($how)"
@@ -931,6 +934,7 @@ rowtimeout() { case $1 in 22|23|25) echo 900;; 3|19|24|27|29|35|10|33) echo 420;
 
 case "$1" in
 row)
+    echo 0 > /proc/self/oom_score_adj 2>/dev/null   # the guest harness runs at -1000; the rows' processes must stay killable
     mkdir -p "$STATE" "$RAW"
     echo "===== ROW $2 | $(title $2) | system=$SYSNAME mode=$MODE kernel=$(uname -r) arch=$ARCH | $(date -u +%FT%TZ) ====="
     "row$2"

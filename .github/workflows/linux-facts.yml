@@ -9,6 +9,7 @@ permissions:
 jobs:
   runner:
     name: runner ${{ matrix.os }}
+    if: ${{ !contains(github.event.head_commit.message, '[guests only]') }}
     strategy:
       fail-fast: false
       matrix:
