@@ -1921,18 +1921,42 @@ def _not_root(what):
         raise LedgerError("%s as root refused: root never opens the shared ledger directory" % what)
 
 
-def read_bounded(name, cap, dir_fd=None, tail=False):
+def read_bounded(name, cap, dir_fd=None, tail=False, shared=False):
     """The bytes of a regular file with a single link, read without following a symbolic link,
     without blocking on a FIFO and never more than `cap` of them; None for anything else (missing,
     a link, a FIFO, a device, a directory, a hard-linked file, or bigger than `cap`). With `tail`
-    a bigger file gives its last whole lines within `cap` instead."""
+    a bigger file gives its last whole lines within `cap` instead.
+
+    `shared` is for the shared ledger directory, where what is read may be written back into a
+    file everyone can read. No check by name or by descriptor can tell a planted hard link from
+    the real file for sure: the attacker links someone's private file there, the reader opens it,
+    the attacker unlinks the name, and the open file has one link again (03-linux C.3, row 19).
+    So the file must also be readable by everyone (oomph writes 0666): all three read bits, since
+    a user in the file's group gets the group's bits and not the others'. A file someone could
+    not read anyway is refused whatever its name, which no race changes, because the
+    descriptor's mode is the file's (an ACL that denies one user is the gap that remains). On top of that, after the read the file must still have one link and the
+    name must still be that file; a writer that renamed a new file over it meanwhile makes the
+    read start again (three tries)."""
+    for _ in range(3 if shared else 1):
+        data = _read_once(name, cap, dir_fd, tail, shared)
+        if data is not _MOVED:
+            return data
+    return None
+
+
+_MOVED = object()
+
+
+def _read_once(name, cap, dir_fd, tail, shared):
     try:
         fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
     except OSError:
         return None
     try:
         st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+        if shared and st.st_nlink == 0:  # renamed over since the open
+            return _MOVED
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or (shared and st.st_mode & 0o444 != 0o444):
             return None
         cut = st.st_size > cap
         if cut:
@@ -1947,6 +1971,10 @@ def read_bounded(name, cap, dir_fd=None, tail=False):
             parts.append(b)
             n += len(b)
         data = b"".join(parts)
+        if shared:
+            after, by = os.fstat(fd), _lstat(name, dir_fd)
+            if after.st_nlink != 1 or not by or (by.st_dev, by.st_ino, by.st_nlink) != (st.st_dev, st.st_ino, 1):
+                return _MOVED
         if len(data) > cap:  # it grew while we read
             if not tail:
                 return None
@@ -1958,6 +1986,13 @@ def read_bounded(name, cap, dir_fd=None, tail=False):
         return None
     finally:
         os.close(fd)
+
+
+def _lstat(name, dir_fd):
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return None
 
 
 def _parse_int(s):
@@ -2280,7 +2315,7 @@ class Ledger:
 
 
 def _read_ledger_at(dfd):
-    L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd)))
+    L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd, shared=True)))
     if L is None:
         # a fresh (or lost) ledger: continue the numbering of the history log, so ids don't repeat
         L = {"seq": _history_max_seq(dfd), "leases": [], "history": []}
@@ -2340,7 +2375,7 @@ def read_history(since=None, dfd=None):
         if dfd is None:
             return []
     try:
-        data = read_bounded(HISTORY_FILE, LIMITS["history"], dfd, tail=True)
+        data = read_bounded(HISTORY_FILE, LIMITS["history"], dfd, tail=True, shared=True)
     finally:
         if own:
             os.close(dfd)
@@ -2369,21 +2404,22 @@ def _append_history(L, recs, now):
     """Add records to the log, under the ledger lock. No writer opens the log's existing name for
     writing: a hard link planted there would turn an append into a write to another user's
     file, and no open flag can refuse a hard link. So every write reads the log (its newest
-    LIMITS["history"] bytes, a file with a single link only), keeps the records of the last
-    HISTORY_DAYS, adds the new ones, drops the oldest beyond LIMITS["history"] bytes and renames
-    a fresh file over the name. The format stays one record per line: readers, and 1.8.1–1.8.3
-    writers (which append under the same lock), work on it unchanged. A new log is seeded with
-    the ledger's own short history."""
+    LIMITS["history"] bytes, a file with a single link that everyone may read: read_bounded's
+    `shared`), keeps the records of the last HISTORY_DAYS that have the shape of oomph's own (what
+    every reader keeps), adds the new ones, drops the oldest beyond LIMITS["history"] bytes and
+    renames a fresh file over the name. The format stays one record per line: readers, and
+    1.8.1–1.8.3 writers (which append under the same lock), work on it unchanged. A new log is
+    seeded with the ledger's own short history."""
     _not_root("writing the history log")
     if _held is None:
         raise LedgerError("the history log is written under the ledger lock only")
     dfd = _held.dfd
-    data = read_bounded(HISTORY_FILE, LIMITS["history"], dfd, tail=True)
+    data = read_bounded(HISTORY_FILE, LIMITS["history"], dfd, tail=True, shared=True)
     cutoff = now - HISTORY_DAYS * 86400
     lines = []
     for line in (data or b"").splitlines():
-        rec = loads_untrusted(line)
-        if isinstance(rec, dict) and _rec_time(rec) >= cutoff:
+        rec = _valid_finished(loads_untrusted(line), log=True)  # shaped like oomph's records, or dropped
+        if rec and _rec_time(rec) >= cutoff:
             lines.append(line)  # carried through unchanged
     if data is None:  # no log yet (or something other than a log had its name)
         keys = {x["key"] for x in recs}
@@ -2976,7 +3012,7 @@ def ledger_view(since=None):
     if dfd is None:
         return {"ledger": None, "records": []}
     try:
-        L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd)))
+        L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd, shared=True)))
         return {"ledger": L, "records": _view_records(read_history(since, dfd))}
     finally:
         os.close(dfd)
@@ -3748,8 +3784,10 @@ def doctor():
 
 def _doctor_ledger(root):
     """The ledger folder's check: a real folder this user can write, its files plain files with one
-    link and within the limits. Only lstat and access, which open nothing; the leases are counted
-    by the ledger's own reader (as root, in a child as the invoking user)."""
+    link (the lock may have more: nothing is read from it), readable by everyone (owner, group
+    and others: the shared read refuses anything less, and other users can't take a private
+    lock) and within the limits. Only lstat and access, which open nothing; the leases are
+    counted by the ledger's own reader (as root, in a child as the invoking user)."""
     L = LEDGER_DIR
     try:
         st = os.lstat(L)
@@ -3765,17 +3803,21 @@ def _doctor_ledger(root):
         return "ledger", "warn", "%s is not writable for you: reservations fail" % L, \
             "sudo chmod 777 %s" % L if sys.platform == "darwin" else None
     for name in ("ledger.json", HISTORY_FILE, "ledger.lock"):
+        p, lock = os.path.join(L, name), name == "ledger.lock"
         try:
-            f = os.lstat(os.path.join(L, name))
+            f = os.lstat(p)
         except OSError:
             continue
-        what = (None if stat.S_ISREG(f.st_mode) and f.st_nlink == 1 else
-                "is not a regular file" if not stat.S_ISREG(f.st_mode) else "has %d hard links" % f.st_nlink)
-        if not what and name == "ledger.json" and f.st_size > LIMITS["ledger"]:
-            what = "is bigger than %d MB and read as empty" % (LIMITS["ledger"] >> 20)
+        what = ("is not a regular file" if not stat.S_ISREG(f.st_mode) else
+                "has %d hard links" % f.st_nlink if f.st_nlink != 1 and not lock else
+                "is bigger than %d MB and read as empty" % (LIMITS["ledger"] >> 20)
+                if name == "ledger.json" and f.st_size > LIMITS["ledger"] else None)
         if what:
-            return ("ledger", "warn", "%s/%s %s, so it is refused" % (L, name, what),
-                    "rm %s  (a new one is written)" % os.path.join(L, name))
+            return "ledger", "warn", "%s %s, so it is refused" % (p, what), "rm %s  (a new one is written)" % p
+        if f.st_mode & 0o444 != 0o444:
+            return ("ledger", "warn", "%s is not readable by everyone, so %s" % (
+                p, "other users can't take the lock: their reservations fail" if lock else "it is refused"),
+                "chmod 666 %s  (as its owner, or with sudo)" % p)
     try:
         n = ledger_live_count()  # as root in a child as the invoking user
     except LedgerError as e:

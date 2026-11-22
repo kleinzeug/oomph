@@ -849,7 +849,8 @@ def capsule(model):
 
 def tab_bar(fr, model, caps, g):
     """Row 0 for one machine: the name, this machine's host name, free memory, the capsule, the clock.
-    What gives way when columns are short: the name, then the clock, then the free memory."""
+    What gives way when columns are short: the name, then the clock, then the free memory. A long
+    host name is cut first, to no less than 12 cells, so it never pushes the others out of a wide row."""
     W, mono = fr.w, caps.color == "none"
     fr.fill(0, 0, W, 1, " ", None, "bar")
     cap_text, cap_role = capsule(model)
@@ -857,7 +858,9 @@ def tab_bar(fr, model, caps, g):
     cur = model.get("cur")
     free = "%.1fG free" % cur["free"] if cur and model.get("logger") != "silent" else None
     host = model.get("host") or "this Mac"
-    label = fit(host, max(4, W - 1 - 1 - cap_w - 1 - 3), g)
+    room = W - 1 - 1 - cap_w - 1 - 3
+    rest = (len(model.get("brand") or "") + 1) + 6 + (len(free) + 2 if free else 0)
+    label = fit(host, max(4, room - rest if room - rest >= 12 else room), g)
     left = [(" " + label + " ", "selfg", "sel", BOLD | (REV if mono else 0))]
     used = 1 + 1 + cap_w + 1 + sum(tw(s[0]) for s in left)
     fre = bool(free) and used + len(free) + 2 <= W

@@ -623,6 +623,136 @@ for f in os.listdir(LD):
     if f.endswith(".tmp"):
         os.remove(os.path.join(LD, f))
 
+# the read side's race (03-linux C.3 row 19), planted deterministically: the attacker links someone's
+# private file at the log's name, and removes the link right after the writer opened it, so the open
+# file has one link again by the time it is checked. A hook in os.open plays the attacker.
+real_open = os.open
+armed = []
+
+
+def racing_open(path, flags, mode=0o777, *, dir_fd=None):
+    fd = real_open(path, flags, mode, dir_fd=dir_fd)
+    if armed and path == armed[0][0] and not flags & (os.O_WRONLY | os.O_RDWR):
+        armed.pop(0)[1](path, dir_fd)
+    return fd
+
+
+def raced(fn, *a, moves=(), **kw):
+    """fn(*a, **kw) with os.open hooked: each move (name, action(name, dir_fd)) runs right after
+    the next read-only open of that name, once."""
+    armed[:] = list(moves)
+    os.open = racing_open
+    try:
+        return fn(*a, **kw), not armed
+    finally:
+        os.open = real_open
+        armed[:] = []
+
+
+def unlink_it(name, dfd):
+    os.unlink(name, dir_fd=dfd)
+
+
+log_p = os.path.join(LD, "reservations.jsonl")
+keep_log = open(log_p, "rb").read()
+secret = os.path.join(scratch, "private-log")  # someone's own oomph-shaped file, mode 0600
+now_t = time.time()
+open(secret, "w").write("".join(json.dumps({"event": "end", "t": now_t, "key": "r%d@1" % i, "id": "r%d" % i,
+                                            "gb": 1, "requested": now_t - 60, "ended": now_t, "outcome": "released",
+                                            "purpose": "SECRET-%d" % i}) + "\n" for i in range(3)))
+os.chmod(secret, 0o600)
+before_s = digest(secret)
+os.remove(log_p)
+os.link(secret, log_p)
+dfd = os.open(LD, os.O_RDONLY | os.O_DIRECTORY)
+got, fired = raced(oomph.read_bounded, "reservations.jsonl", 1 << 20, dfd, moves=[("reservations.jsonl", unlink_it)])
+check(fired and got and b"SECRET-0" in got and not os.path.lexists(log_p),
+      "read race planted: without `shared`, the private file is read through the vanished link (the old check)")
+os.link(secret, log_p)
+x = oomph.reserve(0.1, "read race", me)
+real_lstat = oomph._lstat
+oomph._lstat = lambda name, dfd: os.stat(secret) if name == "reservations.jsonl" else real_lstat(name, dfd)
+# ^ and the attacker wins the race of the check by name, too (C.3 row 19): it reports the victim, one link
+real_read_once, reads = oomph._read_once, []
+
+
+def watched_read_once(name, cap, dfd, tail, shared):  # which read met the attacker, and what it returned
+    n = len(armed)
+    got = real_read_once(name, cap, dfd, tail, shared)
+    reads.append((name, shared, len(armed) < n, got))
+    return got
+
+
+oomph._read_once = watched_read_once
+try:
+    _, fired = raced(oomph.release, x["id"], moves=[("reservations.jsonl", unlink_it)])
+finally:
+    oomph._lstat, oomph._read_once = real_lstat, real_read_once
+log_now = open(log_p, "rb").read()
+check(("reservations.jsonl", True, True, None) in reads, "read race: the raced open was the writer's shared read "
+      "of the log, and it was refused (%s)" % [r[:3] + (r[3] if r[3] is None else len(r[3]),) for r in reads])
+check(fired and b"SECRET" not in log_now and b"read race" in log_now and digest(secret) == before_s,
+      "read race: a writer refuses a private file it opened through a vanished link, even when the check by name "
+      "is raced too; nothing of it reaches the shared log, the file is unchanged")
+public = os.path.join(scratch, "public-log")  # readable by everyone: only the link checks after the read can tell
+open(public, "wb").write(open(secret, "rb").read())
+os.chmod(public, 0o644)
+os.remove(log_p)
+os.link(public, log_p)
+got, fired = raced(oomph.read_bounded, "reservations.jsonl", 1 << 20, dfd, shared=True,
+                   moves=[("reservations.jsonl", unlink_it)])
+check(fired and got is None, "read race: the name gone after the read: refused (%r)" % (got and got[:20]))
+
+
+os.link(public, log_p)
+real_fstat, calls = os.fstat, []
+
+
+def fstat_relinking(fd):  # the attacker links the name again between the read and the check after it
+    calls.append(fd)
+    if len(calls) == 2:
+        os.link(public, log_p)
+    return real_fstat(fd)
+
+
+os.fstat = fstat_relinking
+try:
+    got, fired = raced(oomph.read_bounded, "reservations.jsonl", 1 << 20, dfd, shared=True,
+                       moves=[("reservations.jsonl", unlink_it)])
+finally:
+    os.fstat = real_fstat
+check(fired and got is None, "read race: the link planted again after the read: still two links by name, refused")
+os.remove(log_p)
+sdfd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+modes = {}
+for m in (0o644, 0o604, 0o640, 0o600):  # a user in the file's group gets the group's bits, not the others'
+    os.chmod(public, m)
+    modes[oct(m)] = oomph.read_bounded("public-log", 1 << 20, sdfd, shared=True) is not None
+os.chmod(public, 0o644)
+os.close(sdfd)
+check(modes == {"0o644": True, "0o604": False, "0o640": False, "0o600": False},
+      "shared read: only a file with all three read bits is read (%s)" % modes)
+
+
+def renamed_over(name, dfd):  # an honest writer replaces the file while it is read
+    oomph._replace(dfd, name, b'{"seq": 7, "leases": [], "history": []}')
+
+
+keep_ledger = open(os.path.join(LD, "ledger.json"), "rb").read()
+open(os.path.join(LD, "ledger.json"), "w").write('{"seq": 6, "leases": [], "history": []}')
+got, fired = raced(oomph.read_bounded, "ledger.json", 1 << 20, dfd, shared=True, moves=[("ledger.json", renamed_over)])
+check(fired and got and b'"seq": 7' in got, "shared read: a file renamed over the name meanwhile → read again, the new one")
+oomph._replace(dfd, "ledger.json", keep_ledger)
+odd_line = json.dumps({"t": now_t, "note": "SECRET-dated-but-not-oomph"}).encode()
+oomph._replace(dfd, "reservations.jsonl", keep_log + odd_line + b"\n")
+os.close(dfd)
+n0 = len(oomph.read_history())
+x = oomph.reserve(0.1, "shape", me)
+oomph.release(x["id"])
+log_now = open(log_p, "rb").read()
+check(b"SECRET" not in log_now and len(oomph.read_history()) > n0 > 0 and b'"shape"' in log_now,
+      "history rewrite: a dated line not shaped like oomph's records is not carried over; oomph's are (%d)" % n0)
+
 # the directory itself replaced by a link
 real_ld = oomph.LEDGER_DIR
 other_dir = os.path.join(scratch, "elsewhere")
@@ -982,6 +1112,11 @@ check(r.returncode == 0 and len(lines) == 24 and all(view.tw(x) == 80 for x in l
       % (r.returncode, r.stderr.strip()[-200:]))
 check(lines and lines[0].lstrip().startswith(oomph.BRAND) and re.search(r"Logging every|Incident open|Logger", lines[-1]),
       "top: the frame has the name, this machine and the logger's status (%r)" % (lines[-1:] or [""])[0].strip())
+m = oomph_top.load_model("24h", t_now, log_dir=tlog, live=False)
+row0 = view.render(dict(m, host="ci-runner-" + "x" * 70, os="o"), 80, 24, view.Caps("256", "unicode", "dark"),
+                   {"span": "24h"}).text().split("\n")[0]
+check(row0.lstrip().startswith(oomph.BRAND) and "ci-runner-" in row0 and view.tw(row0) == 80,
+      "top: a long host name is cut, the name stays in row 0 (%r)" % row0.strip()[:60])
 r = subprocess.run(top_cmd + ["--once", "--size", "100x30", "--span", "1h", "--glyphs", "ascii", "--color", "256",
                               "--some-later-option"], capture_output=True, text=True, timeout=120, env=dict(os.environ))
 lines = r.stdout.split("\n")[:-1]
@@ -1172,16 +1307,26 @@ planted = tempfile.mkdtemp(prefix="oomph-doctor-")
 os.symlink(LD, os.path.join(planted, "linked"))
 os.mkdir(os.path.join(planted, "fifo"))
 os.mkfifo(os.path.join(planted, "fifo", "ledger.json"))
+os.mkdir(os.path.join(planted, "private"))
+os.close(os.open(os.path.join(planted, "private", "reservations.jsonl"), os.O_CREAT | os.O_WRONLY, 0o600))
+os.mkdir(os.path.join(planted, "group"))
+os.close(os.open(os.path.join(planted, "group", "ledger.json"), os.O_CREAT | os.O_WRONLY, 0o604))
+os.chmod(os.path.join(planted, "group", "ledger.json"), 0o604)
+os.mkdir(os.path.join(planted, "lock"))
+os.close(os.open(os.path.join(planted, "lock", "ledger.lock"), os.O_CREAT | os.O_WRONLY, 0o600))
 saved_ld = oomph.LEDGER_DIR
 found = []
-for name in ("linked", "fifo"):
+for name in ("linked", "fifo", "private", "group", "lock"):
     oomph.LEDGER_DIR = os.path.join(planted, name)
     r = oomph.doctor()
     found.append(next(x for x in r["checks"] if x["id"] == "ledger"))
 oomph.LEDGER_DIR = saved_ld
-check([x["level"] for x in found] == ["warn", "warn"] and "symbolic link" in found[0]["text"] and
-      "not a regular file" in found[1]["text"] and all(x.get("fix") for x in found),
-      "doctor: a ledger folder replaced by a link, a FIFO planted as ledger.json: warn, with the fix (and nothing opened)")
+check([x["level"] for x in found] == ["warn"] * 5 and "symbolic link" in found[0]["text"] and
+      "not a regular file" in found[1]["text"] and "not readable by everyone" in found[2]["text"] and
+      "not readable by everyone, so it is refused" in found[3]["text"] and "can't take the lock" in found[4]["text"]
+      and all(x.get("fix") for x in found) and all(x["fix"].startswith("chmod 666 ") for x in found[2:]),
+      "doctor: a ledger folder replaced by a link, a FIFO planted as ledger.json, a private reservations.jsonl, a "
+      "ledger.json its group can't read, a private lock: warn, with the fix (chmod for a mode; nothing opened)")
 shutil.rmtree(planted, ignore_errors=True)
 
 # --- side-by-side installs, into a throwaway prefix (install.sh's test mode: no root, no launchd)

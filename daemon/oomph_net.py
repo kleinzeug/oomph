@@ -538,13 +538,13 @@ class Server:
         return t
 
     def ledger_file(self, name, cap, tail=False):
-        """A file of the shared ledger directory, read the careful way (oomph.read_bounded)."""
+        """A file of the shared ledger directory, read the careful way (oomph.read_bounded, shared)."""
         try:
             dfd = os.open(self.ledger_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError:
             return None
         try:
-            return oomph.read_bounded(name, cap, dfd, tail=tail)
+            return oomph.read_bounded(name, cap, dfd, tail=tail, shared=True)
         finally:
             os.close(dfd)
 
