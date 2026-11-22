@@ -264,7 +264,8 @@ TOOLS = [
     ("incident", "One incident's full record (triggers, summary, top processes at peak).", {"id": "str"}),
     ("syslog", "The system-log excerpt saved when an incident opened: jetsam exits per service, matching lines.",
      {"id": "str", "contains": "str", "limit": "int"}),
-    ("current_status", "Memory right now: oomph's verdict (ok/tight/critical with reasons) and reservations.", {}),
+    ("current_status", "Memory right now: %s's verdict (ok/tight/critical with reasons) and reservations." % oomph.BRAND,
+     {}),
     ("claude_sessions", "Claude Code sessions seen in a window: project, peak memory, biggest child processes.",
      {"since": "str", "until": "str"}),
 ]
@@ -313,7 +314,7 @@ def run_tool(logs, name, args):
 
 
 # ------------------------------------------------------------------ prompts
-SYSTEM = """You are a memory forensics analyst for a Mac. oomph, a memory monitor, has logged this Mac's \
+SYSTEM = """You are a memory forensics analyst for a Mac. %s, a memory monitor, has logged this Mac's \
 memory every 5–30 seconds (pressure level, app/wired/compressed memory, the compressor's logical size, swap, free \
 disk, the 25 biggest processes with parent, app and Claude Code session, jetsam kills, away state) plus events and \
 incidents. Investigate the report window with the tools and explain to the Mac's owner what went on with memory.
@@ -345,7 +346,7 @@ Write the final report in Markdown with exactly these sections:
 ## Recommendations
 (concrete, specific to the processes and projects found; most important first)
 
-Keep it under about 900 words. Use local times as HH:MM (with the date when it spans days)."""
+Keep it under about 900 words. Use local times as HH:MM (with the date when it spans days).""" % oomph.BRAND
 
 
 def briefing(logs):
@@ -647,10 +648,10 @@ def ai_section(md, provider_key, model, log, seconds):
     return ('<section class="card ai"><div class=ai-head><span class=ai-star>✦</span> AI analysis'
             '<span class=ai-meta>%s · %s · %d tool calls · %ds</span></div>%s'
             '<details><summary>How it was investigated</summary><ol>%s</ol>'
-            '<p class=sub>Written by a language model from oomph\'s logs; check it against the charts and '
+            '<p class=sub>Written by a language model from %s\'s logs; check it against the charts and '
             'tables below.</p></details></section>'
             % (PROVIDER_NAMES.get(provider_key, provider_key), html.escape(model), len(log), seconds,
-               md_to_html(md), steps))
+               md_to_html(md), steps, html.escape(oomph.BRAND)))
 
 
 AI_CSS = """

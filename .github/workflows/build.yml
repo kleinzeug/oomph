@@ -34,8 +34,9 @@ jobs:
         run: |
           bash -n build-app.sh install.sh uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py tools/selftest.py tools/roottest.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py tools/selftest.py tools/roottest.py tools/brandlint.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
+          /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
       - name: Daemon + CLI self-test
         # Samples this runner into a temp dir, simulates a jetsam storm, and checks
@@ -50,6 +51,62 @@ jobs:
         run: |
           /usr/bin/python3 -I -B tools/roottest.py
           sudo /usr/bin/python3 -I -B tools/roottest.py
+
+      - name: Install over 1.8.4, then uninstall (as root)
+        # The real install on this runner. 1.8.4's installer leaves the old layout (a real
+        # directory); this commit's moves it aside and makes /usr/local/libexec/oomph a link to
+        # a directory of its own version. The logger runs from there, installing again changes
+        # nothing, a version replaced more than 7 days ago is removed, and uninstall.sh leaves
+        # nothing behind.
+        run: |
+          VER=$(tools/version.sh)
+          git worktree add -q "$RUNNER_TEMP/v1.8.4" v1.8.4
+          sudo "$RUNNER_TEMP/v1.8.4/install.sh"
+          test -d /usr/local/libexec/oomph && test ! -L /usr/local/libexec/oomph
+          OLDV=$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' /usr/local/libexec/oomph/oomph.py)
+          echo "1.8.4's installer stamped $OLDV"
+          sudo ./install.sh
+          ls -la /usr/local/libexec
+          test "$(readlink /usr/local/libexec/oomph)" = "oomph-$VER"
+          test -f "/usr/local/libexec/oomph-$OLDV/oomphd.py"
+          test "$(/usr/local/bin/oomph version)" = "$VER"
+          sudo launchctl print system/local.oomph.daemon | grep -q "state = running"
+          v=""
+          for i in $(seq 1 30); do
+            v=$(/usr/bin/python3 -I -c 'import json; print(json.load(open("/Library/Logs/oomph/current.json"))["daemon"]["version"])' 2>/dev/null || true)
+            [ "$v" = "$VER" ] && break
+            sleep 2
+          done
+          echo "the logger reports $v"
+          test "$v" = "$VER"
+          sudo ./install.sh
+          test "$(ls -d /usr/local/libexec/oomph-* | wc -l | tr -d ' ')" = 2
+          sudo touch -t 202001010000 "/usr/local/libexec/oomph-$OLDV"
+          sudo ./install.sh
+          test ! -e "/usr/local/libexec/oomph-$OLDV"
+          sudo ./uninstall.sh --purge
+          if ls -d /usr/local/libexec/oomph* /usr/local/bin/oomph /Library/LaunchDaemons/local.oomph.daemon.plist 2>/dev/null; then
+            echo "::error::uninstall.sh left files behind"; exit 1
+          fi
+          git worktree remove --force "$RUNNER_TEMP/v1.8.4"
+
+      - name: Old upgraders build this commit
+        # Installed copies upgrade themselves: their own `oomph upgrade build` runs main's
+        # build-app.sh. The upgraders of v1.6.2 and v1.8.1 must still get an app out of it.
+        run: |
+          git clone -q "$GITHUB_WORKSPACE" "$RUNNER_TEMP/up-repo"
+          git -C "$RUNNER_TEMP/up-repo" checkout -q -B main "$(git rev-parse HEAD)"
+          for tag in v1.6.2 v1.8.1; do
+            old="$RUNNER_TEMP/old-$tag"
+            mkdir -p "$old"
+            git archive "$tag" daemon | tar -x -C "$old"
+            OOMPH_REPO="$RUNNER_TEMP/up-repo" OOMPH_UPGRADE_DIR="$RUNNER_TEMP/up-$tag" \
+              /usr/bin/python3 -I -B "$old/daemon/oomph.py" upgrade build | tail -n 3
+            app="$RUNNER_TEMP/up-$tag/staging/oomph.app"
+            test -x "$app/Contents/MacOS/oomph" || { echo "::error::the $tag upgrader built no app"; exit 1; }
+            id=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$app/Contents/Info.plist")
+            [ "$id" = "local.oomph.menubar" ] || { echo "::error::$tag upgrader: bundle id $id"; exit 1; }
+          done
 
       - name: Build oomph.app
         # Exactly what a contributor runs; ad-hoc signed, no Apple account.

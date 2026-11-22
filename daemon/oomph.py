@@ -53,6 +53,8 @@ import time
 
 VERSION = "dev"  # stamped by build-app.sh / install.sh from `git describe` (tools/version.sh)
 COMMIT = ""      # the git commit the stamped copy was built from
+BRAND = "oomph"  # the product's name in prose and titles: one edit renames it (tools/brandlint.py)
+CMD = "oomph"    # the command, its message prefix and every identifier: never changes
 HARDENING = 1    # H0 (1.8.4): root never opens the shared ledger directory; `oomph share on` requires it
 
 
@@ -74,6 +76,15 @@ def _checkout_version():
 
 if VERSION == "dev":
     VERSION, COMMIT = _checkout_version()
+
+
+def usage(doc):
+    """A module's help as printed. The first `oomph` of its first line is the product's name, so
+    it says BRAND (a docstring cannot interpolate); the commands below it stay `oomph`."""
+    first, _, rest = doc.strip().partition("\n")
+    return re.sub(r"\boomph\b", lambda m: BRAND, first, count=1) + ("\n" + rest if rest else "")
+
+
 LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")
 
 # What the daemon reads from the unified log. On macOS 27 memory kills show up as
@@ -707,8 +718,8 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
         '<button id=ev-x type=button aria-label="Clear filter">✕</button></span></div></div>'
         '<div class=card><div id=ev></div></div>',
         '<script type="application/json" id=oomph-data>%s</script><script>%s</script>' % (blob, REPORT_JS),
-        '<p class=sub style="margin-top:24px">generated %s by oomph %s</p>' % (
-            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), VERSION),
+        '<p class=sub style="margin-top:24px">generated %s by %s %s</p>' % (
+            datetime.datetime.now().strftime("%Y-%m-%d %H:%M"), BRAND, VERSION),
         "</main></body></html>",
     ]
     return "".join(parts)
@@ -1558,6 +1569,55 @@ def _depth_ok(v):
                 return False
             stack.extend((y, d + 1) for y in (x.values() if isinstance(x, dict) else x))
     return True
+
+
+# Switches that survive updates live here, not in the LaunchDaemon's plist, which install.sh
+# replaces. Keys are the switches' names without the prefix and in lower case
+# ({"ioreport": true} for OOMPH_IOREPORT); none is read yet. The file is root's: one that root
+# does not own, or that anyone else could change, is ignored.
+CONFIG_FILE = "/Library/Application Support/oomph/config.json"
+CONFIG_CAP = 64 << 10
+
+
+def read_config(path=CONFIG_FILE):
+    """The root-owned configuration as a dict; {} when it is missing or not to be trusted. Both
+    the file and its directory must belong to root and be writable by nobody else, the file a
+    regular file with one link (read without following links or blocking, like read_bounded),
+    at most CONFIG_CAP bytes of a JSON object within LIMITS."""
+    d, name = os.path.split(path)
+    try:
+        dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return {}
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        os.close(dfd)
+        return {}
+    try:
+        for st in (os.fstat(dfd), os.fstat(fd)):
+            if st.st_uid != 0 or st.st_mode & 0o022:
+                return {}
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > CONFIG_CAP:
+            return {}
+        data = os.read(fd, CONFIG_CAP + 1)
+    except OSError:
+        return {}
+    finally:
+        os.close(fd)
+        os.close(dfd)
+    v = loads_untrusted(data) if len(data) <= CONFIG_CAP else None
+    return v if isinstance(v, dict) else {}
+
+
+def setting(name, default=None, config=None):
+    """A switch: the environment's OOMPH_<NAME> if set (tests, a one-off run), else the
+    configuration file's `name`, else `default`. Env values are strings, the file's are JSON."""
+    env = os.environ.get("OOMPH_" + name.upper())
+    if env is not None:
+        return env
+    return (read_config() if config is None else config).get(name.lower(), default)
 
 
 def _num(x, lo=-1e15, hi=1e15):
@@ -2566,18 +2626,76 @@ def _opt(args, name, default=None):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
 
 
+class UsageError(Exception):
+    """A command line this oomph can't take as given: an option it doesn't know, a missing value,
+    an argument too many, a size that isn't one. The command prints it with its usage, exit 2."""
+
+
+def _strict(args, takes=(), flags=(), npos=1):
+    """Parses args for commands whose numbers matter (reserve, run, amend, release): options in
+    `takes` take the next argument as their value, `flags` stand alone, at most `npos`
+    positionals. Anything else is refused rather than guessed at, so that an option from a
+    newer oomph (`--cpu 8`) never turns its number into gigabytes. Returns (opts, positionals)."""
+    opts, pos, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a in takes:
+            if i + 1 >= len(args):
+                raise UsageError("%s needs a value" % a)
+            opts[a], i = args[i + 1], i + 2
+            continue
+        if a in flags:
+            opts[a] = True
+        elif a.startswith("-") and a != "-" and not a[1:2].isdigit() and a[1:2] != ".":
+            raise UsageError("unknown option %s" % a)  # -1G is a (negative) size: the ledger answers it
+        else:
+            pos.append(a)
+        i += 1
+    if len(pos) > npos:
+        raise UsageError("unexpected argument %s" % pos[npos])
+    return opts, pos
+
+
+def _size(x):
+    """A size argument in GB (6G, 512M, 1.5), or UsageError. Whether it is a size the ledger
+    accepts (more than 0, less than 90 % of RAM) is the ledger's to answer, with its advice."""
+    try:
+        gb = _parse_gb(x)
+    except ValueError:
+        gb = None
+    if gb is None or not math.isfinite(gb):
+        raise UsageError("not a size: %s (use e.g. 6G or 512M)" % x)
+    return gb
+
+
+def _usage_error(cmd, e, text):
+    sys.stderr.write("oomph %s: %s\n%s\n" % (cmd, e, text))
+    return 2
+
+
+RESERVE_USAGE = "usage: oomph reserve <size, e.g. 6G> --for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]"
+RELEASE_USAGE = "usage: oomph release <id | all>   (all = every reservation held by this session)"
+AMEND_USAGE = "usage: oomph amend <id> [--gb 3G] [--ttl 20m] [--for \"what\"] [--json]"
+RUN_USAGE = "usage: oomph run --reserve 6G [--for \"what\"] [--wait 30m] -- <command> [args…]"
+
+
 def cmd_reserve(args):
-    pos = [a for i, a in enumerate(args) if not a.startswith("--") and (i == 0 or args[i - 1] not in
-                                                                        ("--for", "--wait", "--ttl", "--ticket", "--pid"))]
-    ticket = _opt(args, "--ticket")
-    if not pos and not ticket:
-        print("usage: oomph reserve <size, e.g. 6G> --for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
-        return 2
-    gb = _parse_gb(pos[0]) if pos else 0
-    holder = holder_for(int(_opt(args, "--pid")) if "--pid" in args else None)
-    st = acquire(gb, _opt(args, "--for", "unspecified"), holder, parse_dur(_opt(args, "--ttl", "30m")),
-                 parse_dur(_opt(args, "--wait", "0s")), ticket)
-    if "--json" in args:
+    try:
+        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid"), ("--json", "--help", "-h"))
+        ticket = o.get("--ticket")
+        if "--help" in o or "-h" in o or (not pos and not ticket):
+            print(RESERVE_USAGE)
+            return 2
+        gb = _size(pos[0]) if pos else 0
+        pid = o.get("--pid")
+        if pid is not None and not pid.isdigit():
+            raise UsageError("--pid takes a process id, not %s" % pid)
+    except UsageError as e:
+        return _usage_error("reserve", e, RESERVE_USAGE)
+    holder = holder_for(int(pid) if pid is not None else None)
+    st = acquire(gb, o.get("--for", "unspecified"), holder, parse_dur(o.get("--ttl", "30m")),
+                 parse_dur(o.get("--wait", "0s")), ticket)
+    if "--json" in o:
         print(json.dumps(st))
     else:
         print("oomph: %s %s — %s" % (st["status"].upper(), st.get("id", ""), st["advice"]))
@@ -2589,11 +2707,15 @@ def cmd_reserve(args):
 
 
 def cmd_release(args):
-    if not args or args[0].startswith("--"):
-        print("usage: oomph release <id | all>   (all = every reservation held by this session)")
+    try:
+        o, pos = _strict(args, flags=("--json", "--help", "-h"))
+    except UsageError as e:
+        return _usage_error("release", e, RELEASE_USAGE)
+    if not pos or "--help" in o or "-h" in o:
+        print(RELEASE_USAGE)
         return 2
-    res = release(args[0], holder_for()["pid"] if args[0] == "all" else None)
-    if "--json" in args:
+    res = release(pos[0], holder_for()["pid"] if pos[0] == "all" else None)
+    if "--json" in o:
         print(json.dumps(res))
         return 0
     if not res["released"]:
@@ -2608,13 +2730,17 @@ def cmd_release(args):
 
 
 def cmd_amend(args):
-    rid = args[0] if args and not args[0].startswith("--") else None
-    if not rid or not any(o in args for o in ("--gb", "--ttl", "--for")):
-        print("usage: oomph amend <id> [--gb 3G] [--ttl 20m] [--for \"what\"] [--json]")
-        return 2
-    st = amend(rid, _parse_gb(_opt(args, "--gb")) if "--gb" in args else None,
-               parse_dur(_opt(args, "--ttl")) if "--ttl" in args else None, _opt(args, "--for"))
-    if "--json" in args:
+    try:
+        o, pos = _strict(args, ("--gb", "--ttl", "--for"), ("--json", "--help", "-h"))
+        if not pos or not any(k in o for k in ("--gb", "--ttl", "--for")) or "--help" in o or "-h" in o:
+            print(AMEND_USAGE)
+            return 2
+        gb = _size(o["--gb"]) if "--gb" in o else None
+    except UsageError as e:
+        return _usage_error("amend", e, AMEND_USAGE)
+    rid = pos[0]
+    st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"))
+    if "--json" in o:
         print(json.dumps(st))
     else:
         ch = st.get("changed") or {}
@@ -2670,17 +2796,24 @@ def cmd_reservations(args):
 
 def cmd_run(args):
     if "--" not in args or "--reserve" not in args:
-        print("usage: oomph run --reserve 6G [--for \"what\"] [--wait 30m] -- <command> [args…]")
+        print(RUN_USAGE)
         return 2
     i = args.index("--")
-    opts, cmd = args[:i], args[i + 1:]
+    cmd = args[i + 1:]
+    try:
+        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait"), npos=0)
+        gb = _size(opts["--reserve"]) if "--reserve" in opts else None
+    except UsageError as e:
+        return _usage_error("run", e, RUN_USAGE)
+    if gb is None:
+        print(RUN_USAGE)
+        return 2
     if not cmd:
         print("oomph run: no command given")
         return 2
     import signal
-    gb = _parse_gb(_opt(opts, "--reserve"))
-    purpose = _opt(opts, "--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
-    wait_s = parse_dur(_opt(opts, "--wait", "30m"))
+    purpose = opts.get("--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
+    wait_s = parse_dur(opts.get("--wait", "30m"))
     ses = holder_for()
     me = {"pid": os.getpid(), "start": _daemon_module().collect_procs().get(os.getpid(), {}).get("start"),
           "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd()}
@@ -2782,7 +2915,7 @@ MCP_TOOLS = [
                     "within 180 s to keep your place, and see who is ahead) or refused. Calling again with the ticket "
                     "of a granted reservation extends it. Change its size, ttl or purpose with update_reservation, "
                     "and release it with release_memory when the heavy part is over.",
-     "inputSchema": {"type": "object", "required": ["gb", "purpose"], "properties": {
+     "inputSchema": {"type": "object", "required": ["gb", "purpose"], "additionalProperties": False, "properties": {
          "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB"},
          "purpose": {"type": "string", "description": "short label, e.g. 'gradle assembleDebug' — reuse the same "
                                                        "label for the same work so its measured peak can guide estimates"},
@@ -2794,7 +2927,8 @@ MCP_TOOLS = [
     {"name": "release_memory",
      "description": "Release a reservation (id) — or 'all' of this session's — as soon as the memory-heavy work has "
                     "finished, so queued sessions can go. Returns the peak memory the work actually added.",
-     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+     "inputSchema": {"type": "object", "required": ["id"], "additionalProperties": False,
+                     "properties": {"id": {"type": "string"}}}},
     {"name": "update_reservation",
      "description": "Change a reservation (granted or queued) in place: a new size in GB, a new time to live "
                     "(counted from now: shorter or longer), or a new purpose. Shrink as soon as the heaviest part is "
@@ -2803,7 +2937,7 @@ MCP_TOOLS = [
                     "nothing changes, your grant stays) and you should reserve the extra separately with "
                     "reserve_memory, which queues fairly. Growing a queued request moves it to the back of the queue. "
                     "To end a reservation use release_memory.",
-     "inputSchema": {"type": "object", "required": ["id"], "properties": {
+     "inputSchema": {"type": "object", "required": ["id"], "additionalProperties": False, "properties": {
          "id": {"type": "string", "description": "the reservation's id, e.g. r12"},
          "gb": {"type": "number", "exclusiveMinimum": 0, "description": "new size in GB"},
          "ttl_min": {"type": "integer", "minimum": 1, "maximum": 480, "description": "expire this many minutes from now"},
@@ -2837,8 +2971,9 @@ MCP_TOOLS = [
          "timeout_s": {"type": "integer", "minimum": 5, "maximum": 300, "default": 120},
          "min_free_gb": {"type": "number", "minimum": 0, "default": 0}}}},
     {"name": "incidents",
-     "description": "Recorded memory incidents (needs the oomph daemon): id, start, triggers, peak swap, minimum free "
-                    "disk, jetsam kills. Use after unexplained process deaths or an 'out of application memory' dialog.",
+     "description": "Recorded memory incidents (needs the %s daemon): id, start, triggers, peak swap, minimum free "
+                    "disk, jetsam kills. Use after unexplained process deaths or an 'out of application memory' "
+                    "dialog." % BRAND,
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 10}}}},
     {"name": "incident",
      "description": "Full summary of one incident ('latest' or an id): timeline facts, biggest risers, processes and "
@@ -2847,7 +2982,35 @@ MCP_TOOLS = [
 ]
 
 
+class ToolArgError(ValueError):
+    """A tool call's arguments don't fit its schema; the caller gets an error result saying so."""
+
+
+_MCP_NEEDS = {"reserve_memory": ("gb",)}  # purpose is asked for, but a call without it is "unspecified"
+
+
+def _mcp_args(name, a):
+    """Refuses what the tool's schema doesn't allow: a missing argument the call can't do without,
+    or, where the schema closes it (the reservation tools), one it doesn't know. A client written
+    for a newer oomph that sends `cpu` is told so instead of having its request read as memory
+    alone. A re-poll with {gb, ticket} and no purpose keeps working as it always has."""
+    tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
+    if tool is None:
+        raise KeyError(name)
+    if not isinstance(a, dict):
+        raise ToolArgError("%s takes an object of arguments" % name)
+    sch = tool["inputSchema"]
+    missing = [k for k in _MCP_NEEDS.get(name, sch.get("required", ())) if k not in a]
+    if missing:
+        raise ToolArgError("%s needs %s" % (name, ", ".join(missing)))
+    extra = sorted(k for k in a if k not in sch["properties"]) if sch.get("additionalProperties") is False else []
+    if extra:
+        raise ToolArgError("%s takes no argument %s (it takes %s)" % (
+            name, ", ".join(extra), ", ".join(sch["properties"])))
+
+
 def _mcp_call(name, a):
+    _mcp_args(name, a)
     if name == "memory_check":
         return checked_verdict()
     if name == "reserve_memory":
@@ -2888,7 +3051,7 @@ def _mcp_call(name, a):
         ident = a.get("id", "latest")
         inc = (incs[-1] if incs else None) if ident == "latest" else next((i for i in incs if i["id"] == ident), None)
         if not inc:
-            return {"error": "no such incident (is the oomph daemon installed?)"}
+            return {"error": "no such incident (is the %s daemon installed?)" % BRAND}
         out = dict(inc)
         out["report_html"] = os.path.join(inc["dir"], "report.html")
         return out
@@ -2917,8 +3080,8 @@ def cmd_mcp():
             if method == "initialize":
                 result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
                           "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "oomph", "version": VERSION},
-                          "instructions": "oomph reports this Mac's memory, swap and disk, and coordinates memory between "
+                          "serverInfo": {"name": CMD, "title": BRAND, "version": VERSION},
+                          "instructions": BRAND + " reports this Mac's memory, swap and disk, and coordinates memory between "
                                           "Claude sessions and other agents. Before memory-heavy work call "
                                           "reserve_memory with the work's estimated peak (reservation_history shows "
                                           "what similar work really needed); start only when granted. Shrink or "
@@ -2936,7 +3099,7 @@ def cmd_mcp():
                 except KeyError:
                     send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown tool"}})
                     continue
-                except LedgerError as e:  # busy, or refused: say so plainly
+                except (LedgerError, ToolArgError) as e:  # busy, refused, or arguments it can't take: say so plainly
                     result = {"content": [{"type": "text", "text": "oomph: %s" % e}], "isError": True}
                 except Exception as e:
                     result = {"content": [{"type": "text", "text": "oomph error: %r" % e}], "isError": True}
@@ -2951,8 +3114,8 @@ def cmd_mcp():
 
 # ------------------------------------------------------------ claude setup
 def _skill_source():
-    for p in (os.path.join(HERE, "skills", "oomph", "SKILL.md"),                 # installed / app bundle
-              os.path.join(os.path.dirname(HERE), "skills", "oomph", "SKILL.md")):  # repo checkout
+    for p in (os.path.join(HERE, "skills", CMD, "SKILL.md"),                 # installed / app bundle
+              os.path.join(os.path.dirname(HERE), "skills", CMD, "SKILL.md")):  # repo checkout
         if os.path.exists(p):
             return p
     return None
@@ -2961,7 +3124,7 @@ def _skill_source():
 def cmd_setup_claude(args):
     import shutil
     home = os.path.expanduser("~")
-    dest_dir = os.path.join(home, ".claude", "skills", "oomph")
+    dest_dir = os.path.join(home, ".claude", "skills", CMD)
     settings = os.path.join(home, ".claude", "settings.json")
     me = "/usr/local/bin/oomph" if os.path.exists("/usr/local/bin/oomph") else os.path.realpath(__file__)
     claude = shutil.which("claude")
@@ -2974,7 +3137,7 @@ def cmd_setup_claude(args):
             cfg = {}
         hooks = cfg.setdefault("hooks", {})
         post = [h for h in hooks.get("PostToolUse", [])
-                if not any(x.get("command", "").endswith(" hook") and "oomph" in x.get("command", "")
+                if not any(x.get("command", "").endswith(" hook") and CMD in x.get("command", "")
                            for x in h.get("hooks", []))]
         if add:
             post.append({"matcher": "Bash", "hooks": [{"type": "command", "command": hook_cmd, "timeout": 10}]})
@@ -2995,7 +3158,7 @@ def cmd_setup_claude(args):
         shutil.rmtree(dest_dir, ignore_errors=True)
         print("removed skill   %s" % dest_dir)
         if claude:
-            subprocess.run([claude, "mcp", "remove", "oomph", "--scope", "user"], capture_output=True)
+            subprocess.run([claude, "mcp", "remove", CMD, "--scope", "user"], capture_output=True)
             print("removed MCP     oomph (user scope)")
         edit_settings(False)
         print("removed hook    (if it was installed) from %s" % settings)
@@ -3009,8 +3172,8 @@ def cmd_setup_claude(args):
     shutil.copy(src, os.path.join(dest_dir, "SKILL.md"))
     print("installed skill %s/SKILL.md" % dest_dir)
     if claude:
-        subprocess.run([claude, "mcp", "remove", "oomph", "--scope", "user"], capture_output=True)
-        r = subprocess.run([claude, "mcp", "add", "--scope", "user", "oomph", "--", me, "mcp"],
+        subprocess.run([claude, "mcp", "remove", CMD, "--scope", "user"], capture_output=True)
+        r = subprocess.run([claude, "mcp", "add", "--scope", "user", CMD, "--", me, "mcp"],
                            capture_output=True, text=True)
         print(("registered MCP  oomph → %s mcp (user scope)" % me) if r.returncode == 0 else
               ("MCP registration failed: %s" % (r.stderr or r.stdout).strip()))
@@ -3033,7 +3196,7 @@ def main(argv):
 
 def _main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
-        print(__doc__.strip())
+        print(usage(__doc__))
         return 0
     c, rest = argv[0], argv[1:]
     if c == "status":
@@ -3088,10 +3251,10 @@ def _main(argv):
     if c == "html":
         return cmd_html(rest)
     if c == "version":
-        print(json.dumps({"version": VERSION, "commit": COMMIT, "hardening": HARDENING}) if "--json" in rest
-              else VERSION)
+        print(json.dumps({"version": VERSION, "commit": COMMIT, "brand": BRAND, "command": CMD,
+                          "hardening": HARDENING}) if "--json" in rest else VERSION)
         return 0
-    print(__doc__.strip())
+    print(usage(__doc__))
     return 2
 
 

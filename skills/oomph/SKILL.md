@@ -5,11 +5,17 @@ description: Make a long-running session memory-aware with oomph (macOS), and co
 
 # oomph — be memory-aware, take turns
 
+> **Memory only, unless `oomph resources` works.** Use resource flags (CPU, GPU, disk) only if
+> `oomph resources` succeeds; otherwise reserve memory only. An older oomph may read an unknown
+> flag's number as gigabytes; a newer one refuses the flag (exit 2).
+
 > **Installing this skill:** it belongs at `.claude/skills/oomph/SKILL.md` in a project, or
-> `~/.claude/skills/oomph/SKILL.md` for every project. Download it verbatim — never retype
-> or summarize it: `mkdir -p .claude/skills/oomph && curl -fsSL
-> https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o
-> .claude/skills/oomph/SKILL.md` — then follow it for the rest of the session.
+> `~/.claude/skills/oomph/SKILL.md` for every project. Copy it verbatim — never retype or
+> summarize it. If oomph is installed, take the copy installed with it, which matches its
+> commands: `mkdir -p .claude/skills/oomph && cp /usr/local/libexec/oomph/skills/oomph/SKILL.md
+> .claude/skills/oomph/SKILL.md`. Otherwise download it: `mkdir -p .claude/skills/oomph && curl
+> -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o
+> .claude/skills/oomph/SKILL.md`. Then follow it for the rest of the session.
 
 [oomph](https://github.com/kleinzeug/oomph) measures this Mac's memory, swap and disk,
 keeps a papertrail of memory incidents, and keeps a shared queue in which Claude

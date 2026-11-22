@@ -8,6 +8,8 @@ import SwiftUI
 let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
 /// The agents' coordination ledger (ledger.json) and its history log (reservations.jsonl).
 let ledgerDir = ProcessInfo.processInfo.environment["OOMPH_LEDGER_DIR"] ?? "/Users/Shared/oomph"
+let brand = "oomph"  // the product's name in prose and titles (oomph.py's BRAND; tools/brandlint.py)
+let descriptor = ": memory monitor"  // what the header says after the name
 let agentLabel = "local.oomph.menubar"
 let popupWidth: CGFloat = 480
 let statColumn: CGFloat = 96
@@ -75,12 +77,19 @@ enum Keychain {
     }
 }
 
-/// A prompt to paste into a Claude Code session. It downloads the skill verbatim with curl
-/// (a web fetch would hand the model a summary, not the file) and has the session follow it.
+/// The skill installed with the logger and the `oomph` command (install.sh puts it there).
+let installedSkill = "/usr/local/libexec/oomph/skills/oomph/SKILL.md"
+
+/// A prompt to paste into a Claude Code session. It copies the skill that was installed with the
+/// `oomph` command the session will run, so the two always match (`oomph setup-claude` does the
+/// same); only where no logger is installed does it download the one on GitHub's main verbatim
+/// with curl (a web fetch would hand the model a summary, not the file). Then the session follows it.
 func skillPrompt(allProjects: Bool) -> String {
     let dir = allProjects ? "~/.claude/skills/oomph" : ".claude/skills/oomph"
     let scope = allProjects ? "for all my projects" : "to this project"
-    return "Add the oomph memory skill \(scope): run `mkdir -p \(dir) && curl -fsSL \(skillURL) -o \(dir)/SKILL.md`, "
+    let get = FileManager.default.fileExists(atPath: installedSkill)
+        ? "cp \(installedSkill) \(dir)/SKILL.md" : "curl -fsSL \(skillURL) -o \(dir)/SKILL.md"
+    return "Add the oomph skill \(scope): run `mkdir -p \(dir) && \(get)`, "
         + "then read \(dir)/SKILL.md and follow it for the rest of this session."
 }
 let agentPlist = NSHomeDirectory() + "/Library/LaunchAgents/\(agentLabel).plist"
@@ -649,7 +658,7 @@ final class Store: ObservableObject {
         busy = true
         DispatchQueue.global().async {
             var err: NSDictionary?
-            let src = "do shell script \"\(cmd)\" with prompt \"oomph needs administrator rights to install or remove its memory-logging daemon.\" with administrator privileges"
+            let src = "do shell script \"\(cmd)\" with prompt \"\(brand) needs administrator rights to install or remove its memory-logging daemon.\" with administrator privileges"
             let out = NSAppleScript(source: src)?.executeAndReturnError(&err)
             DispatchQueue.main.async {
                 self.busy = false
@@ -881,7 +890,7 @@ final class Store: ObservableObject {
         NSWorkspace.shared.openApplication(at: current, configuration: cfg) { [weak self] _, err in
             if let err {
                 DispatchQueue.main.async {
-                    self?.buildError = "Upgraded, but the relaunch failed (\(err.localizedDescription)). Quit oomph and open it again."
+                    self?.buildError = "Upgraded, but the relaunch failed (\(err.localizedDescription)). Quit \(brand) and open it again."
                 }
             }
         }
@@ -1984,7 +1993,7 @@ struct PopoverView: View {
         .onChange(of: store.aiError) { _, e in
             if let e { error = e; store.aiError = nil }
         }
-        .alert("oomph", isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
+        .alert(brand, isPresented: Binding(get: { error != nil }, set: { if !$0 { error = nil } })) {
             Button("OK") { error = nil }
         } message: { Text(error ?? "") }
     }
@@ -2010,7 +2019,7 @@ struct PopoverView: View {
             .tourAnchor("chip")
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    (Text("oomph").fontWeight(.bold) + Text(": memory monitor").fontWeight(.medium))
+                    (Text(brand).fontWeight(.bold) + Text(descriptor).fontWeight(.medium))
                         .font(.system(size: 14))
                     if let v = store.bundledVersion {
                         Text("v" + v).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
@@ -2379,7 +2388,7 @@ struct PopoverView: View {
             return (zone, [
                 TourNote(title: "Actions",
                          text: """
-                         **Deactivate** stops the background logger, **Activate** starts it; both ask for your password. **Check** asks GitHub for a newer oomph, and **Upgrade** builds and installs it.
+                         **Deactivate** stops the background logger, **Activate** starts it; both ask for your password. **Check** asks GitHub for a newer \(brand), and **Upgrade** builds and installs it.
                          **Report** opens an HTML report of the last 24 hours; **✦** adds an AI analysis to it. The **link** copies the oomph skill, so Claude sessions can check memory before heavy work.
                          **Launch at login** and **Quit** concern only this menu-bar app: the logger keeps recording.
                          """,
@@ -2503,22 +2512,22 @@ struct PopoverView: View {
             Button {} label: {
                 Text("Check").hidden().overlay(ProgressView().controlSize(.small).scaleEffect(0.6))
             }.disabled(true).focusable(false)
-                .help("Checking GitHub for a newer oomph…")
+                .help("Checking GitHub for a newer \(brand)…")
         case .check:
             Button("Check") { store.checkForUpgrade(manual: true) }
                 .focusable(false)
                 .help(store.upgradeCheckError.map { "The last check failed: \($0). Click to try again." }
-                      ?? "Check GitHub for a newer oomph (this is \(cur))" + lastChecked)
+                      ?? "Check GitHub for a newer \(brand) (this is \(cur))" + lastChecked)
                 .contextMenu { autoCheckToggle }
         case .upgrade:
             Button("Upgrade") { store.openUpgrade() }
                 .buttonStyle(.borderedProminent).focusable(false)
-                .help("oomph \(cur) is installed — \(store.availableVersion) is available. Click to see what's new.")
+                .help("\(brand) \(cur) is installed — \(store.availableVersion) is available. Click to see what's new.")
                 .contextMenu { autoCheckToggle }
         case .upToDate:
             Button("Up to date") {}
                 .disabled(true).focusable(false)
-                .help("oomph \(cur) is the newest version on GitHub")
+                .help("\(brand) \(cur) is the newest version on GitHub")
         }
     }
 
@@ -2530,7 +2539,7 @@ struct PopoverView: View {
     }
 
     var autoCheckToggle: some View {
-        Toggle("Check once a day when oomph opens", isOn: Binding(get: { store.upgradeAuto }, set: { store.upgradeAuto = $0 }))
+        Toggle("Check once a day when \(brand) opens", isOn: Binding(get: { store.upgradeAuto }, set: { store.upgradeAuto = $0 }))
     }
 
     static let isoIn = ISO8601DateFormatter()
@@ -2544,7 +2553,7 @@ struct PopoverView: View {
             VStack(alignment: .leading, spacing: 10) {
                 HStack(alignment: .firstTextBaseline) {
                     Image(systemName: "arrow.down.app").foregroundStyle(Color.accentColor)
-                    Text("Upgrade oomph").font(.system(size: 14, weight: .semibold))
+                    Text("Upgrade \(brand)").font(.system(size: 14, weight: .semibold))
                     Spacer()
                     Text("\(cur) → \(store.changelog.first?.version ?? store.availableVersion)")
                         .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
@@ -2568,7 +2577,7 @@ struct PopoverView: View {
                     Button("Cancel") { store.showChangelog = false }.keyboardShortcut(.cancelAction)
                     Spacer()
                     Button("Skip This Version") { store.skipThisVersion() }
-                        .help("Don't offer this version again when oomph checks by itself (Check still finds it)")
+                        .help("Don't offer this version again when \(brand) checks by itself (Check still finds it)")
                     Button("Upgrade Now") { store.upgradeNow() }
                         .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
                         .disabled(store.loadingChangelog || newCount == 0)
@@ -2652,7 +2661,7 @@ struct PopoverView: View {
                 .background(Color(nsColor: .textBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 5))
                 .onChange(of: store.buildLines.count) { _, n in if n > 0 { proxy.scrollTo(n - 1, anchor: .bottom) } }
             }
-            Text("When it's built, oomph replaces itself, restarts and updates the logger (one password prompt).")
+            Text("When it's built, \(brand) replaces itself, restarts and updates the logger (one password prompt).")
                 .font(.system(size: 10)).foregroundStyle(.tertiary)
         }
         .padding(14)
@@ -2843,7 +2852,7 @@ struct PopoverView: View {
         } else {
             Text(draftProvider == .ollama
                  ? "Reports are analysed on this Mac; nothing leaves it."
-                 : "AI reports send memory figures, process names and project paths from oomph's logs to \(draftProvider == .claude ? "Anthropic" : "OpenAI"). The key stays in your keychain.")
+                 : "AI reports send memory figures, process names and project paths from \(brand)'s logs to \(draftProvider == .claude ? "Anthropic" : "OpenAI"). The key stays in your keychain.")
                 .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -2922,7 +2931,7 @@ struct PopoverView: View {
             Spacer()
             Toggle("Launch at login", isOn: Binding(get: { store.launchAtLogin }, set: { store.setLaunchAtLogin($0) }))
                 .toggleStyle(.checkbox).font(.caption).lineLimit(1).fixedSize()
-                .help("Open oomph in the menu bar when you log in. The logger records either way.")
+                .help("Open \(brand) in the menu bar when you log in. The logger records either way.")
                 .tourAnchor("login")
             Button {
                 NSApp.terminate(nil)
@@ -3208,8 +3217,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let img = ChipIcon.make(running: running, pressure: p, label: label)
         item.button?.image = img
         item.button?.toolTip = running
-            ? "oomph — \(label ?? "?") physical memory free · pressure \(p.label)"
-            : "oomph — logging is OFF (click to activate)"
+            ? "\(brand) — \(label ?? "?") physical memory free · pressure \(p.label)"
+            : "\(brand) — logging is OFF (click to activate)"
     }
 }
 
@@ -3325,8 +3334,8 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
         store.showChangelog = true
     }
     if ai == "build" {
-        store.building = true; store.buildVersion = "1.5.0"; store.buildProgress = "Compiling oomph 1.5.0"
-        store.buildLines = ["==> Compiling oomph 1.5.0", "app/oomph.swift:42: note: building for macOS 14"]
+        store.building = true; store.buildVersion = "1.5.0"; store.buildProgress = "Compiling \(brand) 1.5.0"
+        store.buildLines = ["==> Compiling \(brand) 1.5.0", "app/oomph.swift:42: note: building for macOS 14"]
     }
     // `--ai tour:N` draws step N of the guided tour (1-based)
     let tour = ai.hasPrefix("tour:") ? Int(ai.dropFirst(5)).map { $0 - 1 } : nil

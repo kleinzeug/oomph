@@ -24,7 +24,7 @@ import oomph
 
 REPO = os.environ.get("OOMPH_REPO", "https://github.com/kleinzeug/oomph.git")
 HOME = os.path.expanduser("~")
-BASE = os.environ.get("OOMPH_UPGRADE_DIR", os.path.join(HOME, "Library", "Application Support", "oomph"))
+BASE = os.environ.get("OOMPH_UPGRADE_DIR", os.path.join(HOME, "Library", "Application Support", oomph.CMD))
 SRC = os.path.join(BASE, "src")
 STAGING = os.path.join(BASE, "staging")
 
@@ -164,7 +164,7 @@ def build(out=STAGING):
     version = describe("HEAD")
     shutil.rmtree(out, ignore_errors=True)
     os.makedirs(out, exist_ok=True)
-    emit(progress="Building oomph %s" % version, version=version)
+    emit(progress="Building %s %s" % (oomph.BRAND, version), version=version)
     p = subprocess.Popen(["/bin/bash", os.path.join(SRC, "build-app.sh"), out], cwd=SRC,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          env=dict(os.environ, OOMPH_NO_KILL="1"))
@@ -179,7 +179,7 @@ def build(out=STAGING):
     if p.wait() != 0:
         raise UpgradeError("the build failed:\n" + "\n".join(tail[-8:]))
     app = os.path.join(out, "oomph.app")
-    if not os.path.isfile(os.path.join(app, "Contents", "MacOS", "oomph")):
+    if not os.path.isfile(os.path.join(app, "Contents", "MacOS", oomph.CMD)):
         raise UpgradeError("the build produced no app")
     return app, version
 
@@ -202,10 +202,10 @@ def cmd_upgrade(args):
             if js:
                 print(json.dumps(r))
             elif r["newer"]:
-                print("oomph %s is available (this is %s) — oomph upgrade log, then upgrade from the app"
-                      % (r["available"], r["current"]))
+                print("%s %s is available (this is %s) — oomph upgrade log, then upgrade from the app"
+                      % (oomph.BRAND, r["available"], r["current"]))
             else:
-                print("oomph %s is up to date" % r["current"])
+                print("%s %s is up to date" % (oomph.BRAND, r["current"]))
             return 0
         if sub == "log":
             entries = log()
@@ -222,7 +222,7 @@ def cmd_upgrade(args):
             app, version = build(out)
             emit(done=app, version=version)
             return 0
-        print(__doc__.strip())
+        print(oomph.usage(__doc__))
         return 2
     except UpgradeError as e:
         if js or sub == "build":

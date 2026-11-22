@@ -21,7 +21,9 @@ import sys
 import threading
 import time
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The real directory, not /usr/local/libexec/oomph: that is a link that the next install
+# swaps, and this process keeps importing from the version it started from.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import oomph  # noqa: E402  (shared paths + HTML/summary rendering)
 
 VERSION = oomph.VERSION

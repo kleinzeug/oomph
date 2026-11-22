@@ -155,8 +155,13 @@ system daemons that are often the ones growing.
 Click the icon → **Activate** and enter your administrator password once. That runs the
 bundled `install.sh`, which:
 
-- copies `oomphd.py` and `oomph.py` to `/usr/local/libexec/oomph/` (root-owned, so
-  nothing user-writable ever runs as root),
+- copies `oomphd.py` and `oomph.py` to `/usr/local/libexec/oomph-<version>/` (root-owned,
+  so nothing user-writable ever runs as root) and, once that is complete, points the link
+  `/usr/local/libexec/oomph` at it in one step: a process that is running keeps the version
+  it started with, and versions replaced more than 7 days ago are removed (restart an MCP
+  server that has been running for longer than that),
+- makes `/usr/local/libexec` and `/usr/local/bin` root's (755) if they weren't, so nobody else
+  can swap what the daemon runs; a tool that wrote there as your user then needs `sudo`,
 - installs and starts the LaunchDaemon `local.oomph.daemon`,
 - links the `oomph` command into `/usr/local/bin`.
 
@@ -167,8 +172,8 @@ sudo ./install.sh
 ```
 
 Re-running it updates an existing installation. **Deactivate** in the popup, or
-`sudo ./uninstall.sh`, removes the daemon and keeps the logs;
-`sudo ./uninstall.sh --purge` removes the logs too. To remove the app, quit it and
+`sudo ./uninstall.sh`, removes the daemon and every installed version and keeps the logs;
+`sudo ./uninstall.sh --purge` removes the logs and the settings too. To remove the app, quit it and
 delete `oomph.app` (and `~/Library/LaunchAgents/local.oomph.menubar.plist` if you
 turned on launch at login).
 
@@ -259,12 +264,19 @@ while they fit and one after another when they don't.
 `~/.claude/skills/oomph`):
 
 ```
-Add the oomph memory skill to this project: run `mkdir -p .claude/skills/oomph && curl -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o .claude/skills/oomph/SKILL.md`, then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.
+Add the oomph skill to this project: run `mkdir -p .claude/skills/oomph && cp /usr/local/libexec/oomph/skills/oomph/SKILL.md .claude/skills/oomph/SKILL.md`, then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.
 ```
 
-The skill is downloaded verbatim with `curl` on purpose: a web fetch hands the model a
-summary of the page, not the file. Commit `.claude/skills/oomph/` and every session in
-that repo has it.
+The skill travels with the command: the prompt copies the one installed with the logger, so
+it describes exactly the `oomph` the session will run. Without an installed logger it
+downloads the skill on `main` verbatim with `curl` instead (a web fetch would hand the model
+a summary of the page, not the file):
+
+```
+Add the oomph skill to this project: run `mkdir -p .claude/skills/oomph && curl -fsSL https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md -o .claude/skills/oomph/SKILL.md`, then read .claude/skills/oomph/SKILL.md and follow it for the rest of this session.
+```
+
+Commit `.claude/skills/oomph/` and every session in that repo has it.
 
 **For every session**, once:
 
@@ -369,13 +381,24 @@ session B  → granted r8, tests start
 | `/Library/Logs/oomph/samples-YYYY-MM-DD.jsonl[.gz]` | one sample per line; older days compressed; kept 14 days |
 | `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications |
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
-| `/usr/local/libexec/oomph/` | the installed daemon and CLI |
-| `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job |
+| `/usr/local/libexec/oomph/` | a link to the installed daemon and CLI, `/usr/local/libexec/oomph-<version>/` |
+| `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job (replaced by every install) |
+| `/Library/Application Support/oomph/config.json` | settings that survive updates (optional, see below) |
 | `/Users/Shared/oomph/ledger.json` | the sessions' memory reservations and the last 100 finished ones (shared by all users; advisory) |
 | `/Users/Shared/oomph/reservations.jsonl` | every reservation edit and finished reservation, one JSON record per line; kept 14 days |
 
 All in, that is roughly 50–150 MB of logs. The daemon itself uses about 25 MB of
 memory and no measurable CPU.
+
+### Settings
+
+Switches that should survive updates go into `/Library/Application Support/oomph/config.json`,
+a JSON object that no install or upgrade writes: `{"<switch>": value}`, the switch's name
+without `OOMPH_` and in lower case. An `OOMPH_<SWITCH>` variable in the environment takes
+precedence. The file is read only if it and its folder belong to root and nobody else can
+write them (`sudo mkdir -p "/Library/Application Support/oomph"`, then edit the file with
+`sudo`); otherwise it is ignored. No switch needs it yet; the ones coming (such as
+`OOMPH_IOREPORT`) will be read from it.
 
 ### Privacy
 
@@ -397,6 +420,8 @@ build-app.sh                      builds oomph.app and bundles the daemon + scri
 install.sh / uninstall.sh         install or remove the daemon (run as root)
 skills/oomph/SKILL.md             the Claude skill (raw link above)
 tools/selftest.py                 unprivileged end-to-end check of daemon + CLI (also run by CI)
+tools/roottest.py                 the same for what only root can show (CI runs it with sudo)
+tools/brandlint.py                keeps the product's name (BRAND) apart from the command and paths
 DESIGN.md                         the investigation and the design decisions
 docs/index.html                   the website (GitHub Pages, served from /docs)
 ```

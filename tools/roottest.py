@@ -378,6 +378,70 @@ st = os.lstat(os.path.join(p, "ledger.json"))
 check(not REAL or st.st_uid == NOBODY, "dead holder: the daemon's child wrote as nobody (uid %d)" % st.st_uid)
 no_hits("dead holder")
 
+# 9. the root-owned configuration file: read only when root's and nobody else's
+cfgd = os.path.join(base, "config")
+os.mkdir(cfgd)
+os.chmod(cfgd, 0o755)
+cfg = os.path.join(cfgd, "config.json")
+open(cfg, "w").write('{"ioreport": true}')
+os.chmod(cfg, 0o644)
+check(oomph.read_config(cfg) == ({"ioreport": True} if REAL else {}),
+      "config: %s" % ("root's file is read" if REAL else "a file root doesn't own is ignored"))
+if REAL:
+    cases = []
+    os.chmod(cfg, 0o664)
+    cases.append(oomph.read_config(cfg))  # group-writable
+    os.chmod(cfg, 0o644)
+    os.chown(cfg, USER or NOBODY, -1)
+    cases.append(oomph.read_config(cfg))  # someone else's
+    os.chown(cfg, 0, -1)
+    os.chmod(cfgd, 0o777)
+    cases.append(oomph.read_config(cfg))  # in a folder others can write
+    os.chmod(cfgd, 0o755)
+    os.rename(cfg, cfg + ".real")
+    os.symlink(cfg + ".real", cfg)
+    cases.append(oomph.read_config(cfg))  # a link
+    os.remove(cfg)
+    os.mkfifo(cfg, 0o644)
+    t = time.time()
+    cases.append(oomph.read_config(cfg))  # a FIFO
+    check(cases == [{}] * 5 and time.time() - t < 2,
+          "config: ignored when group-writable, someone else's, in a folder others can write, a link or a FIFO")
+
+# 10. install.sh as root into a throwaway prefix: everything root's, the old layout migrated
+#     (the real one, with launchd, runs in CI's "Install over 1.8.4" step)
+#     As root, a prefix someone else could change is refused: root's install follows no one's directory.
+if REAL:
+    loose = os.path.join(base, "loose")
+    os.mkdir(loose)
+    os.chmod(loose, 0o777)
+    r = subprocess.run(["/bin/bash", os.path.join(ROOT, "install.sh")], capture_output=True, text=True, timeout=60,
+                       env=dict(os.environ, OOMPH_INSTALL_ROOT=loose))
+    r2 = subprocess.run(["/bin/bash", os.path.join(ROOT, "uninstall.sh")], capture_output=True, text=True,
+                        timeout=60, env=dict(os.environ, OOMPH_INSTALL_ROOT=loose))
+    check(r.returncode == 1 and r2.returncode == 1 and os.listdir(loose) == [],
+          "install.sh/uninstall.sh as root refuse a prefix others can write")
+# root's all the way up (TMPDIR may be the sudoer's): a fresh folder in /private/tmp
+pfx = tempfile.mkdtemp(prefix="oomph-prefix-", dir="/private/tmp") if REAL else os.path.join(base, "prefix")
+lx = os.path.join(pfx, "usr", "local", "libexec")
+os.makedirs(os.path.join(lx, "oomph"))
+shutil.copy(os.path.join(ROOT, "daemon", "oomph.py"), os.path.join(lx, "oomph"))
+r = subprocess.run(["/bin/bash", os.path.join(ROOT, "install.sh")], capture_output=True, text=True, timeout=120,
+                   env=dict(os.environ, OOMPH_INSTALL_ROOT=pfx))
+target = os.readlink(os.path.join(lx, "oomph")) if os.path.islink(os.path.join(lx, "oomph")) else ""
+paths = [os.path.join(dp, x) for dp, dn, fn in os.walk(os.path.join(lx, target)) for x in dn + fn] if target else []
+bad = [x for x in paths + [os.path.join(lx, "oomph"), os.path.join(lx, target)]
+       if os.lstat(x).st_uid != os.getuid() or stat.S_IMODE(os.lstat(x).st_mode) & 0o022]
+check(r.returncode == 0 and target.startswith("oomph-") and paths and not bad and
+      len([x for x in os.listdir(lx) if x.startswith("oomph-")]) == 2,
+      "install.sh: a complete version directory behind the link, owned by uid %d and writable by nobody else%s"
+      % (os.getuid(), " — " + (r.stderr.strip()[-200:] or str(bad[:3])) if r.returncode or bad else ""))
+r = subprocess.run(["/bin/bash", os.path.join(ROOT, "uninstall.sh")], capture_output=True, text=True, timeout=60,
+                   env=dict(os.environ, OOMPH_INSTALL_ROOT=pfx))
+check(r.returncode == 0 and os.listdir(lx) == [], "uninstall.sh: every version and the link removed")
+if REAL:
+    shutil.rmtree(pfx, ignore_errors=True)
+
 if not REAL:
     print("dry run: real root, user switching and the file owners are checked only under sudo")
 shutil.rmtree(base, ignore_errors=True)

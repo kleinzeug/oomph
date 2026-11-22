@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 import time
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["OOMPH_DIR"] = tempfile.mkdtemp(prefix="oomph-selftest-")
@@ -135,6 +135,8 @@ for args in (["status"], ["report", "--last", "10m"], ["incidents"], ["incident"
     check(rc == 0 and buf.getvalue().strip(), "oomph %s" % " ".join(args))
 html = open(os.path.join(LOG, "adhoc.html")).read()
 check(html.count("<svg") >= 3, "HTML report contains its charts")
+check("by %s %s</p>" % (oomph.BRAND, oomph.VERSION) in html and "id=oomph-data" in html,
+      "HTML report: the footer names BRAND, the data element keeps its id")
 import re  # noqa: E402
 blob = re.search(r'<script type="application/json" id=oomph-data>(.*?)</script>', html, re.S)
 rd = json.loads(blob.group(1).replace("<\\/", "</")) if blob else {}
@@ -150,10 +152,16 @@ check([v[0] for v in views] == ["24h", "6h", "1h"], "a 24h report switches betwe
 v = oomph.verdict(oomph.sample(with_procs=False))
 check(v["level"] in oomph.LEVELS and v["exit_code"] == oomph.LEVELS.index(v["level"]),
       "oomph check: %s, %.1fG free" % (v["level"], v["free_gb"]))
-fake = dict(oomph.live_sample(with_procs=False), pressure=2, disk_free_gb=9.8)
+# fixed numbers, not this Mac's: 36 GB RAM, 10 GB free, empty swap (live swap could be full)
+fixed = {"ram_gb": 36.0, "app_gb": 20.0, "wired_gb": 4.0, "compressed_gb": 2.0, "swap_used_gb": 0.0,
+         "swap_total_gb": 0.0, "jetsam_kills": 0, "unowned_gb": 2.0, "pressure": 1, "disk_free_gb": 60.0}
+check(oomph.verdict(fixed)["level"] == "ok", "verdict: ok with 10 GB free, normal pressure, 60 GB disk")
+fake = dict(fixed, pressure=2, disk_free_gb=9.8)
 check(oomph.verdict(fake)["level"] == "tight", "verdict escalates to tight on WARN pressure / low disk")
 fake.update(pressure=4)
 check(oomph.verdict(fake)["level"] == "critical", "verdict escalates to critical on CRITICAL pressure")
+check(oomph.verdict(dict(fixed, swap_used_gb=7.5, swap_total_gb=8.0, disk_free_gb=12.0))["level"] == "critical",
+      "verdict: full swap on a disk too full to grow it is critical")
 ses = oomph.find_session()
 check(ses is None or ses["total_mb"] >= 0, "oomph session: %s" % ("not under Claude" if ses is None else "pid %s" % ses["pid"]))
 
@@ -606,6 +614,210 @@ check(res8.get("status") == "gone", "MCP update_reservation (unknown id: %s)" % 
 res9 = json.loads(resp.get(9, {}).get("result", {}).get("content", [{}])[0].get("text", "{}"))
 check(res9.get("reservations") and all("amend" in x["purpose"] for x in res9["reservations"]),
       "MCP reservation_history, filtered by purpose (%d)" % len(res9.get("reservations") or []))
+
+# --- N1: one name for people (BRAND), one for machines (CMD, paths, labels), kept apart
+src = {f: open(os.path.join(ROOT, "daemon", f)).read() for f in ("oomph.py", "oomph_upgrade.py", "oomphd.py")}
+check(oomph.CMD == "oomph" and 'LOG_DIR = os.environ.get("OOMPH_DIR", "/Library/Logs/oomph")' in src["oomph.py"] and
+      'LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR", "/Users/Shared/oomph")' in src["oomph.py"] and
+      oomph.SKILL_URL == "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md" and
+      'os.environ.get("OOMPH_REPO", "https://github.com/kleinzeug/oomph.git")' in src["oomph_upgrade.py"] and
+      'CONFIG_FILE = "/Library/Application Support/oomph/config.json"' in src["oomph.py"],
+      "identifiers frozen: CMD, log and ledger directories, skill URL, upgrade repository, config file")
+check('"_ledger-refresh"' in src["oomph.py"] and "_ledger-refresh refuses to run as root" in src["oomph.py"] and
+      "os.path.realpath(__file__)" in src["oomphd.py"], "the hidden ledger command, its root fence, oomphd's real path")
+buf = io.StringIO()
+with redirect_stdout(buf):
+    oomph.main([])
+first = buf.getvalue().splitlines()[0]
+saved_brand = oomph.BRAND
+oomph.BRAND = "oompire"
+other = oomph.usage(oomph.__doc__).splitlines()
+oomph.BRAND = saved_brand
+check(first.startswith(oomph.BRAND + " — ") and other[0].startswith("oompire — ") and
+      other[1:] == oomph.__doc__.strip().splitlines()[1:], "help: the first word is BRAND, the commands stay `oomph`")
+for args, want in ((["version"], oomph.VERSION + "\n"), (["version", "--json"], None)):
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        oomph.main(args)
+    if want:
+        check(buf.getvalue() == want, "oomph version prints exactly the version")
+    else:
+        vj = json.loads(buf.getvalue())
+        check(set(vj) == {"version", "commit", "brand", "command", "hardening"} and vj["command"] == "oomph" and
+              vj["brand"] == oomph.BRAND, "oomph version --json: version, commit, brand, command, hardening")
+init = resp.get(1, {}).get("result", {}).get("serverInfo", {})
+check(init.get("name") == "oomph" and init.get("title") == oomph.BRAND, "MCP serverInfo: name oomph, title BRAND")
+check(sorted(names) == sorted(["memory_check", "reserve_memory", "release_memory", "update_reservation", "reservations",
+                               "reservation_history", "my_session", "memory_status", "wait_for_memory", "incidents",
+                               "incident"]), "MCP tool names frozen")
+skill = open(os.path.join(ROOT, "skills", "oomph", "SKILL.md")).read()
+check(skill.startswith("---\nname: oomph\n") and "`oomph resources` succeeds" in skill[:1200],
+      "SKILL.md: name oomph; its first lines say resource flags only if `oomph resources` succeeds")
+bl = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "brandlint.py")], capture_output=True,
+                    text=True, timeout=60)
+check(bl.returncode == 0, "brandlint: prose and identifiers kept apart (%s)" % bl.stdout.strip().splitlines()[-1:])
+
+# --- strict options: an option this oomph doesn't know is refused, never taken for gigabytes
+oomph._sample_override = lambda: dict(fixed)
+n_before = len(oomph.read_ledger()["leases"])
+for args in (["reserve", "--cpu", "8", "5G", "--for", "x"], ["reserve", "5G", "8", "--for", "x"],
+             ["reserve", "5G", "--for"], ["reserve", "lots", "--for", "x"],
+             ["amend", "r1", "--gb", "3G", "--cpu", "2"], ["release", "r1", "r2"], ["release", "--all"],
+             ["run", "--reserve", "1G", "--cpu", "2", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
+             ["run", "--reserve", "1G", "8", "--", "/usr/bin/touch", os.path.join(LOG, "ran")]):
+    out, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = oomph.main(args)
+    check(rc == 2 and "usage: oomph %s" % args[0] in err.getvalue() and
+          ("unknown option" in err.getvalue() or "unexpected argument" in err.getvalue() or
+           "needs a value" in err.getvalue() or "not a size" in err.getvalue()),
+          "strict: `oomph %s` exits 2 (%s)" % (" ".join(args), err.getvalue().splitlines()[0] if err.getvalue() else rc))
+check(len(oomph.read_ledger()["leases"]) == n_before and not os.path.exists(os.path.join(LOG, "ran")),
+      "strict: nothing was reserved and nothing ran")
+oomph._sample_override = None
+reqs2 = [reqs[0], reqs[1]] + [
+    {"jsonrpc": "2.0", "id": 20 + i, "method": "tools/call", "params": {"name": n, "arguments": a}}
+    for i, (n, a) in enumerate((("reserve_memory", {"gb": 1, "purpose": "x", "cpu": 8}),
+                                ("update_reservation", {"id": "r1", "gb_cpu": 2}),
+                                ("release_memory", {"id": "all", "force": True}),
+                                ("reserve_memory", {"purpose": "x"}),
+                                ("reserve_memory", {"gb": 0.1, "wait_s": 0}),
+                                ("release_memory", {"id": "all"})))]
+out = subprocess.run(["/usr/bin/python3", "-I", "-B", os.path.join(ROOT, "daemon", "oomph.py"), "mcp"],
+                     input="\n".join(json.dumps(r) for r in reqs2) + "\n", capture_output=True, text=True,
+                     env=dict(os.environ), timeout=60).stdout
+resp2 = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
+errs = [resp2.get(20 + i, {}).get("result", {}) for i in range(4)]
+check(all(e.get("isError") for e in errs) and "takes no argument cpu" in errs[0]["content"][0]["text"] and
+      "needs gb" in errs[3]["content"][0]["text"],
+      "MCP: the reservation tools refuse unknown and missing arguments (%s)" % [e.get("isError") for e in errs])
+ok2 = [resp2.get(24 + i, {}).get("result", {}) for i in range(2)]
+check(all(e and not e.get("isError") for e in ok2),
+      "MCP: reserve_memory without purpose still works, as \"unspecified\" (%s)" % [e.get("isError") for e in ok2])
+oomph._sample_override = lambda: dict(fixed)
+out, err = io.StringIO(), io.StringIO()
+with redirect_stdout(out), redirect_stderr(err):
+    rc = oomph.main(["reserve", "-1G", "--for", "x"])
+oomph._sample_override = None
+check(rc == 75 and "unknown option" not in err.getvalue() and "REFUSED" in out.getvalue(),
+      "strict: a negative size is the ledger's to refuse, with its advice (%s)" % (out.getvalue() or err.getvalue()).strip()[:80])
+check(all(t["inputSchema"].get("additionalProperties") is False for t in oomph.MCP_TOOLS
+          if t["name"] in ("reserve_memory", "update_reservation", "release_memory")),
+      "MCP: the reservation tools' schemas are closed")
+
+# --- the root-owned configuration file: anything not root's is ignored
+cfgd = tempfile.mkdtemp(prefix="oomph-config-")
+cfg = os.path.join(cfgd, "config.json")
+open(cfg, "w").write('{"ioreport": true}')
+os.chmod(cfg, 0o644)
+check(oomph.read_config(cfg) == ({"ioreport": True} if os.geteuid() == 0 else {}),
+      "config: a file root doesn't own is ignored")
+check(oomph.read_config(os.path.join(cfgd, "missing.json")) == {} and oomph.read_config("/nonexistent/x.json") == {},
+      "config: a missing file is no configuration")
+os.environ["OOMPH_SELFTEST_SWITCH"] = "1"
+check(oomph.setting("selftest_switch", config={"selftest_switch": False}) == "1" and
+      oomph.setting("other", 5, config={"other": 7}) == 7 and oomph.setting("absent", 5, config={}) == 5,
+      "config: OOMPH_<NAME> beats the file, the file beats the default")
+os.environ.pop("OOMPH_SELFTEST_SWITCH")
+
+# --- side-by-side installs, into a throwaway prefix (install.sh's test mode: no root, no launchd)
+import shutil  # noqa: E402
+inst = tempfile.mkdtemp(prefix="oomph-install-")
+pfx = os.path.join(inst, "root")
+os.mkdir(pfx)
+
+
+def flat_source(name, version, skill_note):
+    """An app bundle's Resources folder, stamped with `version`."""
+    d = os.path.join(inst, name)
+    os.makedirs(os.path.join(d, "skills", "oomph"))
+    for f in ("oomphd.py", "oomph.py", "oomph_ai.py", "oomph_upgrade.py", "local.oomph.daemon.plist"):
+        shutil.copy(os.path.join(ROOT, "daemon", f), d)
+    for f in ("install.sh", "uninstall.sh"):
+        shutil.copy(os.path.join(ROOT, f), d)
+    open(os.path.join(d, "skills", "oomph", "SKILL.md"), "w").write(skill + skill_note)
+    with open(os.path.join(d, "oomphd.py"), "a") as f:  # says where it was imported from, when asked to
+        f.write('\nif __import__("os").environ.get("OOMPH_SELFTEST_IMPORTS"):\n'
+                '    open(__import__("os").environ["OOMPH_SELFTEST_IMPORTS"], "a").write(__file__ + "\\n")\n')
+    t = open(os.path.join(d, "oomph.py")).read().replace('VERSION = "dev"', 'VERSION = "%s"' % version, 1)
+    open(os.path.join(d, "oomph.py"), "w").write(t)
+    return d
+
+
+def sh(script, *args):
+    r = subprocess.run(["/bin/bash", script] + list(args), capture_output=True, text=True, timeout=120,
+                       env=dict(os.environ, OOMPH_INSTALL_ROOT=pfx))
+    return r.returncode, (r.stdout + r.stderr).strip()
+
+
+lx = os.path.join(pfx, "usr", "local", "libexec")
+lib, binp = os.path.join(lx, "oomph"), os.path.join(pfx, "usr", "local", "bin", "oomph")
+os.makedirs(lib)  # the old layout: a real directory, as installed by 1.8.4 and before
+os.makedirs(os.path.dirname(binp))
+old = open(os.path.join(ROOT, "daemon", "oomph.py")).read().replace('VERSION = "dev"', 'VERSION = "1.8.4"', 1)
+open(os.path.join(lib, "oomph.py"), "w").write(old)
+os.symlink(os.path.join(lib, "oomph.py"), binp)
+A, B = flat_source("A", "1.8.5", ""), flat_source("B", "1.8.6", "\n<!-- installed with 1.8.6 -->\n")
+rc, msg = sh(os.path.join(A, "install.sh"))
+ls = lambda: sorted(os.listdir(lx))  # noqa: E731
+ver = lambda: subprocess.run([binp, "version"], capture_output=True, text=True, timeout=30).stdout.strip()  # noqa: E731
+check(rc == 0 and os.readlink(lib) == "oomph-1.8.5" and ls() == ["oomph", "oomph-1.8.4", "oomph-1.8.5"] and
+      ver() == "1.8.5" and os.path.realpath(binp) == os.path.join(os.path.realpath(lx), "oomph-1.8.5", "oomph.py"),
+      "install over the old layout: the real directory moves aside, the link points at the new version (%s)"
+      % (msg.splitlines()[-1:] if rc == 0 else msg[-300:]))
+rc, msg = sh(os.path.join(A, "install.sh"))
+check(rc == 0 and os.readlink(lib) == "oomph-1.8.5" and ls() == ["oomph", "oomph-1.8.4", "oomph-1.8.5"],
+      "install again: the same files are reused, nothing new")
+os.mkdir(os.path.join(lx, "oomph-1.8.5", "__pycache__"))  # as `sudo oomph …` may leave
+os.symlink("oomph-gone", os.path.join(lx, ".oomph.link.99999"))  # an interrupted swap's
+os.symlink("gone", os.path.join(os.path.dirname(binp), ".oomph.link.99999"))
+rc, msg = sh(os.path.join(A, "install.sh"))
+check(rc == 0 and os.readlink(lib) == "oomph-1.8.5" and ls() == ["oomph", "oomph-1.8.4", "oomph-1.8.5"] and
+      os.listdir(os.path.dirname(binp)) == ["oomph"],
+      "install again with a bytecode cache in the current version: still nothing new, leftover links removed (%s)" % ls())
+# a process started through the link imports from the version directory it resolved, and keeps it
+here_a = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", "import sys; sys.path.insert(0, sys.argv[1]); "
+                         "import oomph; print(oomph.HERE)", lib], capture_output=True, text=True, timeout=30).stdout.strip()
+imports = os.path.join(inst, "imports")
+mcp = subprocess.Popen([binp, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                       env=dict(os.environ, OOMPH_SELFTEST_IMPORTS=imports))
+mcp.stdin.write(json.dumps(reqs[0]) + "\n")
+mcp.stdin.flush()
+init = json.loads(mcp.stdout.readline() or "{}")  # it has answered, so it has resolved where it runs from
+rc, msg = sh(os.path.join(B, "install.sh"))
+st_a = os.stat(os.path.join(lx, "oomph-1.8.5"))
+check(rc == 0 and os.readlink(lib) == "oomph-1.8.6" and ver() == "1.8.6" and here_a.endswith("/oomph-1.8.5") and
+      os.path.exists(os.path.join(here_a, "oomphd.py")) and time.time() - st_a.st_mtime < 120,
+      "install a newer version: one rename switches; the version a running process started from stays, "
+      "dated when it was replaced")
+out = mcp.communicate("\n".join(json.dumps(r) for r in (reqs[1], {
+    "jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "reservations", "arguments": {}}})) + "\n",
+    timeout=60)[0]
+got = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
+imported = open(imports).read().split() if os.path.exists(imports) else []
+check(init.get("result", {}).get("serverInfo", {}).get("version") == "1.8.5" and
+      not got.get(3, {}).get("result", {}).get("isError", True) and imported and
+      all(os.path.dirname(x) == os.path.join(os.path.realpath(lx), "oomph-1.8.5") for x in imported),
+      "an MCP server started before the install still answers, as the version it started as, "
+      "and imports later from its own directory (%s)" % [os.path.basename(os.path.dirname(x)) for x in imported])
+for n in ("oomph-1.8.4", "oomph-1.8.5", "oomph-1.8.6"):
+    os.utime(os.path.join(lx, n), (time.time() - 8 * 86400,) * 2)
+os.utime(os.path.join(lx, "oomph-1.8.5"), (time.time() - 6 * 86400,) * 2)
+rc, msg = sh(os.path.join(B, "install.sh"))
+check(rc == 0 and ls() == ["oomph", "oomph-1.8.5", "oomph-1.8.6"],
+      "versions replaced more than 7 days ago are removed, the current one never (%s)" % ls())
+home = os.path.join(inst, "home")
+os.mkdir(home)
+r = subprocess.run([binp, "setup-claude"], capture_output=True, text=True, timeout=60,
+                   env=dict(os.environ, HOME=home, PATH="/usr/bin:/bin"))
+got = os.path.join(home, ".claude", "skills", "oomph", "SKILL.md")
+check(r.returncode == 0 and os.path.exists(got) and open(got).read().endswith("<!-- installed with 1.8.6 -->\n"),
+      "setup-claude installs the SKILL.md installed with this oomph, not main's")
+rc, msg = sh(os.path.join(B, "uninstall.sh"), "--purge")
+left = [os.path.join(dp, f) for dp, dn, fn in os.walk(pfx) for f in fn + [x for x in dn if os.path.islink(os.path.join(dp, x))]]
+check(rc == 0 and not left and not os.path.lexists(lib) and ls() == [], "uninstall removes every version and both links (%s)" % left)
+shutil.rmtree(inst, ignore_errors=True)
+shutil.rmtree(cfgd, ignore_errors=True)
 
 # --- AI report harness against a local mock of the Claude, OpenAI and Ollama APIs
 import http.server  # noqa: E402
