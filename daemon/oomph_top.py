@@ -1233,6 +1233,7 @@ def write_crash(sdir, text):
 
 # ------------------------------------------------------------------ the loop
 NAV = ("up", "down", "pgup", "pgdn", "home", "end")
+KEY_ALIASES = {"j": "down", "k": "up", "f1": "?", " ": "space"}   # the decoder gives a printable key as itself
 SPAN_WORDS = {"inf": "14 days", "24h": "24 h", "6h": "6 h", "1h": "1 h"}
 REPORT_LAST = {"inf": "14d", "24h": "24h", "6h": "6h", "1h": "1h"}
 
@@ -1658,7 +1659,7 @@ class App:
 
     def key(self, k):
         ui, m = self.ui, self.model_now()
-        k = {"j": "down", "k": "up", "f1": "?"}.get(k, k)
+        k = KEY_ALIASES.get(k, k)
         if k == "ctrl-c":
             self.quit = True
             return

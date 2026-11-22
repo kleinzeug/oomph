@@ -344,6 +344,13 @@ def tmux_oracle(frames):
 
 
 # ------------------------------------------------------------------ the selection, the lists, the panels
+def test_space_key():
+    """The space bar reaches the lists as "space": the decoder gives the character itself, the app's
+    aliases name it. (1.9.5 shipped without the alias, so space never moved the focus.)"""
+    keys = [T.KEY_ALIASES.get(k, k) for k in keys_of(decode([b" "]))]
+    check(keys == ["space"], "space bar: the key the app acts on is %r" % keys)
+
+
 def test_selection():
     base = tempfile.mkdtemp(prefix="oomph-toptest-sel-")
     try:
@@ -1329,6 +1336,7 @@ def main():
     frames = golden_frames()
     test_writer(frames)
     tmux_oracle(frames)
+    test_space_key()
     test_selection()
     test_inspect_mouse()
     test_arrays()

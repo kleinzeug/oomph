@@ -60,8 +60,13 @@ same() {  # same DIR1 DIR2: the same files (bytecode caches aside)
   [ -d "$2" ] && [ ! -L "$2" ] && /usr/bin/diff -r -x __pycache__ "$1" "$2" >/dev/null 2>&1
 }
 gitver() {  # tools/version.sh, as whoever ran sudo: git then neither balks at nor leaves root's files in their checkout
-  if [ "$(id -u)" = 0 ] && [ -n "${SUDO_UID:-}" ] && [ "${SUDO_UID:-0}" != 0 ]; then
-    /usr/bin/sudo -u "#$SUDO_UID" "$HERE/tools/version.sh" "$@" || "$HERE/tools/version.sh" "$@"
+  # (without sudo, as from the password dialog of `osascript … with administrator privileges`, as the checkout's owner)
+  u=${SUDO_UID:-}
+  if [ "$(id -u)" = 0 ] && { [ -z "$u" ] || [ "$u" = 0 ]; }; then
+    u=$(/usr/bin/stat -f %u "$HERE" 2>/dev/null || echo 0)
+  fi
+  if [ "$(id -u)" = 0 ] && [ -n "$u" ] && [ "$u" != 0 ]; then
+    /usr/bin/sudo -u "#$u" "$HERE/tools/version.sh" "$@" || "$HERE/tools/version.sh" "$@"
   else
     "$HERE/tools/version.sh" "$@"
   fi
