@@ -49,9 +49,12 @@ sudo timeout ${GUEST_MINUTES:-55}m qemu-system-x86_64 -enable-kvm -cpu host -m 2
   -drive if=none,id=out,file=out.raw,format=raw -device virtio-blk-pci,drive=out,serial=spikeout \
   -nic user,model=virtio-net-pci -device virtio-rng-pci \
   -serial file:console.log -no-reboot &
-QP=$!; seen=0
+QP=$!; seen=0; t0=$(date +%s)
 while kill -0 $QP 2>/dev/null; do   # progress: the guest prints one line per row to its serial console
-    sleep 30; n=$(sudo cat console.log 2>/dev/null | tr -d '\r' | grep -aE '^\[spike\]|^===== ROW|^VERDICT' | wc -l)
+    sleep 30
+    if [ $(( $(date +%s) - t0 )) -gt 420 ] && [ "$(sudo stat -c %s console.log 2>/dev/null || echo 0)" = 0 ]; then
+        echo "::warning title=guest $G::no serial output after 7 minutes; stopping the guest"; sudo pkill -f "qemu-system-x86_64 -enable-kvm" ; break; fi
+    n=$(sudo cat console.log 2>/dev/null | tr -d '\r' | grep -aE '^\[spike\]|^===== ROW|^VERDICT' | wc -l)
     [ "$n" -gt "$seen" ] && sudo cat console.log | tr -d '\r' | grep -aE '^\[spike\]|^===== ROW|^VERDICT' | tail -n $((n-seen)) | cut -c1-200; seen=$n
     # keep a copy of what the guest has written so far, so a timeout still leaves results
     mkdir -p "$OUTD/partial"; sudo tar -xf out.raw -C "$OUTD/partial" 2>/dev/null; sudo cp console.log "$OUTD/console.partial.log" 2>/dev/null
