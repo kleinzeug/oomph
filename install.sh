@@ -110,6 +110,10 @@ if [ -x "$HERE/tools/version.sh" ]; then
   VER=$(gitver); COMMIT=$(gitver --commit)
   /usr/bin/sed -i '' -e "s/^VERSION = \"dev\".*/VERSION = \"$VER\"/" -e "s/^COMMIT = \"\".*/COMMIT = \"$COMMIT\"/" "$NEW/oomph.py"
 fi
+# bytecode, once, as root: every command then imports instead of compiling, and oomph top starts again on
+# it (its 40 MB budget, roadmap 04 §4.9, holds only so). A cache that fails to build costs speed and memory,
+# not function.
+/usr/bin/python3 -I -m compileall -q "$NEW" >/dev/null 2>&1 || true
 if [ -f "$HERE/skills/oomph/SKILL.md" ]; then
   inst -d -m 755 "$NEW/skills" "$NEW/skills/oomph"
   inst -m 644 "$HERE/skills/oomph/SKILL.md" "$NEW/skills/oomph/SKILL.md"

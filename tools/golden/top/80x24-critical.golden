@@ -18,7 +18,7 @@
 │  □  8.0G  docker build api        atlas                        waiting 2 min │
 │  □  5.0G  cargo build --release   indexer                       waiting 40 s │
 │  ■  6.0G  gradle assembleDebug    atlas                using 4.1G · 18m left │
-│  ▾ 4 more                                                                    │
+│  ▾ 4 more                                                          ↓ scrolls │
 ├─ Incidents ────────────────────────────────────────── 1–2 of 4 in 90 days ▾ ─┤
 │  ● Fri 20 13:24  memory pressure critical               3 kills · open 3 min │
 │  ○ Fri 20 10:29  memory pressure critical                              7 min │
@@ -43,7 +43,7 @@ l....g.................g...1111111.......g.....555555555555555555555555555.....l
 l..3................................ddddd........................xxxxxxxxxxxxx.l
 l..6................................ddddddd.......................xxxxxxxxxxxx.l
 l..1................................ddddd................ddddddddddddddddddddd.l
-l..dddddddd....................................................................l
+l..dddddddd..........................................................fffffffff.l
 ll...........lllllllllllllllllllllllllllllllllllllllllldddddddddddddddddddddddll
 l..i...............dddddddddddddddddddddddd...............iiiiiiiiiiiiiiiiiiii.l
 l..f...............dddddddddddddddddddddddd..............................ddddd.l

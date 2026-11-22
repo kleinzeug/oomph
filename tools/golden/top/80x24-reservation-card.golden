@@ -1,0 +1,128 @@
+# oomph top golden frame v2 · 80x24 · scenario=default · span=24h glyphs=unicode color=256 · keys=down enter
+--- text
+ oomph  studio                                         3.3G free  Normal  13:27 
+ 15.2 GB     10.3 GB     7.2 GB   36 GB      0.0 / 0 GB   63 GB      0 s        
+ App memory  Compressed  Wired    RAM total  Swap / size  Free disk  Idle       
+╭─ ∞  24h  6h  1h ──── ■Wired ■App ■Compressed ■Swap ░away ╱no data ┃incident ─╮
+│ ╭─ Reservation ────────────────────────────────────────────────────────────╮G│
+│_│                                                                          │G│
+│▅│  □ 8.0 GB  docker build api                                              │ │
+│█│                                                                          │G│
+│█│  Project    /srv/proj/atlas                                              │ │
+│█│  Holder     Claude session (pid 1)                                       │ │
+│▇│  Waiting    40 s, first in the queue                                     │ │
+│ │  Needs      8.0 GB; 0.0 GB can be granted now                            │ │
+├─│             3.3 GB free, 6.3 GB still owed to grants, 1.8 GB margin      │─┤
+│ │  Ahead      nobody: it is granted as soon as it fits                     │G│
+│▃│  Holding    gradle assembleDebug 6G, pytest -n 8 4G, pnpm check 2G       │ │
+│›│  Requested  13:26:20 as r275                                             │ │
+│ │                                                                          │ │
+│ │  esc close  ↑↓ previous · next                                           │ │
+│ ╰──────────────────────────────────────────────────────────────────────────╯ │
+├─ Incidents ────────────────────────────────────────── 1–2 of 3 in 90 days ▾ ─┤
+│  ○ Fri 20 10:29  memory pressure critical                              7 min │
+│  ○ Thu 19 14:22  14 processes killed for memory in 60 s    14 kills · 28 min │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ esc close                                                   Logging every 30 s 
+--- fg
+.......ssssssss........................................ddddddddd.kkkkkkkk.ddddd.
+................................................................................
+.dddddddddd..dddddddddd..ddddd....ddddddddd..ddddddddddd..ddddddddd..dddd.......
+lldddsssssddddddddllll.wddddd.addd.cdddddddddd.pdddd.ddddd.hddddddd.idddddddd.ll
+l.dd.............ddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddl
+ldd..........................................................................d.l
+lcd..3.......................................................................d.l
+lcd..........................................................................ddl
+lad..ddddddd.................................................................d.l
+lad..dddddd..................................................................d.l
+lwd..ddddddd....xxxxxxxxxxxxxxxxxxxxxxxx.....................................d.l
+l.d..ddddd...................................................................d.l
+lld.............ddddddddddddddddddddddddddddddddddddddddddddddddddddddd......dll
+l.d..ddddd...................................................................dfl
+l0d..ddddddd.................................................................d.l
+lAd..ddddddddd...............................................................d.l
+l.d..........................................................................d.l
+l.d......ddddd.....ddddddddddddddd...........................................d.l
+l.dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd.l
+ll...........lllllllllllllllllllllllllllllllllllllllllldddddddddddddddddddddddll
+l..f...............dddddddddddddddddddddddd..............................ddddd.l
+l..f...............dddddddddddddddddddddddddddddddddddddd....iiiiiiiiiiidddddd.l
+llllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllllll
+.....ddddd...................................................ffffffffffffffffff.
+--- bg
+BBBBBBBSSSSSSSSBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBooooooooBBBBBBB
+................................................................................
+................................................................................
+..TTTSSSSSTTTTTTTT..............................................................
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+.aBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+.6BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+.RBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBR.
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+..BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB..
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+--- attr (1 bold, 2 reverse, 4 underline, 8 dim; hex sum)
+.11111.11111111..................................................11111111.......
+.1111111.....1111111.....111111...11111......1111111111...11111......111........
+................................................................................
+.....11111......................................................................
+....1111111111111...............................................................
+................................................................................
+.......111111111111111111111111.................................................
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+................................................................................
+.1..............................................................................
+................................................................................
+.....111........11..............................................................
+................................................................................
+..11111111111...................................................................
+................................................................................
+................................................................................
+................................................................................
+.111............................................................................
+--- mod (o no longer live)
+................................................................................
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oo............................................................................oo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo
+--- roles
+. = primary text (fg plane) / not painted (bg plane)  A=accent  a=app  B=bar  c=comp  d=dim  f=faint  h=hatch  i=incident  l=line  o=ok  k=onblock  0=r0  3=r3  6=r6  R=rowsel  S=sel  s=selfg  p=swap  T=trough  x=warntx  w=wired

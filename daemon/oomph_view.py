@@ -45,7 +45,7 @@ THEMES = {
         "grid": "#3A3A3A", "bar": "#262626", "wired": "#98989D", "app": "#0091FF", "comp": "#FF9230", "swap": "#FF4245",
         "incident": "#FF4245", "ok": "#30D158", "warn": "#FFD60A", "warntx": "#D78700", "crit": "#FF4245",
         "away": "#303031", "hatch": "#6C6C6C", "sel": "#5F5F5F", "selfg": "#FFFFFF", "trough": "#2B2B2B",
-        "accent": "#0091FF", "onblock": "#111111",
+        "accent": "#0091FF", "onblock": "#111111", "rowsel": "#3A3A3A",
         "r0": "#06AEB9", "r1": "#BF5AF2", "r2": "#E8507A", "r3": "#7A78F5", "r4": "#D69E00", "r5": "#AC8E68",
         "r6": "#4CB85C",
     },
@@ -54,7 +54,7 @@ THEMES = {
         "grid": "#E2E2E2", "bar": "#EEEEEE", "wired": "#8E8E93", "app": "#0088FF", "comp": "#FF8D28", "swap": "#FF383C",
         "incident": "#FF383C", "ok": "#1F8A3B", "warn": "#8A6A00", "warntx": "#8A6A00", "crit": "#C4262A",
         "away": "#EEEEEF", "hatch": "#A8A8A8", "sel": "#FFFFFF", "selfg": "#000000", "trough": "#E4E4E4",
-        "accent": "#0088FF", "onblock": "#FFFFFF",
+        "accent": "#0088FF", "onblock": "#FFFFFF", "rowsel": "#DCDCDC",
         "r0": "#12A5B0", "r1": "#A550E0", "r2": "#F04F78", "r3": "#5E5CE6", "r4": "#C89400", "r5": "#A2845E",
         "r6": "#34A853",
     },
@@ -64,7 +64,7 @@ ON_PAINT = ("ink", "selfg", "onblock")      # text colours that only make sense 
 ROLE_CODE = {None: ".", "fg": ".", "ink": "I", "dim": "d", "faint": "f", "line": "l", "grid": "g", "bar": "B",
              "trough": "T", "sel": "S", "selfg": "s", "wired": "w", "app": "a", "comp": "c", "swap": "p",
              "incident": "i", "ok": "o", "warn": "W", "warntx": "x", "crit": "C", "away": "y", "hatch": "h",
-             "accent": "A", "onblock": "k", "r0": "0", "r1": "1", "r2": "2", "r3": "3", "r4": "4", "r5": "5", "r6": "6"}
+             "accent": "A", "onblock": "k", "rowsel": "R", "r0": "0", "r1": "1", "r2": "2", "r3": "3", "r4": "4", "r5": "5", "r6": "6"}
 MOD_CODE = {"": ".", "off": "o"}
 # 16 colours: the index (0-7 normal, 8-15 bright) or None for the terminal's default. Whatever is a
 # block or a background is one of the eight base colours, so it works as SGR 40-47 too.
@@ -75,9 +75,9 @@ ROLE16 = {"fg": None, "ink": None, "selfg": None, "dim": 8, "faint": 8, "line": 
 # "name@off" is the muted palette of what is no longer live.
 PICK256 = {"dark": {"comp": 208, "ok": 41, "warn": 220, "warntx": 172, "swap": 203, "incident": 203, "r4": 178,
                     "ink": 253, "dim": 246, "faint": 242, "hatch": 242, "bar": 235, "trough": 236, "sel": 59,
-                    "wired@off": 243, "app@off": 67, "comp@off": 137, "swap@off": 131},
+                    "rowsel": 237, "wired@off": 243, "app@off": 67, "comp@off": 137, "swap@off": 131},
            "light": {"comp": 208, "ok": 28, "warn": 94, "warntx": 94, "swap": 203, "incident": 203, "away": 254,
-                     "bar": 255, "trough": 253, "sel": 231, "ink": 235, "dim": 243, "faint": 247, "hatch": 248,
+                     "bar": 255, "trough": 253, "sel": 231, "ink": 235, "dim": 243, "faint": 247, "hatch": 248, "rowsel": 253,
                      "wired@off": 247, "app@off": 110, "comp@off": 180, "swap@off": 174}}
 _CUBE = (0, 95, 135, 175, 215, 255)
 
@@ -140,7 +140,15 @@ class Caps:
         return h
 
     def index(self, role):
-        return PICK256[self.theme].get(role) or nearest256(self.true_hex(role))
+        key = (self.theme, role)
+        i = _INDEX.get(key)
+        if i is None:
+            i = _INDEX[key] = PICK256[self.theme].get(role) or nearest256(self.true_hex(role))
+        return i
+
+
+_INDEX = {}         # (theme, role) → xterm-256 index: the search over 240 colours runs once per role
+_PAINT = {}         # (depth, glyphs, theme, full?, fg, bg, flags) → (character for a full cell, SGR)
 
 
 GLYPHS = {
@@ -173,7 +181,7 @@ def resolve(cell, caps):
     fname, _, fmod = fg.partition("@")
     bname, _, bmod = (bg or "").partition("@")
     if caps.color == "16":
-        if bname == "sel":                                   # selection is reverse video
+        if bname in ("sel", "rowsel"):                       # selection is reverse video
             fl, bname = fl | REV, ""
         elif bname in ("bar", "trough", "away"):             # surfaces are not painted
             bname = ""
@@ -203,14 +211,21 @@ def resolve(cell, caps):
 
 
 def paint(cell, caps):
-    """(char to write, the SGR sequence that must be in force)."""
-    ch, f, b, fl = resolve(cell, caps)
-    codes = ["0"]
-    for bit, code in ((BOLD, "1"), (DIM, "2"), (UL, "4"), (REV, "7")):
-        if fl & bit:
-            codes.append(code)
-    codes += [c for c in (f, b) if c]
-    return ch, "\x1b[%sm" % ";".join(codes)
+    """(char to write, the SGR sequence that must be in force). Remembered per style: a frame has a
+    few dozen styles and thousands of cells."""
+    key = (caps.color, caps.glyphs, caps.theme, cell[0] == FULL, cell[1], cell[2], cell[3])
+    hit = _PAINT.get(key)
+    if hit is None:
+        ch, f, b, fl = resolve(cell, caps)
+        codes = ["0"]
+        for bit, code in ((BOLD, "1"), (DIM, "2"), (UL, "4"), (REV, "7")):
+            if fl & bit:
+                codes.append(code)
+        codes += [c for c in (f, b) if c]
+        if len(_PAINT) > 4096:
+            _PAINT.clear()
+        hit = _PAINT[key] = (ch if cell[0] == FULL else None, "\x1b[%sm" % ";".join(codes))
+    return (cell[0] if hit[0] is None else hit[0]), hit[1]
 
 
 def lint_pairing(frame):
@@ -267,6 +282,8 @@ def cells_of(text, ascii_only=False):
     for ch in unicodedata.normalize("NFC", text):
         k = _CLASS.get(ch)
         if k is None:
+            if len(_CLASS) > 4096:              # a day of hostile text must not grow it without end
+                _CLASS.clear()
             k = _CLASS[ch] = _classify(ch)
         if k == 1:
             c = " " if unicodedata.category(ch) == "Zs" else ch
@@ -287,9 +304,12 @@ def tw(text):
 
 
 def fit(text, n, g=None):
-    """Cut to n cells with an ellipsis; never splits a two-cell character."""
-    cells = cells_of(text)
-    if len(cells) <= n:
+    """Cut to n cells with an ellipsis; never splits a two-cell character. Only the first 4n + 8
+    characters are looked at: a longer text ends in the ellipsis wherever those end (a frame must
+    not pay for megabytes of a planted purpose)."""
+    cut = len(text) > 4 * n + 8
+    cells = cells_of(text[:4 * n + 8] if cut else text)
+    if len(cells) <= n and not cut:
         return "".join(cells)
     ell = (g or GLYPHS["unicode"])["ell"][:1]
     keep = cells[:max(n - 1, 0)]
@@ -305,6 +325,7 @@ class Frame:
 
     def __init__(self, w, h, ascii_only=False):
         self.w, self.h, self.ascii_only = w, h, ascii_only
+        self.yhold = None           # what the plot's y axis holds for the next frame (the loop keeps it)
         self.c = [[[" ", None, None, 0] for _ in range(w)] for _ in range(h)]
 
     def put(self, x, y, text, fg=None, bg=KEEP, fl=0):
@@ -363,6 +384,17 @@ class Frame:
         for yy in range(y + 1, y + h - 1):
             self.put(x, yy, g["v"], fg)
             self.put(x + w - 1, yy, g["v"], fg)
+
+    def bg(self, x, y, w, h, role):
+        """Paint the background of a rectangle, keeping what is drawn there."""
+        for yy in range(max(y, 0), min(y + h, self.h)):
+            for xx in range(max(x, 0), min(x + w, self.w)):
+                self.c[yy][xx][2] = role
+
+    def flag(self, x, y, w, h, fl):
+        for yy in range(max(y, 0), min(y + h, self.h)):
+            for xx in range(max(x, 0), min(x + w, self.w)):
+                self.c[yy][xx][3] |= fl
 
     def restyle(self, x, y, w, h, mod):
         """Append a role modifier ('off') to every colour in a rectangle."""
@@ -552,14 +584,22 @@ def _key(o):
     return o.get("key") or "%s@%d" % (o["id"], int(o.get("requested") or 0))
 
 
+def _s(x, default=None):
+    """A string of the shared ledger, cut to LIMITS["str"] (any user can plant a file of megabytes
+    there; a frame looks at its strings every second). oomph writes at most 80 characters."""
+    return x[:200] if isinstance(x, str) else default
+
+
 def _norm(o):
-    """Reservation(_:): a lease, a ledger history entry or a history log record, in one shape."""
+    """Reservation(_:): a lease, a ledger history entry or a history log record, in one shape. The
+    strings are cut to 200 characters; the key stays whole (it is matched, not drawn)."""
     segs = [(s["t"], s["gb"]) for s in (o.get("segments") or [])
             if isinstance(s, dict) and isinstance(s.get("t"), (int, float)) and isinstance(s.get("gb"), (int, float))]
     h = o.get("holder")
-    return dict(key=_key(o), id=o["id"], purpose=o.get("purpose") if isinstance(o.get("purpose"), str) else "?",
-                project=o.get("project"), holder=h.get("kind") if isinstance(h, dict) else h,
-                requested=o["requested"], granted=o.get("granted"), ended=o.get("ended"), outcome=o.get("outcome"),
+    return dict(key=_key(o), id=_s(o["id"]), purpose=_s(o.get("purpose"), "?"),
+                project=_s(o.get("project")), holder=_s(h.get("kind") if isinstance(h, dict) else h),
+                pid=h.get("pid") if isinstance(h, dict) and isinstance(h.get("pid"), int) else None,
+                requested=o["requested"], granted=o.get("granted"), ended=o.get("ended"), outcome=_s(o.get("outcome")),
                 peak=o.get("peak_gb") or 0, used=o.get("used_gb"), expires=o.get("expires"),
                 segments=segs or [(o["requested"], o["gb"])])
 
@@ -587,10 +627,11 @@ def merge_reservations(records, ledger, now, holder_alive=None):
         if ok(h):
             by.setdefault(_key(h), _norm(h))
     live = set()
-    for lease in ledger.get("leases") or []:
+    for pos, lease in enumerate(ledger.get("leases") or []):
         if not ok(lease):
             continue
         r, k = _norm(lease), _key(lease)
+        r["queue"] = pos                    # the ledger's order is the queue's (a grown request moves back)
         live.add(k)
         seen = lease.get("seen") if isinstance(lease.get("seen"), (int, float)) else r["requested"]
         h = lease.get("holder")
@@ -1010,16 +1051,46 @@ def _owner(segs, r):
     return col
 
 
-def plot_geometry(model, span, W):
+def plot_geometry(model, span, W, hold=None):
+    """The mapper, the columns and the y top of the plot; with the hold the loop kept from the frame
+    before (see y_top), and the hold for the next one."""
     now = model["now"]
     first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
     f, finv = mapper(now, first, SPANS[span])
     cols = columns(model["pts"], model["gaps"], f, finv, W, now, first)
-    top, _ = y_top(model.get("ram"), cols, now=now)
-    return f, finv, cols, top
+    top, new = y_top(model.get("ram"), cols, hold, finv(0.0), now)
+    return f, finv, cols, top, new
+
+
+_PLOT = {}          # the last plot drawn: its key and its cells (04 §4.8: "rasters are cached")
 
 
 def draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
+    """The plot, from the raster of the frame before when nothing it draws has changed: the same
+    points, gaps, incidents, span, size, y hold and style, and "now" in the same column (a minute on
+    the log axis). The clock alone moving costs no plot."""
+    held = ui.get("yhold")
+    held = held[1] if held and held[0] == ui["span"] else None
+    sp = SPANS[ui["span"]]
+    epoch = int(model["now"] // (sp / float(W) if sp else 60.0))
+    pv = model.get("pts_v") or hash(tuple((p["t"], p["wired"], p["app"], p["comp"], p["swap"], p["away"])
+                                         for p in model["pts"]))
+    key = (pv, len(model["pts"]), tuple(model["gaps"]), model.get("first"), model.get("ram"),
+           tuple((i["start"], i["open"]) for i in model["incidents"]), ui["span"], W, H, x0, y0, held, epoch,
+           caps.color, caps.glyphs, caps.theme, fr.ascii_only)
+    hit = _PLOT.get("key") == key
+    if hit:
+        for dy, row in enumerate(_PLOT["cells"]):
+            fr.c[y0 + dy][x0:x0 + len(row)] = [list(c) for c in row]
+        fr.yhold = _PLOT["yhold"]
+        return _PLOT["gridcols"]
+    gridcols = _draw_plot(fr, x0, y0, W, H, model, ui, caps, g)
+    _PLOT.update(key=key, gridcols=gridcols, yhold=fr.yhold,
+                 cells=[[tuple(c) for c in fr.c[y0 + dy][x0:min(x0 + W + 5, fr.w)]] for dy in range(H + 1)])
+    return gridcols
+
+
+def _draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
     """The stacked areas, the away band, the no-data hatch, grid, the RAM line, incident rules, the
     y labels in the gutter and the time axis under it. Returns the grid columns (the strip
     continues them)."""
@@ -1027,7 +1098,8 @@ def draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
     plain_band = mono or caps.color == "16"       # no background colour to spare: the away band is dots
     whole = mono or caps.glyphs in ("cells", "ascii")
     now = model["now"]
-    f, finv, cols, ymax = plot_geometry(model, ui["span"], W)
+    held = ui.get("yhold")
+    f, finv, cols, ymax, fr.yhold = plot_geometry(model, ui["span"], W, held[1] if held and held[0] == ui["span"] else None)
     L = 8 * H
     # MemoryChart.calmBands with columns as the unit: a no-data stretch that touches an away band is part of it
     grey, _ = calm_bands(_runs([st == "data" and p["away"] for st, p in cols]), _runs([st == "gap" for st, p in cols]), 0)
@@ -1163,59 +1235,227 @@ def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=()):
 
 
 # ------------------------------------------------------------------ the lists
+def _queue_key(r):
+    """Where a waiting reservation stands: its place in the ledger's list of leases (a queued request
+    that grows moves to the back), the request time where that is not known."""
+    q = r.get("queue")
+    return (q is None, q if isinstance(q, int) else 0, r["requested"], r["key"])
+
+
 def ordered_res(res):
     """Waiting first (the queue, head on top), then grants by time left, soonest first (a grant
     without a ttl last), then finished ones newest first: whatever a short list cuts off is never
-    the reservation that explains why an agent waits."""
+    the reservation that explains why an agent waits. The live part is the app's order too
+    (Reservation.listOrder; roadmap C13), held to it by tools/vectors/chart.json."""
     live = [r for r in res if r.get("ended") is None]
-    waiting = sorted([r for r in live if r.get("granted") is None], key=lambda r: r["requested"])
+    waiting = sorted([r for r in live if r.get("granted") is None], key=_queue_key)
     granted = sorted([r for r in live if r.get("granted") is not None],
-                     key=lambda r: (r.get("expires") is None, r.get("expires") or 0, r["requested"]))
-    done = sorted([r for r in res if r.get("ended") is not None], key=lambda r: -r["ended"])
+                     key=lambda r: (r.get("expires") is None, r.get("expires") or 0, r["requested"], r["key"]))
+    done = sorted([r for r in res if r.get("ended") is not None], key=lambda r: (-r["ended"], r["key"]))
     return waiting, granted, done
 
 
-def list_rows(model, R):
-    """The R rows of the reservation list: ('res', r) … and, when live ones are hidden, a last row
-    ('more', below_live, below_waiting)."""
+def res_seq(model):
+    """The reservation list as one sequence: waiting, granted, then the finished ones of the last 24 h.
+    Returns (sequence, live count, waiting count)."""
     waiting, granted, done = ordered_res(model["res"])
-    seq = waiting + granted + [r for r in done if r["ended"] >= model["now"] - 86400]
-    n_live, n_wait = len(waiting) + len(granted), len(waiting)
+    return waiting + granted + [r for r in done if r["ended"] >= model["now"] - 86400], len(waiting) + len(granted), \
+        len(waiting)
+
+
+def res_visible(R, n_live, off):
+    """How many reservations R rows show: all R, or R - 1 above a position line when live ones are
+    hidden or the list has been scrolled. A list of one row has no position line while it is
+    focused: it shows the selected reservation (unfocused it counts, 04 §3.2)."""
+    return R if (R < 2 or (n_live <= R and off == 0)) else R - 1
+
+
+def list_rows(model, R, ui=None):
+    """The R rows of the reservation list: ('res', r, index) … and, when live reservations are hidden
+    or the list has been scrolled, a last row ('more', above, below_live, below_waiting, below_all).
+    A single row counts ("3 granted · 1 waiting") until the list has the focus; then it is the
+    selected reservation (the caption counts instead)."""
+    seq, n_live, n_wait = res_seq(model)
+    off = min((ui or {}).get("res_off", 0), max(len(seq) - 1, 0))
     if R <= 0:
         return [], n_live, n_wait
-    if n_live <= R:
-        return [("res", r) for r in seq[:R]], n_live, n_wait
-    below = [r for r in seq[R - 1:] if r.get("ended") is None]
-    rows = [("res", r) for r in seq[:R - 1]]
-    rows.append(("more", len(below), sum(1 for r in below if r.get("granted") is None)))
+    if (R < 2 and (ui or {}).get("focus") == "res") or (n_live <= R and off == 0):
+        return [("res", r, off + i) for i, r in enumerate(seq[off:off + R])], n_live, n_wait
+    shown = seq[off:off + R - 1]
+    below = [r for r in seq[off + R - 1:] if r.get("ended") is None]
+    rows = [("res", r, off + i) for i, r in enumerate(shown)]
+    rows.append(("more", off, len(below), sum(1 for r in below if r.get("granted") is None),
+                 len(seq) - off - len(shown)))
     return rows, n_live, n_wait
 
 
-def draw_res_rows(fr, x, y, w, rows, model, caps, g):
+def panel_area(P):
+    """Where a panel (a s e) goes: in the place of the two lists, below the strip ("lists"); or, in a
+    pane whose list area has fewer than 4 rows, the whole chart box ("chart"). (y of its caption,
+    rows below the caption, where `esc` leads)."""
+    if P["R"] or P["I"]:
+        y0 = P["list_y"] if P["R"] else P["inc_cap_y"]
+        if P["bottom_y"] - y0 >= 4:
+            return y0, P["bottom_y"] - y0 - 1, "lists"
+    return P["box_y"], P["bottom_y"] - P["box_y"] - 1, "chart"
+
+
+def panel_items(model, panel):
+    """The rows of a panel: apps (name, GB, processes), sessions (pid, cwd, GB, processes, biggest),
+    events (t, text, alarming)."""
+    cur = model.get("cur") or {}
+    if panel == "a":
+        return cur.get("groups") or []
+    if panel == "s":
+        return cur.get("claude") or []
+    return model.get("events") or []
+
+
+def press(ui, key, model, P):
+    """What a key does to the selection (04 §3.4, "Selecting and scrolling"): the two lists are two
+    focus stops. Nothing selected: down enters Reservations at its first row, up enters Incidents at
+    the newest (where the plan has no incident rows, up opens the newest incident's card). Inside a
+    list up and down move by a row and stop at its ends; pgup / pgdn move by a page, home / end
+    jump; space moves the focus to the other list. Each list keeps its own row and its own scroll
+    offset until esc, which lets go of both. An offset moves as little as keeps the row on screen.
+    With a panel open (a s e) the panel is the one focus stop. Changes `ui`; returns it."""
+    if ui.get("panel"):
+        return _press_panel(ui, key, model, P)
+    R, I = P["R"], P["I"]
+    seq, n_live, _ = res_seq(model)
+    incs = model["incidents"]
+    has = {"res": bool(R and seq), "inc": bool(I and incs)}
+    f = ui.get("focus")
+    if key == "esc":
+        for k in ("focus", "res_sel", "res_off", "inc_sel", "inc_off"):
+            ui.pop(k, None)
+        return ui
+    if f is None:
+        if key == "up" and incs and not I:
+            ui["overlay"] = {"kind": "inc", "id": incs[0]["id"]}
+        elif key in ("down", "up"):
+            want = "res" if key == "down" else "inc"
+            if not has[want]:
+                want = "inc" if want == "res" else "res"
+            if has[want]:
+                ui["focus"] = want
+                ui.setdefault(want + "_sel", 0)
+        return ui
+    if key == "space":
+        other = "inc" if f == "res" else "res"
+        if has[other]:
+            ui["focus"] = other
+            ui.setdefault(other + "_sel", 0)
+        return ui
+    n = len(seq) if f == "res" else len(incs)
+    if n == 0:
+        return ui
+    page = max(1, (res_visible(R, n_live, ui.get("res_off", 0)) if f == "res" else I) - 1)
+    sel = ui.get(f + "_sel", 0)
+    sel = {"down": sel + 1, "up": sel - 1, "pgdn": sel + page, "pgup": sel - page, "home": 0, "end": n - 1}.get(key, sel)
+    sel = max(0, min(n - 1, sel))
+    off = ui.get(f + "_off", 0)
+    if f == "res":
+        off = min(off, sel)
+        while sel > off + res_visible(R, n_live, off) - 1:
+            off += 1
+    else:
+        off = max(min(off, sel), sel - I + 1, 0)
+        off = min(off, max(len(incs) - I, 0))
+    ui[f + "_sel"], ui[f + "_off"] = sel, off
+    return ui
+
+
+def panel_page(P, model, panel):
+    """(rows per column, columns, rows shown) of a panel: Top apps in two columns from 72 cells when
+    one does not hold them all; a last row says what is above and below when not all fit."""
+    _, rows, _ = panel_area(P)
+    n = len(panel_items(model, panel))
+    if panel == "e":
+        return rows, 1, max(1, rows)
+    ncol = 2 if panel == "a" and P["lw"] - 2 >= 72 and rows < n else 1
+    body = rows - 1 if n > rows * ncol else rows
+    return body, ncol, max(1, body * ncol)
+
+
+def _press_panel(ui, key, model, P):
+    items = panel_items(model, ui["panel"])
+    _, _, per = panel_page(P, model, ui["panel"])
+    if key == "esc":
+        for k in ("panel", "focus", "panel_sel", "panel_off"):
+            ui.pop(k, None)
+        return ui
+    n = len(items)
+    if ui["panel"] == "e":                          # events scroll; nothing is selected
+        off = ui.get("panel_off", 0)
+        off = {"down": off + 1, "up": off - 1, "pgdn": off + per - 1, "pgup": off - per + 1, "home": 0,
+               "end": n}.get(key, off)
+        ui["panel_off"] = max(0, min(off, max(n - per, 0)))
+        return ui
+    if not n or key not in ("down", "up", "pgdn", "pgup", "home", "end"):
+        return ui
+    if ui.get("focus") != "panel":
+        ui["focus"], ui["panel_sel"], ui["panel_off"] = "panel", 0, 0
+        return ui
+    sel = ui.get("panel_sel", 0)
+    sel = {"down": sel + 1, "up": sel - 1, "pgdn": sel + per - 1, "pgup": sel - per + 1, "home": 0,
+           "end": n - 1}.get(key, sel)
+    sel = max(0, min(n - 1, sel))
+    off = ui.get("panel_off", 0)
+    off = max(min(off, sel), sel - per + 1, 0)
+    ui["panel_sel"], ui["panel_off"] = sel, off
+    return ui
+
+
+def highlight(fr, x, y, w, caps, g, focus):
+    """The selected row: a painted row with an accent mark while its list has the focus; a faint mark
+    only (where `space` leads back to) while it has not."""
+    if focus:
+        if caps.color == "none":
+            fr.flag(x, y, w, 1, REV)
+        else:
+            for xx in range(max(x, 0), min(x + w, fr.w)):
+                cell = fr.c[y][xx]
+                if cell[2] is None:
+                    cell[2] = "rowsel"
+        fr.put(x, y, g["sel"], "accent", KEEP, BOLD | (REV if caps.color == "none" else 0))
+    else:
+        fr.put(x, y, g["sel"], "faint", KEEP)
+
+
+def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
+    ui = ui or {}
     mono = caps.color == "none"
     now = model["now"]
     pw, px = res_columns(w)
+    focus, sel = ui.get("focus") == "res", ui.get("res_sel")
     for i, row in enumerate(rows):
         yy = y + i
         if row[0] == "more":
-            _, below, waiting = row
+            _, above, below, waiting, rest = row
             parts = []
-            if len(rows) == 1:                          # the only row: it counts, in words that add up
+            if above:
+                parts.append(("%s %d above" % (g["up"], above), "dim"))
+            if below and not above and len(rows) == 1:      # the only row: it counts, in words that add up
                 if below - waiting:
                     parts.append(("%d granted" % (below - waiting), "fg"))
                 if waiting:
                     parts.append(("%d waiting" % waiting, "warntx"))
-            else:
+            elif below:
                 parts.append(("%s %d more" % (g["down"], below), "dim"))
                 if waiting:
                     parts.append(("%d waiting" % waiting, "warntx"))
+            elif rest:
+                parts.append(("%s %d finished" % (g["down"], rest), "dim"))
             xx = x + 2
             for k, (text, role) in enumerate(parts):
                 if k:
                     xx = fr.put(xx, yy, " %s " % g["mid"], "faint")
                 xx = fr.put(xx, yy, text, role)
+            if not focus and w >= 44 and len(rows) > 1 and (below or rest):
+                fr.rput(x + w - 2, yy, "%s scrolls" % g["updown"][1], "faint")
             continue
-        r = row[1]
+        r, idx = row[1], row[2]
         live = r.get("ended") is None
         granted = r.get("granted") is not None
         fr.put(x + 2, yy, g["sw"] if granted else g["swq"], None if mono else res_color(r["purpose"]), KEEP)
@@ -1239,9 +1479,13 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g):
         project = r.get("project")
         if isinstance(project, str) and project and end - px >= 3:
             fr.put(x + px, yy, fit(project.rstrip("/").rsplit("/", 1)[-1], end - px, g), "dim", KEEP)
+        if idx == sel:
+            highlight(fr, x, yy, w, caps, g, focus)
 
 
-def draw_incident_rows(fr, x, y, w, rows, model, caps, g):
+def draw_incident_rows(fr, x, y, w, rows, model, caps, g, ui=None, first=0):
+    ui = ui or {}
+    focus, sel = ui.get("focus") == "inc", ui.get("inc_sel")
     for i, inc in enumerate(rows):
         yy = y + i
         fr.put(x + 2, yy, g["dot"] if inc["open"] else g["odot"], "incident" if inc["open"] else "faint", KEEP)
@@ -1256,6 +1500,8 @@ def draw_incident_rows(fr, x, y, w, rows, model, caps, g):
             fr.rput(xr, yy, k, "incident", KEEP)
             xr -= len(k)
         fr.put(x + 18, yy, fit(inc.get("desc") or "", xr - (x + 18) - 1, g), "dim", KEEP)
+        if first + i == sel:
+            highlight(fr, x, yy, w, caps, g, focus)
 
 
 def section(fr, x, y, w, g, title, right=None, top=False, right_role="dim"):
@@ -1264,6 +1510,106 @@ def section(fr, x, y, w, g, title, right=None, top=False, right_role="dim"):
     x1 = fr.put(x + 2, y, " %s " % title, "fg", None, BOLD)
     if right and tw(right) + 4 <= x + w - 2 - x1:
         fr.rput(x + w - 3, y, " %s " % right, right_role, None)
+
+
+# ------------------------------------------------------------------ the panels: a s e, in the place of the lists
+PANELS = {"a": "Top apps", "s": "Claude sessions", "e": "Events"}
+
+
+def session_reservations(model, pid):
+    """The live reservations a Claude session holds (its holder is the session's root process)."""
+    return [r for r in model["res"] if r.get("ended") is None and r.get("pid") == pid]
+
+
+def draw_panel(fr, model, ui, P, caps, g):
+    """The panel that a, s or e opened, with the rows the lists had: nothing above it moves."""
+    panel = ui["panel"]
+    y0, rows, where = panel_area(P)
+    lw = P["lw"]
+    fr.fill(1, y0 + 1, lw - 2, rows, " ", None, None)
+    for yy in range(y0 + 1, y0 + 1 + rows):         # the sides, where a section's ├ ┤ was
+        fr.put(0, yy, g["v"], "line")
+        fr.put(lw - 1, yy, g["v"], "line")
+    cur = model.get("cur") or {}
+    items = panel_items(model, panel)
+    right = None
+    if panel == "a":
+        bits = []
+        if cur.get("procs"):
+            bits.append("%d processes" % cur["procs"])
+        if cur.get("unowned") is not None:
+            bits.append("%.1f GB not owned%s" % (cur["unowned"], " by a process" if lw >= 72 else ""))
+        right = (" %s " % g["mid"]).join(bits) or None
+    elif panel == "s":
+        right = "%.1f GB in %d session%s" % (sum(s[2] for s in items), len(items), "" if len(items) == 1 else "s") \
+            if items else None
+    else:
+        right = "newest first"
+    section(fr, 0, y0, lw, g, PANELS[panel], right, top=(where == "chart"))
+    x, w = 1, lw - 2
+    focus = ui.get("focus") == "panel"
+    sel, off = ui.get("panel_sel", 0), ui.get("panel_off", 0)
+    if not items:
+        fr.put(x + 2, y0 + 1, {"a": "No readings yet", "s": "No Claude sessions running",
+                               "e": "No events yet"}[panel], "dim")
+        return
+    if panel == "e":
+        shown = items[off:off + rows]
+        last_day = None
+        for i, (t, text, alarm) in enumerate(shown):
+            ry = y0 + 1 + i
+            day = DAYS[_lt(t).tm_wday]
+            fr.put(x + 1, ry, day if day != last_day else "   ", "faint")
+            last_day = day
+            fr.put(x + 5, ry, hhmm(t), "dim")
+            fr.put(x + 11, ry, fit(text.replace("→", g["arrow"]), w - 13, g), "incident" if alarm else "fg")
+        return
+    body, ncol, per = panel_page(P, model, panel)
+    shown = items[off:off + per]
+    cw = w // ncol
+    if panel == "a":
+        top = max((gb for _, gb, _ in items), default=0) or 1
+        for i, (name, gb, n) in enumerate(shown):
+            cx, ry = x + (i // body) * cw, y0 + 1 + i % body
+            fr.put(cx + 2, ry, "%2d" % (off + i + 1), "faint", KEEP)
+            nw = max(8, min(18, cw - 24))
+            fr.put(cx + 5, ry, fit(name, nw, g), "fg", KEEP)
+            fr.put(cx + 5 + nw + 1, ry, "%3d" % n, "faint", KEEP)
+            bw = cw - (5 + nw + 5) - 7
+            if bw >= 3:
+                bar = min(bw, max(1, int(round(gb / top * bw))))
+                fr.put(cx + 5 + nw + 5, ry, (g["eighths"][5] if g["eighths"][8] == FULL else g["meter"]) * bar,
+                       "app" if caps.color != "none" else None, KEEP)
+            fr.rput(cx + cw - 2, ry, "%.1fG" % gb, "fg", KEEP)
+            if off + i == sel and focus:
+                highlight(fr, cx, ry, cw, caps, g, True)
+    else:
+        for i, (pid, cwd, gb, n, big) in enumerate(shown):
+            ry = y0 + 1 + i
+            fr.put(x + 2, ry, "%5.1fG" % gb, "fg", KEEP, BOLD)
+            fr.put(x + 9, ry, fit(cwd, 18 if w >= 70 else 12, g), "fg", KEEP)
+            xr = fr.put(x + (28 if w >= 70 else 22), ry, "%2d procs" % n, "faint", KEEP) + 2
+            held = session_reservations(model, pid)
+            tail = x + w - 2
+            if held:
+                text = "%.1fG %s" % (sum(r["segments"][-1][1] for r in held), held[0]["purpose"])
+                if len(held) > 1:
+                    text += " +%d" % (len(held) - 1)
+                text = fit(text, max(8, min(30, w - (xr - x) - 12)), g)
+                fr.rput(tail, ry, text, "dim", KEEP)
+                tail -= tw(text) + 1
+                fr.put(tail - 1, ry, g["sw"], None if caps.color == "none" else res_color(held[0]["purpose"]), KEEP)
+                tail -= 3
+            if big and tail - xr >= 6:
+                fr.put(xr, ry, fit(big, tail - xr, g), "dim", KEEP)
+            if off + i == sel and focus:
+                highlight(fr, x, ry, w, caps, g, True)
+    if len(items) > per or off:
+        below = max(0, len(items) - off - per)
+        text = ("%s %d above" % (g["up"], off) if off else "") + (" %s " % g["mid"] if off and below else "") + \
+               ("%s %d more" % (g["down"], below) if below else "")
+        if text:
+            fr.put(x + 2, y0 + rows, text, "dim")
 
 
 # ------------------------------------------------------------------ the second column (from 120 columns)
@@ -1378,6 +1724,313 @@ def draw_right(fr, P, model, caps, g):
         fr.restyle(x + 1, y + 1, w - 2, h - 2 - ev, "off")
 
 
+# ------------------------------------------------------------------ dialogs: help and the cards
+def _wrap(text, w):
+    """Words into lines of at most w cells (never splits a word that fits a line)."""
+    out, line = [], ""
+    for word in text.split():
+        if line and tw(line) + 1 + tw(word) > w:
+            out.append(line)
+            line = word
+        else:
+            line = (line + " " + word) if line else word
+    if line:
+        out.append(line)
+    return out or [""]
+
+
+def dialog(fr, g, caps, title, bw, bh, lines, hints):
+    """One mechanism for every dialog (04 §3.8). Where the box fits with a margin under row 0 it is a
+    box, centred, over the dimmed pane. Anywhere smaller it takes everything below row 0: no border,
+    the title a rule in row 1, the hints on the key line, and its lines give way by priority (the
+    highest number first; a paragraph as a whole). lines: [(priority, draw(fr, x, y, w, bg) or None,
+    group)]. Works down to 40 x 10. Returns whether it was boxed."""
+    W, H = fr.w, fr.h
+    boxed = W >= bw + 2 and H >= bh + 3
+    if boxed:
+        x, y = (W - bw) // 2, max(1, (H - bh) // 2)
+        fr.restyle(0, 1, W, H - 1, "off")
+        fr.fill(x, y, bw, bh, " ", None, "bar")
+        fr.box(x, y, bw, bh, g, "dim")
+        fr.bg(x, y, bw, bh, "bar")
+        fr.put(x + 2, y, " %s " % fit(title, bw - 6, g), "fg", "bar", BOLD)
+        cx, cy, cw, n, bg, hy, hx, hend = x + 3, y + 1, bw - 6, bh - 3, "bar", y + bh - 2, x + 3, x + bw - 3
+    else:
+        fr.fill(0, 1, W, H - 1, " ", None, None)
+        fr.hline(0, 1, W, g, "line")
+        fr.put(1, 1, " %s " % fit(title, W - 6, g), "fg", None, BOLD)
+        cx, cy, cw, n, bg, hy, hx, hend = 1, 2, W - 2, H - 3, None, H - 1, 1, W - 1
+    lines = [tuple(l) + (None,) * (3 - len(l)) for l in lines]
+    while len(lines) > n:
+        worst = max(range(len(lines)), key=lambda i: (lines[i][0], i))
+        if lines[worst][0] == 0:
+            break
+        group = lines[worst][2]
+        lines = [l for i, l in enumerate(lines) if i != worst and (group is None or l[2] is not group)]
+    for i, (_, fn, _) in enumerate(lines[:n]):
+        if fn:
+            fn(fr, cx, cy + i, cw, bg)
+    for k, d in hints:
+        if hx + tw(k) + tw(d) + 1 > hend:
+            break
+        if k:
+            hx = fr.put(hx, hy, k, "fg", bg, BOLD) + 1
+        hx = fr.put(hx, hy, d, "dim", bg) + 2
+    return boxed
+
+
+def _text(text, role="fg", fl=0):
+    return lambda fr, x, y, w, bg: fr.put(x, y, fit(text, w, GLYPHS["ascii" if fr.ascii_only else "unicode"]), role, bg, fl)
+
+
+def _para(text, w, pri, role="dim"):
+    group = object()
+    return [(pri, _text(line, role), group) for line in _wrap(text, w)]
+
+
+def _kv(k, v, role="fg", kw=11):
+    def fn(fr, x, y, w, bg):
+        fr.put(x, y, k, "dim", bg)
+        fr.put(x + kw, y, fit(v, w - kw), role, bg)
+    return fn
+
+
+def help_pages(g, model):
+    """The help (04 §3.10), built from what this build has: the keys of T1, no machines, no
+    inspect, no mouse. Returns (left column, right column, 'what you see' rows)."""
+    A, U = g["arrows"], g["updown"]
+    left = [("Chart", None), ("%s %s" % (A[0], A[1]), "longer %s shorter" % g["mid"]),
+            ("t  T", "cycle spans %s back" % g["mid"]), ("", ""),
+            ("Panels", None), ("a", "top apps"), ("s", "Claude sessions"), ("e", "events"),
+            ("enter", "its processes"), ("", ""),
+            ("General", None), ("?  F1", "help %s next page" % g["mid"]), ("esc", "close %s back" % g["mid"]),
+            ("q  ctrl-c", "quit")]
+    right = [("Lists", None), (U[1], "into Reservations"), (U[0], "into Incidents"),
+             ("%s %s  j k" % (U[0], U[1]), "move in the list"), ("space", "the other list"),
+             ("pgup pgdn", "a page"), ("home end", "first %s last row" % g["mid"]), ("enter", "details"),
+             ("o", "open the report"), ("y", "copy its path"), ("", ""),
+             ("Terminal", None), ("ctrl-l", "redraw"), ("ctrl-z", "suspend")]
+    away = model.get("os", "").startswith("macOS") or "os" not in model
+    see = [("Chart", None),
+           ([(g["sw"], role) for _, role in SERIES_WORDS], "%s, stacked; %s is the RAM" % (
+               ", ".join(n for n, _ in SERIES_WORDS), g["ram"][1]))]
+    if away:
+        see.append(([(g["legend_away"], "dim")], "away: idle for 5 min, screen locked or display off"))
+    see += [([(g["hatch"], "hatch")], "no data: asleep or off, or the logger was not running"),
+            ([(g["inc"], "incident")], "an incident began here"),
+            ("Reserved by agents", None),
+            ([(g["eighths"][5] * 2, "r0"), (" ", None), (g["queued"] * 2, "r3")],
+             "a block per reservation; height is GB; %s is waiting" % g["queued"]),
+            ([(g["swq"], "r3"), (" ", None), (g["sw"], "r0")], "waiting %s granted; a dimmed row has ended" % g["mid"]),
+            ("Incidents", None),
+            ([(g["dot"], "incident"), (" ", None), (g["odot"], "faint")], "still open %s closed" % g["mid"])]
+    return left, right, see
+
+
+def help_entries(g, model):
+    """Both pages as one column, for the full-pane form that scrolls."""
+    left, right, see = help_pages(g, model)
+    return [e for e in left + right if e != ("", "")] + [("", ""), ("What you see", None)] + see
+
+
+def overlay_help(fr, caps, g, model, ui, ov):
+    """? opens the keys; ? again turns to "What you see". Where the box does not fit, both pages are
+    one column that scrolls."""
+    left, right, see = help_pages(g, model)
+    mono = caps.color == "none"
+
+    def entry(k, d, kw):
+        def fn(fr, x, y, w, bg):
+            if d is None:
+                fr.put(x, y, k, "accent" if not mono else None, bg, BOLD)
+            elif isinstance(k, list):
+                xx = x
+                for text, role in k:
+                    xx = fr.put(xx, y, text, None if mono else role, bg)
+                fr.put(x + kw, y, fit(d, w - kw, g), "fg", bg)
+            elif k or d:
+                fr.put(x, y, k, "fg", bg, BOLD)
+                fr.put(x + kw, y, fit(d, w - kw, g), "dim", bg)
+        return fn
+
+    if fr.w >= 76 and fr.h >= 24:
+        if ov.get("page", 1) == 1:
+            def row(i):
+                def fn(fr, x, y, w, bg):
+                    if i < len(left):
+                        entry(left[i][0], left[i][1], 11)(fr, x, y, 34, bg)
+                    if i < len(right):
+                        entry(right[i][0], right[i][1], 11)(fr, x + 36, y, w - 36, bg)
+                return fn
+            rows = [(1, row(i)) for i in range(15)]
+        else:
+            rows = [(1, entry(k, d, 8)) for k, d in see] + [(1, None)] * (15 - len(see))
+        lines = [(9, None)] + rows + [(8, None), (5, _text(ui.get("detected") or "", "faint"))]
+        return dialog(fr, g, caps, "Keys" if ov.get("page", 1) == 1 else "What you see", 74, 21, lines,
+                      [("esc", "close"), ("?", "what you see" if ov.get("page", 1) == 1 else "keys"),
+                       ("", "page %d of 2" % ov.get("page", 1))])
+    entries = help_entries(g, model)
+    n = fr.h - 3
+    off = max(0, min(ov.get("off", 0), len(entries) - n))
+    lines = [(1, entry(k, d, 12 if not isinstance(k, list) else 6)) for k, d in entries[off:off + n]]
+    pos = "%d%s%d of %d" % (off + 1, g["dash"], min(off + n, len(entries)), len(entries))
+    return dialog(fr, g, caps, "Help", 74, 21, lines, [("esc", "close"), (g["updown"], "scroll"), ("", pos)])
+
+
+def help_rows(fr_w, fr_h, g, model):
+    """How many entries the scrolling help has, and how many fit (the loop clamps its offset)."""
+    return len(help_entries(g, model)), fr_h - 3
+
+
+def selected(model, ui):
+    """The reservation or incident the selection is on, by list: (kind, item) or (None, None)."""
+    f = ui.get("focus")
+    if f == "res":
+        seq = res_seq(model)[0]
+        i = ui.get("res_sel", 0)
+        return ("res", seq[i]) if 0 <= i < len(seq) else (None, None)
+    if f == "inc":
+        incs = model["incidents"]
+        i = ui.get("inc_sel", 0)
+        return ("inc", incs[i]) if 0 <= i < len(incs) else (None, None)
+    if f == "panel" and ui.get("panel") in ("a", "s"):
+        items = panel_items(model, ui["panel"])
+        i = ui.get("panel_sel", 0)
+        return (ui["panel"], items[i]) if 0 <= i < len(items) else (None, None)
+    return None, None
+
+
+def _holder_text(r):
+    kind = {"session": "Claude session", "run": "oomph run", "process": "process"}.get(r.get("holder") or "", r.get("holder"))
+    if not kind:
+        return "unknown"
+    return "%s (pid %d)" % (kind, r["pid"]) if r.get("pid") else str(kind)
+
+
+def card_res(fr, caps, g, model, r):
+    """enter on a reservation: the app's ReservationCard. For a waiting one: what it waits for."""
+    now = model["now"]
+    waiting, granted, _ = ordered_res(model["res"])
+    mono = caps.color == "none"
+    gb = r["segments"][-1][1]
+
+    def head(fr, x, y, w, bg):
+        fr.put(x, y, g["sw"] if r.get("granted") is not None else g["swq"], None if mono else res_color(r["purpose"]), bg)
+        fr.put(x + 2, y, fit("%.1f GB  %s" % (gb, r["purpose"]), w - 2, g), "fg", bg, BOLD)
+    project = r.get("project") if isinstance(r.get("project"), str) else None
+    lines = [(9, None), (0, head), (8, None)]
+    if project:
+        lines.append((1, _kv("Project", project)))
+    lines.append((2, _kv("Holder", _holder_text(r))))
+    if len(r["segments"]) > 1:
+        lines.append((3, _kv("Sizes", (" %s " % g["arrow"]).join(
+            "%s %s" % (gfmt(s_gb), hhmm(t)) for t, s_gb in r["segments"][-4:]))))
+    if r.get("ended") is not None:
+        lines += [(0, _kv("Ended", "%s at %s" % ((r.get("outcome") or "ended").replace("_", " "), hhmm(r["ended"])))),
+                  (1, _kv("Peak", "%.1f GB" % _gb(r.get("peak"))))]
+        if r.get("granted") is not None:
+            lines.append((2, _kv("Ran", "%s, after waiting %s" % (ago(r["ended"] - r["granted"]),
+                                                                     ago(r["granted"] - r["requested"])))))
+    elif r.get("granted") is None:
+        ahead = [w_ for w_ in waiting if _queue_key(w_) < _queue_key(r)]
+        st = model.get("ledger_state") or {}
+        owed = sum(max(0.0, x_["segments"][-1][1] - _gb(x_.get("used"))) for x_ in granted)
+        lines.append((0, _kv("Waiting", "%s, %s" % (ago(now - r["requested"]), "first in the queue" if not ahead else
+                                                    "behind %d in the queue" % len(ahead)), "warntx")))
+        if isinstance(st.get("free_gb"), (int, float)) and isinstance(st.get("margin_gb"), (int, float)):
+            avail = st["free_gb"] - owed - st["margin_gb"]
+            lines += [(1, _kv("Needs", "%.1f GB; %.1f GB can be granted now" % (gb, max(0.0, avail)))),
+                      (2, _kv("", "%.1f GB free, %.1f GB still owed to grants, %.1f GB margin"
+                              % (st["free_gb"], owed, st["margin_gb"]), "dim"))]
+        else:
+            lines.append((1, _kv("Needs", "%.1f GB" % gb)))
+        lines.append((3, _kv("Ahead", "nobody: it is granted as soon as it fits" if not ahead else
+                             ", ".join("%s %s" % (a["purpose"], gfmt(a["segments"][-1][1])) for a in ahead[:3]) +
+                             (" %s" % g["ell"] if len(ahead) > 3 else ""))))
+        if granted:
+            big = sorted(granted, key=lambda x_: -x_["segments"][-1][1])
+            lines.append((2, _kv("Holding", ", ".join("%s %s" % (x_["purpose"], gfmt(x_["segments"][-1][1]))
+                                                      for x_ in big[:3]) + (" %s" % g["ell"] if len(big) > 3 else ""))))
+    else:
+        lines.append((0, _kv("Using", "%.1f GB now %s peak %.1f GB" % (_gb(r.get("used")), g["mid"], _gb(r.get("peak"))))))
+        lines.append((1, _kv("Granted", "%s, after waiting %s" % (hhmm(r["granted"]), ago(r["granted"] - r["requested"])))))
+        if r.get("expires") is not None:
+            lines.append((1, _kv("Expires", "in %s, unless its holder renews it" % left_of(r["expires"] - now))))
+    lines += [(4, _kv("Requested", "%s as %s" % (time.strftime("%H:%M:%S", _lt(r["requested"])), r.get("id") or "?"))),
+              (9, None)]
+    return dialog(fr, g, caps, "Reservation", 76, len(lines) + 3, lines,
+                  [("esc", "close"), (g["updown"], "previous %s next" % g["mid"])])
+
+
+def card_inc(fr, caps, g, model, inc):
+    """enter on an incident: the summary of its incident.json, in place."""
+    now = model["now"]
+    end = now if inc["open"] or inc.get("end") is None else inc["end"]
+    head = "%s %s %s%s" % (day_hhmm(inc["start"]), g["mid"], "open " if inc["open"] else "", ago(end - inc["start"]))
+    lines = [(9, None), (0, _text(head, "incident" if inc["open"] else "fg", BOLD)), (8, None)]
+    reasons = inc.get("reasons") or ([inc["desc"]] if inc.get("desc") else [])
+    for i, d in enumerate(reasons[:3]):
+        lines.append((0 if i == 0 else 1, _kv("Triggers" if i == 0 else "", d, "incident")))
+    s = inc.get("summary") or {}
+    peak = []
+    if s.get("peak_pressure"):
+        peak.append("%s%s" % (s["peak_pressure"], " at %s" % s["peak_at"][11:16] if isinstance(s.get("peak_at"), str)
+                              and len(s["peak_at"]) >= 16 else ""))
+    if isinstance(s.get("max_swap_used_gb"), (int, float)):
+        peak.append("swap %.1f of %.1f GB" % (s["max_swap_used_gb"], _gb(s.get("max_swap_total_gb"))))
+    if peak:
+        lines.append((1, _kv("Peak", (" %s " % g["mid"]).join(peak))))
+    if inc.get("kills"):
+        mk = s.get("most_killed") or []
+        lines.append((1, _kv("Killed", "%d%s" % (inc["kills"], (": " + ", ".join("%s %d" % kv for kv in mk[:3])) if mk else
+                                                 ""))))
+    if s.get("risers"):
+        lines.append((2, _kv("Grew most", (" %s " % g["mid"]).join("%s +%.1fG" % kv for kv in s["risers"][:3]))))
+    if s.get("on_top"):
+        lines.append((2, _kv("On top", (" %s " % g["mid"]).join("%s %.1fG" % kv for kv in s["on_top"][:4]))))
+    if s.get("sessions"):
+        lines.append((3, _kv("Sessions", (" %s " % g["mid"]).join("%s %.1fG" % kv for kv in s["sessions"][:2]))))
+    if isinstance(s.get("away_fraction"), (int, float)):
+        lines.append((4, _kv("Away", "%d %% of the time" % round(100 * s["away_fraction"]))))
+    if inc.get("report"):
+        lines.append((5, _kv("Report", inc["report"], "dim")))
+    elif inc["open"]:
+        lines.append((5, _kv("Report", "written when it closes", "dim")))
+    lines.append((9, None))
+    return dialog(fr, g, caps, "Incident %s" % inc["id"], 76, len(lines) + 3, lines,
+                  [("esc", "close"), ("o", "open the report"), ("y", "copy its path")])
+
+
+def card_procs(fr, caps, g, model, kind, item):
+    """enter on an app or a Claude session: its processes among the 25 biggest of the sample, and
+    for a session what it holds reserved."""
+    procs = (model.get("cur") or {}).get("top") or []
+    if kind == "a":
+        name, gb, n = item
+        title, mine = name, [p for p in procs if p[3] == name]
+        head = "%.1f GB in %d process%s" % (gb, n, "" if n == 1 else "es")
+    else:
+        pid, cwd, gb, n, _ = item
+        title, mine = cwd, [p for p in procs if p[4] == pid]
+        head = "%.1f GB in %d process%s %s session pid %d" % (gb, n, "" if n == 1 else "es", g["mid"], pid)
+    lines = [(9, None), (0, _text(head, "fg", BOLD)), (8, None)]
+    for p in mine[:12]:
+        lines.append((1, _kv("%6.2fG" % p[2], "%s  (pid %d)" % (p[1], p[0]), "fg", 9)))
+    if not mine:
+        lines.append((1, _text("none among the 25 biggest processes of the last sample", "dim")))
+    elif len(mine) > 12:
+        lines.append((2, _text("%d more among the 25 biggest" % (len(mine) - 12), "dim")))
+    if kind == "s":
+        held = session_reservations(model, pid)
+        if held:
+            lines.append((3, None))
+            for r in held[:4]:
+                lines.append((3, _kv("Reserved", "%s %s" % (gfmt(r["segments"][-1][1]), r["purpose"]), "fg")))
+    lines.append((9, None))
+    return dialog(fr, g, caps, fit(title, 60, g), 76, len(lines) + 3, lines,
+                  [("esc", "close"), (g["updown"], "previous %s next" % g["mid"])])
+
+
 # ------------------------------------------------------------------ the frame
 def keys_main(g, model):
     """The hints of the key line, most useful first. While pressure is not normal or an incident is
@@ -1394,16 +2047,46 @@ def keys_main(g, model):
     return k
 
 
-def status_of(model, g):
+def keys_of(g, model, ui, P):
+    """The key line of the mode the dashboard is in; every mode but the plain view starts with esc
+    and where it leads."""
+    if ui.get("panel"):
+        where = panel_area(P)[2]
+        k = [("esc", where)]
+        k += [(p, {"a": "apps", "s": "sessions", "e": "events"}[p]) for p in "ase" if p != ui["panel"]]
+        if ui["panel"] == "e":
+            k.append((g["updown"], "scroll"))
+        else:
+            k += [(g["updown"], "select"), ("enter", "its processes")]
+        return k + [("q", "quit"), ("?", "help")]
+    f = ui.get("focus")
+    if f in ("res", "inc"):
+        k = [("esc", "deselect"), (g["updown"], "move")]
+        other = "inc" if f == "res" else "res"
+        if (P["I"] if other == "inc" else P["R"]) and (model["incidents"] if other == "inc" else model["res"]):
+            k.append(("space", "incidents" if other == "inc" else "reservations"))
+        k.append(("enter", "details"))
+        if f == "inc":
+            k += [("o", "report"), ("y", "copy path")]
+        return k
+    return keys_main(g, model)
+
+
+def status_of(model, g, ui=None):
     """(text, role) at the right of the key line, in the app's words."""
+    ui = ui or {}
+    if ui.get("note"):
+        return ui["note"][0], ui["note"][1]
     if model.get("status"):
         return model["status"], model.get("status_role", "faint")
     for i in model["incidents"]:
         if i["open"]:
             return "Incident open %s %s" % (g["mid"], ago(model["now"] - i["start"])), "crit"
+    if ui.get("readonly"):
+        return ui["readonly"], "warntx"
     lg = model.get("logger")
     if lg == "off":
-        return "Logging is off", "warntx"
+        return model.get("off_text") or "Logging is off", "warntx"
     if lg == "silent":
         return "Logger not reporting since %s" % hhmm(model.get("logger_t") or model["now"]), "warntx"
     return "Logging every %d s" % (model.get("interval") or 30), "faint"
@@ -1441,14 +2124,20 @@ def too_small(W, H, caps):
     return fr
 
 
+def layout(model, W, H):
+    """The row plan for this model at this size (its slow facts: reservations and incidents on record)."""
+    return plan(W, H, has_res=bool(model["res"]), has_inc=bool(model["incidents"]))
+
+
 def render(model, W, H, caps, ui):
     """The whole frame: a pure function of the model, the size, the terminal's capabilities and the
-    ui state ({"span": "24h"}). model: see oomph_top.load_model."""
+    ui state ({"span": "24h"} and, while running, the selection, the panel, the dialog, a note).
+    model: see oomph_top.load_model. The frame's `yhold` is what the loop keeps for the next one."""
     g = GLYPHS[caps.glyphs]
     if W < 40 or H < 10:
         return too_small(W, H, caps)
     fr = Frame(W, H, caps.glyphs == "ascii")
-    P = plan(W, H, has_res=bool(model["res"]), has_inc=bool(model["incidents"]))
+    P = layout(model, W, H)
     tab_bar(fr, model, caps, g)
     if P["stats"]:
         draw_stats(fr, 1, P["stats_y"], W - 2, model, g, P["stats"])
@@ -1457,13 +2146,45 @@ def render(model, W, H, caps, ui):
     draw_body(fr, P, model, ui, caps, g)
     if P["wide"]:
         draw_right(fr, P, model, caps, g)
-    status, srole = status_of(model, g)
-    draw_footer(fr, H - 1, g, status, keys_main(g, model), srole)
+    status, srole = status_of(model, g, ui)
+    keys = keys_of(g, model, ui, P)
+    ov = ui.get("overlay")
+    if ov:
+        boxed = draw_overlay(fr, model, ui, ov, caps, g)
+        if not boxed:
+            return fr                           # its hints are on the key line
+        fr.fill(0, H - 1, W, 1, " ", None, None)
+        keys = [("esc", "close")]
+    draw_footer(fr, H - 1, g, status, keys, srole, must=("esc",) if keys[0][0] == "esc" else ("a",))
+    if ov:
+        fr.restyle(0, H - 1, W, 1, "off")
     return fr
 
 
+def draw_overlay(fr, model, ui, ov, caps, g):
+    kind = ov.get("kind")
+    if kind == "help":
+        return overlay_help(fr, caps, g, model, ui, ov)
+    if kind == "inc":
+        inc = next((i for i in model["incidents"] if i["id"] == ov.get("id")), None)
+        if inc:
+            return card_inc(fr, caps, g, model, inc)
+    elif kind == "res":
+        r = next((r for r in model["res"] if r["key"] == ov.get("key")), None)
+        if r:
+            return card_res(fr, caps, g, model, r)
+    elif kind in ("a", "s"):
+        items = panel_items(model, kind)
+        item = next((x for x in items if (x[0] == ov.get("id"))), None)
+        if item:
+            return card_procs(fr, caps, g, model, kind, item)
+    return dialog(fr, g, caps, "Gone", 60, 6, [(9, None), (0, _text("This is no longer in the data.", "dim")), (9, None)],
+                  [("esc", "close")])
+
+
 def draw_body(fr, P, model, ui, caps, g):
-    """The chart box: span selector and legend, plot, time axis, the reservation strip, the lists."""
+    """The chart box: span selector and legend, plot, time axis, the reservation strip, the lists (or
+    the panel that took their place)."""
     lw = P["lw"]
     x0, pw, ph = P["plot_x"], P["plot_w"], P["plot_h"]
     for yy in range(P["box_y"] + 1, P["bottom_y"]):
@@ -1473,7 +2194,7 @@ def draw_body(fr, P, model, ui, caps, g):
     draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory")
     gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
     now = model["now"]
-    rows, n_live, n_wait = list_rows(model, P["R"])
+    rows, n_live, n_wait = list_rows(model, P["R"], ui)
     if P["cap_y"] is not None:
         live = [r for r in model["res"] if r.get("ended") is None]
         reserved = sum(r["segments"][-1][1] for r in live if r.get("granted") is not None)
@@ -1489,12 +2210,65 @@ def draw_body(fr, P, model, ui, caps, g):
         if P["S"]:
             draw_strip(fr, x0, P["strip_y"], pw, P["S"], model, ui, caps, g, gridcols)
     if P["R"]:
-        draw_res_rows(fr, 1, P["list_y"], lw - 2, rows, model, caps, g)
+        draw_res_rows(fr, 1, P["list_y"], lw - 2, rows, model, caps, g, ui)
     if P["I"]:
         incs = model["incidents"]
         n = model.get("incidents_90d", len(incs))
+        off = min(ui.get("inc_off", 0), max(len(incs) - P["I"], 0))
         right = "%d in 90 days" % n
-        if n > P["I"]:
-            right = "1%s%d of %s %s" % (g["dash"], P["I"], right, g["down"])
+        if n > P["I"] or off:
+            last = min(off + P["I"], len(incs))
+            right = "%d%s%d of %s %s" % (off + 1, g["dash"], last, right, g["down"] if last < n else g["up"])
         section(fr, 0, P["inc_cap_y"], lw, g, "Incidents", right)
-        draw_incident_rows(fr, 1, P["inc_y"], lw - 2, incs[:P["I"]], model, caps, g)
+        draw_incident_rows(fr, 1, P["inc_y"], lw - 2, incs[off:off + P["I"]], model, caps, g, ui, off)
+    if ui.get("panel"):
+        draw_panel(fr, model, ui, P, caps, g)
+
+
+# ------------------------------------------------------------------ the writer: two frames → bytes
+def diff_ansi(prev, cur, caps, join=4):
+    """The bytes that turn a screen showing `prev` into `cur` (prev None: clear and paint all). Changed
+    cells are grouped into runs; runs fewer than `join` cells apart are written as one (moving the
+    cursor costs more than repainting a few cells). A two-cell character is atomic: a run never
+    starts on its second cell and never ends on its first. One synchronized update per frame; no
+    change writes nothing. Only sequences built here from numbers reach the terminal."""
+    full = prev is None or prev.w != cur.w or prev.h != cur.h
+    out, style = ["\x1b[?2026h" + ("\x1b[0m\x1b[2J" if full else "")], None
+    blank = [" ", None, None, 0]
+    for y in range(cur.h):
+        row = cur.c[y]
+        old = None if full else prev.c[y]
+        x = 0
+        while x < cur.w:
+            if old is not None and old[x] == row[x]:
+                x += 1
+                continue
+            if old is None and row[x] == blank:      # after a clear, blanks are there already
+                x += 1
+                continue
+            end, k, same = x + 1, x + 1, 0
+            while k < cur.w and same < join:
+                unchanged = old[k] == row[k] if old is not None else row[k] == blank
+                if unchanged:
+                    same += 1
+                else:
+                    same, end = 0, k + 1
+                k += 1
+            while x > 0 and (row[x][0] == "" or (old is not None and old[x][0] == "")):   # not inside a pair
+                x -= 1
+            while end < cur.w and (row[end][0] == "" or (old is not None and old[end][0] == "")):
+                end += 1
+            out.append("\x1b[%d;%dH" % (y + 1, x + 1))
+            for cell in row[x:end]:
+                if cell[0] == "":
+                    continue
+                ch, sgr = paint(cell, caps)
+                if sgr != style:
+                    out.append(sgr)
+                    style = sgr
+                out.append(ch)
+            x = end
+    if len(out) == 1 and not full:
+        return ""
+    out.append("\x1b[0m\x1b[?2026l")
+    return "".join(out)

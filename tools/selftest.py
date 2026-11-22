@@ -1041,10 +1041,13 @@ check(oomph.setting("selftest_switch", config={"selftest_switch": False}) == "1"
       "config: OOMPH_<NAME> beats the file, the file beats the default")
 os.environ.pop("OOMPH_SELFTEST_SWITCH")
 
-# --- oomph top (T0): the chart maths held to the app's, golden frames, one frame of this run's data
+# --- oomph top: the chart maths held to the app's, golden frames, one frame of this run's data (T0); the
+# full-screen program in a pseudo-terminal, its decoder and writer, tmux as an oracle, --ssh (T1)
 import oomph_view as view  # noqa: E402
 for tool, what in (("chartvectors.py", "chart maths agree with the app's (tools/vectors/chart.json)"),
-                   ("topfixture.py", "golden frames match (tools/golden/top)")):
+                   ("topfixture.py", "golden frames match (tools/golden/top)"),
+                   ("toptest.py", "the dashboard in a terminal: keys, resizes, signals, suspend, --ssh, tmux "
+                                  "(tools/toptest.py)")):
     r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", tool)], capture_output=True, text=True,
                        timeout=300)
     bad = [x for x in r.stdout.splitlines() if "FAIL" in x or "DIFFER" in x]
@@ -1379,7 +1382,11 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
     rc, msg = sh(os.path.join(A, "install.sh"))
     check(rc == 0 and os.readlink(lib) == "oomph-1.8.5" and ls() == ["oomph", "oomph-1.8.4", "oomph-1.8.5"],
           "install again: the same files are reused, nothing new")
-    os.mkdir(os.path.join(lx, "oomph-1.8.5", "__pycache__"))  # as `sudo oomph …` may leave
+    cache = os.path.join(lx, "oomph-1.8.5", "__pycache__")
+    check(any(n.startswith("oomph_top.") and n.endswith(".pyc") for n in os.listdir(cache))
+          if os.path.isdir(cache) else False,
+          "install compiles the modules once (oomph top and every command import instead of compiling)")
+    os.makedirs(cache, exist_ok=True)  # as `sudo oomph …` may leave
     os.symlink("oomph-gone", os.path.join(lx, ".oomph.link.99999"))  # an interrupted swap's
     os.symlink("gone", os.path.join(os.path.dirname(binp), ".oomph.link.99999"))
     rc, msg = sh(os.path.join(A, "install.sh"))

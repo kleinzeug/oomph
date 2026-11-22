@@ -245,6 +245,7 @@ struct Reservation: Identifiable {
     var peak = 0.0
     var used: Double?
     var expires: Double?
+    var queue: Int?                      // its place in ledger.json's list of leases: the queue's order
 
     var live: Bool { ended == nil }
     var gb: Double { segments.last?.gb ?? 0 }
@@ -260,6 +261,25 @@ struct Reservation: Identifiable {
         var h: UInt32 = 5381
         for u in purpose.unicodeScalars { h = (h &* 33) ^ u.value }
         return Int(h % UInt32(Reservation.palette.count))
+    }
+
+    /// The order of the reservation list (roadmap C13, 02 §3.4.6), the same in `oomph top`
+    /// (tools/vectors/chart.json): waiting first, in queue order (the ledger's: a queued request that
+    /// grows moves to the back; by request time where the place is unknown); then grants by time left,
+    /// the one that ends soonest first, a grant without a ttl last. With a cap, the rows that explain
+    /// why an agent waits are the ones that stay.
+    static func listOrder(_ live: [Reservation]) -> [Reservation] {
+        let waiting = live.filter { $0.granted == nil }.sorted { a, b in
+            let ka: (Int, Int, Double, String) = (a.queue == nil ? 1 : 0, a.queue ?? 0, a.requested, a.id)
+            let kb: (Int, Int, Double, String) = (b.queue == nil ? 1 : 0, b.queue ?? 0, b.requested, b.id)
+            return ka < kb
+        }
+        let granted = live.filter { $0.granted != nil }.sorted { a, b in
+            let ka: (Int, Double, Double, String) = (a.expires == nil ? 1 : 0, a.expires ?? 0, a.requested, a.id)
+            let kb: (Int, Double, Double, String) = (b.expires == nil ? 1 : 0, b.expires ?? 0, b.requested, b.id)
+            return ka < kb
+        }
+        return waiting + granted
     }
 
     /// From a ledger lease, a ledger history entry or a reservations.jsonl record.
@@ -415,9 +435,7 @@ final class MachineStore: ObservableObject {
     @Published var events: [ChartEvent] = []
     /// The agents' reservations, live and of the last 14 days, stacked for the strip under the chart.
     @Published var reservations: [ResBlock] = []
-    var liveReservations: [Reservation] {
-        reservations.map(\.res).filter(\.live).sorted { ($0.granted == nil ? 1 : 0, $0.requested) < ($1.granted == nil ? 1 : 0, $1.requested) }
-    }
+    var liveReservations: [Reservation] { Reservation.listOrder(reservations.map(\.res).filter(\.live)) }
     private var eventsStamp = ""
     @Published var incidents: [Incident] = []
     /// A mirror's link, coverage and machine (nil for this Mac).
@@ -782,8 +800,9 @@ final class Store: ObservableObject {
         for h in (ledger["history"] as? [[String: Any]]) ?? [] {
             if let r = Reservation(h), byKey[r.id] == nil { byKey[r.id] = r }
         }
-        for l in (ledger["leases"] as? [[String: Any]]) ?? [] {
+        for (pos, l) in ((ledger["leases"] as? [[String: Any]]) ?? []).enumerated() {
             guard var r = Reservation(l) else { continue }
+            r.queue = pos
             let seen = (l["seen"] as? NSNumber)?.doubleValue ?? r.requested
             let pid = ((l["holder"] as? [String: Any])?["pid"] as? NSNumber)?.int32Value ?? 0
             if let e = r.expires, r.granted != nil, e < now { r.ended = e; r.outcome = "expired" }
@@ -3875,6 +3894,15 @@ func chartVectors(_ path: String) -> Int32 {
             ["key": r.id, "ended": r.ended.map { $0 as Any } ?? NSNull(), "outcome": r.outcome.map { $0 as Any } ?? NSNull(),
              "gb": r.gb, "segments": r.segments.count]
         }
+    }
+    out["order"] = cases("order").map { c -> [String] in
+        let rs: [Reservation]
+        if let ledger = c["ledger"] as? [String: Any] {     // through the merge: places in the queue
+            rs = Store.mergeReservations(records: nil, ledger: ledger, now: num(c["now"]), holderGone: { _ in false })
+        } else {
+            rs = ((c["reservations"] as? [[String: Any]]) ?? []).compactMap { Reservation($0) }
+        }
+        return Reservation.listOrder(rs.filter(\.live)).map(\.id)
     }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)

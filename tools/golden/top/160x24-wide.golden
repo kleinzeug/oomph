@@ -11,7 +11,7 @@
 │█████████████████████████████████████████████████████┃███████████████████████████████████████████████████     ││   Free disk                            63 GB │
 │▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅┃▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅▅     ││   Not owned by a process              3.6 GB │
 │█████████████████████████████████████████████████████┃███████████████████████████████████████████████████     ││   Idle                      0 s · display on │
-│        08:00            09:00             10:00            11:00             12:00            13:00          │├─ Top apps ───────────────────────────────────┤
+│        08:00            09:00             10:00            11:00             12:00            13:00          │├─ Top apps ─────────────────── 742 processes ─┤
 ├─ Reserved by agents ──────────────────────────────────────────────── 12.0 GB reserved · 39 in the last 24 h ─┤│   1 Google Chrome       23 ▅▅▅▅▅▅▅▅▅▅▅  5.1G │
 │          ┊                ┊                 ┊                ┊      ▃▃        ▁┊                ┊      ▒  24G││   2 Xcode                6 ▅▅▅▅▅▅▅▅▅    4.2G │
 │          ┊                ┊                 ┊           ▁▁▁  ┊      ▅▅      ▒▁▄▄▄▄          ▄▄▄ ┊   ▄▄▅▅     ││   3 Code                14 ▅▅▅▅▅▅▅      3.4G │
@@ -36,7 +36,7 @@ laaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaiaaaaaaaaaaaaaaaaaaaaaaaaa
 laaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaiaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.....ll...ddddddddd..................................l
 lwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwiwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww.....ll...dddddddddddddddddddddd.....................l
 lwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwiwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww.....ll...dddd.......................................l
-l........ddddd............ddddd.............ddddd............ddddd.............ddddd............ddddd..........lll..........llllllllllllllllllllllllllllllllllll
+l........ddddd............ddddd.............ddddd............ddddd.............ddddd............ddddd..........lll..........llllllllllllllllllldddddddddddddddll
 ll....................llllllllllllllllllllllllllllllllllllllllllllllllddddddddddddddddddddddddddddddddddddddddlll..ff....................fff.aaaaaaaaaaa.......l
 l..........g................g.................g................g......11........2g................g......3..fffll..ff....................fff.aaaaaaaaa.........l
 l..........g................g.................g...........000..g......11......002222..........111.g...1111.....ll..ff....................fff.aaaaaaa...........l

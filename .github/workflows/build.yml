@@ -34,15 +34,28 @@ jobs:
         run: |
           bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/fixtureplat.py tools/mirrorfixture.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
+
+      - name: tmux, the oracle of the terminal tests
+        # tools/toptest.py paints frames into tmux and reads them back; with CI set, a missing tmux
+        # fails the test instead of skipping it.
+        run: command -v tmux || brew install tmux
 
       - name: Daemon + CLI self-test
         # Samples this runner into a temp dir, simulates a jetsam storm, and checks
         # the incident lifecycle, the HTML report and every CLI command, the chart maths of
-        # `oomph top` against tools/vectors/chart.json and its golden frames (tools/golden/top).
+        # `oomph top` against tools/vectors/chart.json, its golden frames (tools/golden/top) and
+        # the full-screen program in a pseudo-terminal (tools/toptest.py).
         run: /usr/bin/python3 -I -B tools/selftest.py
+
+      - name: oomph top for a minute
+        # The budget of the terminal dashboard (roadmap 04 §4.9): installed as install.sh installs it
+        # (compiled), a minute at 160 x 48 on 14 days of data with a sample every 10 s, in a
+        # pseudo-terminal: under 1 % of a core and 40 MB peak resident; the numbers are in the log. A shared
+        # runner gets a margin: over 1 % warns, over 1.5 % fails (three times the logger's rate, so still strict).
+        run: /usr/bin/python3 -I -B tools/toptest.py --minute
 
       - name: Root test (H0)
         # As real root (the runner has passwordless sudo): neither the daemon nor
@@ -216,4 +229,6 @@ jobs:
           echo "doctor exit $rc"; test "$rc" = 2   # nothing measures Linux yet: it says so, and exits 2
 
       - name: Self-test, portable half
-        run: python3 -I -B tools/selftest.py
+        run: |
+          command -v tmux || { sudo apt-get update -q && sudo apt-get install -y -q tmux; }
+          python3 -I -B tools/selftest.py

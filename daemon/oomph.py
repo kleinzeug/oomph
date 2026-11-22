@@ -3,8 +3,10 @@
 
   oomph status
   oomph report [--last 2h | --since ISO [--until ISO]]
-  oomph top --once [--span inf|24h|6h|1h] [--size 80x24] [--glyphs unicode|cells|ascii]
-                                     the popup's dashboard as one frame in the terminal
+  oomph top [--span inf|24h|6h|1h] [--glyphs unicode|cells|ascii] [--bell]
+                                     the popup's dashboard, full screen (? lists its keys)
+  oomph top --ssh [USER@]HOST       the same on another Mac, over ssh
+  oomph top --once [--size 80x24]   one frame of it, as text
   oomph incidents
   oomph incident <id|latest> [--html]
   oomph html [--last 24h | --since ISO [--until ISO]] [-o FILE] [--open]
@@ -3924,6 +3926,15 @@ def cmd_setup_claude(args):
     return 0
 
 
+def _has_bytecode():
+    """Whether this file has bytecode beside it (install.sh compiles every module once, as root)."""
+    import importlib.util
+    try:
+        return os.path.isfile(importlib.util.cache_from_source(os.path.realpath(__file__)))
+    except (NotImplementedError, ValueError):
+        return False
+
+
 def main(argv):
     try:
         return _main(argv)
@@ -3966,6 +3977,17 @@ def _main(argv):
     if c == "top":
         if HERE not in sys.path:
             sys.path.insert(0, HERE)
+        if __name__ == "__main__" and "--once" not in rest and sys.executable and _has_bytecode():
+            # Run as a script, this module was compiled from source, and what that leaves behind stays
+            # resident (about 9 MB) for as long as the dashboard runs: start again, same process and
+            # terminal, on the bytecode install.sh made. (-I, and -B if given, as this run had them.)
+            mod = os.path.splitext(os.path.basename(os.path.realpath(__file__)))[0]
+            os.execv(sys.executable, [sys.executable, "-I"] + (["-B"] if sys.flags.dont_write_bytecode else []) +
+                     ["-c", "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
+                            "sys.exit(importlib.import_module(sys.argv[2]).main(sys.argv[3:]))", HERE, mod, "top"] + rest)
+        # oomph_top imports oomph: let it have this module instead of compiling and holding a second copy
+        # of it (run as a script, this module is __main__). A dashboard meant to stay small needs the 10 MB.
+        sys.modules.setdefault(CMD, sys.modules[__name__])
         import oomph_top
         return oomph_top.cmd_top(rest)
     if c == "ai-check":

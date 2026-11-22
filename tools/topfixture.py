@@ -8,7 +8,7 @@ and a colour change are separate, readable diffs).
     tools/topfixture.py --update      rewrite them (review the diff before committing)
     tools/topfixture.py --dir DIR     only write the fixture directories into DIR (by hand:
                                       OOMPH_DIR=DIR/default/log OOMPH_LEDGER_DIR=DIR/default/ledger
-                                      oomph top --once --now 1795191997)
+                                      oomph top --once --now 1795177620)
 
 All data is invented. The list of frames is closed: a new one retires an old one.
 """
@@ -160,7 +160,8 @@ def reservations(live, seed=82, now=NOW):
         if not queued:
             lease.update(granted=req, ttl=ttl, expires=req + ttl)
         leases.append(lease)
-    return recs, {"seq": seq, "leases": leases, "history": [], "state": {}}
+    return recs, {"seq": seq, "leases": leases, "history": [],
+                  "state": {"t": now - 1, "level": "ok", "free_gb": 3.3, "margin_gb": 1.8}}
 
 
 INCIDENTS = [("20261120-102907", T(20, 10, 29, 7), T(20, 10, 36), 0, "memory pressure critical"),
@@ -169,6 +170,17 @@ INCIDENTS = [("20261120-102907", T(20, 10, 29, 7), T(20, 10, 36), 0, "memory pre
 GROUPS = [("Google Chrome", 5.1, 23), ("Xcode", 4.2, 6), ("Code", 3.4, 14), ("OrbStack", 3.1, 4), ("Slack", 1.2, 5),
           ("Safari", 1.1, 9), ("Figma", 0.9, 4), ("iTerm2", 0.6, 3), ("Spotify", 0.5, 4), ("Mail", 0.4, 2),
           ("Notes", 0.3, 1), ("Finder", 0.2, 1)]
+PROCS = [(4410, "Google Chrome Helper (Renderer)", 1650, "Google Chrome", None), (4402, "Google Chrome", 980, "Google Chrome", None),
+         (2301, "Xcode", 3100, "Xcode", None), (4471, "Google Chrome Helper (GPU)", 760, "Google Chrome", None),
+         (651, "java", 2253, "Code", 640), (2215, "python", 1946, "Code", 2210), (3127, "node", 819, "Code", 3120),
+         (1201, "OrbStack Helper", 2900, "OrbStack", None)]
+INCIDENT_SUMMARY = {"peak_pressure": "critical", "peak_at": "2026-11-19T14:24:40", "max_swap_used_gb": 7.4,
+                    "max_swap_total_gb": 9.0, "jetsam_kills": 14,
+                    "most_killed": {"WebContent": 6, "mdworker_shared": 3, "Slack Helper": 2},
+                    "group_risers": [{"name": "java", "rise_mb": 6963}, {"name": "Google Chrome", "rise_mb": 1229}],
+                    "groups_at_peak": [{"name": "java", "mb": 9114}, {"name": "Google Chrome", "mb": 5222},
+                                       {"name": "Xcode", "mb": 4300}],
+                    "claude_at_peak": [{"cwd": "/srv/proj/atlas", "mb": 9626}], "away_fraction": 0.0}
 EVENTS = [(T(20, 12, 40), "sleep_gap", {"seconds": 2100}), (T(20, 10, 29), "pressure_change", {"old": 2, "new": 4}),
           (T(20, 10, 21), "pressure_change", {"old": 1, "new": 2}), (T(20, 8, 12), "sleep_gap", {"seconds": 20400}),
           (T(19, 14, 22), "jetsam", {"kills": 14}), (T(19, 14, 20), "pressure_change", {"old": 2, "new": 4}),
@@ -206,7 +218,9 @@ def write_fixture(d, scenario):
                claude=[{"pid": 640, "cwd": "/srv/proj/atlas", "mb": 3174, "n": 14, "biggest": {"name": "java", "mb": 2253}},
                        {"pid": 2210, "cwd": "/srv/proj/ml-eval", "mb": 2662, "n": 9, "biggest": {"name": "python", "mb": 1946}},
                        {"pid": 3120, "cwd": "/srv/proj/webshop", "mb": 1434, "n": 11, "biggest": {"name": "node", "mb": 819}}],
-               daemon={"pid": 99, "version": "1.8.7", "interval": 30, "incident": None, "root": True})
+               daemon={"pid": 99, "version": "1.8.7", "interval": 30, "incident": None, "root": True},
+               procs=742, top=[{"pid": pid, "ppid": 1, "name": n, "uid": 501, "mb": mb, "g": g, "s": ses}
+                               for pid, n, mb, g, ses in PROCS])
     if scenario == "hostile":
         cur["groups"][0]["name"] = "\x1b[2J\x1b[Hevil\x07 app"
         cur["groups"][1]["name"] = "\u202eppA dooG"
@@ -228,7 +242,8 @@ def write_fixture(d, scenario):
         with open(os.path.join(log, "incidents", iid, "incident.json"), "w") as f:
             json.dump({"id": iid, "start": start, "end": end, "open": end is None,
                        "reasons": [{"kind": "pressure", "desc": desc, "t": start}],
-                       "summary": {"jetsam_kills": kills}}, f)
+                       "summary": dict(INCIDENT_SUMMARY, jetsam_kills=kills) if kills == 14 else
+                       {"jetsam_kills": kills}}, f)
     if scenario != "fresh":
         recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else LIVE)
         with open(os.path.join(led, "reservations.jsonl"), "w") as f:
@@ -239,7 +254,7 @@ def write_fixture(d, scenario):
     return log, led
 
 
-# (name, scenario, width, height, span, colour, glyphs, theme, format)
+# (name, scenario, width, height, span, colour, glyphs, theme, format[, keys pressed first])
 FRAMES = [
     ("80x24-default", "default", 80, 24, "24h", "256", "unicode", "dark", "golden"),
     ("80x24-inf", "default", 80, 24, "inf", "256", "unicode", "dark", "golden"),
@@ -259,7 +274,38 @@ FRAMES = [
     ("80x24-hostile", "hostile", 80, 24, "24h", "256", "unicode", "dark", "golden"),
     ("80x24-256-dark", "default", 80, 24, "24h", "256", "unicode", "dark", "ans"),
     ("80x24-truecolor-light", "critical", 80, 24, "1h", "truecolor", "cells", "light", "ans"),
+    # T1: the selection, a panel, the help, the cards (the keys are pressed through oomph_view.press, as the
+    # program presses them)
+    ("80x24-selected", "default", 80, 24, "24h", "256", "unicode", "dark", "golden",
+     "down down down down down space down"),
+    ("80x24-apps", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "a down"),
+    ("60x16-apps", "default", 60, 16, "24h", "256", "unicode", "dark", "golden", "a"),
+    ("80x24-help", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "?"),
+    ("80x24-reservation-card", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "down enter"),
+    ("80x24-incident-card", "default", 80, 24, "24h", "256", "unicode", "dark", "golden", "up down enter"),
 ]
+
+
+def press_keys(model, w, h, span, keys):
+    """The ui state after `keys`, as the program's key map reaches it for these keys."""
+    import oomph_top
+    import oomph_view as view
+    ui = {"span": span}
+    if keys:
+        ui["detected"] = oomph_top.detected_text(view.Caps("256", "unicode", "dark"), {"theme": True}, (w, h))
+    for k in (keys or "").split():
+        P = view.layout(model, w, h)
+        if k == "?":
+            ui["overlay"] = {"kind": "help", "page": 1, "off": 0}
+        elif k in ("a", "s", "e"):
+            ui["panel"] = k
+        elif k == "enter":
+            kind, item = view.selected(model, ui)
+            ui["overlay"] = {"kind": kind, "key": item["key"]} if kind == "res" else \
+                {"kind": kind, "id": item["id"] if kind == "inc" else item[0]}
+        else:
+            view.press(ui, k, model, P)
+    return ui
 
 
 def frames(base):
@@ -268,7 +314,7 @@ def frames(base):
     import oomph_top
     import oomph_view as view
     dirs, out = {}, {}
-    for name, scen, w, h, span, color, glyphs, theme, fmt in FRAMES:
+    for name, scen, w, h, span, color, glyphs, theme, fmt, *keys in FRAMES:
         if scen not in dirs:
             dirs[scen] = write_fixture(os.path.join(base, scen), scen)
         log, led = dirs[scen]
@@ -276,10 +322,10 @@ def frames(base):
         model = oomph_top.load_model(span, NOW, log_dir=log, live=False)
         model.update(host=HOST if scen != "hostile" else "st\x1b[2Judio\u202e", os=OS)
         caps = view.Caps(color, glyphs, theme)
-        fr = view.render(model, w, h, caps, {"span": span})
+        fr = view.render(model, w, h, caps, press_keys(model, w, h, span, keys[0] if keys else None))
         if fmt == "golden":
-            text = fr.golden("oomph top golden frame v2 · %dx%d · scenario=%s · span=%s glyphs=%s color=%s"
-                             % (w, h, scen, span, glyphs, color))
+            text = fr.golden("oomph top golden frame v2 · %dx%d · scenario=%s · span=%s glyphs=%s color=%s%s"
+                             % (w, h, scen, span, glyphs, color, " · keys=%s" % keys[0] if keys else ""))
         else:
             text = fr.ansi(caps)
         out[name + "." + ("golden" if fmt == "golden" else "ans")] = (text, fr)

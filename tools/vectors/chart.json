@@ -1394,5 +1394,146 @@
     {"ended": 1795179890, "gb": 2, "key": "q3@1795179100", "outcome": "lapsed", "segments": 1}
    ]
   }
+ ],
+ "order": [
+  {
+   "now": 1795180000.0,
+   "reservations": [
+    {
+     "id": "o1",
+     "key": "o1@1795179100",
+     "gb": 2.0,
+     "purpose": "p o1",
+     "requested": 1795179100.0,
+     "granted": 1795179100.0,
+     "expires": 1795180600.0
+    },
+    {
+     "id": "o2",
+     "key": "o2@1795179700",
+     "gb": 4.0,
+     "purpose": "p o2",
+     "requested": 1795179700.0,
+     "granted": null
+    },
+    {
+     "id": "o3",
+     "key": "o3@1795179200",
+     "gb": 1.0,
+     "purpose": "p o3",
+     "requested": 1795179200.0,
+     "granted": 1795179300.0
+    },
+    {
+     "id": "o4",
+     "key": "o4@1795179400",
+     "gb": 3.0,
+     "purpose": "p o4",
+     "requested": 1795179400.0,
+     "granted": null
+    },
+    {
+     "id": "o5",
+     "key": "o5@1795179900",
+     "gb": 1.0,
+     "purpose": "p o5",
+     "requested": 1795179900.0,
+     "granted": 1795179910.0,
+     "expires": 1795180060.0
+    },
+    {
+     "id": "o6",
+     "key": "o6@1795175000",
+     "gb": 2.0,
+     "purpose": "p o6",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "ended": 1795176000.0
+    },
+    {
+     "id": "o7",
+     "key": "o7@1795179950",
+     "gb": 1.0,
+     "purpose": "p o7",
+     "requested": 1795179950.0,
+     "granted": 1795179960.0,
+     "expires": 1795180600.0
+    },
+    {
+     "id": "o8",
+     "key": "o8@1795179400",
+     "gb": 2.0,
+     "purpose": "p o8",
+     "requested": 1795179400.0,
+     "granted": null
+    }
+   ],
+   "out": [
+    "o4@1795179400",
+    "o8@1795179400",
+    "o2@1795179700",
+    "o5@1795179900",
+    "o1@1795179100",
+    "o7@1795179950",
+    "o3@1795179200"
+   ]
+  },
+  {"now": 1795180000.0, "reservations": [], "out": []},
+  {
+   "now": 1795180000.0,
+   "ledger": {
+    "seq": 23,
+    "history": [],
+    "leases": [
+     {
+      "id": "r20",
+      "key": "r20@1795179100",
+      "gb": 2.0,
+      "purpose": "p r20",
+      "requested": 1795179100.0,
+      "granted": 1795179100.0,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "granted",
+      "seen": 1795179995.0,
+      "expires": 1795180900.0
+     },
+     {
+      "id": "r22",
+      "key": "r22@1795179600",
+      "gb": 1.0,
+      "purpose": "p r22",
+      "requested": 1795179600.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179995.0
+     },
+     {
+      "id": "r23",
+      "key": "r23@1795179700",
+      "gb": 2.0,
+      "purpose": "p r23",
+      "requested": 1795179700.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179995.0
+     },
+     {
+      "id": "r21",
+      "key": "r21@1795179400",
+      "gb": 6.0,
+      "purpose": "p r21",
+      "requested": 1795179400.0,
+      "granted": null,
+      "segments": [{"t": 1795179400.0, "gb": 3.0}, {"t": 1795179880.0, "gb": 6.0}],
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179995.0
+     }
+    ]
+   },
+   "out": ["r22@1795179600", "r23@1795179700", "r21@1795179400", "r20@1795179100"]
+  }
  ]
 }

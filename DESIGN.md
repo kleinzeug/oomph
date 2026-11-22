@@ -76,7 +76,7 @@ Two practical lessons that shaped the implementation:
             ▲ reads (no privileges needed)
 ┌───────────┴─────────── user ─────────────────────────────┐
 │ oomph.app (menu bar)        oomph CLI (/usr/local/bin)    │
-│                              oomph mcp ← Claude sessions   │
+│ oomph top (terminal, 1.9)    oomph mcp ← Claude sessions   │
 │                                 │ flock, read/write        │
 │                                 ▼                          │
 │        /Users/Shared/oomph/ledger.json  (reservations)     │
@@ -93,7 +93,7 @@ Two practical lessons that shaped the implementation:
 |---|---|---|
 | Runner | **LaunchDaemon as root** (`local.oomph.daemon`), `KeepAlive`, `RunAtLoad` | Survives logout, reboot and closed terminals — the incidents happen exactly when nobody is watching. Only root can read the physical footprint of *every* process, including root daemons like `spotlightknowledged` and WindowServer. |
 | Install path | Code in `/usr/local/libexec/oomph-<version>/` (root-owned, 755), reached through the link `/usr/local/libexec/oomph`, which an install swaps by one rename once the new directory is complete; old versions go 7 days after they were replaced. CLI symlink `/usr/local/bin/oomph` | A root daemon must never execute user-writable files. A running process (the logger, an MCP server) keeps importing from the directory it started in, so it never mixes two versions' modules. |
-| Interpreter | `/usr/bin/python3 -I -B`, standard library only | Not affected by Homebrew upgrades; no dependencies; `-I` ignores environment and current directory. |
+| Interpreter | `/usr/bin/python3 -I -B`, standard library only. From 1.9 `install.sh` also compiles the installed modules once, as root (`compileall`: root-owned `__pycache__` in the root-owned version directory); `-B` still keeps every run from writing any | Not affected by Homebrew upgrades; no dependencies; `-I` ignores environment and current directory. Bytecode built by root beside root's files is as trusted as the files; `oomph top` needs it to stay small (see below). A cache that fails to build costs speed, not function. |
 | Metrics | Measured only by the backend module for the system (`oomph_darwin.py` on a Mac, reached through `oomph.plat()`; oomph.py and oomphd.py import no native code and load on any system): `libproc` via ctypes (`proc_pid_rusage` → `ri_phys_footprint`, the same figure as Activity Monitor's *Memory* column), `sysctl` via ctypes, `vm_stat`, `ioreg`, `pmset -g assertions` | Fast (~5 ms for ~750 processes), accurate, no third-party tools. |
 | Sampling | **Adaptive**: every 30 s; every 5 s ("hot mode") while pressure ≥ warning, swap grew > 512 MB within 60 s, jetsam kills occurred, free disk < 5 GB, or an incident is open | Fine resolution exactly when it matters, near-zero cost otherwise. |
 | Retention | Samples 14 days (previous days gzip-compressed); incidents 90 days; `events.jsonl` rotated at 20 MB | ~50–150 MB on disk in total. |
@@ -228,7 +228,7 @@ reservation queue that the sessions use through the skill, the CLI and the MCP s
 | Enforcement | None — advisory, like the rest of oomph | Killing or pausing an agent's work would be worse than the problem. The skill tells sessions never to start reserved-for work early and never to release others' entries. |
 | Edits | `oomph amend` / MCP `update_reservation`: gb, ttl (from now), purpose. Shrinking applies at once. Growing a grant applies only if a new request for the extra would be granted now (fits, nobody queued, not critical); otherwise refused with advice to reserve the extra separately, and nothing changes. Growing a queued request moves it to the back | Growth that skipped the queue would let a holder overtake everyone waiting; a pending-growth state would complicate every client. Refusal keeps the grant intact and the queue fair, and the advice is one tool call. |
 | History | `reservations.jsonl` next to the ledger (666), one record per line, written under the ledger lock: an `edit` record per applied change, an `end` record when a lease is retired, each a full snapshot (key, purpose, project, holder kind, gb and `segments` [{t, gb}] once edited, requested, granted, ended, outcome, peak). Every write rewrites it (see the next table): 14 days and at most 8 MB are kept; seeded once from the ledger's own last-100 history | Agents and the popup need spans of sessions that are long gone. Snapshots make the last record per key self-contained. The key is `id@requested`, and a fresh ledger continues the id numbering from the log, so ids never repeat after a reset. Ends are the real ones: an expiry at its expiry time, a lapse when polling stopped, a dead holder within one daemon sample. |
-| Popup strip | One block per reservation under the memory chart, drawn on the chart's own time mapping (same plot frame, same animated linear/log blend). Height ∝ GB; stacked by lanes (first-fit by start), and the stack at any moment is the sum of what is reserved there, so a block steps down when one below ends or shrinks; queued stretches hatched. The list below uses the same colours, hashed from the purpose | Lining up with the chart lets you read cause and effect; stacking shows the total the ledger promised. |
+| Popup strip | One block per reservation under the memory chart, drawn on the chart's own time mapping (same plot frame, same animated linear/log blend). Height ∝ GB; stacked by lanes (first-fit by start), and the stack at any moment is the sum of what is reserved there, so a block steps down when one below ends or shrinks; queued stretches hatched. The list below uses the same colours, hashed from the purpose; from 1.9 it is ordered as in `oomph top`: waiting first, in the ledger's queue order (by request time where that is unknown), then grants by time left, the one ending soonest first, a grant without a ttl last | Lining up with the chart lets you read cause and effect; stacking shows the total the ledger promised. With the list capped, the rows that explain why an agent waits are the ones that stay. |
 
 ### The shared directory is untrusted (1.8.4, H0)
 
@@ -251,6 +251,21 @@ republishes from it is rebuilt from typed, capped fields.**
 
 `oomph version --json` reports `"hardening": 1`, so a later `oomph share on` can refuse code
 without it.
+
+## The terminal dashboard (1.9)
+
+`oomph top` is the popup's dashboard full screen in a terminal (spans, the two lists and their
+cards, the panels, help, themes, glyph sets); `--once` prints one frame, `--ssh host` runs it on
+another machine.
+
+| Topic | Decision | Why |
+|---|---|---|
+| What it may do | Read only: it shows the logs, the ledger and the incidents and starts no change to any of them. `o` writes a report through `oomph html` / `oomph incident --html` (a child in its own session, left to finish after `q`, one at a time), `y` copies a path | The first full-screen release is a viewer; acting on reservations from it is a later decision |
+| As root | `sudo oomph top` is a pure viewer: the ledger is read as in every root path (a child as `SUDO_UID` or `nobody`, here every 30 s), nothing is saved, no report is written, no clipboard tool runs; the status line says "read-only" | The 1.8.4 invariant: root opens nothing in the shared directory, and writes nothing into a user's folder |
+| Settings | `top.json` in the user's own state folder (`~/Library/Application Support/oomph`, on Linux `$XDG_STATE_HOME/oomph`, found from the password database, not `$HOME`), mode 600, written by a new file and a rename; the span, `--bell`, and a colour, theme or glyph set given by hand. A folder that is not the user's makes the run read-only; choices passed by `--ssh` are not saved on the far side | `sudo -u` keeps `$HOME`; a damaged file falls back to the defaults |
+| `--ssh` | The local `oomph top` stays as the parent of `ssh -t` with fixed options (no multiplexing, agent, forwardings or `RemoteCommand` from `~/.ssh/config`; keep-alive ends a dead link in about 15 s). It puts this terminal back when ssh exits; the far side leaves when its terminal hangs up. The far side's shell exits 121/122/123 (no oomph on macOS / Linux / other) or 124 (an oomph without the dashboard); the parent then prints the install line for that system and exits 127. Nothing is copied to the other machine | A far side that dies cannot restore this terminal; no code runs remotely without an install |
+| Budget | Under 1 % of a core and 40 MB resident for a day in a pane, measured in CI (`tools/toptest.py --minute`). The worker reads only what changed (file identities once a second), keeps the history as typed arrays, draws a quiet screen every 10 s and writes nothing when nothing changed. Started as a script, `oomph.py` compiles itself and keeps that resident, so `oomph top` starts again (`execv`, same process and terminal) on the bytecode `install.sh` built. Without a logger it measures itself every 30 s and keeps only the chart's points | A dashboard that watches memory must not be what uses it |
+| The terminal | Raw mode, the alternate screen and bracketed paste, restored on every way out (`q`, an exception, SIGTERM, SIGHUP, a vanished terminal) without waiting on a terminal that stopped reading; ctrl-z stops it where a shell does job control | A broken terminal after a crash is worse than the crash |
 
 ## AI analysis (1.4)
 

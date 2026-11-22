@@ -11,7 +11,7 @@
 │   ▇┃█▆▄▇           █▃▁▄   ╱╱╱╱╱╱             ┊   ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱                █┃▄▄    ┊  ▁▃      ││   Free disk                            63 GB │
 │ ▂▃█┃████▅▂▃     ▃▂▃████▃  ╱╱╱╱╱╱             ┊   ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱          █▇▄▂▃▄█┃█▇█▆▇███▇███     ││   Not owned by a process              3.6 GB │
 │████┃███████▇▆██▆████████▁ ╱╱╱╱╱╱             ┊   ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱         ▇███████┃████████████     ││   Idle                      0 s · display on │
-│████┃█████████████████████▆╱╱╱╱╱╱  ▁▃▂▃▂▂▁    ┊   ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱         ████████┃████████████     │├─ Top apps ───────────────────────────────────┤
+│████┃█████████████████████▆╱╱╱╱╱╱  ▁▃▂▃▂▂▁    ┊   ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱         ████████┃████████████     │├─ Top apps ─────────────────── 742 processes ─┤
 │████┃██████████████████████╱╱╱╱╱╱█▇█████████▂ ┊   ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱         ████████┃████████████     ││   1 Google Chrome       23 ▅▅▅▅▅▅▅▅▅▅▅  5.1G │
 │███▅┃▇██████████████▆▁█▁███╱╱╱╱╱╱████████████▅▁▃▂▂╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱▁ ▂▁▂▁▁ ██▃▂████▁┃▃████████▁▂█  24G││   2 Xcode                6 ▅▅▅▅▅▅▅▅▅    4.2G │
 │▁▁▃█┃█▅▄▁▁█▁███▁█▃▂▃██▇█▂██╱╱╱╱╱╱█████████████████╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱█▇█████▇█▆██▅▄▄▆█┃█▆▇▅▇█▇▇▆███     ││   3 Code                14 ▅▅▅▅▅▅▅      3.4G │
@@ -60,7 +60,7 @@ ld.dpicppd.d.d.d.d.d.g.d.d.dhhhhhh.d.d.d.d.d.d.g.d.hhhhhhhhhhhhhhhhhhhhhhhhh.d.d
 l...cicccp...........cccc...hhhhhh.............g...hhhhhhhhhhhhhhhhhhhhhhhhh................picp....g..cc......ll...ddddddddd..................................l
 l.ccciccccccc.....cccccccc..hhhhhh.............g...hhhhhhhhhhhhhhhhhhhhhhhhh..........cccccccicccccccccccc.....ll...dddddddddddddddddddddd.....................l
 lcccciccccccccccccccccccccc.hhhhhh.............g...hhhhhhhhhhhhhhhhhhhhhhhhh.........ccccccccicccccccccccc.....ll...dddd.......................................l
-lccccicccccccccccccccccccccchhhhhh..ccccccc....g...hhhhhhhhhhhhhhhhhhhhhhhhh.........ccccccccicccccccccccc.....lll..........llllllllllllllllllllllllllllllllllll
+lccccicccccccccccccccccccccchhhhhh..ccccccc....g...hhhhhhhhhhhhhhhhhhhhhhhhh.........ccccccccicccccccccccc.....lll..........llllllllllllllllllldddddddddddddddll
 lccccicccccccccccccccccccccchhhhhhcccccccccccc.g...hhhhhhhhhhhhhhhhhhhhhhhhh.........ccccccccicccccccccccc.....ll..ff....................fff.aaaaaaaaaaa.......l
 lcccaiaccccccccccccccaacaccchhhhhhccccccccccccccccchhhhhhhhhhhhhhhhhhhhhhhhhc.ccccc.ccaaccccaiaccccccccaac..dddll..ff....................fff.aaaaaaaaa.........l
 laaaaiaaaaacacccacaaaaaaaacchhhhhhccccccccccccccccchhhhhhhhhhhhhhhhhhhhhhhhhcccccccccaaaaaaaaiaaaaaaaaaaaa.....ll..ff....................fff.aaaaaaa...........l

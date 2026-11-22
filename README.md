@@ -217,9 +217,35 @@ oomph report --since 2026-11-13T18:00 --until 2026-11-13T20:00
 oomph incidents                 # list of incidents
 oomph incident latest --html    # open the latest incident's report
 oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
-oomph top --once                # the popup's dashboard as one frame of text (--span inf|24h|6h|1h, --glyphs cells|ascii)
+oomph top                       # the popup's dashboard, full screen in the terminal (see below)
 oomph doctor                    # what works here and what to fix: logger, versions, ledger, Claude setup (--json)
 ```
+
+### In the terminal
+
+`oomph top` is the popup in a terminal window: the readings, the memory chart with its four
+spans, the reservations agents hold and wait for, and the incidents. It is driven by the
+keyboard and only reads: `←` `→` change the span (∞, 24 h, 6 h, 1 h), `↓` steps into the
+reservations and `↑` into the incidents (`space` switches between the two lists, `enter` shows
+a row's details, `esc` lets go), `a` `s` `e` show the biggest apps, the Claude sessions and the
+events in place of the lists, `o` opens the report, `?` lists every key and explains every mark,
+`q` quits. It fits 80 × 24 and uses the room of a bigger window; it works in tmux, and
+`--bell` rings the terminal's bell when an incident opens, at most every 15 minutes.
+
+```sh
+oomph top                       # this Mac
+oomph top --ssh build-mac       # another Mac, over ssh: needs oomph there, nothing else
+ssh -t build-mac /usr/local/bin/oomph top   # the same by hand: sshd's PATH lacks /usr/local/bin
+oomph top --once                # one frame as text (--span, --size 100x30, --glyphs cells|ascii)
+```
+
+`--glyphs cells` draws the chart with whole cells only, for a font or line spacing that shows thin
+lines between block characters; `--glyphs ascii` uses no Unicode at all. The span, `--bell` and
+a `--glyphs`, `--color` or `--theme` you give are remembered in
+`~/Library/Application Support/oomph/top.json` (`--glyphs auto` forgets the glyph set); under
+`sudo` the dashboard writes nothing, its reservations lag by up to 30 seconds, and it refuses
+`--ssh`. `--ssh` needs oomph 1.9.0 or newer on the other Mac and says so when it is missing or
+older.
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
 `oomph run --reserve`, `oomph reserve` / `amend` / `release` / `reservations`,
@@ -371,8 +397,8 @@ session B  → granted r8, tests start
   memory chart shows every reservation over time — one block per reservation, its
   height the GB reserved, stacked when they overlap, hatched while queued, aligned with
   the memory chart in every range — and the **Reserved by agents** list below it shows
-  the active ones in the same colours (up to five lines; with more, the last one reads
-  "+N more" and opens the full list).
+  the active ones in the same colours, waiting ones first, then grants by the time they have
+  left (up to five lines; with more, the last one reads "+N more" and opens the full list).
 - **Advisory:** ***oomph*** still never stops or kills anything. Taking turns is
   something the sessions agree on through the skill.
 - **Nothing in the shared folder is trusted:** every user can write to
@@ -425,7 +451,7 @@ that provider for each AI report (Ollama keeps it local).
 daemon/oomphd.py                  the sampler daemon (root)
 daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon), the path table
 daemon/oomph_darwin.py            everything that measures a Mac (the backend the daemon and CLI call)
-daemon/oomph_top.py               `oomph top`: reads the files and prints the frame
+daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)
 daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer
@@ -440,6 +466,7 @@ tools/roottest.py                 the same for what only root can show (CI runs 
 tools/brandlint.py                keeps the product's name (BRAND) apart from the command and paths
 tools/chartvectors.py             holds `oomph top`'s chart maths to the app's (tools/vectors/chart.json)
 tools/topfixture.py               the golden frames of `oomph top` (tools/golden/top), from fixed data
+tools/toptest.py                  `oomph top` in a pseudo-terminal: keys, signals, --ssh; tmux as the oracle
 tools/nettest.py                  the protocol's tests: serve, sync through a pipe, coverage, hostile input
 tools/mirrorfixture.py            another machine's mirror, for `oomph.app --render-popup … --mirror DIR`
 tools/spike_role_account.sh       a CI spike: a launchd job under a role account, time to first frame

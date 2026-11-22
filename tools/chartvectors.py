@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.join(ROOT, "daemon"))
 
 import oomph_view as V  # noqa: E402
 
-GROUPS = ("mapper", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge")
+GROUPS = ("mapper", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order")
 
 
 def cases():
@@ -113,6 +113,21 @@ def cases():
     queue = [dict(lease("q%d" % i, now - 900, 2.0), holder=holder, state="queued", seen=now - ago)
              for i, ago in enumerate((100, 179, 200, 290))]                       # around QUEUE_STALE_S
     v["merge"].append({"now": now, "records": [], "ledger": {"seq": 4, "leases": queue, "history": []}, "gone": []})
+    # the list's order (C13): waiting by request time, then grants by expiry, one without a ttl last; ties by key
+    v["order"].append({"now": now, "reservations": [
+        lease("o1", now - 900, 2.0, now - 900, expires=now + 600), lease("o2", now - 300, 4.0),
+        lease("o3", now - 800, 1.0, now - 700), lease("o4", now - 600, 3.0), lease("o5", now - 100, 1.0, now - 90,
+                                                                                    expires=now + 60),
+        lease("o6", now - 5000, 2.0, now - 5000, now - 4000), lease("o7", now - 50, 1.0, now - 40, expires=now + 600),
+        lease("o8", now - 600, 2.0)]})
+    v["order"].append({"now": now, "reservations": []})
+    # the queue is the ledger's order: r21 grew while queued and went to the back, behind r22 and r23
+    v["order"].append({"now": now, "ledger": {"seq": 23, "history": [], "leases": [
+        dict(lease("r20", now - 900, 2.0, now - 900), holder=holder, state="granted", seen=now - 5, expires=now + 900),
+        dict(lease("r22", now - 400, 1.0), holder=holder, state="queued", seen=now - 5),
+        dict(lease("r23", now - 300, 2.0), holder=holder, state="queued", seen=now - 5),
+        dict(lease("r21", now - 600, 6.0, segs=[(now - 600, 3.0), (now - 120, 6.0)]), holder=holder, state="queued",
+             seen=now - 5)]}})
     return v
 
 
@@ -136,6 +151,11 @@ def python_answers(v):
         rs = [V._norm(o) for o in c["reservations"]]
         out["stack"].append([{"key": b["res"]["key"], "lane": b["lane"], "steps": [list(st) for st in b["steps"]]}
                              for b in V.stack_reservations(rs, c["now"])])
+    for c in v["order"]:
+        rs = (V.merge_reservations([], c["ledger"], c["now"]) if "ledger" in c else
+              [V._norm(o) for o in c["reservations"]])
+        waiting, granted, _ = V.ordered_res(rs)
+        out["order"].append([r["key"] for r in waiting + granted])
     for c in v["merge"]:
         gone = set(c.get("gone") or ())
         rs = V.merge_reservations(c["records"], c["ledger"], c["now"], lambda pid: pid not in gone)
