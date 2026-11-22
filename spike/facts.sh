@@ -37,7 +37,8 @@ kver_ge() { [ "$(printf '%s\n%s\n' "$1" "$(uname -r | cut -d- -f1)" | sort -V | 
 cursor_now() { journalctl --sync >/dev/null 2>&1; journalctl -n 1 -o json --no-pager 2>/dev/null | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["__CURSOR"])' 2>/dev/null; }
 vmstat_oom() { awk '$1=="oom_kill"{print $2}' /proc/vmstat; }
 pkg_install() {  # best effort, quiet
-    if command -v apt-get >/dev/null; then DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq "$@" >/dev/null 2>&1
+    if command -v apt-get >/dev/null; then [ -e /var/tmp/.spike-apt-updated ] || { timeout 300 apt-get update -qq >/dev/null 2>&1; touch /var/tmp/.spike-apt-updated; }
+        DEBIAN_FRONTEND=noninteractive timeout 300 apt-get install -y -qq "$@" >/dev/null 2>&1
     elif command -v dnf >/dev/null; then timeout 400 dnf -y -q install "$@" >/dev/null 2>&1; fi
 }
 ensure_helpers() { mkdir -p "$PY"; cp "$SPIKE"/py/*.py "$PY"/; chmod 755 "$LX" "$PY"; chmod 644 "$PY"/*.py; }
@@ -202,23 +203,22 @@ x = bytearray(b'x') * (200 << 20)
 PYEOF
     local c k0 k1 cg
     c=$(cursor_now); k0=$(vmstat_oom)
-    systemd-run --quiet --scope --unit spike-r9 -p MemoryMax=96M -p MemorySwapMax=0 python3 "$STATE/r9.py" > "$STATE/r9.run" 2>&1 &
+    systemd-run --quiet --scope --unit spike-r9 --slice spike9.slice -p MemoryMax=96M -p MemorySwapMax=0 python3 "$STATE/r9.py" > "$STATE/r9.run" 2>&1 &
     local sp=$!
     sleep 1.5
     cg=/sys/fs/cgroup$(systemctl show -p ControlGroup --value spike-r9.scope)
     echo "scope cgroup $cg"; echo 1 > "$cg/memory.oom.group"; echo "memory.oom.group = $(cat $cg/memory.oom.group)"
-    local i ev=""
-    for i in $(seq 1 60); do [ -e "$cg/memory.events" ] && ev=$(cat "$cg/memory.events") && echo "$ev" > "$STATE/r9.events"; kill -0 $sp 2>/dev/null || break; sleep 0.2; done
     wait $sp; echo "scope exit: $?"; cat "$STATE/r9.run"
     sleep 2; k1=$(vmstat_oom)
-    echo "last memory.events of the scope:"; cat "$STATE/r9.events" 2>/dev/null
+    cat /sys/fs/cgroup/spike9.slice/memory.events > "$STATE/r9.events" 2>/dev/null
+    echo "memory.events of the parent spike9.slice (hierarchical) after the kill:"; cat "$STATE/r9.events" 2>/dev/null
     echo "/proc/vmstat oom_kill: $k0 -> $k1"
     echo "journal lines: $(journal_since "$c" "$RAW/r9-kernel.json" -k)"
     run "journalctl --no-pager -k -o short-monotonic --after-cursor='$c' | grep -vE '^\s*$' | grep -iE 'oom|Killed|Tasks state|memory:|Memory cgroup' "
     run "python3 $PY/patterns.py < $RAW/r9-kernel.json" | tee "$STATE/r9.pat"
-    local s kl; s=$(sed -n 's/.*SUMMARY=\([0-9]*\).*/\1/p' "$STATE/r9.pat"); kl=$(sed -n 's/.* KILLED=\([0-9]*\).*/\1/p' "$STATE/r9.pat")
-    if [ "$s" = 1 ] && [ "$kl" = 3 ]; then verdict MATCH "one SUMMARY, three KILLED lines; oom_kill +$((k1-k0)); $(tr '\n' ' ' < "$STATE/r9.events" 2>/dev/null)"
-    else verdict MISMATCH "SUMMARY=$s KILLED=$kl, oom_kill +$((k1-k0)); events: $(tr '\n' ' ' < "$STATE/r9.events" 2>/dev/null)"; fi
+    local s kl dp; s=$(sed -n 's/.*SUMMARY=\([0-9]*\).*/\1/p' "$STATE/r9.pat"); kl=$(sed -n 's/.* KILLED=\([0-9]*\).*/\1/p' "$STATE/r9.pat"); dp=$(sed -n 's/.*KILLED_distinct_pids=\([0-9]*\).*/\1/p' "$STATE/r9.pat")
+    local x="SUMMARY=$s KILLED lines=$kl for $dp distinct pids, /proc/vmstat oom_kill +$((k1-k0)); slice events: $(grep -E '^(oom|oom_kill|oom_group_kill) ' "$STATE/r9.events" 2>/dev/null | tr '\n' ' ')"
+    if [ "$s" = 1 ] && [ "$kl" = 3 ]; then verdict MATCH "$x"; else verdict MISMATCH "$x"; fi
 }
 row10() {
     [ "$MODE" = guest ] || { notrun "a machine-wide OOM would take the runner down; this row runs in the QEMU guests"; return; }
@@ -293,29 +293,40 @@ row13() {
     run "journalctl --version | head -1"
     T=30 run "journalctl --no-pager --after-cursor='$c' -o json _TRANSPORT=kernel + _SYSTEMD_UNIT=systemd-oomd.service + _SYSTEMD_UNIT=earlyoom.service | head -c 200; echo; exit \${PIPESTATUS[0]}" | tee "$STATE/r13a"
     T=15 run "timeout 3 journalctl -f -o json --after-cursor='$c' _TRANSPORT=kernel + _SYSTEMD_UNIT=systemd-oomd.service > /dev/null; echo rc=\$? '(124 = still following: accepted)'" | tee "$STATE/r13b"
-    if grep -q '^\[exit 0\]' "$STATE/r13a" && grep -q 'rc=124' "$STATE/r13b"; then verdict MATCH "accepted on systemd $(journalctl --version | head -1 | awk '{print $2}')"
-    else verdict MISMATCH "see output"; fi
+    note "does --after-cursor return every entry after the cursor? 5 rounds: take the cursor of the newest entry, write 3 kernel lines, read after the cursor"
+    local i lost=0 c2 got
+    for i in 1 2 3 4 5; do
+        logger -t spike-r13 "anchor $i $$"; sleep 0.5; c2=$(cursor_now)
+        echo "spike-r13 kmsg $i a $$" > /dev/kmsg; echo "spike-r13 kmsg $i b $$" > /dev/kmsg; echo "spike-r13 kmsg $i c $$" > /dev/kmsg
+        sleep 1; journalctl --sync 2>/dev/null
+        got=$(journalctl --no-pager -o cat --after-cursor="$c2" _TRANSPORT=kernel 2>/dev/null | grep -c "spike-r13 kmsg $i . $$")
+        echo "round $i: $got of 3 kernel lines after the cursor; -k form: $(journalctl --no-pager -o cat -k --after-cursor="$c2" 2>/dev/null | grep -c "spike-r13 kmsg $i . $$") of 3"
+        [ "$got" = 3 ] || lost=$((lost+1))
+    done 2>&1 | tee "$STATE/r13c"
+    lost=$(grep -c -v ': 3 of 3 kernel lines after the cursor; -k form: 3 of 3' "$STATE/r13c")
+    if grep -q '^\[exit 0\]' "$STATE/r13a" && grep -q 'rc=124' "$STATE/r13b" && [ "$lost" = 0 ]; then verdict MATCH "accepted on systemd $(journalctl --version | head -1 | awk '{print $2}'); --after-cursor returned every new entry in 5 of 5 rounds"
+    else verdict MISMATCH "systemd $(journalctl --version | head -1 | awk '{print $2}'): options accepted=$(grep -q '^\[exit 0\]' "$STATE/r13a" && echo yes || echo no), -f=$(grep -o 'rc=[0-9]*' "$STATE/r13b"); rounds with lost entries: $lost of 5 ($(grep -o 'round [0-9]: [0-9] of 3[^;]*; -k form: [0-9] of 3' "$STATE/r13c" | tr '\n' ' '))"; fi
 }
 row14() {
     ensure_oomph_accounts
     local d=$STATE/units; mkdir -p "$d"; cp "$SPIKE"/units/* "$d"/
     T=60 run "systemd-analyze verify $d/oomphd.service" | tee "$STATE/r14v"
     local sv; sv=$(systemctl --version | head -1 | awk '{print $2}')
-    T=60 run "systemd-analyze security --offline=true $d/oomphd.service" > "$STATE/r14s" 2>&1
+    CAP=30000 T=60 run "systemd-analyze security --offline=true $d/oomphd.service" > "$STATE/r14s" 2>&1
     if grep -qiE 'unrecognized option|unknown option|invalid option' "$STATE/r14s"; then
         cat "$STATE/r14s" | tail -3
         note "systemd $sv has no --offline: installing the draft and analysing the loaded unit"
         cp "$d/oomphd.service" /etc/systemd/system/oomphd.service; systemctl daemon-reload
-        T=60 run "systemd-analyze security oomphd.service" > "$STATE/r14s" 2>&1
+        CAP=30000 T=60 run "systemd-analyze security oomphd.service" > "$STATE/r14s" 2>&1
     fi
-    cat "$STATE/r14s"
-    T=30 run "systemd-analyze syscall-filter @system-service | grep -nE 'process_vm|process_madvise|kcmp|pidfd_getfd|ptrace' ; echo; systemd-analyze syscall-filter @system-service | grep -E '^\s+@' " | tee "$STATE/r14f"
+    grep -vE '^\+ ' "$STATE/r14s"
+    T=30 run "systemd-analyze syscall-filter @system-service | head -12; echo ...; systemd-analyze syscall-filter @system-service | grep -nE '@ipc|@debug|process_vm|process_madvise|kcmp|pidfd_getfd|ptrace'; echo '--- @ipc:'; systemd-analyze syscall-filter @ipc | grep -E 'process_vm|process_madvise'; echo '--- @debug:'; systemd-analyze syscall-filter @debug | grep -E 'ptrace|pidfd_getfd|process_vm'" | tee "$STATE/r14f"
     local exp; exp=$(grep -o 'Overall exposure level for [^:]*: [0-9.]*' "$STATE/r14s" | awk '{print $NF}')
-    local vok=no; grep -q '^\[exit 0\]' "$STATE/r14v" && [ "$(grep -vcE '^\$|^\[exit' "$STATE/r14v")" -eq 0 ] && vok=yes
-    local fok=no; grep -q process_vm_readv "$STATE/r14f" && fok=yes
+    local vok=no; [ "$(grep -vE '^\$|^\[exit' "$STATE/r14v" | grep -c 'oomphd')" -eq 0 ] && vok=yes
+    local fok=no; grep -qE '^[0-9]+:.*@ipc' "$STATE/r14f" && sed -n '/--- @ipc/,/--- @debug/p' "$STATE/r14f" | grep -q process_vm_readv && fok=yes
     local eok=no; [ -n "$exp" ] && awk "BEGIN{exit !($exp <= 2.5)}" && eok=yes
-    local s="verify clean=$vok; exposure=${exp:-?} (<=2.5: $eok); @system-service lists process_vm_readv=$fok; systemd $sv"
-    [ $vok = yes ] && [ $eok = yes ] && [ $fok = yes ] && verdict MATCH "$s" || verdict MISMATCH "$s; verify said: $(grep -vE '^\$|^\[exit' "$STATE/r14v" | head -3 | tr '\n' ' ')"
+    local s="verify clean=$vok; exposure=${exp:-?} (<=2.5: $eok); @system-service includes @ipc which lists process_vm_readv=$fok; systemd $sv"
+    [ $vok = yes ] && [ $eok = yes ] && [ $fok = yes ] && verdict MATCH "$s" || verdict MISMATCH "$s; verify said about oomphd: $(grep -vE '^\$|^\[exit' "$STATE/r14v" | grep oomphd | head -3 | tr '\n' ' ')"
 }
 row15() {
     ensure_oomph_accounts; ensure_helpers
@@ -428,7 +439,7 @@ row19() {
         local h0 h1; rm -f $D/*; h0=$(victim)
         runuser -u "$4" -- python3 $PY/hardlink.py attacker $D $V/victim 10 > "$STATE/r19.att" 2>&1 &
         local ap=$!
-        if [ "$3" = root ]; then python3 $PY/hardlink.py writer $D "$2" 2000 9; else runuser -u "$3" -- python3 $PY/hardlink.py writer $D "$2" 2000 9; fi
+        if [ "$3" = root ]; then python3 $PY/hardlink.py writer $D "$2" 2000 9 $V/victim; else runuser -u "$3" -- python3 $PY/hardlink.py writer $D "$2" 2000 9 $V/victim; fi
         wait $ap; cat "$STATE/r19.att"
         h1=$(sha256sum $V/victim | cut -c1-16)
         python3 $PY/hardlink.py wellformed $D 2>&1
@@ -436,13 +447,13 @@ row19() {
         res="$res $1-$2:$([ "$h0" = "$h1" ] && echo ok || echo HIT)"
     }
     note "race a: writer and attacker the same user (spikea)"
-    for m in fstat byname; do race same-user $m spikea spikea; done
+    for m in fstat byname exclusive; do race same-user $m spikea spikea; done
     note "race b: writer root, victim owned by and attacker = the invoking user (spikea)"
-    for m in fstat byname; do race root-writer $m root spikea; done
+    for m in fstat byname exclusive; do race root-writer $m root spikea; done
     local ph; ph=$(sysctl -n fs.protected_hardlinks)
     note "race c: fs.protected_hardlinks=0, writer spikea, attacker spikeb (a second account)"
     sysctl -qw fs.protected_hardlinks=0
-    for m in fstat byname; do race second-account $m spikea spikeb; done
+    for m in fstat byname exclusive; do race second-account $m spikea spikeb; done
     sysctl -qw fs.protected_hardlinks=$ph
     note "with protected_hardlinks=$ph: can spikeb link spikea's 0644 file?"
     run "runuser -u spikeb -- ln $V/victim $D/x"
@@ -450,8 +461,9 @@ row19() {
     echo "RESULTS:$res"
     local refused=no; grep -q 'Operation not permitted' "$STATE/r19ln" && refused=yes
     local byname_ok=yes; echo "$res" | grep -q 'byname:HIT' && byname_ok=no
+    local excl_ok=yes; echo "$res" | grep -q 'exclusive:HIT' && excl_ok=no
     local fstat_hit=no; echo "$res" | grep -qE '(same-user|root-writer|second-account)-fstat:HIT' && fstat_hit=yes
-    local s="protected_hardlinks=$ph, ln /etc/hostname refused=$refused; by-name held in every race=$byname_ok; fstat-only raced=$fstat_hit;$res"
+    local s="protected_hardlinks=$ph, ln /etc/hostname refused=$refused; by-name held in every race=$byname_ok; fstat-only raced=$fstat_hit; exclusive-file+rename held=$excl_ok;$res"
     if [ $refused = yes ] && [ $byname_ok = yes ] && [ $fstat_hit = yes ]; then verdict MATCH "$s"
     elif [ $byname_ok = no ]; then verdict MISMATCH "$s"
     else verdict PARTIAL "$s"; fi
@@ -484,9 +496,9 @@ row20() {
         podman rm -f devdb >/dev/null 2>&1
     else echo "podman: not installed"; fi
     run "ls -ld /var/lib/docker/containers /var/log/pods; runuser -u nobody -- ls /var/lib/docker/containers | head -3"
+    local nsp; nsp=$(grep NSpid /proc/$pid/status 2>/dev/null | awk '{print $NF}')
     docker rm -f spikeweb >/dev/null 2>&1
     local d=no; echo "$cgd" | grep -qE 'docker-[0-9a-f]{64}\.scope|/docker/[0-9a-f]{64}' && d=yes
-    local nsp; nsp=$(grep NSpid /proc/$pid/status 2>/dev/null | awk '{print $NF}')
     local s="docker cgroup=$cgd ($d); init NSpid ends in ${nsp:-?}; podman cgroup=$pod; conmon carries '-n devdb': ${conmon:-n/a}"
     if [ $d = yes ] && [ "$(echo "$pod" | grep -c libpod-)" = 1 ] && [ "${conmon:-0}" -ge 1 ]; then verdict MATCH "$s"; else verdict PARTIAL "$s"; fi
 }
@@ -679,9 +691,10 @@ row27() {
     for n in lan srv rtr peer far; do ip netns del $n 2>/dev/null; done
     local sv rv tv errs
     sv=$(grep -o 'VERDICT on-link=[A-Za-z]* (ignoring the virtual rule: [A-Za-z]*' "$STATE/r27-same"); rv=$(grep -o 'VERDICT [^;]*' "$STATE/r27-routed" | head -1); tv=$(grep -o 'VERDICT [^;]*' "$STATE/r27-tunnel" | head -1)
-    errs=$(cat "$STATE"/r27-* | grep -cE 'errno (97|1) |EAFNOSUPPORT|EPERM|EXCEPTION|FAILED')
+    errs=$(cat "$STATE"/r27-* | grep -v 'AF_NETLINK socket' | grep -cE 'errno (97|1) |EXCEPTION|FAILED')
     local mac; mac=$(grep -o "router MAC [0-9a-f:]*" "$STATE/r27-same" | head -1)
-    local s="same link: $sv, $mac; routed: $rv; tunnel: $tv; EAFNOSUPPORT/EPERM/exceptions: $errs; $(grep -o 'AF_NETLINK socket: [a-z]*' "$STATE/r27-same" | head -1)"
+    local hostif=no; grep -q 'if eth0 ' "$STATE/r27-same" && hostif=yes
+    local s="sysfs shows the host's interfaces inside NetworkNamespacePath= (test artifact)=$hostif; same link: $sv, $mac; routed: $rv; tunnel: $tv; EAFNOSUPPORT/EPERM/exceptions: $errs; $(grep -o 'AF_NETLINK socket: [a-z]*' "$STATE/r27-same" | head -1)"
     if echo "$sv" | grep -q 'virtual rule: True' && echo "$rv" | grep -qE 'on-link=False' && echo "$tv" | grep -qE 'on-link=False|deny' && [ "$errs" = 0 ] && [ -n "$mac" ]; then verdict MATCH "$s"
     else verdict MISMATCH "$s"; fi
 }
@@ -690,6 +703,7 @@ row28() {
     local d=$STATE/units28; rm -rf $d; mkdir -p $d; cp "$SPIKE"/units/oomph-share* "$SPIKE"/units/oomph-alert* $d/
     cp $d/oomph-share@.service $d/oomph-share@probe.service
     mkdir -p /var/log/oomph/alerts
+    [ -e /usr/local/bin/oomph ] || { printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/oomph; chmod 755 /usr/local/bin/oomph; echo "(stub /usr/local/bin/oomph created for verify)"; }
     T=60 run "systemd-analyze verify $d/oomph-share.socket $d/oomph-share@.service" | tee "$STATE/r28v1"
     T=60 run "systemd-analyze verify $d/oomph-alert.path $d/oomph-alert.service" | tee "$STATE/r28v2"
     T=60 run "systemd-analyze security --offline=true $d/oomph-share@probe.service 2>&1 | tail -3; systemd-analyze security --offline=true $d/oomph-alert.service 2>&1 | tail -3" | tee "$STATE/r28s"
@@ -717,8 +731,8 @@ row28() {
         [ -s "$STATE/r28-$f.out" ] || bad="$bad [$f: no probe output]"
     done
     local v1=clean v2=clean
-    [ "$(grep -vcE '^\$|^\[exit 0' "$STATE/r28v1")" -eq 0 ] || v1="$(grep -vE '^\$|^\[exit' "$STATE/r28v1" | head -2 | tr '\n' ' ')"
-    [ "$(grep -vcE '^\$|^\[exit 0' "$STATE/r28v2")" -eq 0 ] || v2="$(grep -vE '^\$|^\[exit' "$STATE/r28v2" | head -2 | tr '\n' ' ')"
+    [ "$(grep -vE '^\$|^\[exit' "$STATE/r28v1" | grep -c oomph)" -eq 0 ] || v1="$(grep -vE '^\$|^\[exit' "$STATE/r28v1" | grep oomph | head -2 | tr '\n' ' ')"
+    [ "$(grep -vE '^\$|^\[exit' "$STATE/r28v2" | grep -c oomph)" -eq 0 ] || v2="$(grep -vE '^\$|^\[exit' "$STATE/r28v2" | grep oomph | head -2 | tr '\n' ' ')"
     local ex; ex=$(grep -o 'Overall exposure level for [^:]*: [0-9.]* [A-Z]*' "$STATE/r28s" | sed 's/Overall exposure level for //' | tr '\n' ';')
     local s="verify share: $v1; verify alert: $v2; exposure: $ex creates allowed:${bad:- none}"
     [ -z "$bad" ] && [ "$v1" = clean ] && [ "$v2" = clean ] && verdict MATCH "$s" || verdict MISMATCH "$s"

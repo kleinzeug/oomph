@@ -20,6 +20,7 @@ SUSPECT = re.compile(r"oom|Killed|kill|SIGTERM|SIGKILL|out of memory", re.I)
 quiet = "-q" in sys.argv
 counts = collections.Counter(); shown = collections.Counter(); unmatched = []
 prefixed = unprefixed = 0
+pids = set()
 for raw in sys.stdin:
     raw = raw.rstrip("\n")
     if not raw: continue
@@ -37,6 +38,7 @@ for raw in sys.stdin:
         if m:
             counts[name] += 1
             if name == "KILLED":
+                pids.add(m.group("pid"))
                 if m.group("what"): prefixed += 1
                 else: unprefixed += 1
             if not quiet or shown[name] < 3:
@@ -44,10 +46,12 @@ for raw in sys.stdin:
                 print("%-8s %s | %s" % (name, {k: v for k, v in m.groupdict().items() if v is not None}, msg[:300]))
             break
     else:
+        if re.match(r"^\s|^\[\s*pid\s*\]|^\[\s*\d+\]|.*\+0x[0-9a-f]+/0x", msg):
+            continue  # stack frames and the task table of the report, not records
         if SUSPECT.search(msg) and ("oom" in msg.lower() or "earlyoom" in src or "Killed process" in msg):
             unmatched.append((src, msg))
 print("COUNTS " + " ".join("%s=%d" % (n, counts[n]) for n, _ in PATS)
-      + " KILLED_prefixed=%d KILLED_unprefixed=%d" % (prefixed, unprefixed))
+      + " KILLED_prefixed=%d KILLED_unprefixed=%d KILLED_distinct_pids=%d" % (prefixed, unprefixed, len(pids)))
 print("UNMATCHED oom-related lines: %d" % len(unmatched))
 for s, m in unmatched[:40]:
     print("  UNMATCHED [%s] %s" % (s, m[:300]))
