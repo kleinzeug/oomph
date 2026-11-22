@@ -847,6 +847,86 @@ check(oomph.setting("selftest_switch", config={"selftest_switch": False}) == "1"
       "config: OOMPH_<NAME> beats the file, the file beats the default")
 os.environ.pop("OOMPH_SELFTEST_SWITCH")
 
+# --- oomph top (T0): the chart maths held to the app's, golden frames, one frame of this run's data
+import oomph_view as view  # noqa: E402
+for tool, what in (("chartvectors.py", "chart maths agree with the app's (tools/vectors/chart.json)"),
+                   ("topfixture.py", "golden frames match (tools/golden/top)")):
+    r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", tool)], capture_output=True, text=True,
+                       timeout=300)
+    bad = [x for x in r.stdout.splitlines() if "FAIL" in x or "DIFFER" in x]
+    check(r.returncode == 0, "top: %s (%s)" % (what, (bad or r.stdout.strip().splitlines()[-1:] or [r.stderr[-300:]])[0]))
+check([view.nice_top(r * 1.1) for r in (8, 16, 36, 64)] == [10, 20, 40, 72] and
+      view.y_top(36, [("data", dict(t=1, wired=8, app=22, comp=10, swap=0, away=False, kills=0))])[0] == 48,
+      "top: the y axis tops out at a round value over 1.1 x RAM and the peak (8 → 10, 16 → 20, 36 → 40, 64 → 72)")
+g8 = view.GLYPHS["unicode"]["eighths"]
+cells = view.stack_cells([(0, 12, "wired"), (12, 16, "swap")], 2, g8)
+check(cells[0] == (g8[8], "wired", None) and cells[1] == (g8[4], "wired", "swap") and
+      view.stack_cells([(0, 3, "app"), (3, 8, "comp")], 1, g8)[0] == (g8[3], "app", "comp"),
+      "top: a cell holds the lower series as glyph and the upper as background, to the eighth (%s)" % cells)
+hostile = "\x1b]52;c;aGk=\x07\x1b[2J‮evil⁦ שלום \U0001F680 構築 é́́ \x9b31m\x7f﻿"
+fr = view.Frame(40, 1)
+fr.put(0, 0, hostile)
+import unicodedata  # noqa: E402
+check(not any(unicodedata.category(ch)[0] == "C" for c in fr.c[0] for ch in c[0]) and "ש" not in fr.text() and
+      view.tw(fr.text().rstrip("\n")) == 40 and view.tw("構築") == 4 and view.fit("構築構築", 4) == "構 …",
+      "top: text is cleaned (no control, format or right-to-left character reaches a cell; wide characters are two)")
+import oomph_top  # noqa: E402
+tlog = tempfile.mkdtemp(prefix="oomph-top-")
+t_now = 1795180000.0
+with open(os.path.join(tlog, "events.jsonl"), "w") as f:      # past EVENTS_CAP, the newest line last
+    pad = json.dumps({"t": t_now - 86400, "kind": "daemon_start", "pad": "x" * 200}) + "\n"
+    f.write(pad * (oomph_top.EVENTS_CAP // len(pad) + 50))
+    f.write(json.dumps({"t": t_now - 60, "kind": "jetsam", "kills": 2}) + "\n")
+ev = oomph_top.load_events(tlog)
+check(os.path.getsize(os.path.join(tlog, "events.jsonl")) > oomph_top.EVENTS_CAP and ev and
+      ev[0][1] == "2 killed by jetsam" and ev[0][2],
+      "top: an events file bigger than the cap still shows its newest event (%r)" % (ev[:1],))
+for i in range(oomph_top.INCIDENTS_SHOWN + 5):                 # every 2 days, all named by local start time
+    st0 = t_now - 86400 * (2 * i + 1)
+    iid = time.strftime("%Y%m%d-%H%M%S", time.localtime(st0))
+    os.makedirs(os.path.join(tlog, "incidents", iid))
+    with open(os.path.join(tlog, "incidents", iid, "incident.json"), "w") as f:
+        json.dump({"id": iid, "start": st0, "end": st0 + 60}, f)
+shown, n90 = oomph_top.load_incidents(tlog, t_now)
+check(len(shown) == oomph_top.INCIDENTS_SHOWN and n90 == oomph_top.INCIDENTS_SHOWN + 5,
+      "top: the incidents of 90 days are counted past the %d shown (%d shown, %d counted)"
+      % (oomph_top.INCIDENTS_SHOWN, len(shown), n90))
+odd = []
+for cur in ({"t": -1e300}, {"t": t_now, "groups": 5, "claude": "x", "pressure": [1]},
+            {"t": t_now, "ram_gb": 16, "app_gb": -40, "compressed_gb": 4, "wired_gb": 3, "pressure": {"a": 1}}):
+    with open(os.path.join(tlog, "current.json"), "w") as f:
+        json.dump(cur, f)
+    try:
+        m = oomph_top.load_model("24h", t_now, log_dir=tlog, live=False)
+        fr = view.render(dict(m, host="h", os="o"), 130, 40, view.Caps("256", "unicode", "dark"), {"span": "24h"})
+        lines = fr.text().rstrip("\n").split("\n")
+        if len(lines) != 40 or any(view.tw(x) != 130 for x in lines):
+            odd.append("%s: frame is not 130x40" % sorted(cur))
+    except Exception as e:
+        odd.append("%s: %r" % (sorted(cur), e))
+check(not odd, "top: odd types in current.json draw a frame, not a traceback (%s)" % "; ".join(odd))
+fr = view.Frame(20, 1)
+view.meter(fr, 5, 0, 10, [(-40.0, "app"), (4.0, "comp")], 16.0, view.GLYPHS["unicode"], view.Caps("256", "unicode", "dark"))
+check(all(c[0] == " " and c[1] is None for c in fr.c[0][:5] + fr.c[0][15:]),
+      "top: a meter stays in its cells when a reading is negative")
+shutil.rmtree(tlog, ignore_errors=True)
+top_cmd = [sys.executable, "-I", "-B", os.path.join(ROOT, "daemon", "oomph.py"), "top"]
+r = subprocess.run(top_cmd + ["--once"], capture_output=True, text=True, timeout=120, env=dict(os.environ))
+lines = r.stdout.split("\n")[:-1]
+check(r.returncode == 0 and len(lines) == 24 and all(view.tw(x) == 80 for x in lines) and "\x1b" not in r.stdout,
+      "top: `oomph top --once` into a pipe prints 24 lines of 80 cells without escapes (exit %s %s)"
+      % (r.returncode, r.stderr.strip()[-200:]))
+check(lines and lines[0].lstrip().startswith(oomph.BRAND) and re.search(r"Logging every|Incident open|Logger", lines[-1]),
+      "top: the frame has the name, this machine and the logger's status (%r)" % (lines[-1:] or [""])[0].strip())
+r = subprocess.run(top_cmd + ["--once", "--size", "100x30", "--span", "1h", "--glyphs", "ascii", "--color", "256",
+                              "--some-later-option"], capture_output=True, text=True, timeout=120, env=dict(os.environ))
+lines = r.stdout.split("\n")[:-1]
+check(r.returncode == 0 and len(lines) == 30 and "\x1b[" in r.stdout and "ignored: --some-later-option" in lines[-1] and
+      all(ord(ch) < 128 for ch in re.sub(r"\x1b\[[0-9;]*m", "", r.stdout)),
+      "top: --size, --span, --glyphs ascii, --color 256; an unknown option is ignored and named")
+r = subprocess.run(top_cmd + ["--once", "--span", "2d"], capture_output=True, text=True, timeout=60, env=dict(os.environ))
+check(r.returncode == 2 and "--span" in r.stderr, "top: a span it does not know is a usage error (exit 2)")
+
 # --- side-by-side installs, into a throwaway prefix (install.sh's test mode: no root, no launchd)
 inst = tempfile.mkdtemp(prefix="oomph-install-")
 pfx = os.path.join(inst, "root")
@@ -857,7 +937,8 @@ def flat_source(name, version, skill_note):
     """An app bundle's Resources folder, stamped with `version`."""
     d = os.path.join(inst, name)
     os.makedirs(os.path.join(d, "skills", "oomph"))
-    for f in ("oomphd.py", "oomph.py", "oomph_ai.py", "oomph_upgrade.py", "local.oomph.daemon.plist"):
+    for f in ("oomphd.py", "oomph.py", "oomph_ai.py", "oomph_upgrade.py", "oomph_top.py", "oomph_view.py",
+              "local.oomph.daemon.plist"):
         shutil.copy(os.path.join(ROOT, "daemon", f), d)
     for f in ("install.sh", "uninstall.sh"):
         shutil.copy(os.path.join(ROOT, f), d)

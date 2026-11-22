@@ -217,6 +217,7 @@ oomph report --since 2026-11-13T18:00 --until 2026-11-13T20:00
 oomph incidents                 # list of incidents
 oomph incident latest --html    # open the latest incident's report
 oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
+oomph top --once                # the popup's dashboard as one frame of text (--span inf|24h|6h|1h, --glyphs cells|ascii)
 ```
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
@@ -415,6 +416,8 @@ that provider for each AI report (Ollama keeps it local).
 ```
 daemon/oomphd.py                  the sampler daemon (root)
 daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon)
+daemon/oomph_top.py               `oomph top`: reads the files and prints the frame
+daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/local.oomph.daemon.plist   the LaunchDaemon job
 app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Charts)
 app/Info.plist
@@ -424,6 +427,8 @@ skills/oomph/SKILL.md             the Claude skill (raw link above)
 tools/selftest.py                 unprivileged end-to-end check of daemon + CLI (also run by CI)
 tools/roottest.py                 the same for what only root can show (CI runs it with sudo)
 tools/brandlint.py                keeps the product's name (BRAND) apart from the command and paths
+tools/chartvectors.py             holds `oomph top`'s chart maths to the app's (tools/vectors/chart.json)
+tools/topfixture.py               the golden frames of `oomph top` (tools/golden/top), from fixed data
 DESIGN.md                         the investigation and the design decisions
 docs/index.html                   the website (GitHub Pages, served from /docs)
 ```

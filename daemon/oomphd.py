@@ -124,7 +124,7 @@ def proc_cwd(pid):
 
 def run(cmd, timeout=10):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout).stdout
     except Exception:
         return ""
 
@@ -179,7 +179,8 @@ def away_state():
     preventers = sorted({mm.group(1) for mm in _PREVENT_RE.finditer(asr) if mm.group(1) != "powerd"})
     locked, user, uid = False, None, None
     try:
-        raw = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"], capture_output=True, timeout=10).stdout
+        raw = subprocess.run(["/usr/sbin/ioreg", "-n", "Root", "-d1", "-a"], stdin=subprocess.DEVNULL, capture_output=True,
+                             timeout=10).stdout
         for u in plistlib.loads(raw).get("IOConsoleUsers", []):
             if u.get("kCGSSessionOnConsoleKey"):
                 user, uid = u.get("kCGSSessionUserNameKey"), u.get("kCGSSessionUserIDKey")

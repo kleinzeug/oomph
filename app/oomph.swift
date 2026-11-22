@@ -248,10 +248,12 @@ struct Reservation: Identifiable {
     /// Colours avoid the memory chart's grey, blue, orange and red. The same purpose always gets the
     /// same colour (a stable hash, not Swift's per-launch one), in the blocks and in the list.
     static let palette: [Color] = [.teal, .purple, .pink, .indigo, Color(red: 0.84, green: 0.62, blue: 0.0), .brown, .green]
-    var color: Color {
+    var color: Color { Reservation.palette[Reservation.colorIndex(purpose)] }
+    /// The palette index of a purpose. Shared with `oomph top` (tools/vectors/chart.json).
+    static func colorIndex(_ purpose: String) -> Int {
         var h: UInt32 = 5381
         for u in purpose.unicodeScalars { h = (h &* 33) ^ u.value }
-        return Reservation.palette[Int(h % UInt32(Reservation.palette.count))]
+        return Int(h % UInt32(Reservation.palette.count))
     }
 
     /// From a ledger lease, a ledger history entry or a reservations.jsonl record.
@@ -280,7 +282,7 @@ struct Reservation: Identifiable {
 
 /// A reservation laid out on the strip: steps of [a, b) in time with the stacked GB below (lo) and
 /// at its top (hi). Reservations overlapping in time stack in lanes, so the top of the stack is the
-/// total reserved; lanes are packed first-fit by start time.
+/// total reserved; lanes are packed first-fit by start time. Shared with `oomph top` (tools/vectors/chart.json).
 struct ResBlock: Identifiable {
     let res: Reservation
     var lane = 0
@@ -482,12 +484,26 @@ final class Store: ObservableObject {
     }
 
     /// Finished reservations from the history log and the ledger's own short history, plus the live
-    /// ones. A live lease whose holder is gone, that expired or whose queue place lapsed ends there
-    /// (the logger retires it within a sample; an older logger may not have yet). On loadQueue only.
+    /// ones, stacked for the strip. On loadQueue only.
     private func loadReservations(now: Double) -> [ResBlock] {
+        let records = readShared(ledgerDir + "/reservations.jsonl", cap: historyCap, tail: true)
+        let ledger = readShared(ledgerDir + "/ledger.json", cap: ledgerCap)
+            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
+        let rs = Store.mergeReservations(records: records, ledger: ledger, now: now,
+                                         holderGone: { pid in kill(pid, 0) != 0 && errno == ESRCH })
+        return ResBlock.stack(rs, now: now)
+    }
+
+    /// The merge behind loadReservations, without files or the kernel: the last record per key of the
+    /// history log (an "end" is never undone by a later "edit"), the ledger's own short history, then
+    /// the live leases. A live lease whose holder is gone, that expired or whose queue place lapsed
+    /// ends there (the logger retires it within a sample; an older logger may not have yet).
+    /// `oomph top` does the same (oomph_view.merge_reservations; tools/vectors/chart.json).
+    static func mergeReservations(records: Data?, ledger: [String: Any], now: Double,
+                                  holderGone: (Int32) -> Bool) -> [Reservation] {
         var byKey: [String: Reservation] = [:]
         var events: [String: String] = [:]
-        if let d = readShared(ledgerDir + "/reservations.jsonl", cap: historyCap, tail: true) {
+        if let d = records {
             for line in d.split(separator: 0x0A) {
                 guard let o = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
                       let r = Reservation(o) else { continue }
@@ -495,8 +511,6 @@ final class Store: ObservableObject {
                 if ev == "end" || events[r.id] != "end" { byKey[r.id] = r; events[r.id] = ev }
             }
         }
-        let ledger = readShared(ledgerDir + "/ledger.json", cap: ledgerCap)
-            .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
         for h in (ledger["history"] as? [[String: Any]]) ?? [] {
             if let r = Reservation(h), byKey[r.id] == nil { byKey[r.id] = r }
         }
@@ -506,7 +520,7 @@ final class Store: ObservableObject {
             let pid = ((l["holder"] as? [String: Any])?["pid"] as? NSNumber)?.int32Value ?? 0
             if let e = r.expires, r.granted != nil, e < now { r.ended = e; r.outcome = "expired" }
             else if r.granted == nil, now - seen > 180 { r.ended = seen + 180; r.outcome = "lapsed" }
-            else if pid > 0, kill(pid, 0) != 0, errno == ESRCH { r.ended = max(seen, r.granted ?? r.requested); r.outcome = "holder_gone" }
+            else if pid > 0, holderGone(pid) { r.ended = max(seen, r.granted ?? r.requested); r.outcome = "holder_gone" }
             byKey[r.id] = r
         }
         // an edit record whose reservation neither ended nor is live: the ledger was reset under it
@@ -518,7 +532,7 @@ final class Store: ObservableObject {
             }
         }
         let keep = now - 14 * 86400
-        return ResBlock.stack(byKey.values.filter { ($0.ended ?? now) >= keep }, now: now)
+        return byKey.values.filter { ($0.ended ?? now) >= keep }
     }
 
     /// On loadQueue only.
@@ -535,11 +549,7 @@ final class Store: ObservableObject {
         var all: [Point] = []
         for day in days.sorted() { all += loadDay(day, isToday: day == today) }
         all.sort { $0.id < $1.id }
-        var gaps: [Gap] = []
-        for i in all.indices.dropFirst() where all[i].id - all[i - 1].id > Store.gapSeconds {
-            gaps.append(Gap(from: all[i - 1].id, to: all[i].id))
-        }
-        if let last = all.last, now - last.id > Store.gapSeconds { gaps.append(Gap(from: last.id, to: now)) }
+        let gaps = Store.findGaps(all, now: now)
         // drop cached files that are gone (a day's plain file once it is gzipped)
         let present = Set(files.map { "\(logDir)/\($0)" })
         for k in cache.keys where !present.contains(k) { cache[k] = nil }
@@ -618,6 +628,18 @@ final class Store: ObservableObject {
     /// Longer than this without a sample is a gap (the logger samples every 30 s; the report uses 5 min).
     static let gapSeconds: Double = 300
 
+    /// Stretches without samples in the history as logged (before thinning), and from the last
+    /// sample to now. Shared with `oomph top` (tools/vectors/chart.json).
+    static func findGaps(_ all: [Point], now: Double) -> [Gap] {
+        var gaps: [Gap] = []
+        for i in all.indices.dropFirst() where all[i].id - all[i - 1].id > Store.gapSeconds {
+            gaps.append(Gap(from: all[i - 1].id, to: all[i].id))
+        }
+        if let last = all.last, now - last.id > Store.gapSeconds { gaps.append(Gap(from: last.id, to: now)) }
+        return gaps
+    }
+
+    /// Shared with `oomph top`, like worst (tools/vectors/chart.json).
     static func multires(_ pts: [Point], now: Double) -> [Point] {
         var out: [Point] = []
         var j = pts.count - 1
@@ -1109,6 +1131,7 @@ struct MemoryChart: View, Animatable {
     }
 
     /// Linear: the last 10^lgRange s. Log: all history, ages under minAge at the right edge.
+    /// Shared with `oomph top` (tools/vectors/chart.json).
     static func mapper(now: Double, first: Double, lgRange: Double, blend b: Double) -> (Double) -> Double {
         let r = pow(10, lgRange), m = MemoryChart.minAge
         let span = log10(max(now - first, 3600) / m)
@@ -1204,6 +1227,7 @@ struct MemoryChart: View, Animatable {
 
     /// Merges spans (in px) closer than `tolerance`. Grey: away spans, bridged by no-data stretches
     /// that touch them (asleep while away); a no-data stretch with nobody away near it stays white.
+    /// Shared with `oomph top` (tools/vectors/chart.json).
     static func calmBands(away: [(Double, Double)], gaps: [(Double, Double)], tolerance: Double)
         -> (grey: [(Double, Double)], hatched: [(Double, Double)]) {
         func merge(_ spans: [(Double, Double, Bool)]) -> [(Double, Double, Bool)] {
@@ -1244,7 +1268,7 @@ struct MemoryChart: View, Animatable {
         for b in reservations where f(b.end) >= 0 {
             for st in b.steps where f(st.b) >= 0 { vis = max(vis, st.hi) }
         }
-        let top = [2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256].first { $0 >= vis } ?? vis
+        let top = MemoryChart.stripTop(vis)
         let usable = H - 4
         var out: [(i: Int, r: CGRect, queued: Bool)] = []
         for (i, b) in reservations.enumerated() {
@@ -1261,6 +1285,12 @@ struct MemoryChart: View, Animatable {
             }
         }
         return (out, top)
+    }
+
+    /// The strip's scale: the first round figure at or above the tallest stack in view. Shared with
+    /// `oomph top` (tools/vectors/chart.json).
+    static func stripTop(_ vis: Double) -> Double {
+        [2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256].first { $0 >= vis } ?? vis
     }
 
     func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [GridLine]) -> some View {
@@ -3349,11 +3379,78 @@ func renderPopup(to path: String, dark: Bool, ai: String = "") {
     try? png.write(to: URL(fileURLWithPath: path))
 }
 
+/// `oomph --chart-vectors FILE`: runs the chart's pure functions over the inputs of FILE (the shared
+/// vectors, tools/vectors/chart.json) and prints their answers as JSON. tools/chartvectors.py compares
+/// them with the file's expected values, which are this output; `oomph top` must reproduce them too.
+@MainActor
+func chartVectors(_ path: String) -> Int32 {
+    guard let data = FileManager.default.contents(atPath: path),
+          let v = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        FileHandle.standardError.write("oomph: --chart-vectors: can't read \(path)\n".data(using: .utf8)!)
+        return 2
+    }
+    func num(_ x: Any?) -> Double { (x as? NSNumber)?.doubleValue ?? 0 }
+    func cases(_ k: String) -> [[String: Any]] { (v[k] as? [[String: Any]]) ?? [] }
+    var out: [String: Any] = [:]
+    out["mapper"] = cases("mapper").map { c -> [Double] in
+        let span = (c["span"] as? NSNumber)?.doubleValue
+        let f = MemoryChart.mapper(now: num(c["now"]), first: num(c["first"]), lgRange: log10(span ?? 86400),
+                                   blend: span == nil ? 1 : 0)
+        return ((c["t"] as? [NSNumber]) ?? []).map { f($0.doubleValue) }
+    }
+    out["color_index"] = cases("color_index").map { Reservation.colorIndex(($0["purpose"] as? String) ?? "") }
+    out["strip_top"] = cases("strip_top").map { MemoryChart.stripTop(num($0["tallest"])) }
+    func points(_ x: Any?) -> [Point] {
+        ((x as? [[String: Any]]) ?? []).map { p in
+            Point(id: num(p["t"]), date: Date(timeIntervalSince1970: num(p["t"])), wired: num(p["wired"]),
+                  app: num(p["app"]), comp: num(p["comp"]), swap: num(p["swap"]),
+                  away: (p["away"] as? Bool) ?? false, kills: Int(num(p["kills"])))
+        }
+    }
+    out["multires"] = cases("multires").map { c -> [[Any]] in
+        Store.multires(points(c["points"]), now: num(c["now"])).map { [$0.id, $0.wired, $0.app, $0.comp, $0.swap, $0.away, $0.kills] }
+    }
+    out["gaps"] = cases("gaps").map { c -> [[Double]] in
+        Store.findGaps(points(c["points"]), now: num(c["now"])).map { [$0.from, $0.to] }
+    }
+    func spans(_ x: Any?) -> [(Double, Double)] { ((x as? [[NSNumber]]) ?? []).compactMap { $0.count >= 2 ? ($0[0].doubleValue, $0[1].doubleValue) : nil } }
+    out["calm_bands"] = cases("calm_bands").map { c -> [String: Any] in
+        let r = MemoryChart.calmBands(away: spans(c["away"]), gaps: spans(c["gaps"]), tolerance: num(c["tolerance"]))
+        return ["grey": r.grey.map { [$0.0, $0.1] }, "hatched": r.hatched.map { [$0.0, $0.1] }]
+    }
+    out["stack"] = cases("stack").map { c -> [[String: Any]] in
+        let rs = ((c["reservations"] as? [[String: Any]]) ?? []).compactMap { Reservation($0) }
+        return ResBlock.stack(rs, now: num(c["now"])).map { b in
+            ["key": b.res.id, "lane": b.lane, "steps": b.steps.map { [$0.a, $0.b, $0.lo, $0.hi] }] as [String: Any]
+        }
+    }
+    out["merge"] = cases("merge").map { c -> [[String: Any]] in
+        let lines = ((c["records"] as? [Any]) ?? []).compactMap { r -> String? in
+            (try? JSONSerialization.data(withJSONObject: r)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        let gone = Set(((c["gone"] as? [NSNumber]) ?? []).map { $0.int32Value })
+        let rs = Store.mergeReservations(records: lines.joined(separator: "\n").data(using: .utf8),
+                                         ledger: (c["ledger"] as? [String: Any]) ?? [:], now: num(c["now"]),
+                                         holderGone: { gone.contains($0) })
+        return rs.sorted { ($0.requested, $0.id) < ($1.requested, $1.id) }.map { r -> [String: Any] in
+            ["key": r.id, "ended": r.ended.map { $0 as Any } ?? NSNull(), "outcome": r.outcome.map { $0 as Any } ?? NSNull(),
+             "gb": r.gb, "segments": r.segments.count]
+        }
+    }
+    guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
+    FileHandle.standardOutput.write(json)
+    FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+    return 0
+}
+
 @main
 struct Main {
     static func main() {
         // Development aid: `oomph --render-popup out.png [--dark]` draws the popup into a PNG and exits.
         let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--chart-vectors"), i + 1 < args.count {
+            exit(MainActor.assumeIsolated { chartVectors(args[i + 1]) })
+        }
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
             let ai = args.firstIndex(of: "--ai").map { args.count > $0 + 1 ? args[$0 + 1] : "" } ?? ""
             MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark"), ai: ai) }

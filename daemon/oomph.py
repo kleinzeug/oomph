@@ -3,6 +3,8 @@
 
   oomph status
   oomph report [--last 2h | --since ISO [--until ISO]]
+  oomph top --once [--span inf|24h|6h|1h] [--size 80x24] [--glyphs unicode|cells|ascii]
+                                     the popup's dashboard as one frame in the terminal
   oomph incidents
   oomph incident <id|latest> [--html]
   oomph html [--last 24h | --since ISO [--until ISO]] [-o FILE] [--open]
@@ -2676,6 +2678,45 @@ def reservation_history(since_s=24 * 3600, limit=50):
             "log": _history_path()}
 
 
+VIEW_FIELDS = ("event", "key", "id", "purpose", "project", "holder", "gb", "requested", "granted", "ended",
+               "outcome", "peak_gb", "used_gb", "expires", "segments")
+
+
+def _view_records(recs):
+    """The history log's records as a viewer merges them (oomph_view.merge_reservations): the last
+    per key, except that an "end" is never replaced by a later "edit", with only the fields the
+    merge reads. One record per reservation keeps a root caller's answer far below LIMITS["child"]."""
+    by = {}
+    for r in recs:
+        k, ev = r["key"], r.get("event") if isinstance(r.get("event"), str) else "end"
+        prev = by.get(k)
+        if ev == "end" or prev is None or (prev.get("event") if isinstance(prev.get("event"), str) else "end") != "end":
+            by[k] = {f: r[f] for f in VIEW_FIELDS if f in r}
+    return list(by.values())
+
+
+@_unprivileged()
+def ledger_view(since=None):
+    """What a dashboard (`oomph top`) shows of the ledger, read only: the ledger as it is (None when
+    there is none or it was refused) and the history log's reservations that end at or after the
+    unix time `since` (default: HISTORY_DAYS ago), one record each (_view_records). The caller's
+    clock decides the window, so a frame drawn for a fixed time stays the same. Unlike read_ledger,
+    never the whole log to continue a numbering: a viewer needs none."""
+    if since is None:
+        since = time.time() - HISTORY_DAYS * 86400
+    try:
+        dfd = _ledger_dir()
+    except LedgerError:
+        dfd = None  # replaced by a link: nothing to read
+    if dfd is None:
+        return {"ledger": None, "records": []}
+    try:
+        L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd)))
+        return {"ledger": L, "records": _view_records(read_history(since, dfd))}
+    finally:
+        os.close(dfd)
+
+
 @_unprivileged()
 def refresh_ledger(s, procs):
     """The daemon's tick: retire leases whose holder died or that expired, close to when it
@@ -3396,6 +3437,11 @@ def _main(argv):
             sys.path.insert(0, HERE)
         import oomph_upgrade
         return oomph_upgrade.cmd_upgrade(rest)
+    if c == "top":
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import oomph_top
+        return oomph_top.cmd_top(rest)
     if c == "ai-check":
         if HERE not in sys.path:
             sys.path.insert(0, HERE)

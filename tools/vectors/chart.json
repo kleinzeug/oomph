@@ -1,0 +1,1398 @@
+{
+ "v": 1,
+ "tolerance": 1e-06,
+ "about": "Inputs and the app's answers (oomph --chart-vectors); written by tools/chartvectors.py --write, checked against both programs.",
+ "mapper": [
+  {
+   "now": 1795180000.0,
+   "first": 1794557920.0,
+   "span": 86400.0,
+   "t": [
+    1795180000.0,
+    1795179940.0,
+    1795179700.0,
+    1795176400.0,
+    1795158400.0,
+    1795093600.0,
+    1794920800.0,
+    1794557920.0
+   ],
+   "out": [1, 0.999305556, 0.996527778, 0.958333333, 0.75, -0.0, -2.0, -6.2]
+  },
+  {
+   "now": 1795180000.0,
+   "first": 1794557920.0,
+   "span": 21600.0,
+   "t": [
+    1795180000.0,
+    1795179940.0,
+    1795179700.0,
+    1795176400.0,
+    1795158400.0,
+    1795093600.0,
+    1794920800.0,
+    1794557920.0
+   ],
+   "out": [1, 0.997222222, 0.986111111, 0.833333333, -0.0, -3.0, -11.0, -27.8]
+  },
+  {
+   "now": 1795180000.0,
+   "first": 1794557920.0,
+   "span": 3600.0,
+   "t": [
+    1795180000.0,
+    1795179940.0,
+    1795179700.0,
+    1795176400.0,
+    1795158400.0,
+    1795093600.0,
+    1794920800.0,
+    1794557920.0
+   ],
+   "out": [1, 0.983333333, 0.916666667, 0, -5, -23, -71, -171.8]
+  },
+  {
+   "now": 1795180000.0,
+   "first": 1794557920.0,
+   "span": null,
+   "t": [
+    1795180000.0,
+    1795179940.0,
+    1795179700.0,
+    1795176400.0,
+    1795158400.0,
+    1795093600.0,
+    1794920800.0,
+    1794557920.0
+   ],
+   "out": [1, 1, 1, 0.674624441, 0.440010099, 0.258487665, 0.11463454, 0]
+  },
+  {
+   "now": 1795180000.0,
+   "first": 1795179400.0,
+   "span": null,
+   "t": [1795180000.0, 1795179800.0, 1795179600.0, 1795179400.0],
+   "out": [1, 1, 0.884228217, 0.721057054]
+  },
+  {
+   "now": 1795180000.0,
+   "first": 1794557920.0,
+   "span": 3600.0,
+   "t": [1795180001.0, 1795180090.0, 1795187200.0],
+   "out": [1, 1, 1]
+  },
+  {
+   "now": 1795180000.0,
+   "first": 1794557920.0,
+   "span": null,
+   "t": [1795180001.0, 1795180090.0, 1795187200.0],
+   "out": [1, 1, 1]
+  }
+ ],
+ "color_index": [
+  {"purpose": "gradle assembleDebug", "out": 1},
+  {"purpose": "pnpm check", "out": 0},
+  {"purpose": "pytest -n 8", "out": 2},
+  {"purpose": "docker build api", "out": 3},
+  {"purpose": "xcodebuild test", "out": 5},
+  {"purpose": "cargo build --release", "out": 6},
+  {"purpose": "playwright e2e", "out": 0},
+  {"purpose": "training eval (overnight)", "out": 4},
+  {"purpose": "größer – 構築", "out": 0},
+  {"purpose": "", "out": 5},
+  {"purpose": "emoji 🚀 and é", "out": 5}
+ ],
+ "strip_top": [
+  {"tallest": 0, "out": 2},
+  {"tallest": 0.5, "out": 2},
+  {"tallest": 2, "out": 2},
+  {"tallest": 2.01, "out": 4},
+  {"tallest": 5.5, "out": 6},
+  {"tallest": 12, "out": 12},
+  {"tallest": 13, "out": 16},
+  {"tallest": 40, "out": 48},
+  {"tallest": 256, "out": 256},
+  {"tallest": 300, "out": 300}
+ ],
+ "multires": [
+  {
+   "now": 1795180000.0,
+   "points": [
+    {"t": 1795090000.0, "wired": 7.0, "app": 10.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795090030.0, "wired": 7.1, "app": 11.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795090060.0, "wired": 7.2, "app": 12.0, "comp": 5.6, "swap": 0.0, "away": true, "kills": 0},
+    {"t": 1795090090.0, "wired": 7.3, "app": 13.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795130000.0, "wired": 7.4, "app": 10.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795130030.0, "wired": 7.5, "app": 11.0, "comp": 5.6, "swap": 0.5, "away": false, "kills": 0},
+    {"t": 1795130060.0, "wired": 7.6, "app": 12.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795179600.0, "wired": 7.7, "app": 13.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795179630.0, "wired": 7.8, "app": 10.0, "comp": 5.6, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795179940.0, "wired": 7.9, "app": 11.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 1},
+    {"t": 1795179970.0, "wired": 8.0, "app": 12.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 1},
+    {"t": 1795180000.0, "wired": 8.1, "app": 13.0, "comp": 5.6, "swap": 0.0, "away": false, "kills": 0}
+   ],
+   "out": [
+    [1795090090, 7.3, 13, 6, 0, true, 0],
+    [1795130060, 7.6, 12, 6, 0, false, 0],
+    [1795179600, 7.7, 13, 5.8, 0, false, 0],
+    [1795179630, 7.8, 10, 5.6, 0, false, 0],
+    [1795179940, 7.9, 11, 6, 0, false, 1],
+    [1795179970, 8, 12, 5.8, 0, false, 1],
+    [1795180000, 8.1, 13, 5.6, 0, false, 0]
+   ]
+  },
+  {
+   "now": 1795180000.0,
+   "points": [
+    {"t": 1794920800.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": true, "kills": 1},
+    {
+     "t": 1794920830.0,
+     "wired": 6.0,
+     "app": 8.5,
+     "comp": 5.333333333333333,
+     "swap": 0.1,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794920860.0,
+     "wired": 6.0,
+     "app": 9.0,
+     "comp": 5.666666666666667,
+     "swap": 0.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794920890.0, "wired": 6.0, "app": 9.5, "comp": 6.0, "swap": 0.3, "away": false, "kills": 0},
+    {
+     "t": 1794920920.0,
+     "wired": 6.0,
+     "app": 10.0,
+     "comp": 6.333333333333333,
+     "swap": 0.4,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794920950.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.5, "away": false, "kills": 0},
+    {
+     "t": 1794920980.0,
+     "wired": 6.0,
+     "app": 11.0,
+     "comp": 5.333333333333333,
+     "swap": 0.6,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794921010.0,
+     "wired": 6.0,
+     "app": 8.25,
+     "comp": 5.666666666666667,
+     "swap": 0.7,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921040.0, "wired": 6.0, "app": 8.75, "comp": 6.0, "swap": 0.8, "away": false, "kills": 0},
+    {
+     "t": 1794921070.0,
+     "wired": 6.0,
+     "app": 9.25,
+     "comp": 6.333333333333333,
+     "swap": 0.9,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921100.0, "wired": 6.0, "app": 9.75, "comp": 5.0, "swap": 1.0, "away": false, "kills": 0},
+    {
+     "t": 1794921130.0,
+     "wired": 6.0,
+     "app": 10.25,
+     "comp": 5.333333333333333,
+     "swap": 1.1,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794921160.0,
+     "wired": 6.0,
+     "app": 10.75,
+     "comp": 5.666666666666667,
+     "swap": 1.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921190.0, "wired": 6.0, "app": 8.0, "comp": 6.0, "swap": 1.3, "away": false, "kills": 0},
+    {
+     "t": 1794921220.0,
+     "wired": 6.0,
+     "app": 8.5,
+     "comp": 6.333333333333333,
+     "swap": 1.4,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921250.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 1.5, "away": false, "kills": 0},
+    {
+     "t": 1794921280.0,
+     "wired": 6.0,
+     "app": 9.5,
+     "comp": 5.333333333333333,
+     "swap": 1.6,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794921310.0,
+     "wired": 6.0,
+     "app": 10.0,
+     "comp": 5.666666666666667,
+     "swap": 0.0,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921340.0, "wired": 6.0, "app": 10.5, "comp": 6.0, "swap": 0.1, "away": false, "kills": 0},
+    {
+     "t": 1794921370.0,
+     "wired": 6.0,
+     "app": 11.0,
+     "comp": 6.333333333333333,
+     "swap": 0.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921400.0, "wired": 6.0, "app": 8.25, "comp": 5.0, "swap": 0.3, "away": false, "kills": 0},
+    {
+     "t": 1794921430.0,
+     "wired": 6.0,
+     "app": 8.75,
+     "comp": 5.333333333333333,
+     "swap": 0.4,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794921460.0,
+     "wired": 6.0,
+     "app": 9.25,
+     "comp": 5.666666666666667,
+     "swap": 0.5,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921490.0, "wired": 6.0, "app": 9.75, "comp": 6.0, "swap": 0.6, "away": true, "kills": 0},
+    {
+     "t": 1794921520.0,
+     "wired": 6.0,
+     "app": 10.25,
+     "comp": 6.333333333333333,
+     "swap": 0.7,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921550.0, "wired": 6.0, "app": 10.75, "comp": 5.0, "swap": 0.8, "away": false, "kills": 0},
+    {
+     "t": 1794921580.0,
+     "wired": 6.0,
+     "app": 8.0,
+     "comp": 5.333333333333333,
+     "swap": 0.9,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794921610.0,
+     "wired": 6.0,
+     "app": 8.5,
+     "comp": 5.666666666666667,
+     "swap": 1.0,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921640.0, "wired": 6.0, "app": 9.0, "comp": 6.0, "swap": 1.1, "away": false, "kills": 0},
+    {
+     "t": 1794921670.0,
+     "wired": 6.0,
+     "app": 9.5,
+     "comp": 6.333333333333333,
+     "swap": 1.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921700.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 1.3, "away": false, "kills": 0},
+    {
+     "t": 1794921730.0,
+     "wired": 6.0,
+     "app": 10.5,
+     "comp": 5.333333333333333,
+     "swap": 1.4,
+     "away": false,
+     "kills": 1
+    },
+    {
+     "t": 1794921760.0,
+     "wired": 6.0,
+     "app": 11.0,
+     "comp": 5.666666666666667,
+     "swap": 1.5,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921790.0, "wired": 6.0, "app": 8.25, "comp": 6.0, "swap": 1.6, "away": false, "kills": 0},
+    {
+     "t": 1794921820.0,
+     "wired": 6.0,
+     "app": 8.75,
+     "comp": 6.333333333333333,
+     "swap": 0.0,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921850.0, "wired": 6.0, "app": 9.25, "comp": 5.0, "swap": 0.1, "away": false, "kills": 0},
+    {
+     "t": 1794921880.0,
+     "wired": 6.0,
+     "app": 9.75,
+     "comp": 5.333333333333333,
+     "swap": 0.2,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794921910.0,
+     "wired": 6.0,
+     "app": 10.25,
+     "comp": 5.666666666666667,
+     "swap": 0.3,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794921940.0, "wired": 6.0, "app": 10.75, "comp": 6.0, "swap": 0.4, "away": false, "kills": 0},
+    {
+     "t": 1794921970.0,
+     "wired": 6.0,
+     "app": 8.0,
+     "comp": 6.333333333333333,
+     "swap": 0.5,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922000.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.6, "away": false, "kills": 0},
+    {
+     "t": 1794922030.0,
+     "wired": 6.0,
+     "app": 9.0,
+     "comp": 5.333333333333333,
+     "swap": 0.7,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794922060.0,
+     "wired": 6.0,
+     "app": 9.5,
+     "comp": 5.666666666666667,
+     "swap": 0.8,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922090.0, "wired": 6.0, "app": 10.0, "comp": 6.0, "swap": 0.9, "away": false, "kills": 0},
+    {
+     "t": 1794922120.0,
+     "wired": 6.0,
+     "app": 10.5,
+     "comp": 6.333333333333333,
+     "swap": 1.0,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922150.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 1.1, "away": false, "kills": 0},
+    {
+     "t": 1794922180.0,
+     "wired": 6.0,
+     "app": 8.25,
+     "comp": 5.333333333333333,
+     "swap": 1.2,
+     "away": true,
+     "kills": 0
+    },
+    {
+     "t": 1794922210.0,
+     "wired": 6.0,
+     "app": 8.75,
+     "comp": 5.666666666666667,
+     "swap": 1.3,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922240.0, "wired": 6.0, "app": 9.25, "comp": 6.0, "swap": 1.4, "away": false, "kills": 0},
+    {
+     "t": 1794922270.0,
+     "wired": 6.0,
+     "app": 9.75,
+     "comp": 6.333333333333333,
+     "swap": 1.5,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922300.0, "wired": 6.0, "app": 10.25, "comp": 5.0, "swap": 1.6, "away": false, "kills": 0},
+    {
+     "t": 1794922330.0,
+     "wired": 6.0,
+     "app": 10.75,
+     "comp": 5.333333333333333,
+     "swap": 0.0,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794922360.0,
+     "wired": 6.0,
+     "app": 8.0,
+     "comp": 5.666666666666667,
+     "swap": 0.1,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922390.0, "wired": 6.0, "app": 8.5, "comp": 6.0, "swap": 0.2, "away": false, "kills": 0},
+    {
+     "t": 1794922420.0,
+     "wired": 6.0,
+     "app": 9.0,
+     "comp": 6.333333333333333,
+     "swap": 0.3,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922450.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.4, "away": false, "kills": 0},
+    {
+     "t": 1794922480.0,
+     "wired": 6.0,
+     "app": 10.0,
+     "comp": 5.333333333333333,
+     "swap": 0.5,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794922510.0,
+     "wired": 6.0,
+     "app": 10.5,
+     "comp": 5.666666666666667,
+     "swap": 0.6,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922540.0, "wired": 6.0, "app": 11.0, "comp": 6.0, "swap": 0.7, "away": false, "kills": 0},
+    {
+     "t": 1794922570.0,
+     "wired": 6.0,
+     "app": 8.25,
+     "comp": 6.333333333333333,
+     "swap": 0.8,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794922600.0, "wired": 6.0, "app": 8.75, "comp": 5.0, "swap": 0.9, "away": false, "kills": 0},
+    {
+     "t": 1794923030.0,
+     "wired": 6.0,
+     "app": 9.25,
+     "comp": 5.333333333333333,
+     "swap": 1.0,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923060.0,
+     "wired": 6.0,
+     "app": 9.75,
+     "comp": 5.666666666666667,
+     "swap": 1.1,
+     "away": false,
+     "kills": 1
+    },
+    {"t": 1794923090.0, "wired": 6.0, "app": 10.25, "comp": 6.0, "swap": 1.2, "away": false, "kills": 0},
+    {
+     "t": 1794923120.0,
+     "wired": 6.0,
+     "app": 10.75,
+     "comp": 6.333333333333333,
+     "swap": 1.3,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923150.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 1.4, "away": false, "kills": 0},
+    {
+     "t": 1794923180.0,
+     "wired": 6.0,
+     "app": 8.5,
+     "comp": 5.333333333333333,
+     "swap": 1.5,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923210.0,
+     "wired": 6.0,
+     "app": 9.0,
+     "comp": 5.666666666666667,
+     "swap": 1.6,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923240.0, "wired": 6.0, "app": 9.5, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {
+     "t": 1794923270.0,
+     "wired": 6.0,
+     "app": 10.0,
+     "comp": 6.333333333333333,
+     "swap": 0.1,
+     "away": true,
+     "kills": 0
+    },
+    {"t": 1794923300.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.2, "away": false, "kills": 0},
+    {
+     "t": 1794923330.0,
+     "wired": 6.0,
+     "app": 11.0,
+     "comp": 5.333333333333333,
+     "swap": 0.3,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923360.0,
+     "wired": 6.0,
+     "app": 8.25,
+     "comp": 5.666666666666667,
+     "swap": 0.4,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923390.0, "wired": 6.0, "app": 8.75, "comp": 6.0, "swap": 0.5, "away": false, "kills": 0},
+    {
+     "t": 1794923420.0,
+     "wired": 6.0,
+     "app": 9.25,
+     "comp": 6.333333333333333,
+     "swap": 0.6,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923450.0, "wired": 6.0, "app": 9.75, "comp": 5.0, "swap": 0.7, "away": false, "kills": 0},
+    {
+     "t": 1794923480.0,
+     "wired": 6.0,
+     "app": 10.25,
+     "comp": 5.333333333333333,
+     "swap": 0.8,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923510.0,
+     "wired": 6.0,
+     "app": 10.75,
+     "comp": 5.666666666666667,
+     "swap": 0.9,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923540.0, "wired": 6.0, "app": 8.0, "comp": 6.0, "swap": 1.0, "away": false, "kills": 0},
+    {
+     "t": 1794923570.0,
+     "wired": 6.0,
+     "app": 8.5,
+     "comp": 6.333333333333333,
+     "swap": 1.1,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923600.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 1.2, "away": false, "kills": 0},
+    {
+     "t": 1794923630.0,
+     "wired": 6.0,
+     "app": 9.5,
+     "comp": 5.333333333333333,
+     "swap": 1.3,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923660.0,
+     "wired": 6.0,
+     "app": 10.0,
+     "comp": 5.666666666666667,
+     "swap": 1.4,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923690.0, "wired": 6.0, "app": 10.5, "comp": 6.0, "swap": 1.5, "away": false, "kills": 0},
+    {
+     "t": 1794923720.0,
+     "wired": 6.0,
+     "app": 11.0,
+     "comp": 6.333333333333333,
+     "swap": 1.6,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923750.0, "wired": 6.0, "app": 8.25, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {
+     "t": 1794923780.0,
+     "wired": 6.0,
+     "app": 8.75,
+     "comp": 5.333333333333333,
+     "swap": 0.1,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923810.0,
+     "wired": 6.0,
+     "app": 9.25,
+     "comp": 5.666666666666667,
+     "swap": 0.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923840.0, "wired": 6.0, "app": 9.75, "comp": 6.0, "swap": 0.3, "away": false, "kills": 0},
+    {
+     "t": 1794923870.0,
+     "wired": 6.0,
+     "app": 10.25,
+     "comp": 6.333333333333333,
+     "swap": 0.4,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794923900.0, "wired": 6.0, "app": 10.75, "comp": 5.0, "swap": 0.5, "away": false, "kills": 0},
+    {
+     "t": 1794923930.0,
+     "wired": 6.0,
+     "app": 8.0,
+     "comp": 5.333333333333333,
+     "swap": 0.6,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794923960.0,
+     "wired": 6.0,
+     "app": 8.5,
+     "comp": 5.666666666666667,
+     "swap": 0.7,
+     "away": true,
+     "kills": 0
+    },
+    {"t": 1794923990.0, "wired": 6.0, "app": 9.0, "comp": 6.0, "swap": 0.8, "away": false, "kills": 1},
+    {
+     "t": 1794924020.0,
+     "wired": 6.0,
+     "app": 9.5,
+     "comp": 6.333333333333333,
+     "swap": 0.9,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924050.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 1.0, "away": false, "kills": 0},
+    {
+     "t": 1794924080.0,
+     "wired": 6.0,
+     "app": 10.5,
+     "comp": 5.333333333333333,
+     "swap": 1.1,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794924110.0,
+     "wired": 6.0,
+     "app": 11.0,
+     "comp": 5.666666666666667,
+     "swap": 1.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924140.0, "wired": 6.0, "app": 8.25, "comp": 6.0, "swap": 1.3, "away": false, "kills": 0},
+    {
+     "t": 1794924170.0,
+     "wired": 6.0,
+     "app": 8.75,
+     "comp": 6.333333333333333,
+     "swap": 1.4,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924200.0, "wired": 6.0, "app": 9.25, "comp": 5.0, "swap": 1.5, "away": false, "kills": 0},
+    {
+     "t": 1794924230.0,
+     "wired": 6.0,
+     "app": 9.75,
+     "comp": 5.333333333333333,
+     "swap": 1.6,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794924260.0,
+     "wired": 6.0,
+     "app": 10.25,
+     "comp": 5.666666666666667,
+     "swap": 0.0,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924290.0, "wired": 6.0, "app": 10.75, "comp": 6.0, "swap": 0.1, "away": false, "kills": 0},
+    {
+     "t": 1794924320.0,
+     "wired": 6.0,
+     "app": 8.0,
+     "comp": 6.333333333333333,
+     "swap": 0.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924350.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.3, "away": false, "kills": 0},
+    {
+     "t": 1794924380.0,
+     "wired": 6.0,
+     "app": 9.0,
+     "comp": 5.333333333333333,
+     "swap": 0.4,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794924410.0,
+     "wired": 6.0,
+     "app": 9.5,
+     "comp": 5.666666666666667,
+     "swap": 0.5,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924440.0, "wired": 6.0, "app": 10.0, "comp": 6.0, "swap": 0.6, "away": false, "kills": 0},
+    {
+     "t": 1794924470.0,
+     "wired": 6.0,
+     "app": 10.5,
+     "comp": 6.333333333333333,
+     "swap": 0.7,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924500.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.8, "away": false, "kills": 0},
+    {
+     "t": 1794924530.0,
+     "wired": 6.0,
+     "app": 8.25,
+     "comp": 5.333333333333333,
+     "swap": 0.9,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794924560.0,
+     "wired": 6.0,
+     "app": 8.75,
+     "comp": 5.666666666666667,
+     "swap": 1.0,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924590.0, "wired": 6.0, "app": 9.25, "comp": 6.0, "swap": 1.1, "away": false, "kills": 0},
+    {
+     "t": 1794924620.0,
+     "wired": 6.0,
+     "app": 9.75,
+     "comp": 6.333333333333333,
+     "swap": 1.2,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924650.0, "wired": 6.0, "app": 10.25, "comp": 5.0, "swap": 1.3, "away": true, "kills": 0},
+    {
+     "t": 1794924680.0,
+     "wired": 6.0,
+     "app": 10.75,
+     "comp": 5.333333333333333,
+     "swap": 1.4,
+     "away": false,
+     "kills": 0
+    },
+    {
+     "t": 1794924710.0,
+     "wired": 6.0,
+     "app": 8.0,
+     "comp": 5.666666666666667,
+     "swap": 1.5,
+     "away": false,
+     "kills": 0
+    },
+    {"t": 1794924740.0, "wired": 6.0, "app": 8.5, "comp": 6.0, "swap": 1.6, "away": false, "kills": 0},
+    {
+     "t": 1794924770.0,
+     "wired": 6.0,
+     "app": 9.0,
+     "comp": 6.333333333333333,
+     "swap": 0.0,
+     "away": false,
+     "kills": 0
+    }
+   ],
+   "out": [
+    [1794920800, 6, 8, 5, 0, true, 1],
+    [1794921160, 6, 10.75, 5.666666667, 1.2, false, 0],
+    [1794921370, 6, 11, 6.333333333, 0.2, true, 0],
+    [1794921760, 6, 11, 5.666666667, 1.5, false, 1],
+    [1794922120, 6, 10.5, 6.333333333, 1, true, 0],
+    [1794922540, 6, 11, 6, 0.7, false, 0],
+    [1794923120, 6, 10.75, 6.333333333, 1.3, true, 1],
+    [1794923690, 6, 10.5, 6, 1.5, false, 0],
+    [1794923720, 6, 11, 6.333333333, 1.6, true, 1],
+    [1794924110, 6, 11, 5.666666667, 1.2, false, 0],
+    [1794924470, 6, 10.5, 6.333333333, 0.7, true, 0]
+   ]
+  },
+  {
+   "now": 1795180000.0,
+   "points": [
+    {"t": 1794748000.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748030.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748060.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748090.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748120.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748150.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748180.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748210.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748240.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748270.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748300.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748330.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748360.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748390.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748820.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748850.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748880.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748910.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748940.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794748970.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749000.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749030.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749060.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749090.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749120.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749150.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749180.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749210.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749240.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749270.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749300.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749330.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749360.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749390.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749420.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749450.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749480.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794749510.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750090.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750120.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750150.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750180.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750210.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750240.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750270.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750300.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750330.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750360.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750390.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750420.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750450.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750480.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750510.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750540.0, "wired": 6.0, "app": 10.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750570.0, "wired": 6.0, "app": 10.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750600.0, "wired": 6.0, "app": 11.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750630.0, "wired": 6.0, "app": 8.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750660.0, "wired": 6.0, "app": 8.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750690.0, "wired": 6.0, "app": 9.0, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1794750720.0, "wired": 6.0, "app": 9.5, "comp": 5.0, "swap": 0.0, "away": false, "kills": 0}
+   ],
+   "out": [
+    [1794748180, 6, 11, 5, 0, false, 0],
+    [1794748910, 6, 9.5, 5, 0, false, 0],
+    [1794749000, 6, 11, 5, 0, false, 0],
+    [1794750120, 6, 10, 5, 0, false, 0],
+    [1794750180, 6, 11, 5, 0, false, 0]
+   ]
+  }
+ ],
+ "gaps": [
+  {
+   "now": 1795180400.0,
+   "points": [
+    {"t": 1795090000.0, "wired": 7.0, "app": 10.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795090030.0, "wired": 7.1, "app": 11.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795090060.0, "wired": 7.2, "app": 12.0, "comp": 5.6, "swap": 0.0, "away": true, "kills": 0},
+    {"t": 1795090090.0, "wired": 7.3, "app": 13.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795130000.0, "wired": 7.4, "app": 10.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795130030.0, "wired": 7.5, "app": 11.0, "comp": 5.6, "swap": 0.5, "away": false, "kills": 0},
+    {"t": 1795130060.0, "wired": 7.6, "app": 12.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795179600.0, "wired": 7.7, "app": 13.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795179630.0, "wired": 7.8, "app": 10.0, "comp": 5.6, "swap": 0.0, "away": false, "kills": 0},
+    {"t": 1795179940.0, "wired": 7.9, "app": 11.0, "comp": 6.0, "swap": 0.0, "away": false, "kills": 1},
+    {"t": 1795179970.0, "wired": 8.0, "app": 12.0, "comp": 5.8, "swap": 0.0, "away": false, "kills": 1},
+    {"t": 1795180000.0, "wired": 8.1, "app": 13.0, "comp": 5.6, "swap": 0.0, "away": false, "kills": 0}
+   ],
+   "out": [[1795090090, 1795130000], [1795130060, 1795179600], [1795179630, 1795179940], [1795180000, 1795180400]]
+  },
+  {"now": 1795180000.0, "points": [], "out": []},
+  {
+   "now": 1795180000.0,
+   "points": [{"t": 1795179699.0, "wired": 0, "app": 0, "comp": 0, "swap": 0, "away": false, "kills": 0}],
+   "out": [[1795179699, 1795180000]]
+  }
+ ],
+ "calm_bands": [
+  {
+   "away": [[10, 20], [40, 45]],
+   "gaps": [[20, 26], [30, 31], [60, 70]],
+   "tolerance": 0.0,
+   "out": {"grey": [[10, 26], [40, 45]], "hatched": [[20, 26], [30, 31], [60, 70]]}
+  },
+  {
+   "away": [[10, 20], [40, 45]],
+   "gaps": [[21.5, 26], [27, 39], [60, 70]],
+   "tolerance": 2.0,
+   "out": {"grey": [[10, 45]], "hatched": [[21.5, 39], [60, 70]]}
+  },
+  {"away": [], "gaps": [[5, 6], [6.5, 9]], "tolerance": 1.0, "out": {"grey": [], "hatched": [[5, 9]]}},
+  {"away": [[3, 4], [0, 2]], "gaps": [], "tolerance": 0.0, "out": {"grey": [[0, 2], [3, 4]], "hatched": []}}
+ ],
+ "stack": [
+  {
+   "now": 1795180000.0,
+   "reservations": [
+    {
+     "id": "a",
+     "key": "a@1795179100",
+     "gb": 4.0,
+     "purpose": "p a",
+     "requested": 1795179100.0,
+     "granted": 1795179100.0,
+     "ended": 1795179700.0,
+     "segments": [{"t": 1795179100.0, "gb": 6.0}, {"t": 1795179400.0, "gb": 4.0}]
+    },
+    {
+     "id": "b",
+     "key": "b@1795179200",
+     "gb": 2.0,
+     "purpose": "p b",
+     "requested": 1795179200.0,
+     "granted": 1795179300.0
+    },
+    {
+     "id": "c",
+     "key": "c@1795179700",
+     "gb": 8.0,
+     "purpose": "p c",
+     "requested": 1795179700.0,
+     "granted": null
+    }
+   ],
+   "out": [
+    {
+     "key": "a@1795179100",
+     "lane": 0,
+     "steps": [[1795179100, 1795179400, 0, 6], [1795179400, 1795179700, 0, 4]]
+    },
+    {
+     "key": "b@1795179200",
+     "lane": 1,
+     "steps": [
+      [1795179200, 1795179300, 6, 8],
+      [1795179300, 1795179400, 6, 8],
+      [1795179400, 1795179700, 4, 6],
+      [1795179700, 1795180000, 8, 10]
+     ]
+    },
+    {"key": "c@1795179700", "lane": 0, "steps": [[1795179700, 1795180000, 0, 8]]}
+   ]
+  },
+  {
+   "now": 1795180000.0,
+   "reservations": [
+    {
+     "id": "d",
+     "key": "d@1795175000",
+     "gb": 3.0,
+     "purpose": "p d",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "ended": 1795176000.0
+    },
+    {
+     "id": "e",
+     "key": "e@1795175500",
+     "gb": 1.0,
+     "purpose": "p e",
+     "requested": 1795175500.0,
+     "granted": 1795175600.0,
+     "ended": 1795177000.0
+    },
+    {
+     "id": "f",
+     "key": "f@1795176000",
+     "gb": 2.0,
+     "purpose": "p f",
+     "requested": 1795176000.0,
+     "granted": 1795176000.0,
+     "ended": 1795176500.0
+    },
+    {
+     "id": "g",
+     "key": "g@1795176200",
+     "gb": 5.0,
+     "purpose": "p g",
+     "requested": 1795176200.0,
+     "granted": 1795176400.0,
+     "ended": 1795176410.0
+    },
+    {
+     "id": "h",
+     "key": "h@1795179990",
+     "gb": 1.5,
+     "purpose": "p h",
+     "requested": 1795179990.0,
+     "granted": null
+    }
+   ],
+   "out": [
+    {"key": "d@1795175000", "lane": 0, "steps": [[1795175000, 1795176000, 0, 3]]},
+    {
+     "key": "e@1795175500",
+     "lane": 1,
+     "steps": [
+      [1795175500, 1795175600, 3, 4],
+      [1795175600, 1795176000, 3, 4],
+      [1795176000, 1795176500, 2, 3],
+      [1795176500, 1795177000, 0, 1]
+     ]
+    },
+    {"key": "f@1795176000", "lane": 0, "steps": [[1795176000, 1795176500, 0, 2]]},
+    {
+     "key": "g@1795176200",
+     "lane": 2,
+     "steps": [[1795176200, 1795176400, 3, 8], [1795176400, 1795176410, 3, 8]]
+    },
+    {"key": "h@1795179990", "lane": 0, "steps": [[1795179990, 1795180000, 0, 1.5]]}
+   ]
+  }
+ ],
+ "merge": [
+  {
+   "now": 1795180000.0,
+   "records": [
+    {
+     "id": "r1",
+     "key": "r1@1795175000",
+     "gb": 6.0,
+     "purpose": "p r1",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "segments": [{"t": 1795175000.0, "gb": 8.0}, {"t": 1795176000.0, "gb": 6.0}],
+     "event": "edit",
+     "t": 1795176000.0,
+     "holder": "session"
+    },
+    {
+     "id": "r1",
+     "key": "r1@1795175000",
+     "gb": 6.0,
+     "purpose": "p r1",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "ended": 1795177000.0,
+     "segments": [{"t": 1795175000.0, "gb": 8.0}, {"t": 1795176000.0, "gb": 6.0}],
+     "event": "end",
+     "t": 1795177000.0,
+     "outcome": "released",
+     "holder": "session",
+     "peak_gb": 5.1
+    },
+    {
+     "id": "r1",
+     "key": "r1@1795175000",
+     "gb": 6.0,
+     "purpose": "p r1",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "event": "edit",
+     "t": 1795177100.0,
+     "holder": "session"
+    },
+    {
+     "id": "r2",
+     "key": "r2@1795178000",
+     "gb": 3.0,
+     "purpose": "p r2",
+     "requested": 1795178000.0,
+     "granted": 1795178000.0,
+     "segments": [{"t": 1795178000.0, "gb": 4.0}, {"t": 1795178500.0, "gb": 3.0}],
+     "event": "edit",
+     "t": 1795178500.0,
+     "holder": "run"
+    },
+    {
+     "id": "r9",
+     "key": "r9@1795179000",
+     "gb": 2.0,
+     "purpose": "p r9",
+     "requested": 1795179000.0,
+     "granted": 1795179000.0,
+     "segments": [{"t": 1795179000.0, "gb": 1.0}, {"t": 1795179100.0, "gb": 2.0}],
+     "event": "edit",
+     "t": 1795179100.0,
+     "holder": "session"
+    },
+    {
+     "id": "r3",
+     "key": "r3@1793452000",
+     "gb": 1.0,
+     "purpose": "p r3",
+     "requested": 1793452000.0,
+     "granted": 1793452000.0,
+     "ended": 1793538400.0,
+     "event": "end",
+     "outcome": "released"
+    },
+    {"id": "r4", "purpose": "no size"}
+   ],
+   "ledger": {
+    "seq": 12,
+    "leases": [
+     {
+      "id": "r9",
+      "key": "r9@1795179000",
+      "gb": 2.0,
+      "purpose": "p r9",
+      "requested": 1795179000.0,
+      "granted": 1795179000.0,
+      "segments": [{"t": 1795179000.0, "gb": 1.0}, {"t": 1795179100.0, "gb": 2.0}],
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "granted",
+      "seen": 1795179990.0,
+      "expires": 1795180800.0,
+      "used_gb": 1.2
+     },
+     {
+      "id": "r10",
+      "key": "r10@1795176000",
+      "gb": 5.0,
+      "purpose": "p r10",
+      "requested": 1795176000.0,
+      "granted": 1795176000.0,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "granted",
+      "seen": 1795177500.0,
+      "expires": 1795177800.0
+     },
+     {
+      "id": "r11",
+      "key": "r11@1795179400",
+      "gb": 7.0,
+      "purpose": "p r11",
+      "requested": 1795179400.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179600.0
+     },
+     {
+      "id": "r12",
+      "key": "r12@1795179700",
+      "gb": 1.0,
+      "purpose": "p r12",
+      "requested": 1795179700.0,
+      "granted": 1795179710.0,
+      "holder": {"pid": 4343, "start": 1, "kind": "process"},
+      "state": "granted",
+      "seen": 1795179980.0,
+      "expires": 1795181000.0
+     }
+    ],
+    "history": [
+     {
+      "id": "r0",
+      "purpose": "p r0",
+      "gb": 1.0,
+      "holder": "session",
+      "requested": 1795171000.0,
+      "granted": 1795171000.0,
+      "ended": 1795172000.0,
+      "outcome": "released",
+      "peak_gb": 0.4
+     }
+    ]
+   },
+   "gone": [4343],
+   "out": [
+    {"ended": 1795172000, "gb": 1, "key": "r0@1795171000", "outcome": "released", "segments": 1},
+    {"ended": 1795177000, "gb": 6, "key": "r1@1795175000", "outcome": "released", "segments": 2},
+    {"ended": 1795177800, "gb": 5, "key": "r10@1795176000", "outcome": "expired", "segments": 1},
+    {"ended": 1795178500, "gb": 3, "key": "r2@1795178000", "outcome": "unknown", "segments": 2},
+    {"ended": null, "gb": 2, "key": "r9@1795179000", "outcome": null, "segments": 2},
+    {"ended": 1795179780, "gb": 7, "key": "r11@1795179400", "outcome": "lapsed", "segments": 1},
+    {"ended": 1795179980, "gb": 1, "key": "r12@1795179700", "outcome": "holder_gone", "segments": 1}
+   ]
+  },
+  {
+   "now": 1795180000.0,
+   "records": [
+    {
+     "id": "r1",
+     "key": "r1@1795175000",
+     "gb": 6.0,
+     "purpose": "p r1",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "segments": [{"t": 1795175000.0, "gb": 8.0}, {"t": 1795176000.0, "gb": 6.0}],
+     "event": "edit",
+     "t": 1795176000.0,
+     "holder": "session"
+    },
+    {
+     "id": "r1",
+     "key": "r1@1795175000",
+     "gb": 6.0,
+     "purpose": "p r1",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "ended": 1795177000.0,
+     "segments": [{"t": 1795175000.0, "gb": 8.0}, {"t": 1795176000.0, "gb": 6.0}],
+     "event": "end",
+     "t": 1795177000.0,
+     "outcome": "released",
+     "holder": "session",
+     "peak_gb": 5.1
+    },
+    {
+     "id": "r1",
+     "key": "r1@1795175000",
+     "gb": 6.0,
+     "purpose": "p r1",
+     "requested": 1795175000.0,
+     "granted": 1795175000.0,
+     "event": "edit",
+     "t": 1795177100.0,
+     "holder": "session"
+    },
+    {
+     "id": "r2",
+     "key": "r2@1795178000",
+     "gb": 3.0,
+     "purpose": "p r2",
+     "requested": 1795178000.0,
+     "granted": 1795178000.0,
+     "segments": [{"t": 1795178000.0, "gb": 4.0}, {"t": 1795178500.0, "gb": 3.0}],
+     "event": "edit",
+     "t": 1795178500.0,
+     "holder": "run"
+    },
+    {
+     "id": "r9",
+     "key": "r9@1795179000",
+     "gb": 2.0,
+     "purpose": "p r9",
+     "requested": 1795179000.0,
+     "granted": 1795179000.0,
+     "segments": [{"t": 1795179000.0, "gb": 1.0}, {"t": 1795179100.0, "gb": 2.0}],
+     "event": "edit",
+     "t": 1795179100.0,
+     "holder": "session"
+    },
+    {
+     "id": "r3",
+     "key": "r3@1793452000",
+     "gb": 1.0,
+     "purpose": "p r3",
+     "requested": 1793452000.0,
+     "granted": 1793452000.0,
+     "ended": 1793538400.0,
+     "event": "end",
+     "outcome": "released"
+    },
+    {"id": "r4", "purpose": "no size"}
+   ],
+   "ledger": {"seq": 0, "leases": [], "history": []},
+   "gone": [],
+   "out": [
+    {"ended": 1795177000, "gb": 6, "key": "r1@1795175000", "outcome": "released", "segments": 2},
+    {"ended": 1795178500, "gb": 3, "key": "r2@1795178000", "outcome": "unknown", "segments": 2},
+    {"ended": 1795179100, "gb": 2, "key": "r9@1795179000", "outcome": "unknown", "segments": 2}
+   ]
+  },
+  {
+   "now": 1795180000.0,
+   "records": [],
+   "ledger": {
+    "seq": 4,
+    "leases": [
+     {
+      "id": "q0",
+      "key": "q0@1795179100",
+      "gb": 2.0,
+      "purpose": "p q0",
+      "requested": 1795179100.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179900.0
+     },
+     {
+      "id": "q1",
+      "key": "q1@1795179100",
+      "gb": 2.0,
+      "purpose": "p q1",
+      "requested": 1795179100.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179821.0
+     },
+     {
+      "id": "q2",
+      "key": "q2@1795179100",
+      "gb": 2.0,
+      "purpose": "p q2",
+      "requested": 1795179100.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179800.0
+     },
+     {
+      "id": "q3",
+      "key": "q3@1795179100",
+      "gb": 2.0,
+      "purpose": "p q3",
+      "requested": 1795179100.0,
+      "granted": null,
+      "holder": {"pid": 4242, "start": 1, "kind": "session"},
+      "state": "queued",
+      "seen": 1795179710.0
+     }
+    ],
+    "history": []
+   },
+   "gone": [],
+   "out": [
+    {"ended": null, "gb": 2, "key": "q0@1795179100", "outcome": null, "segments": 1},
+    {"ended": null, "gb": 2, "key": "q1@1795179100", "outcome": null, "segments": 1},
+    {"ended": 1795179980, "gb": 2, "key": "q2@1795179100", "outcome": "lapsed", "segments": 1},
+    {"ended": 1795179890, "gb": 2, "key": "q3@1795179100", "outcome": "lapsed", "segments": 1}
+   ]
+  }
+ ]
+}

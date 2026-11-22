@@ -34,13 +34,14 @@ jobs:
         run: |
           bash -n build-app.sh install.sh uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py tools/selftest.py tools/roottest.py tools/brandlint.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py tools/selftest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
       - name: Daemon + CLI self-test
         # Samples this runner into a temp dir, simulates a jetsam storm, and checks
-        # the incident lifecycle, the HTML report and every CLI command.
+        # the incident lifecycle, the HTML report and every CLI command, the chart maths of
+        # `oomph top` against tools/vectors/chart.json and its golden frames (tools/golden/top).
         run: /usr/bin/python3 -I -B tools/selftest.py
 
       - name: Root test (H0)
@@ -112,6 +113,13 @@ jobs:
         # Exactly what a contributor runs; ad-hoc signed, no Apple account.
         run: ./build-app.sh "$RUNNER_TEMP/dist"
 
+      - name: Chart vectors, both programs
+        # The chart maths exist twice: in the app (Swift) and in `oomph top` (Python). The
+        # app's answers are tools/vectors/chart.json; both must reproduce them.
+        run: |
+          /usr/bin/python3 -I -B tools/chartvectors.py
+          /usr/bin/python3 -I -B tools/chartvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
+
       - name: Verify app bundle
         run: |
           APP="$RUNNER_TEMP/dist/oomph.app"
@@ -130,7 +138,7 @@ jobs:
           grep -q "^VERSION = \"$version\"" "$APP/Contents/Resources/oomph.py" || { echo "::error::bundled CLI not stamped"; exit 1; }
 
           # Activate/Deactivate run these from the bundle.
-          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_ai.py oomph_upgrade.py local.oomph.daemon.plist; do
+          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py local.oomph.daemon.plist; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }

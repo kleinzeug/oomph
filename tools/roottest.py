@@ -8,7 +8,7 @@ directory, to read or to write, by any route, and root never waits on it. Used b
 
 Copies daemon/ into a root-owned 0755 directory (the unprivileged children must read it),
 points OOMPH_DIR and OOMPH_LEDGER_DIR at temporary directories, and runs the daemon's
-sampling and `oomph reserve` / `reservations` / `release` against a planted symbolic link, a
+sampling and `oomph reserve` / `reservations` / `release` / `top` against a planted symbolic link, a
 FIFO, endless and sparse files, a held lock, malformed leases, a hard link and a directory
 replaced by a link. An audit hook records every file this (root) process opens, renames,
 removes or creates: anything inside the ledger directories fails the test, as does a changed
@@ -38,7 +38,7 @@ code, ledgers, victims = (os.path.join(base, x) for x in ("code", "ledgers", "vi
 for d in (code, ledgers, victims):
     os.mkdir(d)
     os.chmod(d, 0o755)
-for f in ("oomph.py", "oomphd.py"):
+for f in ("oomph.py", "oomphd.py", "oomph_top.py", "oomph_view.py"):
     shutil.copy(os.path.join(ROOT, "daemon", f), code)
     os.chmod(os.path.join(code, f), 0o644)
 os.environ["OOMPH_DIR"] = os.path.join(base, "logs")
@@ -202,6 +202,7 @@ with Watch():
     tick()
     s, dt, ran = tick()
     rid = json.loads(r1[1] or "{}").get("id", "r0")
+    r5 = cli("top", "--once", "--color", "never", "--size", "100x30")
     r3 = cli("release", rid, "--json")
 st = os.lstat(os.path.join(p, "ledger.json")) if os.path.lexists(os.path.join(p, "ledger.json")) else None
 check(r1[0] == 0 and r2[0] == 0 and r3[0] == 0 and json.loads(r3[1] or "{}").get("released"),
@@ -210,6 +211,8 @@ check(st and stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o666 and 
       "plain: ledger.json written 0666 by uid %s, not by root" % (st and st.st_uid))
 check([x["id"] for x in s.get("leases", [])] == [rid] and ran and dt < 2,
       "plain: the sample (%.2f s) carries the reservation, from the daemon's child" % dt)
+check(r5[0] == 0 and "roottest plain" in r5[1] and len(r5[1].splitlines()) == 30,
+      "plain: `oomph top --once` as root shows the reservation, read by a child (%s)" % [r5[0], r5[2][-200:]])
 no_hits("plain")
 
 # 2. symbolic links planted at ledger.json and reservations.jsonl, to files only root may read and write
@@ -227,7 +230,8 @@ with Watch():
     r2 = cli("reservations", "--json")
     r3 = cli("release", json.loads(r1[1] or "{}").get("id", "r0"), "--json")
     r4 = cli("status")
-check("SECRET" not in json.dumps(s) + r1[1] + r2[1] + r3[1] + r4[1] and (digest(secret), digest(rootlog)) == before,
+    r5 = cli("top", "--once", "--color", "never", "--size", "100x30")
+check("SECRET" not in json.dumps(s) + r1[1] + r2[1] + r3[1] + r4[1] + r5[1] and r5[0] == 0 and (digest(secret), digest(rootlog)) == before,
       "symlink: nothing read or written through the planted links (rc %s)" % [r1[0], r2[0], r3[0], r4[0]])
 check(all(stat.S_ISREG(os.lstat(os.path.join(p, f)).st_mode) for f in ("ledger.json", "reservations.jsonl")),
       "symlink: fresh files took the names")
@@ -241,8 +245,10 @@ with Watch():
     s, dt_s, ran = tick()
     r1 = cli("reserve", "1G", "--for", "roottest fifo", "--json")
     r3 = cli("release", json.loads(r1[1] or "{}").get("id", "r0"))
-check(dt_s < 2 and ran and r1[0] == 0 and r3[0] == 0 and r1[3] + r3[3] < 20,
-      "FIFO: the sample took %.2f s, reserve %.1f s, release %.1f s; nothing hung" % (dt_s, r1[3], r3[3]))
+    r5 = cli("top", "--once", "--color", "never")
+check(dt_s < 2 and ran and r1[0] == 0 and r3[0] == 0 and r5[0] == 0 and r1[3] + r3[3] + r5[3] < 30,
+      "FIFO: the sample took %.2f s, reserve %.1f s, release %.1f s, top %.1f s; nothing hung"
+      % (dt_s, r1[3], r3[3], r5[3]))
 no_hits("FIFO")
 p = case("fifo-lock")
 os.mkfifo(os.path.join(p, "ledger.lock"), 0o666)
