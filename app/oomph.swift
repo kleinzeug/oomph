@@ -773,6 +773,9 @@ final class Store: ObservableObject {
     @Published var upgradeCheckError: String?
     @Published var changelog: [ChangelogEntry] = []
     @Published var showChangelog = false
+    @Published var optionHeld = false     // ⌥ down while the popup is up: Check becomes a forced Upgrade
+    @Published var forceUpgrade = false   // the changelog was opened with ⌥: rebuild main even if it isn't newer
+    private var flagsMonitor: Any?
     @Published var loadingChangelog = false
     @Published var building = false
     @Published var buildProgress = ""
@@ -1005,6 +1008,7 @@ final class Store: ObservableObject {
     /// (no background timer — it only runs while you look).
     func popupOpened() {
         if upgradeButton == .upToDate { upgradeButton = .check }
+        watchOption()
         let now = Date().timeIntervalSince1970
         if now - defaults.double(forKey: "upgradeToolsChecked") > 86400 {
             runUpgradeCLI(["tools", "--json"]) { [weak self] data, _ in
@@ -1057,7 +1061,19 @@ final class Store: ObservableObject {
         }
     }
 
-    func openUpgrade() {
+    /// Follow the ⌥ key while the app is active (the popup is its key window).
+    func watchOption() {
+        optionHeld = NSEvent.modifierFlags.contains(.option)
+        guard flagsMonitor == nil else { return }
+        flagsMonitor = NSEvent.addLocalMonitorForEvents(matching: .flagsChanged) { [weak self] e in
+            let down: Bool = e.modifierFlags.contains(.option)
+            if self?.optionHeld != down { self?.optionHeld = down }
+            return e
+        }
+    }
+
+    func openUpgrade(force: Bool = false) {
+        forceUpgrade = force
         showChangelog = true
         loadingChangelog = true
         changelog = []
@@ -1065,7 +1081,7 @@ final class Store: ObservableObject {
             guard let self else { return }
             self.loadingChangelog = false
             if status == 0, let entries = try? JSONDecoder().decode([ChangelogEntry].self, from: data) {
-                if entries.isEmpty {  // nothing newer after all: say so instead of an empty changelog
+                if entries.isEmpty && !self.forceUpgrade {  // nothing newer after all: say so instead of an empty changelog
                     self.showChangelog = false
                     self.defaults.removeObject(forKey: "upgradeAvailable")
                     self.defaults.removeObject(forKey: "upgradeAvailableCommit")
@@ -3061,6 +3077,8 @@ struct PopoverView: View {
                 Text("Check").hidden().overlay(ProgressView().controlSize(.small).scaleEffect(0.6))
             }.disabled(true).focusable(false)
                 .help("Checking GitHub for a newer \(brand)…")
+        case .check where store.optionHeld, .upToDate where store.optionHeld:
+            forcedUpgradeButton(cur)
         case .check:
             Button("Check") { store.checkForUpgrade(manual: true) }
                 .focusable(false)
@@ -3077,6 +3095,13 @@ struct PopoverView: View {
                 .disabled(true).focusable(false)
                 .help("\(brand) \(cur) is the newest version on GitHub")
         }
+    }
+
+    /// ⌥ held over Check or "Up to date": rebuild and reinstall GitHub's main even if it isn't newer.
+    func forcedUpgradeButton(_ cur: String) -> some View {
+        Button("Upgrade") { store.openUpgrade(force: true) }
+            .buttonStyle(.borderedProminent).focusable(false)
+            .help("Rebuild and reinstall the newest \(brand) from GitHub's main, even if it is \(cur) already")
     }
 
     var lastChecked: String {
@@ -3107,6 +3132,7 @@ struct PopoverView: View {
                         .font(.system(size: 11, design: .monospaced)).foregroundStyle(.secondary)
                 }
                 Text(store.loadingChangelog ? "Fetching the changelog from GitHub…"
+                     : newCount == 0 && store.forceUpgrade ? "Nothing newer than yours. Upgrade Now rebuilds GitHub's main and installs it again."
                      : newCount == 1 ? "1 new version since yours. Each commit on main is a release."
                      : "\(newCount) new versions since yours. Each commit on main is a release.")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
@@ -3124,11 +3150,13 @@ struct PopoverView: View {
                 HStack {
                     Button("Cancel") { store.showChangelog = false }.keyboardShortcut(.cancelAction)
                     Spacer()
-                    Button("Skip This Version") { store.skipThisVersion() }
-                        .help("Don't offer this version again when \(brand) checks by itself (Check still finds it)")
+                    if newCount > 0 {
+                        Button("Skip This Version") { store.skipThisVersion() }
+                            .help("Don't offer this version again when \(brand) checks by itself (Check still finds it)")
+                    }
                     Button("Upgrade Now") { store.upgradeNow() }
                         .keyboardShortcut(.defaultAction).buttonStyle(.borderedProminent)
-                        .disabled(store.loadingChangelog || newCount == 0)
+                        .disabled(store.loadingChangelog || (newCount == 0 && !store.forceUpgrade))
                 }
                 .controlSize(.regular)
             }
@@ -3148,10 +3176,40 @@ struct PopoverView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// A commit body as the popup should wrap it: git's hard line breaks inside a paragraph or a list
+    /// item are joined (else each wrapped line breaks again in the narrow sheet, a comb); blank lines
+    /// and the start of a list item ("- ", "* ", "1. ") keep their line break.
+    static func unwrap(_ body: String) -> String {
+        var out: [String] = []
+        for raw in body.components(separatedBy: "\n") {
+            let line: String = raw.trimmingCharacters(in: .whitespaces)
+            let item: Bool = line.hasPrefix("- ") || line.hasPrefix("* ") || line.hasPrefix("• ")
+                || (line.first?.isNumber == true && line.contains(". ") && line.prefix(4).contains("."))
+            if line.isEmpty {
+                if out.last != "" { out.append("") }
+            } else if item || out.isEmpty || out.last == "" || Self.isHeading(out[out.count - 1]) {
+                let indent: String = String(raw.prefix(while: { $0 == " " }))
+                out.append((item ? indent : "") + line)
+            } else {
+                out[out.count - 1] += " " + line
+            }
+        }
+        while out.last == "" { out.removeLast() }
+        return out.joined(separator: "\n")
+    }
+
+    /// A line that stands alone: all bold ("**Per file**"), or short and ending in a colon ("Per file:";
+    /// a long one is a sentence that git wrapped after its colon).
+    static func isHeading(_ line: String) -> Bool {
+        let t: String = line.trimmingCharacters(in: .whitespaces)
+        return (t.hasPrefix("**") && t.hasSuffix("**") && t.count > 4) || (t.hasSuffix(":") && t.count <= 40)
+    }
+
     func changelogEntry(_ e: ChangelogEntry) -> some View {
         let day = Self.isoIn.date(from: e.date).map { Self.dayOut.string(from: $0) } ?? String(e.date.prefix(10))
-        let body = (try? AttributedString(markdown: e.body, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
-            ?? AttributedString(e.body)
+        let text: String = Self.unwrap(e.body)
+        let body = (try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(text)
         return VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text(e.version).font(.system(size: 11, weight: .semibold, design: .monospaced))
