@@ -1348,6 +1348,13 @@ class App:
             return
         raise Leave(signum)
 
+    @staticmethod
+    def _late(signum, frame):
+        """SIGTERM, SIGHUP while leaving: no Leave, so the terminal's restore runs to its end (a blocked
+        write is resumed), but a second one kills outright, as in _leave. A handler, not SIG_IGN: an
+        ignored signal would stay ignored in any child started meanwhile, a handler resets at exec."""
+        signal.signal(signum, signal.SIG_DFL)
+
     # ---- running
     def run(self):
         tb = None
@@ -1357,6 +1364,8 @@ class App:
             self.size = self.term.size()
             try:
                 self.src.step()                      # the first frame needs today, the ledger, nothing else
+            except (Leave, Gone):
+                raise
             except Exception:
                 if not self.readonly:                # the worker tries again; the frame says "reading…"
                     write_crash(state_dir(), traceback.format_exc())
@@ -1377,6 +1386,8 @@ class App:
         except Exception:
             tb, rc = traceback.format_exc(), 1
         finally:
+            for s in (signal.SIGTERM, signal.SIGHUP):         # leaving anyway: a first one doesn't interrupt the restore
+                signal.signal(s, self._late)
             self.src.stop.set()
             self.src.wake.set()
             try:
@@ -1545,6 +1556,8 @@ class App:
             m = at(self.model, now)
             try:
                 fr = view.render(m, W, H, self.caps, self.ui)
+            except (Leave, Gone):
+                raise
             except Exception:
                 tb = traceback.format_exc()
                 if not self.readonly:
@@ -1827,7 +1840,8 @@ class App:
                 else:
                     self.osc52(data)
             elif rc:
-                self.note("report failed (%s: exit %d)" % (data or "it", rc), "warntx", 8.0)
+                self.note("report failed (%s: exit %d)" % (data, rc) if data else "couldn't open the report (exit %d)" % rc,
+                          "warntx", 8.0)
         self.children = keep
 
     def leave_children(self):

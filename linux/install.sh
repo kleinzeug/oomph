@@ -82,7 +82,7 @@ s = re.sub(r"(?m)^VERSION = \"dev\".*$", "VERSION = \"%s\"" % ver, s, count=1)
 s = re.sub(r"(?m)^COMMIT = \"\".*$", "COMMIT = \"%s\"" % commit, s, count=1)
 open(p, "w").write(s)' "$NEW/oomph.py" "$VER" "$COMMIT" "$PY"
 # bytecode, once: every command imports instead of compiling, and oomph top starts again on it
-"$PY" -I -m compileall -q "$NEW" >/dev/null 2>&1 || true
+(umask 022; "$PY" -I -m compileall -q "$NEW" >/dev/null 2>&1) || true
 chmod 755 "$NEW" "$NEW/oomph.py"
 NAME="oomph-$(printf '%s' "$VER" | tr -c 'A-Za-z0-9._+-' '_')"
 CUR=$(readlink "$LIB" 2>/dev/null || true)

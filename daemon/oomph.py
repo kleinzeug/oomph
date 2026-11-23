@@ -250,6 +250,16 @@ def notify_text(x, n=200):
     return _NOTIFY_BAD.sub(" ", str(x if x is not None else ""))[:n]
 
 
+_TERM_BAD = re.compile("[\x00-\x1f\x7f-\x9f\u061c\u200e\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]")
+
+
+def term_text(x):
+    """Text for the terminal that carries names their owners chose (a volume's, a process's): control,
+    escape and direction characters become "?", so no name can move the cursor, retitle the window
+    or reorder a line."""
+    return _TERM_BAD.sub("?", str(x if x is not None else ""))
+
+
 def _day_range(since, until):
     d = datetime.date.fromtimestamp(since)
     end = datetime.date.fromtimestamp(until)
@@ -351,7 +361,7 @@ SAMPLE_KEYS = dict(
                            "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident", "cpu", "gpu", "io",
                            "psi", "scope", "cgroup_kills", "killed")]  # the last four: Linux (03 §6.1), as 01 asked
     + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu", "top_io", "disks",
-                             "linux")]
+                             "linux", "cpu_names")]
     + [("daemon", "full")])
 SLIM_STR = 64        # characters of a string in a slim sample
 AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
@@ -377,7 +387,8 @@ FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "p
                               "waiting_min")),
               "top_cpu": (8, ("pid", "name", "g", "s", "cpu")),
               "top_gpu": (5, ("pid", "name", "g", "s", "gpu")),
-              "top_io": (5, ("pid", "name", "g", "s", "w"))}
+              "top_io": (5, ("pid", "name", "g", "s", "w")),
+              "cpu_names": (5, ("name", "cpu", "n"))}
 FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root")
 FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
 
@@ -591,6 +602,24 @@ def _rows(x, n, keep):
     return [{k: r[k] for k in keep if k in r} for r in (x if isinstance(x, list) else [])[:n] if isinstance(r, dict)]
 
 
+def by_names(rows, field, n=5):
+    """A top_cpu / top_gpu list as [{"name", field, "n"}]: a name's processes added up and counted,
+    the biggest first (a sample older than `cpu_names`, or the GPU's few rows)."""
+    out = {}
+    for r in rows if isinstance(rows, list) else ():
+        if isinstance(r, dict) and _fin(r.get(field)):
+            a = out.setdefault(str(r.get("name") or "?")[:64], [0.0, 0])
+            a[0] += r[field]
+            a[1] += 1
+    return [{"name": k, field: round(v[0], 2), "n": v[1]} for k, v in sorted(out.items(), key=lambda kv: -kv[1][0])[:n]]
+
+
+def names_text(rows, field, fmt):
+    """`yes ×14 11.8, cc1plus ×3 2.4`: grouped rows in words, a count only where a name has several."""
+    return ", ".join("%s%s %s" % (r.get("name", "?"), " ×%d" % r["n"] if _fin(r.get("n")) and r["n"] > 1 else "",
+                                  fmt % (r.get(field) or 0)) for r in rows if isinstance(r, dict))
+
+
 class _Summary:
     """summarize() as a fold over samples: one pass, holding a few numbers, the peak sample
     and the risers, so a long incident is summarised in bounded memory."""
@@ -711,7 +740,9 @@ class _Summary:
         out = {}
         if self.cpu:
             out.update(max_cpu_busy=self.cpu[0], max_cpu_at=self.cpu[1]["iso"],
-                       top_cpu_at_peak=_rows(self.cpu[1].get("top_cpu"), 8, ("pid", "name", "g", "cpu")))
+                       top_cpu_at_peak=_rows(self.cpu[1].get("top_cpu"), 8, ("pid", "name", "g", "cpu")),
+                       names_cpu_at_peak=_rows(self.cpu[1].get("cpu_names"), 5, ("name", "cpu", "n"))
+                       or by_names(self.cpu[1].get("top_cpu"), "cpu"))
             if self.cpu_n:
                 out["cpu_n"] = self.cpu_n
         for kind, pk in (("util", self.gpu_util), ("busy", self.gpu_busy)):
@@ -1682,7 +1713,23 @@ def collapse_pressure_events(events):
     return out
 
 
+VOLUME_WHAT = {"mounted": "mounted", "unmounted": "unmounted", "watched": "watched", "unwatched": "no longer watched"}
+
+
 def _event_detail(e):
+    """An event's fields for a line of `oomph report`; a volume's in words ("Datasets unmounted"),
+    the busiest of a saturation by name with a count."""
+    if e.get("kind") == "volume":
+        name = next((e[k] for k in ("name", "mount", "pool") if isinstance(e.get(k), str) and e[k]), "a disk")
+        what = e.get("what")
+        return "%s %s%s" % (name, VOLUME_WHAT.get(what, "changed") if isinstance(what, str) else "changed",
+                            " (%d changes)" % e["changes"] if _fin(e.get("changes")) and e["changes"] > 1 else "")
+    if e.get("kind") == "cpu_saturated" and isinstance(e.get("top"), dict):
+        cnt = e.get("top_n") if isinstance(e.get("top_n"), dict) else {}
+        rows = [{"name": k, "cpu": v, "n": cnt.get(k)} for k, v in e["top"].items() if _fin(v)]
+        e = {k: v for k, v in e.items() if k not in ("top", "top_n")}
+        return ", ".join(["%s=%s" % (k, v) for k, v in e.items() if k not in ("t", "iso", "kind")] +
+                         (["busiest: " + names_text(rows, "cpu", "%.1f")] if rows else []))[:300]
     if e.get("kind") == "pressure_change" and "old" in e:
         e = dict(e, old=PRESSURE.get(e["old"], e["old"]), new=PRESSURE.get(e["new"], e["new"]))
     skip = {"t", "iso", "kind"}
@@ -1932,13 +1979,13 @@ def cmd_report(args):
             datetime.datetime.fromtimestamp(r[0]["t"]).strftime("%H:%M"), PRESSURE.get(worst.get("pressure", 0)),
             worst["app_gb"], worst["compressed_gb"], worst["swap_used_gb"], worst["disk_free_gb"],
             sum(s.get("jetsam_kills", 0) for s in r), "yes" if any(is_away(s) for s in r) else "",
-            fit_group(g.get("name", ""), w - 58 - len(size)), size))
+            fit_group(term_text(g.get("name", "")), w - 58 - len(size)), size))
     summ = summarize(samples, events)
     for title, key in (("apps", "group_risers"), ("processes", "process_risers")):
         print("\nbiggest risers (%s):" % title)
         for x in summ[key][:8]:
-            print("  +%6d MB  %-*s peak %d MB at %s" % (x["rise_mb"], w - 56, fit_group(x["name"], w - 56), x["peak_mb"],
-                                                      x["peak_iso"]))
+            print("  +%6d MB  %-*s peak %d MB at %s" % (x["rise_mb"], w - 56, fit_group(term_text(x["name"]), w - 56),
+                                                      x["peak_mb"], x["peak_iso"]))
     names = {}
     for x in samples:
         for d in disk_pools_of(x):
@@ -1947,14 +1994,15 @@ def cmd_report(args):
     if res:
         print("\nother resources:")
         for line in res:
-            print("  " + cut_end(line, w - 2))
+            print("  " + cut_end(term_text(line), w - 2))
     notable = [e for e in events if e.get("kind") not in ("jetsam", "notified")]
     if summ["jetsam_kills"]:
         print("\njetsam kills: %d   reasons: %s" % (summ["jetsam_kills"], summ["jetsam_reasons"]))
     if notable:
         print("\nevents:")
         for e in notable[-30:]:
-            print("  %s  %-16s %s" % (e["iso"][11:19], e["kind"], cut_end(_event_detail(e), w - 29)))
+            print("  %s  %-16s %s" % (term_text(e["iso"][11:19]), term_text(e["kind"])[:40],
+                                      cut_end(term_text(_event_detail(e)), w - 29)))
     return 0
 
 
@@ -1964,11 +2012,11 @@ def resource_summary_lines(summ, names=None):
     samples before 1.9.1. The GPU's figure is named as what it is (full speed, or busy time)."""
     out = []
     if summ.get("max_cpu_busy") is not None:
-        top = ", ".join("%s %.1f" % (r.get("name", "?"), r.get("cpu", 0)) for r in (summ.get("top_cpu_at_peak") or [])[:3])
+        top = names_text((summ.get("names_cpu_at_peak") or by_names(summ.get("top_cpu_at_peak"), "cpu"))[:3], "cpu", "%.1f")
         out.append("cores: at most %.1f%s busy, at %s%s" % (
             summ["max_cpu_busy"], " of %d" % summ["cpu_n"] if summ.get("cpu_n") else "",
             (summ.get("max_cpu_at") or "")[11:16], " (%s)" % top if top else ""))
-    top = ", ".join("%s %.0f %%" % (r.get("name", "?"), r.get("gpu", 0)) for r in (summ.get("top_gpu_at_peak") or [])[:3])
+    top = names_text(by_names(summ.get("top_gpu_at_peak"), "gpu")[:3], "gpu", "%.0f %%")
     if summ.get("max_gpu_util") is not None:
         out.append("gpu: at most %.0f %% of full speed, at %s%s" % (summ["max_gpu_util"],
                                                                     (summ.get("max_gpu_util_at") or "")[11:16],
@@ -2358,10 +2406,16 @@ def checked_verdict(mine=None, s=None):
     s = s or (_sample_override() if _sample_override else sample(with_procs=False))
     v = verdict(s)
     try:
-        pinned_verdict(v, s, volume_prefs()[0])
+        pinned = volume_prefs()[0]
     except Exception:  # a damaged settings file is no reason to fail a check
+        pinned = set()
+    try:
+        pinned_verdict(v, s, pinned)
+    except Exception:
         pass
-    v["resources"] = {k: s[k] for k in ("cpu", "gpu", "disks", "io") if k in s}
+    v["resources"] = {k: s[k] for k in ("cpu", "gpu", "io") if k in s}
+    if "disks" in s:   # each disk with `pinned`, and a pinned pool with its floors and level (as `resources`)
+        v["resources"]["disks"] = disk_rows(s, pinned)
     try:
         coordination_verdict(v, coordination(mine if mine is not None else holder_for()["pid"], s))
     except Exception as e:  # the ledger is a bonus; never let it break a check
@@ -2679,7 +2733,8 @@ def cmd_ps(args):
             m = _daemon_module()
             s.update(m.rate_lists(procs, use, m._summarize(procs, use)[3], plat().group_key, n))
         note = "%s: a live reading of %s" % ("the logger is older than 1.9.1" if older else "logging is off",
-                                              "your own processes" if os.geteuid() else "every process")
+                                              "every user's processes (the GPU counts them all)" if key == "top_gpu"
+                                              else "every process" if os.geteuid() == 0 else "your own processes")
     rows = [r for r in (s.get(key) or []) if isinstance(r, dict) and _n(r.get(field)) is not None][:n]
     if key == "top":
         rows.sort(key=lambda r: -r["mb"])
@@ -3032,9 +3087,10 @@ def read_bounded(name, cap, dir_fd=None, tail=False, shared=False):
     So the file must also be readable by everyone (oomph writes 0666): all three read bits, since
     a user in the file's group gets the group's bits and not the others'. A file someone could
     not read anyway is refused whatever its name, which no race changes, because the
-    descriptor's mode is the file's (an ACL that denies one user is the gap that remains). On top of that, after the read the file must still have one link and the
-    name must still be that file; a writer that renamed a new file over it meanwhile makes the
-    read start again (three tries)."""
+    descriptor's mode is the file's (an ACL that denies one user is the gap that remains). On top
+    of that, after the read the file must still have one link and the name must still be that
+    file; a writer that renamed a new file over it meanwhile makes the read start again (three
+    tries)."""
     for _ in range(3 if shared else 1):
         data = _read_once(name, cap, dir_fd, tail, shared)
         if data is not _MOVED:
@@ -3598,13 +3654,32 @@ def _ledger_dir(create=False):
         finally:
             os.umask(old)
     try:
-        return os.open(LEDGER_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(LEDGER_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
     except FileNotFoundError:
         if create:
             raise LedgerError("can't create %s" % LEDGER_DIR)
         return None
     except OSError as e:
         raise LedgerError("%s is not a plain directory (%s)" % (LEDGER_DIR, e.strerror))
+    if _per_user_ledger():
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid() or st.st_mode & 0o077:
+            os.close(fd)
+            raise LedgerError("%s is refused: a per-user ledger folder must be yours alone (mode 700); this one is "
+                              "uid %d's with mode %03o. If you made it, `chmod 700` it; else remove it"
+                              % (LEDGER_DIR, st.st_uid, stat.S_IMODE(st.st_mode)))
+    return fd
+
+
+def _per_user_ledger():
+    """Linux's per-user ledger at its default path (under XDG_STATE_HOME, which may be anywhere,
+    /tmp included): another user who made that folder first would see and steer this user's
+    reservations, so it is used only while it is the user's own with mode 700. Decided by the
+    process that chose the folder: under sudo the ledger child (run_bounded) is told with
+    OOMPH_LEDGER_PRIVATE=1, since it can't see the XDG_STATE_HOME its parent may have taken it from.
+    The variable only switches the check on, never off."""
+    return os.environ.get("OOMPH_LEDGER_PRIVATE") == "1" or \
+        (PATHS_HERE["ledger_mode"] == 0o700 and LEDGER_DIR == _path("ledger"))
 
 
 def _replace(dfd, name, data):
@@ -3898,6 +3973,8 @@ def _holder_gone(r, procs, now):
     anyone can write the ledger, and a lease no pid can end must not outlive what a grant could."""
     h = r["holder"]
     if not _in_own_ns(r):
+        if max(r["seen"], r.get("granted") or 0) > now + 60:
+            return True   # stamped in the future (no writer does): it would hold its place until then
         if r["state"] != "granted":
             return False  # a request lapses when its owner stops polling
         if r.get("expires"):
@@ -4122,7 +4199,8 @@ def run_bounded(cmd, data, cap, timeout, **kw):
     child that takes longer or says more is killed; either way it is reaped. Returns (exit
     status, stdout, stderr text); raises LedgerError on a timeout or an overflow."""
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/",
-                         env={"PATH": "/usr/bin:/bin", "OOMPH_LEDGER_DIR": LEDGER_DIR}, **kw)
+                         env=dict({"PATH": "/usr/bin:/bin", "OOMPH_LEDGER_DIR": LEDGER_DIR},
+                                  **({"OOMPH_LEDGER_PRIVATE": "1"} if _per_user_ledger() else {})), **kw)
 
     def feed():
         try:
@@ -4328,11 +4406,12 @@ def holder_for(pid=None, kind=None):
 
 def _on_ram(s):
     """Where a request is too big, for the refusal: "on a Mac with 16 GB RAM", "on a machine with
-    …", "in a cgroup limited to 2 GB"."""
+    …", "in a cgroup limited to 2 GB" (0.5 GB: one decimal under 1 GB, never "0 GB")."""
     ram = s.get("ram_gb") or 0
+    gb = ("%.1f" if ram < 0.95 else "%.0f") % ram
     if s.get("os", "macos") == "macos":
-        return "on a Mac with %.0f GB RAM" % ram
-    return "on a machine with %.0f GB RAM" % ram if _scope_id(s) == "host" else "in a cgroup limited to %.0f GB" % ram
+        return "on a Mac with %s GB RAM" % gb
+    return "on a machine with %s GB RAM" % gb if _scope_id(s) == "host" else "in a cgroup limited to %s GB" % gb
 
 
 @_unprivileged(inputs=True)
@@ -5042,7 +5121,8 @@ def cmd_hook(args):
     except Exception:
         pass
     global _lock_wait
-    _lock_wait = 0.25  # after every Bash call: never wait on a held lock (03 §10)
+    _lock_wait = 0.25  # after every Bash call: never wait on a held lock (03 §10). On a Mac too, since 1.9.4:
+    # the hook only reads the ledger, and a check without the coordination is better than a stalled Bash call
     v = checked_verdict()
     hd = _hook_dir()
     state = os.path.join(hd, "oomph-hook-%d.json" % os.getppid()) if hd else None

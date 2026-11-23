@@ -173,6 +173,8 @@ samples with and without it (older samples have none).
 - `top_cpu` (8), `top_gpu` (5), `top_io` (5): the biggest consumers in cores, percent of
   the GPU and MB/s written; a list is left out when nothing used that resource and after a
   start or a gap. Top processes, groups and sessions carry `cpu`, `gpu` and `w` likewise.
+- `cpu_names` (5, 1.9.9): the busiest process names over the whole process table, each
+  `{name, cpu, n}` with its processes' cores added up and counted (fourteen `yes` are one row).
 
 On the wire (`serve`, mirrors), slim samples carry the numbers of `cpu`, `gpu` and `io`; the
 top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb` exceeds
@@ -198,7 +200,7 @@ top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb
   | kind | fields | when |
   |---|---|---|
   | `thermal` | `old new busy` (`flips`) | the thermal level changed; batched like pressure flips |
-  | `cpu_saturated` / `cpu_saturated_cleared` | `busy n minutes top{name: cores}` | busy on ≥ 90 % of the cores for 10 minutes; over below 75 %; at most once an hour |
+  | `cpu_saturated` / `cpu_saturated_cleared` | `busy n minutes top{name: cores} top_n{name: processes}` (from `cpu_names` since 1.9.9) | busy on ≥ 90 % of the cores for 10 minutes; over below 75 %; at most once an hour |
   | `disk_low` | `disk_free_gb` as before, plus `pool name mount free_gb level` | per watched disk, every 6 hours at most; the startup disk's with the swap notification as before |
   | `disk_filling` | `pool name mount free_gb rate_gb_min eta_min top{name: MB/s}` | a watched disk lost ≥ 2 GB in two minutes and reaches its critical floor within 30 minutes at that rate; every 30 minutes at most; a notification when that is under 10 minutes away. Sampling is hot while it fills |
   | `volume` | `pool name mount what` (`mounted unmounted watched unwatched`) | a listed or watched disk came, went, or changed class; not in the first two minutes after a start |
@@ -240,7 +242,8 @@ top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb
   the report in two passes that keep at most 1,200 points per view), so closing an
   incident does not hold a day of samples in the logger's memory.
 - **The other resources (1.9.5):** the summary adds, only where the samples have them (absent,
-  never zero, for "not recorded"): `max_cpu_busy` `cpu_n` `max_cpu_at` `top_cpu_at_peak`;
+  never zero, for "not recorded"): `max_cpu_busy` `cpu_n` `max_cpu_at` `top_cpu_at_peak`
+  `names_cpu_at_peak` (1.9.9: by name with a count);
   `max_gpu_util` (the share of the GPU's capacity at full speed, from samples with IOReport's
   figure) and `max_gpu_busy` (busy time, from the others), each with its time, never averaged or
   compared; `top_gpu_at_peak`; `max_gpu_mem_gb`; `min_free_gb{pool}`; `writers` (the peak MB/s
@@ -360,7 +363,7 @@ roadmap 03 (§5, §7.3, §7.5).
 |---|---|---|
 | Who investigates | The model, through ten read-only tools over the logs (`overview`, `timeline`, `top_at`, `process_history`, `events`, `incidents`, `incident`, `syslog`, `current_status`, `claude_sessions`), up to 12 rounds, then a forced write-up | A fixed prompt with a data dump can't follow a lead; tools let it zoom from "critical at 03:53" to the process, its parent and its session. Results are capped at 14 k characters so a broad query can't flood the context. |
 | Providers | Claude (Messages API, `claude-opus-5-5`, adaptive thinking at effort high, server-side refusal fallback), OpenAI (Responses API), Ollama (`/api/chat`; models without tool support get one pass over the briefing) | What the user asked for; all over plain HTTPS with the standard library. The Claude turn sends the whole previous assistant content back unchanged. |
-| Credentials | Login keychain, one item per provider; handed to the harness in `OOMPH_AI_TOKEN` | Never in a file, a preference or `ps` output. |
+| Credentials | Login keychain, one item per provider; handed to the harness in `OOMPH_AI_TOKEN`; read only for a report (an ad hoc signed build is trusted by its hash, so each upgrade asks once), forgotten on Disconnect | Never in a file, a preference or `ps` output. |
 | Progress and abort | The harness prints one JSON object per line (`progress`, then `done` or `error`); the app shows the latest as the Report button's tooltip and stops the run with SIGTERM | No IPC beyond a pipe; aborting leaves nothing behind. |
 | Output | The normal 24 h report with the analysis on top and the tool-call log in a fold | The model's claims sit right above the evidence they cite. |
 

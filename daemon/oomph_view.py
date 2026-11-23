@@ -914,7 +914,7 @@ def tab_bar(fr, model, caps, g):
     host = model.get("host") or "this Mac"
     room = W - 1 - 1 - cap_w - 1 - 3
     rest = (len(model.get("brand") or "") + 1) + 6 + (len(free) + 2 if free else 0)
-    label = fit(host, max(4, room - rest if room - rest >= 12 else room), g)
+    label = fit(host, max(4, min(room, max(12, room - rest))), g)
     left = [(" " + label + " ", "selfg", "sel", BOLD | (REV if mono else 0))]
     used = 1 + 1 + cap_w + 1 + sum(tw(s[0]) for s in left)
     fre = bool(free) and used + len(free) + 2 <= W

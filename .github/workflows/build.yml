@@ -304,5 +304,9 @@ jobs:
           echo "doctor exit $rc"; test "$rc" = 0 || test "$rc" = 1
 
       - name: As root, without sudo
+        # The workspace is the tester's now: git refuses it to root unless told it is safe, and
+        # linux/install.sh would stamp 0.0.0-nogit instead of the real version.
         run: |
-          HOME=$(getent passwd 0 | cut -d: -f6) python3 -I -B tools/linuxtest.py root
+          export HOME=$(getent passwd 0 | cut -d: -f6)
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          OOMPH_LINUXTEST_GIT=1 python3 -I -B tools/linuxtest.py root

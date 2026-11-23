@@ -55,26 +55,73 @@ struct ChangelogEntry: Decodable, Identifiable {
     var id: String { commit }
 }
 
-/// Access tokens live in the login keychain, one item per provider.
+/// Access tokens live in the login keychain, one item per provider, and are read only when a
+/// connection needs one (a report): never when the app starts or the dialog opens.
+///
+/// Why macOS asks: a keychain item's access list trusts the app that made it by its designated
+/// requirement, and an ad hoc signed app's is `cdhash H"…"`, the hash of that very build. Every
+/// rebuild (every upgrade) is a different app to the keychain, so reading the token asks once per
+/// build ("Always Allow" lasts until the next upgrade). Up to 1.9.8 the popup read it on every
+/// launch just to know that one existed, so every first launch after an upgrade asked. Without a
+/// developer certificate no build can be trusted ahead of time, so the read waits until it is needed.
+/// An earlier build's item can't be deleted or replaced by this one either (errSecInvalidOwnerEdit,
+/// no prompt): a new token then goes into an item of its own, and the provider's account name in
+/// the defaults says which item is current.
 enum Keychain {
     static let service = "local.oomph.ai"
     static func base(_ account: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
     }
-    static func get(_ account: String) -> String? {
-        var q = base(account)
+    /// The item that holds a provider's token: `claude`, or `claude.<8 hex>` once a later build saved one.
+    static func account(_ provider: String) -> String {
+        UserDefaults.standard.string(forKey: "aiTokenAccount." + provider) ?? provider
+    }
+    /// The token, or the keychain's status: errSecItemNotFound (none saved), errSecUserCanceled or
+    /// errSecAuthFailed (the prompt was declined). The one call that may ask for access.
+    static func get(_ provider: String) -> (String?, OSStatus) {
+        var q = base(account(provider))
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: AnyObject?
-        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
-        return String(data: d, encoding: .utf8)
+        let st = SecItemCopyMatching(q as CFDictionary, &out)
+        guard st == errSecSuccess, let d = out as? Data else { return (nil, st == errSecSuccess ? errSecDecode : st) }
+        return (String(data: d, encoding: .utf8), st)
     }
-    static func set(_ value: String, _ account: String) {
-        SecItemDelete(base(account) as CFDictionary)
+    /// Saves a token as this build's item, which this build then reads without asking.
+    static func set(_ value: String, _ provider: String) {
+        forget(provider)
         guard !value.isEmpty else { return }
-        var add = base(account)
+        var acct = account(provider)
+        var add = base(acct)
         add[kSecValueData as String] = Data(value.utf8)
-        SecItemAdd(add as CFDictionary, nil)
+        if SecItemAdd(add as CFDictionary, nil) == errSecDuplicateItem {   // an earlier build's, kept from this one
+            acct = provider + "." + String(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(8)).lowercased()
+            add = base(acct)
+            add[kSecValueData as String] = Data(value.utf8)
+            guard SecItemAdd(add as CFDictionary, nil) == errSecSuccess else { return }
+        }
+        UserDefaults.standard.set(acct, forKey: "aiTokenAccount." + provider)
+    }
+    /// Deletes the current item, never asking: an earlier build's item stays (the keychain allows
+    /// that only to a build the user trusted with "Always Allow").
+    static func forget(_ provider: String) {
+        quietly { SecItemDelete(base(account(provider)) as CFDictionary) }
+    }
+    /// `body` with the keychain's prompts off: what would ask fails instead. The switch is the old
+    /// keychain's own (SecKeychainSetUserInteractionAllowed), looked up by name: it has no successor
+    /// for this keychain, and its deprecation would be the build's only warning.
+    @discardableResult static func quietly(_ body: () -> OSStatus) -> OSStatus {
+        typealias Get = @convention(c) (UnsafeMutablePointer<UInt8>) -> OSStatus
+        typealias Set = @convention(c) (UInt8) -> OSStatus
+        let h = dlopen(nil, RTLD_NOW)
+        guard let g = dlsym(h, "SecKeychainGetUserInteractionAllowed"),
+              let s = dlsym(h, "SecKeychainSetUserInteractionAllowed") else { return errSecUnimplemented }
+        let get = unsafeBitCast(g, to: Get.self), set = unsafeBitCast(s, to: Set.self)
+        var was: UInt8 = 1
+        _ = get(&was)
+        guard set(0) == errSecSuccess else { return errSecInteractionRequired }  // never delete where it could ask
+        defer { _ = set(was) }
+        return body()
     }
 }
 
@@ -767,6 +814,8 @@ final class Store: ObservableObject {
     @Published var aiProgress = ""
     @Published var aiError: String?
     private var aiProcess: Process?
+    /// Tokens read or pasted in this session: the keychain is asked at most once per launch.
+    private var sessionTokens: [AIProvider: String] = [:]
 
     // upgrades ("Upgrade" replaces this app with a newer version; "Update" installs the bundled logger)
     @Published var upgradeButton: UpgradeButton = .hidden
@@ -1226,10 +1275,30 @@ final class Store: ObservableObject {
         get { UserDefaults.standard.string(forKey: "ollamaURL") ?? "http://localhost:11434" }
         set { UserDefaults.standard.set(newValue, forKey: "ollamaURL") }
     }
-    func hasToken(_ p: AIProvider) -> Bool { (Keychain.get(p.rawValue) ?? "").isEmpty == false }
-    func aiConfigured(_ p: AIProvider) -> Bool { !p.needsToken || hasToken(p) }
-    /// Reports include an AI analysis from this provider (the render aid has no keychain).
-    var aiConnected: Bool { aiOn && (renderMode || aiConfigured(aiProvider)) }
+    /// Reports include an AI analysis from this provider. Connect switches it on only once the token
+    /// is saved, so this needs no look into the keychain (which would ask for access, 1.9.9).
+    var aiConnected: Bool { aiOn }
+
+    /// The token for a report: this session's, else the keychain's (the one read that may ask, once
+    /// per launch; "Always Allow" makes it once per build). nil: aiError says why.
+    func reportToken(_ p: AIProvider) -> String? {
+        if !p.needsToken { return "" }
+        if let t = sessionTokens[p], !t.isEmpty { return t }
+        let (t, st) = Keychain.get(p.rawValue)
+        if let t, !t.isEmpty {
+            sessionTokens[p] = t
+            return t
+        }
+        if st == errSecItemNotFound || st == errSecSuccess || st == errSecDecode {
+            aiOn = false   // nothing to report with: connected no more, the dialog asks for the key
+            aiError = "The \(p.title) key is no longer in your keychain, so this report has no AI analysis. "
+                + "Connect again with the key."
+        } else {
+            aiError = "The keychain didn't hand over the \(p.title) key. Try Report again and allow access, "
+                + "or disconnect and connect again with the key."
+        }
+        return nil
+    }
 
     /// Connect: confirm the provider takes the token and knows the model (one cheap request
     /// via `oomph ai-check`, no tokens spent), then save the token and switch AI reports on.
@@ -1266,7 +1335,10 @@ final class Store: ObservableObject {
                     done(false)
                     return
                 }
-                if p.needsToken { Keychain.set(token, p.rawValue) }
+                if p.needsToken {
+                    Keychain.set(token, p.rawValue)
+                    self.sessionTokens[p] = token
+                }
                 self.setAIModel(model.isEmpty ? (reply["model"] as? String ?? "") : model, p)
                 if p == .ollama { self.ollamaURL = url }
                 self.aiProvider = p
@@ -1276,10 +1348,17 @@ final class Store: ObservableObject {
         }
     }
 
-    /// Disconnect: reports go back to plain HTML. The token stays in the keychain for a reconnect.
+    /// Disconnect: reports go back to plain HTML, and the token is forgotten (here and in the
+    /// keychain): a reconnect takes it pasted again, as Update takes the password only when used.
+    /// Only this build's item can be deleted without a prompt (Keychain.forget): an earlier build's
+    /// stays in the login keychain until the user deletes it in Keychain Access.
     func disconnectAI() {
         aiOn = false
         aiConnectError = nil
+        for p in AIProvider.allCases where p.needsToken {
+            sessionTokens[p] = nil
+            if !renderMode { Keychain.forget(p.rawValue) }
+        }
     }
 
     var aiSummary: String {
@@ -1293,6 +1372,11 @@ final class Store: ObservableObject {
     }
 
     func runAIReport() {
+        aiError = nil   // a second identical failure is news again
+        guard let token = reportToken(aiProvider) else {
+            if !aiOn { runCLI(["html", "--last", "24h", "--open"]) }  // the key is gone: the plain report still opens
+            return
+        }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         var args = ["-I", "-B", cliPath, "ai-report", "--provider", aiProvider.rawValue, "--last", "24h", "--open"]
@@ -1301,7 +1385,7 @@ final class Store: ObservableObject {
         if aiProvider == .ollama { args += ["--base-url", ollamaURL] }
         p.arguments = args
         var env = ProcessInfo.processInfo.environment
-        env["OOMPH_AI_TOKEN"] = Keychain.get(aiProvider.rawValue) ?? ""  // via the environment, not argv
+        env["OOMPH_AI_TOKEN"] = token  // via the environment, not argv
         p.environment = env
         let out = Pipe()
         p.standardOutput = out
@@ -3361,8 +3445,8 @@ struct PopoverView: View {
     }
 
     func loadDraft(for p: AIProvider) {
-        // the saved token comes back into the field: reconnecting never needs a new one
-        draftToken = p.needsToken ? (Keychain.get(p.rawValue) ?? "") : ""
+        // never from the keychain (reading it asks for access): pasted on each connect
+        draftToken = ""
         store.aiConnectError = nil
         draftModel = store.aiModel(p)
         draftURL = store.ollamaURL
@@ -3415,7 +3499,8 @@ struct PopoverView: View {
         if draftProvider.needsToken {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    SecureField("Paste access token", text: $draftToken)
+                    // connected: dots in place of the key, which is not read just to fill the field
+                    SecureField("Paste access token", text: connected ? .constant(String(repeating: "•", count: 24)) : $draftToken)
                         .textFieldStyle(.roundedBorder)
                         .onSubmit { if canConnect && !connected && !busy { connectAI() } }
                     Button("Paste") { draftToken = NSPasteboard.general.string(forType: .string) ?? "" }
@@ -3453,7 +3538,7 @@ struct PopoverView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
         } else if connected {
-            Text("Reports include an analysis by \(store.aiSummary). Disconnect to switch provider or key; the key stays saved for a reconnect.")
+            Text("Reports include an analysis by \(store.aiSummary). Disconnect to switch provider or key.")
                 .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         } else {
             Text(draftProvider == .ollama
@@ -3470,7 +3555,9 @@ struct PopoverView: View {
             Spacer()
             Button("Disconnect") { withAnimation(.easeOut(duration: 0.15)) { store.disconnectAI() } }
                 .disabled(!connected)
-                .help(connected ? "Stop adding an AI analysis to reports. The key stays saved." : "Not connected")
+                .help(connected ? "Stop adding an AI analysis to reports, and forget the key. A key an earlier version of "
+                      + "\(brand) saved can stay in your keychain (“\(Keychain.service)” in Keychain Access) until you delete it there."
+                      : "Not connected")
             Button { connectAI() } label: { Text(busy ? "Connecting…" : "Connect") }
                 .keyboardShortcut(.defaultAction)
                 .disabled(connected || busy || !canConnect)

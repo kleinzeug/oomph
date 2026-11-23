@@ -176,6 +176,7 @@ def _summarize(procs, use=None):
 
 # ---------------------------------------------------------------- CPU, GPU, I/O and disks (roadmap 02 §4, §5.1)
 TOP_RATES = {"top_cpu": ("cpu", 8), "top_gpu": ("gpu", 5), "top_io": ("w", 5)}
+CPU_NAMES_N = 5           # rows of the sample's cpu_names (the cores by process name)
 
 
 class Meter:
@@ -616,6 +617,21 @@ def _by_name(rows, field, n=5):
     return dict(sorted(out.items(), key=lambda kv: -kv[1])[:n])
 
 
+def cpu_names(procs, use, n=CPU_NAMES_N):
+    """The sample's `cpu_names`: the busiest names over the whole process table, each name's cores
+    added up, with how many processes carry it (fourteen `yes` at 0.9 are one row of 12.6, which the
+    eight rows of top_cpu cannot say)."""
+    out = {}
+    for pid, u in use.items():
+        c = u.get("cpu") or 0.0
+        if c > 0 and pid in procs:
+            a = out.setdefault(str(procs[pid]["name"] or "?")[:64], [0.0, 0])
+            a[0] += c
+            a[1] += 1
+    rows = sorted(((v[0], k, v[1]) for k, v in out.items()), reverse=True)[:n]
+    return [{"name": k, "cpu": round(c, 2), "n": m} for c, k, m in rows if round(c, 2) > 0]
+
+
 def rate_lists(procs, use, session_of, group_key, n=None):
     """top_cpu (8), top_gpu (5), top_io (5): the biggest consumers of each, in cores, percent of the
     GPU and MB/s written (`n` of each instead, for `oomph ps`)."""
@@ -666,6 +682,7 @@ class Volumes:
             for k in [k for k in self.facts if k not in live]:
                 del self.facts[k]
                 self.failed.pop(k, None)
+            self.todo = [x for x in self.todo if x[0] in live]   # gone before diskutil was asked: not asked
             for k, t in list(self.failed.items()):
                 if time.time() - t > self.RETRY_S:
                     del self.failed[k]
@@ -1223,12 +1240,16 @@ class Daemon:
         s["groups"] = groups
         s["claude"] = sessions
         s.update(rate_lists(procs, use, session_of, P.group_key))
+        names = cpu_names(procs, use)
+        if names:
+            s["cpu_names"] = names
         # Retire reservations of sessions that died or expired, close to when it happened, and
         # copy the live ones into the sample. The shared ledger directory is world-writable, so
         # the daemon never opens anything in it: its thread hands the work to an unprivileged
         # child and the sample carries the last snapshot that child answered with (none if it
         # is older than two intervals).
-        self.ledger.offer({k: v for k, v in s.items() if k not in ("top", "groups", "claude") and k not in TOP_RATES},
+        self.ledger.offer({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
+                           and k not in TOP_RATES},
                           procs)
         leases = self.ledger.latest(2 * (HOT_INTERVAL if self.hot else INTERVAL))
         if leases:
@@ -1378,8 +1399,10 @@ class Daemon:
                 self.sat_since = self.sat_since or t
                 if not self.sat_on and t - self.sat_since >= CPU_SAT_S and t - self.last_sat >= CPU_SAT_COOLDOWN:
                     self.sat_on, self.last_sat = True, t
+                    names = [x for x in s.get("cpu_names") or () if isinstance(x, dict)][:5]
                     self.event("cpu_saturated", busy=busy, n=n, minutes=round((t - self.sat_since) / 60),
-                               top=_by_name(s.get("top_cpu"), "cpu"))
+                               **({"top": {x["name"]: x["cpu"] for x in names}, "top_n": {x["name"]: x["n"] for x in names}}
+                                  if names else {"top": _by_name(s.get("top_cpu"), "cpu")}))
             elif busy < CPU_SAT_CLEAR * n or not self.sat_on:   # once saturated, over only below the lower mark
                 if self.sat_on:
                     self.event("cpu_saturated_cleared", busy=busy, n=n, minutes=round((t - self.sat_since) / 60))

@@ -333,8 +333,15 @@ verdict, timeline, root cause, evidence, who was involved, risk now, recommendat
 above the usual charts, with the list of tool calls it made. While it works, Report
 shows a spinner whose tooltip says what it is looking at, and the mark turns into a stop
 button. Click the mark to see which provider and model are connected; **Disconnect** there
-goes back to plain reports. The token stays in your keychain and in the dialog, so
-connecting again takes one click.
+goes back to plain reports and forgets the token, so connecting again takes it pasted again.
+A token saved by an earlier version of the app can't be deleted by a later one without asking,
+so it may stay in the login keychain under `local.oomph.ai` until you delete it in Keychain
+Access.
+
+The token is read from your keychain only when a report needs it, never when oomph starts or
+the dialog opens. A self-built app is signed ad hoc, so the keychain knows each build only by
+its hash: after every upgrade, the first AI report asks once for access to the token (choose
+**Always Allow** and that build won't ask again).
 
 ```sh
 OOMPH_AI_TOKEN=sk-ant-… oomph ai-report --open                     # Claude (claude-opus-5-5)

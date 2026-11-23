@@ -1161,6 +1161,54 @@ row0 = view.render(dict(m, host="ci-runner-" + "x" * 70, os="o"), 80, 24, view.C
                    {"span": "24h"}).text().split("\n")[0]
 check(row0.lstrip().startswith(oomph.BRAND) and "ci-runner-" in row0 and view.tw(row0) == 80,
       "top: a long host name is cut, the name stays in row 0 (%r)" % row0.strip()[:60])
+host_w = {}
+for w_ in range(30, 161):     # no width at which one column less gives the host name more of the row (the cliff)
+    r0 = view.render(dict(m, host="ci-runner-" + "x" * 140, os="o"), w_, 24, view.Caps("256", "unicode", "dark"),
+                     {"span": "24h"}).text().split("\n")[0]
+    hm = re.search(r"ci-r[^ ]*", r0)
+    host_w[w_] = len(hm.group(0)) if hm else 0
+cliff = [w_ for w_ in range(31, 161) if host_w[w_ - 1] > host_w[w_]]
+check(not cliff and host_w[80] >= 12, "top: a long host name gets no more of row 0 as the terminal narrows; no cliff "
+      "(at %s)" % ["%d: %d > %d" % (w_, host_w[w_ - 1], host_w[w_]) for w_ in cliff[:3]])
+
+
+class _Term99:
+    entered = False
+
+    def enter(self, extra=""):
+        _Term99.entered = True
+        raise oomph_top.Gone()        # (if reached, end the run rather than wait for keys)
+
+    def restore(self):
+        pass
+
+    def size(self):
+        return 80, 24
+
+    def present(self, *a):
+        pass
+
+    def forget(self):
+        pass
+
+
+app99 = oomph_top.App(_Term99(), view.Caps("256", "unicode", "dark"), {}, "24h", tempfile.mkdtemp(prefix="oomph-top99-"),
+                      readonly="test", probe=False)
+app99.src.step = lambda: (_ for _ in ()).throw(oomph_top.Leave(15))
+rc99 = app99.run()
+app99.model = m
+real_render, real_at = view.render, oomph_top.at
+view.render = lambda *a, **k: (_ for _ in ()).throw(oomph_top.Leave(1))
+oomph_top.at = lambda model, now: model
+try:
+    app99.paint()
+    painted = "swallowed"
+except oomph_top.Leave:
+    painted = "raised"
+finally:
+    view.render, oomph_top.at = real_render, real_at
+check(rc99 == 0 and not _Term99.entered and painted == "raised", "top: a SIGTERM (Leave) during the first step or a "
+      "render leaves at once, never swallowed as a crash (entered %s, paint %s)" % (_Term99.entered, painted))
 r = subprocess.run(top_cmd + ["--once", "--size", "100x30", "--span", "1h", "--glyphs", "ascii", "--color", "256",
                               "--some-later-option"], capture_output=True, text=True, timeout=120, env=dict(os.environ))
 lines = r.stdout.split("\n")[:-1]
@@ -1470,9 +1518,10 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
         return d
 
 
-    def sh(script, *args):
+    def sh(script, *args, umask=None):
         r = subprocess.run(["/bin/bash", script] + list(args), capture_output=True, text=True, timeout=120,
-                           env=dict(os.environ, OOMPH_INSTALL_ROOT=pfx))
+                           env=dict(os.environ, OOMPH_INSTALL_ROOT=pfx),
+                           preexec_fn=None if umask is None else (lambda: os.umask(umask)))
         return r.returncode, (r.stdout + r.stderr).strip()
 
 
@@ -1514,7 +1563,13 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
     mcp.stdin.write(json.dumps(reqs[0]) + "\n")
     mcp.stdin.flush()
     init = json.loads(mcp.stdout.readline() or "{}")  # it has answered, so it has resolved where it runs from
-    rc, msg = sh(os.path.join(B, "install.sh"))
+    rc, msg = sh(os.path.join(B, "install.sh"), umask=0)     # as from a sudo that passed on a umask of 000
+    loose = [os.path.relpath(os.path.join(dp, x), lx) for dp, dn, fn in os.walk(os.path.join(lx, "oomph-1.8.6"))
+             for x in dn + fn if os.lstat(os.path.join(dp, x)).st_mode & 0o022]
+    pyc = [x for x in os.listdir(os.path.join(lx, "oomph-1.8.6", "__pycache__"))] \
+        if os.path.isdir(os.path.join(lx, "oomph-1.8.6", "__pycache__")) else []
+    check(rc == 0 and pyc and not loose, "install under a umask of 000: the bytecode (%d files) and everything else in "
+          "the version directory is writable by its owner alone (%s)" % (len(pyc), loose[:3]))
     st_a = os.stat(os.path.join(lx, "oomph-1.8.5"))
     check(rc == 0 and os.readlink(lib) == "oomph-1.8.6" and ver() == "1.8.6" and here_a.endswith("/oomph-1.8.5") and
           os.path.exists(os.path.join(here_a, "oomphd.py")) and time.time() - st_a.st_mtime < 120,
@@ -2260,6 +2315,14 @@ check(v_unpinned["level"] == "ok" and v_pinned["level"] == "tight" and "on Scrat
       "user (floors 20 and 5 GB there), and nothing when not pinned (%s / %s)" % (v_unpinned["level"], v_pinned["level"]))
 check(v_pinned["advice"].startswith("Disk space is short on Scratch") and "parallelism" not in v_pinned["advice"] and
       not v_pinned.get("notes"), "pins: a pinned low disk gets disk advice, not memory advice")
+dk_p = {d["id"]: d for d in v_pinned["resources"]["disks"]}
+dk_mcp = {d["id"]: d for d in oomph._mcp_call("memory_check", {})["resources"]["disks"]}
+pin_id = "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"
+check(all(d[pin_id].get("pinned") is True and d[pin_id].get("low_gb") == 20.0 and d[pin_id].get("crit_gb") == 5.0 and
+          d[pin_id].get("level") == "low" and d["data"].get("pinned") is False for d in (dk_p, dk_mcp)) and
+      all(x.get("pinned") is False and "low_gb" not in x for x in v_unpinned["resources"]["disks"] if x["id"] == pin_id),
+      "check --json and MCP memory_check: each disk says whether it is pinned, a pinned pool carries its floors and "
+      "level, as `resources --json` (%s)" % {k: (v.get("pinned"), v.get("low_gb")) for k, v in dk_p.items()})
 oomph._sample_override = lambda: dict(low_s, pressure=2)
 v_both = oomph.checked_verdict()
 oomph._sample_override = lambda: dict(res_s, disks=RES_EXAMPLE["disks"][:1])
@@ -2567,6 +2630,120 @@ check(len(odd_c) >= 1 and any(t == "2 killed by jetsam" for _, t, _ in odd_ev) a
       _ot.event_text({"kind": "volume", "what": ["x"]}) == "disk changed: ?",
       "event words: a line with odd values (a list for a word) does not take the other events with it (%s)"
       % [x[1] for x in odd_ev])
+
+# --- 1.9.9: the busiest by name with a count, the report's words and clean names, smaller fixes
+procs99 = {i: {"pid": i, "name": "yes"} for i in range(100, 114)}
+procs99.update({200: {"pid": 200, "name": "cc1plus"}, 201: {"pid": 201, "name": "cc1plus"},
+                300: {"pid": 300, "name": "WindowServer"}})
+use99 = {i: {"cpu": 0.9} for i in range(100, 114)}
+use99.update({200: {"cpu": 1.0}, 201: {"cpu": 0.5}, 300: {"cpu": 0.2}, 999: {"cpu": 5.0}})
+cn99 = oomphd.cpu_names(procs99, use99)
+check(cn99 == [{"name": "yes", "cpu": 12.6, "n": 14}, {"name": "cc1plus", "cpu": 1.5, "n": 2},
+               {"name": "WindowServer", "cpu": 0.2, "n": 1}],
+      "sample: cpu_names adds up each name's cores over the whole process table, with a count (%s)" % cn99[:2])
+dn99, ev99 = oomphd.Daemon(), []
+dn99.event = lambda kind, **kw: ev99.append(dict(kw, kind=kind))
+dn99.notify = lambda *a, **kw: None
+for i in range(22):
+    dn99.evaluate(s3(t3 + 30 * i, busy=13.3, cpu_names=cn99))
+sat99 = [e for e in ev99 if e["kind"] == "cpu_saturated"]
+check(sat99 and sat99[0]["top"] == {"yes": 12.6, "cc1plus": 1.5, "WindowServer": 0.2} and
+      sat99[0]["top_n"] == {"yes": 14, "cc1plus": 2, "WindowServer": 1},
+      "events: cpu_saturated names the busiest from the whole process list, by name with a count, not from the "
+      "eight rows of top_cpu (%s)" % (sat99[0] if sat99 else None))
+sm99 = oomph.summarize([dict(x, cpu_names=cn99) for x in seq3], [])
+l99 = oomph.resource_summary_lines(sm99, {"data": "Data"})
+check(sm99.get("names_cpu_at_peak", [None])[0] == {"name": "yes", "cpu": 12.6, "n": 14} and
+      any("(yes ×14 12.6, cc1plus ×2 1.5, WindowServer 0.2)" in x for x in l99) and
+      any("(cargo ×2 9.0)" in x for x in lines3) and any("(WindowServer 5 %)" in x for x in lines3),
+      "oomph report, other resources: the busiest grouped by name with a count; an older sample's top_cpu grouped "
+      "too (%s | %s)" % ([x for x in l99 if x.startswith("cores")], [x for x in lines3 if x.startswith("cores")]))
+vol99 = {"t": t3, "iso": oomphd.now_iso(t3), "kind": "volume", "pool": "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10",
+         "mount": "/Volumes/Datasets", "name": "Datasets", "what": "unmounted"}
+check(oomph._event_detail(vol99) == "Datasets unmounted" and
+      oomph._event_detail(dict(vol99, name=None, what="watched", changes=3)) == "/Volumes/Datasets watched (3 changes)",
+      "oomph report, events: a volume event in words (%r)" % oomph._event_detail(vol99))
+rdir = tempfile.mkdtemp(prefix="oomph-report99-")
+evil = "ev\x1b]0;owned\x07il\x1b[2J\u202e"
+for x in seq3[-20:]:
+    y = dict(x, cpu_names=[dict(cn99[0], name="yes" + evil)] + cn99[1:], groups=[{"name": "app" + evil, "mb": 900, "n": 1}])
+    with open(os.path.join(rdir, "samples-%s.jsonl" % oomphd.datetime.date.fromtimestamp(y["t"]).isoformat()), "a") as f:
+        f.write(json.dumps(y) + "\n")
+with open(os.path.join(rdir, "events.jsonl"), "w") as f:
+    f.write(json.dumps(dict(vol99, t=seq3[-5]["t"], iso=oomphd.now_iso(seq3[-5]["t"]), name="Data" + evil)) + "\n")
+saved_log99, oomph.LOG_DIR = oomph.LOG_DIR, rdir
+buf = io.StringIO()
+try:
+    with redirect_stdout(buf):
+        rc = oomph.main(["report", "--last", "2h"])
+finally:
+    oomph.LOG_DIR = saved_log99
+rep99 = buf.getvalue()
+check(rc == 0 and not re.search("[\x00-\x09\x0b-\x1f\x7f-\x9f\u202a-\u202e]", rep99) and "yesev?]0;owned?il?[2J? ×14" in rep99
+      and "Dataev?]0;owned?il?[2J? unmounted" in rep99,
+      "oomph report: names with escape and direction characters reach the terminal cleaned (%r)"
+      % [x for x in rep99.splitlines() if "owned" in x][-2:])
+check(oomph.term_text("a\u200fb\u061cc\u200ed\ufeff\x1b") == "a?b?c?d??",
+      "oomph report: the bidi marks (LRM, RLM, ALM) and a BOM are cleaned too (%r)" % oomph.term_text("a\u200fb\u061c"))
+_saved99 = (os.environ.get("OOMPH_LEDGER_PRIVATE"), oomph.LEDGER_DIR)
+try:
+    oomph.LEDGER_DIR = os.path.join(os.environ["OOMPH_DIR"], "named-ledger")  # a folder named on purpose
+    os.environ.pop("OOMPH_LEDGER_PRIVATE", None)
+    named = oomph._per_user_ledger()
+    os.environ["OOMPH_LEDGER_PRIVATE"] = "1"
+    told = oomph._per_user_ledger()
+    os.environ["OOMPH_LEDGER_PRIVATE"] = "0"
+    off = oomph._per_user_ledger()
+finally:
+    oomph.LEDGER_DIR = _saved99[1]
+    if _saved99[0] is None:
+        os.environ.pop("OOMPH_LEDGER_PRIVATE", None)
+    else:
+        os.environ["OOMPH_LEDGER_PRIVATE"] = _saved99[0]
+check(not named and told and not off, "ledger: a sudo caller's child is told that its folder is the per-user default "
+      "(OOMPH_LEDGER_PRIVATE=1) and checks it; the variable switches the check on, never off (%s %s %s)" % (named, told, off))
+check(oomph._on_ram({"os": "linux", "ram_gb": 0.5, "scope": {"kind": "cgroup", "id": "/x"}}) == "in a cgroup limited to 0.5 GB"
+      and oomph._on_ram({"os": "linux", "ram_gb": 2.0, "scope": {"kind": "cgroup", "id": "/x"}}) == "in a cgroup limited to 2 GB"
+      and oomph._on_ram({"ram_gb": 36.0}) == "on a Mac with 36 GB RAM",
+      "a refusal says 0.5 GB for a 512 MB cgroup, not 0 GB")
+now99 = time.time()
+fut99 = {"holder": {"pid": 1, "start": 1, "ns": "pid:[4026531999]"}, "state": "granted", "requested": now99 - 60,
+         "granted": now99 + 30 * 86400, "seen": now99 + 30 * 86400, "ttl": 1800.0, "expires": now99 + 30 * 86400 + 1800}
+check(oomph._holder_gone(fut99, {}, now99) and oomph._holder_gone(dict(fut99, state="queued", granted=None), {}, now99) and
+      not oomph._holder_gone(dict(fut99, granted=now99 - 60, seen=now99 - 30, expires=now99 + 1740), {}, now99),
+      "a lease of another pid namespace stamped in the future is gone (it would hold its place until then); a "
+      "current one is not")
+
+
+class _VolP:
+    mounts = staticmethod(lambda: [])
+    mount_key = staticmethod(lambda r: r["mount"])
+    disk_pools = staticmethod(lambda recs, facts: ([], []))
+
+
+vq = oomphd.Volumes(_VolP)
+vq.todo = [("/Volumes/Gone", "/dev/disk9s1")]
+vq.read()
+check(vq.todo == [], "volumes: a mount gone before diskutil was asked about it leaves the queue")
+saved_ds, saved_me = oomph._daemon_sample, oomphd.measure
+oomph._daemon_sample, oomphd.measure = (lambda: None), (lambda *a, **k: ({}, {}, {}))
+buf = io.StringIO()
+try:
+    with redirect_stdout(buf):
+        oomph.main(["ps", "--gpu"])
+finally:
+    oomph._daemon_sample, oomphd.measure = saved_ds, saved_me
+check("every user's processes" in buf.getvalue() and "your own" not in buf.getvalue(),
+      "oomph ps --gpu without the logger: the note says the GPU covers every user (%r)" % buf.getvalue().strip()[-90:])
+check("`OOMPH top` is a full-screen dashboard for people" in skill and "OOMPH status --json" in skill and
+      "OOMPH top --once" in skill, "SKILL.md: oomph top is for people; agents use status --json or top --once")
+swift99 = open(os.path.join(ROOT, "app", "oomph.swift")).read()
+gets99 = [m_.start() for m_ in re.finditer(r"Keychain\.get\(", swift99)]
+fn99 = swift99.find("func reportToken(")
+check(len(gets99) == 1 and fn99 != -1 and fn99 < gets99[0] < swift99.find("\n    }\n", fn99) and
+      re.search(r"var aiConnected: Bool \{ aiOn \}", swift99) and "Keychain.get" not in swift99[swift99.find("func loadDraft"):
+                                                                                              swift99.find("func fetchOllamaModels")],
+      "the app reads the keychain only for a report (reportToken): not to know it is connected, not to fill the dialog")
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,

@@ -312,7 +312,10 @@ def run_capped(cmd, cap, timeout):
     finally:
         if p.returncode is None:
             p.kill()
-            p.wait()
+            try:
+                p.wait(2)    # a child stuck in the kernel ignores even SIGKILL: the sampler goes on
+            except subprocess.TimeoutExpired:
+                pass
         p.stdout.close()
 
 

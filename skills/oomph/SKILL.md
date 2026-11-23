@@ -87,6 +87,11 @@ ticket), `update_reservation` (id, gb?, ttl_min?, purpose?), `release_memory` (i
 `wait_for_memory` (timeout ≤ 300 s), `memory_status`, `incidents`, `incident`.
 `oomph run` has no MCP twin: run it through your shell.
 
+`OOMPH top` is a full-screen dashboard for people at a terminal: it takes over the screen
+and waits for keys, so don't run it yourself. Use `OOMPH status --json` (or
+`memory_status`) for the numbers, or `OOMPH top --once` for a printed picture of the
+dashboard.
+
 ## 3. Coordinate heavy work with other sessions
 
 **What counts as heavy:** anything likely to add more than ~1 GB — full builds
@@ -212,6 +217,10 @@ session's own work.
 - **ledger** (`ledger.kind` in `check --json`, `reservations --json` and the MCP answers):
   `shared` means you coordinate with every session on the machine (a Mac: all accounts);
   `user` means only with your own user's sessions (Linux until a machine-wide install exists).
+- **disks** (`resources.disks` in `check --json`, `resources --json` and `memory_check`): each
+  disk says whether the user `pinned` it (`OOMPH volumes watch PATH`); a pinned disk carries
+  its floors `low_gb` and `crit_gb` and its `level`, and a low or critical one raises your
+  check as memory would.
 
 **On Linux** the words differ a little; the levels, exit codes and rules above do not:
 

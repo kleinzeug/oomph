@@ -93,8 +93,8 @@ def fx_cli(scenario, *args, timeout=60, **kw):
     if not os.path.isdir(root):
         linuxfixture.build(root, scenario)
     r = subprocess.run([sys.executable, "-I", "-B", "-c", AS_LINUX, DAEMON] + list(args), capture_output=True, text=True,
-                       timeout=timeout, env=env(OOMPH_SYSROOT=root, OOMPH_LEDGER_DIR=os.path.join(TMP, "fxl", scenario),
-                                                XDG_STATE_HOME=os.path.join(TMP, "xdg"), **kw))
+                       timeout=timeout, env=env(**dict(dict(OOMPH_SYSROOT=root, OOMPH_LEDGER_DIR=os.path.join(TMP, "fxl", scenario),
+                                                            XDG_STATE_HOME=os.path.join(TMP, "xdg")), **kw)))
     return r.returncode, r.stdout, r.stderr
 
 
@@ -296,6 +296,24 @@ def part_fixtures():
     check(rc == 0 and not c.get("mine") and not c.get("others") and any(
         h["id"] == "r90" and h["outcome"] == "holder_gone" for h in c.get("history", [])),
           "a lease of an earlier boot ends as holder_gone, though its holder's pid lives again")
+    # the per-user ledger at its default path: used only while it is this user's own, mode 700
+    pu = dict(OOMPH_LEDGER_DIR=None, OOMPH_STATE_DIR=os.path.join(TMP, "state-pu"))
+    rc, out, _ = fx_cli("ubuntu-server-idle", "reservations", "--json", **pu)
+    dflt = ((json.loads(out) if out.strip() else {}).get("ledger") or {}).get("path") or ""
+    made = dflt.startswith(TMP + "/")
+    if made:
+        os.makedirs(dflt, 0o755, exist_ok=True)    # (reading the reservations made it already, 0700)
+        os.chmod(dflt, 0o755)
+    rc1, out1, err1 = fx_cli("ubuntu-server-idle", "reserve", "1G", "--for", "loose folder", "--json", **pu)
+    if made:
+        os.chmod(dflt, 0o700)
+    rc2, out2, _ = fx_cli("ubuntu-server-idle", "reserve", "1G", "--for", "own folder", "--json", **pu)
+    fx_cli("ubuntu-server-idle", "release", "all", **pu)
+    wrote = "loose folder" in (open(os.path.join(dflt, "ledger.json")).read()
+                               if os.path.exists(os.path.join(dflt, "ledger.json")) else "")
+    check(made and rc1 == 1 and "mode 700" in err1 and not wrote and rc2 == 0,
+          "a per-user ledger folder others can reach (0755) is refused, nothing written; at 0700 it is used (%s %s)"
+          % (dflt[len(TMP):], (err1 or out1).strip()[-160:]))
 
 
     # the hook's state: a folder of this user's own, never the shared /tmp itself; a planted or
@@ -581,6 +599,10 @@ def part_root():
                        timeout=60, env=ie) if r.returncode == 0 else None
     check(r.returncode == 0 and c is not None and c.returncode == 0, "linux/install.sh as root (HOME %s): installs, and "
           "the installed oomph reserves, exit %s%s" % (home, c and c.returncode, "" if r.returncode == 0 else ": " + r.stderr[-200:]))
+    if os.environ.get("OOMPH_LINUXTEST_GIT") == "1":     # CI's checkout, which git must accept from root too
+        ver = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=30, env=ie).stdout.strip() \
+            if r.returncode == 0 else ""
+        check(ver and "nogit" not in ver and ver != "dev", "linux/install.sh as root stamps the checkout's version (%s)" % ver)
     if c:
         subprocess.run([exe, "release", "all"], capture_output=True, timeout=60, env=ie)
     r3 = subprocess.run([os.path.join(ROOT, "linux", "install.sh")], capture_output=True, text=True, timeout=60,
