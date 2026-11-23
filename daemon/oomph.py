@@ -104,6 +104,7 @@ def _checkout_version():
     return (d[1:] if d.startswith("v") else "0.0.0-g" + d), c
 
 
+STAMPED = VERSION != "dev"  # an installed or bundled copy; a checkout derives its version from git
 if VERSION == "dev":
     VERSION, COMMIT = _checkout_version()
 
@@ -3287,12 +3288,21 @@ def switched_on(v):
         (isinstance(v, str) and v.strip().lower() in ("1", "true", "yes", "on"))
 
 
+# The GPU at full speed (IOReport, in a helper that runs as nobody) for everybody, or only for whoever asks.
+# Opt-in since 1.9.3. On by default is prepared (1.10.6) and waits for one check by hand: the figure against
+# `sudo powermetrics --samplers gpu_power` under a GPU load (roadmap 02 §4.2). Then this one constant
+# becomes True; "ioreport": false (OOMPH_IOREPORT=0) or "no_ioreport" still switches it off on a Mac.
+IOREPORT_DEFAULT = False
+
+
 def ioreport_wanted(config=None):
     """Whether the logger may start the IOReport helper for the GPU's full-speed figure (roadmap 02
-    §4.2): opt-in in 1.9.3, so only with "ioreport": true in the configuration file (or
-    OOMPH_IOREPORT=1), and never with "no_ioreport" (OOMPH_NO_IOREPORT=1), which wins."""
+    §4.2): "ioreport" in the configuration file (or OOMPH_IOREPORT) when it is set, else
+    IOREPORT_DEFAULT; never with "no_ioreport" (OOMPH_NO_IOREPORT=1), which wins."""
     config = read_config() if config is None else config
-    return switched_on(setting("ioreport", config=config)) and not switched_on(setting("no_ioreport", config=config))
+    v = setting("ioreport", config=config)
+    return (IOREPORT_DEFAULT if v is None else switched_on(v)) and \
+        not switched_on(setting("no_ioreport", config=config))
 
 
 def _num(x, lo=-1e15, hi=1e15):
@@ -5324,59 +5334,248 @@ def _here_words(x):
     return x
 
 
-def cmd_mcp():
-    """Minimal MCP server (JSON-RPC 2.0, newline-delimited over stdio)."""
+MCP_LINE_CAP = 8 << 20  # a request longer than this is answered with a parse error and skipped
+MCP_HEAD_CAP = 16 << 10  # where an installed oomph.py's stamped VERSION is looked for (line 83 of 1.10.6)
+MCP_SELFCHECK_S = 5      # the new code's time to answer `mcp --selfcheck` (a test may give more: OOMPH_MCP_SELFCHECK_S)
+MCP_INSTRUCTIONS = (
+    "%s reports %s memory, swap and disk, and coordinates memory between Claude sessions and other agents. "
+    "Before memory-heavy work call reserve_memory with the work's estimated peak (reservation_history shows what "
+    "similar work really needed); start only when granted. Shrink or extend it with update_reservation as the work "
+    "changes, and release_memory when done. Call memory_check periodically and back off when it says tight or "
+    "critical.")
+
+
+def _mcp_answer(req):
+    """The JSON-RPC answer to one request of the MCP server (a dict), None for a notification."""
+    if not isinstance(req, dict):
+        return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "invalid request"}}
+    rid, method, params = req.get("id"), req.get("method"), req.get("params") or {}
+    if rid is None:
+        return None  # a notification (e.g. notifications/initialized)
+    if not isinstance(params, dict):
+        params = {}
+    try:
+        if method == "initialize":
+            result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                      "capabilities": {"tools": {}},
+                      "serverInfo": {"name": CMD, "title": BRAND, "version": VERSION},
+                      "instructions": MCP_INSTRUCTIONS % (
+                          BRAND, "this Mac's" if sys.platform == "darwin" else "this machine's")}
+        elif method == "ping":
+            result = {}
+        elif method == "tools/list":
+            result = {"tools": _here_words(MCP_TOOLS)}
+        elif method == "tools/call":
+            try:
+                data = _mcp_call(params.get("name"), params.get("arguments") or {})
+                result = {"content": [{"type": "text", "text": json.dumps(data, indent=1)}], "isError": False}
+            except KeyError:
+                return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown tool"}}
+            except (LedgerError, ToolArgError) as e:  # busy, refused, or arguments it can't take: say so plainly
+                result = {"content": [{"type": "text", "text": "oomph: %s" % e}], "isError": True}
+            except Exception as e:
+                result = {"content": [{"type": "text", "text": "oomph error: %r" % e}], "isError": True}
+        else:
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}}
+        return {"jsonrpc": "2.0", "id": rid, "result": result}
+    except Exception as e:
+        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": repr(e)}}
+
+
+def _stamped(path, owner=0):
+    """(real path, stamped VERSION, (device, inode)) of the oomph.py that `path` leads to (links followed:
+    /usr/local/bin/oomph leads to the installed version's directory), or (None, None, None) unless that file
+    may replace a running MCP server: a regular file of `owner` (root: an installed copy, never a checkout
+    someone edits) in a directory of `owner`'s, neither writable by group or others, opened without following
+    a further link or blocking. Only its first MCP_HEAD_CAP bytes are read."""
+    none = None, None, None
+    try:
+        real = os.path.realpath(path)
+        dfd = os.open(os.path.dirname(real), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except (OSError, ValueError):
+        return none
+    try:
+        fd = os.open(os.path.basename(real), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dfd)
+    except OSError:
+        os.close(dfd)
+        return none
+    try:
+        sts = (os.fstat(dfd), os.fstat(fd))
+        if any(st.st_uid != owner or st.st_mode & 0o022 for st in sts) or not stat.S_ISREG(sts[1].st_mode):
+            return none
+        head = os.read(fd, MCP_HEAD_CAP)
+    except OSError:
+        return none
+    finally:
+        os.close(fd)
+        os.close(dfd)
+    m = re.search(rb'^VERSION = "([0-9A-Za-z.+_-]{1,64})"', head, re.M)
+    return (real, m.group(1).decode(), (sts[1].st_dev, sts[1].st_ino)) if m else none
+
+
+class _SelfReplace:
+    """An MCP server lives as long as its Claude session, so after an update it would answer with old code for
+    hours (roadmap 02 §9.3). Before each request it looks at the VERSION stamped into the file it was started
+    from (`watch`, links followed, so an update that swapped /usr/local/libexec/oomph shows) and replaces itself
+    only when all of this holds: that file is an installed copy (_stamped: root's, writable by nobody else; a
+    test injects its own uid with OOMPH_MCP_OWNER), its version differs from the running one, neither is
+    "dev" (a checkout's), the new code passes `mcp --selfcheck` within MCP_SELFCHECK_S, and the file is
+    still the one checked (same path, device, inode and version) just before the exec. A failed self-check
+    (or a file swapped meanwhile) keeps the old code and is not tried again until the stamped file changes:
+    another version, or the same one installed afresh (another inode). Only a root-owned install replaces
+    itself (the Mac's, Linux's system mode): a Linux user install is the user's own, not root's. The session
+    keeps the tool surface it was given at its start (it asks once; every version accepts the names earlier
+    ones listed) and gets the new ledger logic. A server running as root never replaces itself (the
+    security rule of 1.8.4)."""
+
+    def __init__(self, watch):
+        self.watch = watch
+        o = os.environ.get("OOMPH_MCP_OWNER", "")
+        self.owner = int(o) if o.isdigit() else 0
+        s = os.environ.get("OOMPH_MCP_SELFCHECK_S", "")
+        self.deadline = min(int(s), 120) if s.isdigit() and int(s) > 0 else MCP_SELFCHECK_S
+        self.failed = None  # _stamped() of the last file whose self-check (or exec) failed
+        self.got = None     # _stamped() of the file target() checked
+
+    def target(self):
+        """The real path of the code to replace this server with, or None."""
+        if not STAMPED or os.geteuid() == 0:  # root's server would put the bytes in hand into a shared /tmp
+            return None
+        got = _stamped(self.watch, self.owner)
+        real, ver = got[0], got[1]
+        if real is None or ver in ("dev", VERSION) or got == self.failed:
+            return None
+        self.got = got
+        try:
+            r = subprocess.run([sys.executable or "/usr/bin/python3", "-I", "-B", real, "mcp", "--selfcheck"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               timeout=self.deadline)
+            ok = r.returncode == 0 and r.stdout.startswith(b"ok")
+        except (OSError, subprocess.SubprocessError):
+            ok = False
+        if not ok:
+            self.failed = got
+            return None
+        return real
+
+    def hand_over(self, real, pending):
+        """exec the new code with the bytes read and not yet answered (the request at hand first) in an
+        unlinked file whose descriptor it inherits; it answers those, then reads on from descriptor 0. Returns
+        only if the exec failed, or the file is no longer the one checked (the old code then answers)."""
+        import tempfile
+        py = sys.executable or "/usr/bin/python3"
+        if _stamped(self.watch, self.owner) != self.got or real != self.got[0]:  # swapped since the check
+            self.failed = self.got
+            return
+        try:
+            with tempfile.TemporaryFile() as f:
+                f.write(pending)
+                f.flush()
+                fd = os.dup(f.fileno())
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.set_inheritable(fd, True)
+            sys.stdout.flush()
+            os.execv(py, [py, "-I", "-B", real, "mcp", "--resume-fd", str(fd), "--watch", self.watch])
+        except OSError:
+            self.failed = self.got
+            try:
+                os.close(fd)
+            except (OSError, NameError):
+                pass
+
+
+def _mcp_resumed(args):
+    """The bytes a replaced server handed over (`--resume-fd N`: a regular file, read once and closed), and
+    the file the server was started from (`--watch PATH`)."""
+    def arg(name):
+        return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+    watch = arg("--watch")
+    watch = watch if watch and os.path.isabs(watch) else os.path.abspath(__file__)
+    fd = arg("--resume-fd")
+    if not (fd and fd.isdigit() and 2 < int(fd) < 65536):
+        return b"", watch
+    fd, data = int(fd), b""
+    try:
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            while len(data) <= MCP_LINE_CAP + 65536:
+                b = os.read(fd, 65536)
+                if not b:
+                    break
+                data += b
+        os.close(fd)
+    except OSError:
+        pass
+    return data[:MCP_LINE_CAP + 65536], watch
+
+
+def _mcp_selfcheck():
+    """`oomph mcp --selfcheck`: what a running server asks of new code before it becomes that code: its
+    modules import, and it answers tools/list to itself. Prints ok and exits 0."""
+    try:
+        _daemon_module()
+        r = _mcp_answer({"jsonrpc": "2.0", "id": 0, "method": "tools/list"})
+        ok = len(r["result"]["tools"]) > 0 and json.dumps(r)
+    except Exception as e:
+        sys.stderr.write("%s mcp --selfcheck: %r\n" % (CMD, e))
+        return 1
+    print("ok %s %d tools" % (VERSION, len(r["result"]["tools"])) if ok else "no tools")
+    return 0 if ok else 1
+
+
+def cmd_mcp(args=()):
+    """Minimal MCP server (JSON-RPC 2.0, newline-delimited over stdio). It reads descriptor 0 itself
+    (os.read, its own lines) because a buffered reader would take bytes from the pipe that an exec then
+    loses; see _SelfReplace."""
+    args = list(args)
+    if "--selfcheck" in args:
+        return _mcp_selfcheck()
+    buf, watch = _mcp_resumed(args)
+    buf = bytearray(buf)
+    swap = _SelfReplace(watch)
+    eof, skipping, scan = False, False, 0
+
     def send(msg):
         sys.stdout.write(json.dumps(msg) + "\n")
         sys.stdout.flush()
 
-    for line in sys.stdin:
-        line = line.strip()
+    while True:
+        nl = buf.find(b"\n", scan)
+        if nl < 0:
+            if len(buf) > MCP_LINE_CAP:  # a line too long to hold: dropped up to its end, then answered
+                del buf[:]
+                skipping = True
+            if not eof:
+                scan = len(buf)
+                chunk = os.read(0, 65536)
+                if chunk:
+                    buf.extend(chunk)
+                else:
+                    eof = True
+                continue
+            if not buf.strip():
+                return 0
+            nl = len(buf)
+        line, rest = bytes(buf[:nl]).strip(), nl + 1
+        del buf[:rest]
+        scan = 0
+        if skipping:
+            skipping = False
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "request too long"}})
+            continue
         if not line:
             continue
         try:
-            req = json.loads(line)
-        except ValueError:
+            req = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, RecursionError):
             send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
             continue
-        rid, method, params = req.get("id"), req.get("method"), req.get("params") or {}
-        if rid is None:
-            continue  # notification (e.g. notifications/initialized)
-        try:
-            if method == "initialize":
-                result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
-                          "capabilities": {"tools": {}},
-                          "serverInfo": {"name": CMD, "title": BRAND, "version": VERSION},
-                          "instructions": BRAND + " reports %s memory, swap and disk, and coordinates memory between "
-                                          % ("this Mac's" if sys.platform == "darwin" else "this machine's") +
-                                          "Claude sessions and other agents. Before memory-heavy work call "
-                                          "reserve_memory with the work's estimated peak (reservation_history shows "
-                                          "what similar work really needed); start only when granted. Shrink or "
-                                          "extend it with update_reservation as the work changes, and "
-                                          "release_memory when done. Call memory_check periodically and back off "
-                                          "when it says tight or critical."}
-            elif method == "ping":
-                result = {}
-            elif method == "tools/list":
-                result = {"tools": _here_words(MCP_TOOLS)}
-            elif method == "tools/call":
-                try:
-                    data = _mcp_call(params.get("name"), params.get("arguments") or {})
-                    result = {"content": [{"type": "text", "text": json.dumps(data, indent=1)}], "isError": False}
-                except KeyError:
-                    send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unknown tool"}})
-                    continue
-                except (LedgerError, ToolArgError) as e:  # busy, refused, or arguments it can't take: say so plainly
-                    result = {"content": [{"type": "text", "text": "oomph: %s" % e}], "isError": True}
-                except Exception as e:
-                    result = {"content": [{"type": "text", "text": "oomph error: %r" % e}], "isError": True}
-            else:
-                send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not found"}})
-                continue
-            send({"jsonrpc": "2.0", "id": rid, "result": result})
-        except Exception as e:
-            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": repr(e)}})
-    return 0
+        if isinstance(req, dict) and req.get("id") is not None:
+            new = swap.target()
+            if new:
+                swap.hand_over(new, line + b"\n" + bytes(buf))
+        out = _mcp_answer(req)
+        if out is not None:
+            send(out)
 
 
 # ------------------------------------------------------------------ doctor
@@ -5587,8 +5786,9 @@ def _no_full_speed():
 
 
 def _doctor_gpu(c, kick):
-    """The GPU's full-speed figure: opt-in in 1.9.3 (IOReport, in a helper that runs as nobody).
-    `c`: the logger's current sample when it is fresh, which says what the logger does."""
+    """The GPU's full-speed figure (IOReport, in a helper that runs as nobody): opt-in, or on unless
+    switched off once IOREPORT_DEFAULT is True. `c`: the logger's current sample when it is fresh,
+    which says what the logger does."""
     d = c.get("daemon") if c and isinstance(c.get("daemon"), dict) else {}
     state = d.get("ioreport") if isinstance(d.get("ioreport"), str) else None
     gpus = c.get("gpu") if c and isinstance(c.get("gpu"), list) else []
@@ -5598,14 +5798,18 @@ def _doctor_gpu(c, kick):
     if full or state == "on":
         return "gpu", "ok", "at full speed, from IOReport (a helper that runs as nobody)" if full else \
             "full speed switched on; the logger's next sample has it"
-    if ioreport_wanted():
-        return "gpu", "note", "full speed switched on in %s, not yet used by the logger" % CONFIG_FILE, \
+    if ioreport_wanted() and not (setting("ioreport") is None and _no_full_speed()):
+        return "gpu", "note", "full speed %s, not yet used by the logger" % (
+            "switched on in %s" % CONFIG_FILE if setting("ioreport") is not None else "on by default"), \
             kick if c else None
     if switched_on(setting("no_ioreport")):
         return "gpu", "note", "busy time only: the full-speed figure is switched off (no_ioreport)"
     if _no_full_speed():
         return "gpu", "note", "busy time only (the share of time the GPU worked, at any speed); this Mac has no GPU " \
             "frequency table, so the figure at full speed is not available here"
+    if IOREPORT_DEFAULT:  # on by default, so here someone switched it off ("ioreport": false)
+        return "gpu", "note", "busy time only: the full-speed figure is switched off (\"ioreport\": false in %s)" % \
+            CONFIG_FILE
     turn_on = "add \"ioreport\": true to %s (with sudo); %s" % (CONFIG_FILE, kick) if os.path.lexists(CONFIG_FILE) else \
         "sudo mkdir -p \"%s\"; echo '{\"ioreport\": true}' | sudo tee \"%s\"; %s" % (
             os.path.dirname(CONFIG_FILE), CONFIG_FILE, kick)
@@ -5863,7 +6067,7 @@ def _main(argv):
     if c == "hook":
         return cmd_hook(rest)
     if c == "mcp":
-        return cmd_mcp()
+        return cmd_mcp(rest)
     if c == "_ledger-refresh":
         return _cmd_ledger_refresh()
     if c == "_ledger-call":

@@ -7,11 +7,34 @@ import Network
 import Security
 import SwiftUI
 
-let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
+/// A render's own flags (`--fixture DIR`, `--now T`): their value, honoured only with `--render-popup`, so
+/// that the running app never draws anything but this Mac. Nil without them.
+func renderFlag(_ name: String) -> String? {
+    let a = CommandLine.arguments
+    guard a.contains("--render-popup"), let i = a.firstIndex(of: name), i + 1 < a.count else { return nil }
+    return a[i + 1]
+}
+/// `--fixture DIR` (renders): one directory instead of this Mac's: DIR/log, DIR/ledger and DIR/machines,
+/// as tools/renderfixture.py writes it. It wins over OOMPH_DIR, OOMPH_LEDGER_DIR and OOMPH_MACHINES_DIR, so
+/// that nothing of the Mac that renders reaches the picture.
+let fixtureDir = renderFlag("--fixture")
+/// `--now T` (renders): the clock stands at T (seconds since 1970), so that two renders of one fixture
+/// are byte-identical (roadmap 02 §8). Every "now" that decides what is drawn reads wallNow().
+let frozenNow: Double? = renderFlag("--now").flatMap { Double($0) }.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+/// `--no-liveness` (renders): a lease's state and a mirror's link come from the files alone; no process
+/// is asked whether it lives (kill(pid, 0)), so a fixture's holders need no live process.
+let noLiveness = CommandLine.arguments.contains("--render-popup") && CommandLine.arguments.contains("--no-liveness")
+/// Now, as the popup draws it: the wall clock, or the clock of `--now`.
+func wallNow() -> Double { frozenNow ?? Date().timeIntervalSince1970 }
+func wallDate() -> Date { Date(timeIntervalSince1970: wallNow()) }
+/// Whether `d` falls on the day of wallNow() (Calendar's isDateInToday asks the wall clock).
+func isWallToday(_ d: Date) -> Bool { Calendar.current.isDate(d, inSameDayAs: wallDate()) }
+
+let logDir = fixtureDir.map { $0 + "/log" } ?? ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
 /// The agents' coordination ledger (ledger.json) and its history log (reservations.jsonl).
-let ledgerDir = ProcessInfo.processInfo.environment["OOMPH_LEDGER_DIR"] ?? "/Users/Shared/oomph"
+let ledgerDir = fixtureDir.map { $0 + "/ledger" } ?? ProcessInfo.processInfo.environment["OOMPH_LEDGER_DIR"] ?? "/Users/Shared/oomph"
 /// Where `oomph remote` keeps the machines this Mac watches: machines.json and one mirror per machine.
-let machinesDir = ProcessInfo.processInfo.environment["OOMPH_MACHINES_DIR"]
+let machinesDir = fixtureDir.map { $0 + "/machines" } ?? ProcessInfo.processInfo.environment["OOMPH_MACHINES_DIR"]
     ?? (NSHomeDirectory() + "/Library/Application Support/oomph/machines")
 let brand = "oomph"  // the product's name in prose and titles (oomph.py's BRAND; tools/brandlint.py)
 let descriptor = ": memory monitor"  // what the header says after the name
@@ -388,7 +411,11 @@ struct ResBlock: Identifiable {
     var id: String { res.id }
 
     static func stack(_ rs: [Reservation], now: Double) -> [ResBlock] {
-        var blocks = rs.sorted { $0.requested < $1.requested }
+        // by request, then id: `rs` comes out of a Dictionary, whose order changes with every launch
+        var blocks = rs.sorted { a, b in
+            let ka: (Double, String) = (a.requested, a.id), kb: (Double, String) = (b.requested, b.id)
+            return ka < kb
+        }
             .map { ResBlock(res: $0, end: max($0.ended ?? now, $0.requested + 1)) }
         var laneEnd: [Double] = []
         for i in blocks.indices {
@@ -560,7 +587,7 @@ final class MachineStore: ObservableObject {
     /// All logged history, oldest first, finer near now (see Store.multires): every range draws from it.
     @Published var history: [Point] = []
     /// When `history` was loaded: the chart measures ages from here (for a mirror, on its clock).
-    @Published var historyNow = Date().timeIntervalSince1970
+    @Published var historyNow = wallNow()
     /// Stretches without samples (asleep, off, logger stopped), found in the raw samples; for a
     /// mirror also the stretches it has not received (Gap.kind).
     @Published var gaps: [Gap] = []
@@ -601,7 +628,7 @@ final class MachineStore: ObservableObject {
 
     /// The machine's clock: a mirror's times are the remote's own, corrected by the offset measured
     /// at the handshake (roadmap 01 §4.6).
-    var now: Double { Date().timeIntervalSince1970 + (isLocal ? 0 : sync?.offset_s ?? 0) }
+    var now: Double { wallNow() + (isLocal ? 0 : sync?.offset_s ?? 0) }
 
     /// A mirror is live while its engine says so and has rewritten status.json within the last 10 s
     /// from a process that still exists; in every other case it is drawn stale, so a crashed engine
@@ -609,7 +636,7 @@ final class MachineStore: ObservableObject {
     var linkLive: Bool {
         guard let l = link, l.state == "live" || l.state == "catching_up", let u = l.updated, let pid = l.pid, pid > 0
         else { return false }
-        return Date().timeIntervalSince1970 - u < 10 && (kill(pid, 0) == 0 || errno == EPERM)
+        return wallNow() - u < 10 && (noLiveness || kill(pid, 0) == 0 || errno == EPERM)
     }
     /// Another machine that is not live: what claims to be now is drawn grey (roadmap 01 §3.5),
     /// except during the grace of an opening.
@@ -622,7 +649,7 @@ final class MachineStore: ObservableObject {
     var openedLive = false
     enum Opening { case none, grace, connecting }
 
-    func markOpened(at t: Double = Date().timeIntervalSince1970) {
+    func markOpened(at t: Double = wallNow()) {
         openedAt = t
         openedLive = !isLocal && ((link?.state == "idle" && link?.was == "live") || linkLive)
         guard openedLive, !renderMode else { return }
@@ -652,7 +679,7 @@ final class MachineStore: ObservableObject {
         if link?.state == "offline" || link?.state == "needs_attention" || link?.error == "local_network_denied" || probeDenied {
             return .none
         }
-        let age: Double = Date().timeIntervalSince1970 - t
+        let age: Double = wallNow() - t
         return age < grace ? .grace : age < openTimeout ? .connecting : .none
     }
     var inGrace: Bool { opening == .grace }
@@ -797,16 +824,16 @@ final class MachineStore: ObservableObject {
             .flatMap { (try? JSONSerialization.jsonObject(with: $0)) as? [String: Any] } ?? [:]
         let local = isLocal
         let rs = Store.mergeReservations(records: records, ledger: ledger, now: now,
-                                         holderGone: { pid in local && kill(pid, 0) != 0 && errno == ESRCH })
+                                         holderGone: { pid in local && !noLiveness && kill(pid, 0) != 0 && errno == ESRCH })
         return ResBlock.stack(rs, now: now)
     }
 
     /// On loadQueue only. For a mirror: its coverage, whether its link is down (or in the grace of
     /// an opening: the stretch from its last data to now is then left blank), its oldest sample.
     private func loadHistory(_ state: SyncState?, down: Bool, grace: Bool = false, oldest: Double?) -> Loaded {
-        let now = Date().timeIntervalSince1970 + (isLocal ? 0 : state?.offset_s ?? 0)
+        let now = wallNow() + (isLocal ? 0 : state?.offset_s ?? 0)
         let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
-        let today = fmt.string(from: Date())
+        let today = fmt.string(from: wallDate())
         let files = (try? FileManager.default.contentsOfDirectory(atPath: logDir)) ?? []
         var days = Set(files.compactMap { f -> String? in
             guard f.hasPrefix("samples-"), f.hasSuffix(".jsonl") || f.hasSuffix(".jsonl.gz") else { return nil }
@@ -1070,7 +1097,7 @@ final class Store: ObservableObject {
         selected = i
         let m = machines[i]
         UserDefaults.standard.set(m.mid, forKey: "selectedMachine")
-        lastSelected[m.mid] = Date().timeIntervalSince1970
+        lastSelected[m.mid] = wallNow()
         shownThisOpening.insert(m.mid)
         m.refreshAll()
         sendWatch()
@@ -1561,7 +1588,7 @@ final class Store: ObservableObject {
     func popupOpened() {
         if upgradeButton == .upToDate { upgradeButton = .check }
         watchOption()
-        let now = Date().timeIntervalSince1970
+        let now = Date().timeIntervalSince1970  // real time: what is saved and scheduled, never a render's clock
         if now - defaults.double(forKey: "upgradeToolsChecked") > 86400 {
             runUpgradeCLI(["tools", "--json"]) { [weak self] data, _ in
                 guard let self else { return }
@@ -2232,8 +2259,9 @@ struct MemoryChart: View, Animatable {
                 for x in rects {
                     if x.queued { waiting[x.i, default: Path()].addRect(x.r) } else { solid[x.i, default: Path()].addRect(x.r) }
                 }
-                for (i, p) in solid { plotCtx.fill(p, with: .color(blocks[i].res.color.opacity(0.8))) }
-                for (i, p) in waiting {
+                // in the blocks' order: a Dictionary's changes with every launch, and so would the edges
+                for (i, p) in solid.sorted(by: { $0.key < $1.key }) { plotCtx.fill(p, with: .color(blocks[i].res.color.opacity(0.8))) }
+                for (i, p) in waiting.sorted(by: { $0.key < $1.key }) {
                     let c = blocks[i].res.color
                     plotCtx.fill(p, with: .color(c.opacity(0.12)))
                     var h = plotCtx
@@ -2243,7 +2271,7 @@ struct MemoryChart: View, Animatable {
                 // purpose labels on the widest granted part of each block, when it fits
                 var best: [Int: CGRect] = [:]
                 for x in rects where !x.queued && x.r.height >= 9 && x.r.width > (best[x.i]?.width ?? 0) { best[x.i] = x.r }
-                for (i, r) in best where r.width >= 24 {
+                for (i, r) in best.sorted(by: { $0.key < $1.key }) where r.width >= 24 {
                     let purpose = blocks[i].res.purpose
                     var n = purpose.count
                     while n >= 4 {
@@ -2712,7 +2740,7 @@ struct MemoryChart: View, Animatable {
     /// "06:36" today, "Tue 4 Nov 06:36" before.
     static func when(_ t: Double) -> String {
         let d = Date(timeIntervalSince1970: t)
-        if Calendar.current.isDateInToday(d) { return timeFmt.string(from: d) }
+        if isWallToday(d) { return timeFmt.string(from: d) }
         let f = DateFormatter(); f.dateFormat = "EEE d MMM HH:mm"
         return f.string(from: d)
     }
@@ -2767,7 +2795,7 @@ struct ReservationCard: View {
     static let dayClock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d HH:mm"; return f }()
     func at(_ t: Double) -> String {
         let d = Date(timeIntervalSince1970: t)
-        return Calendar.current.isDateInToday(d) ? ReservationCard.clock.string(from: d) : ReservationCard.dayClock.string(from: d)
+        return isWallToday(d) ? ReservationCard.clock.string(from: d) : ReservationCard.dayClock.string(from: d)
     }
     static let outcomes = ["released": "released", "expired": "expired (not released in time)",
                            "holder_gone": "ended: its session or process exited", "lapsed": "lapsed: stopped waiting in the queue",
@@ -3197,7 +3225,7 @@ struct PopoverView: View {
         switch was {
         case "offline":
             s = "No answer since " + MemoryChart.when(m.link?.last_contact ?? m.knownUntil ?? 0)
-            let left: Double = (m.link?.next_try ?? 0) - Date().timeIntervalSince1970
+            let left: Double = (m.link?.next_try ?? 0) - wallNow()
             if m.link?.state == "offline", store.engineRunning, left >= 0.5 { s += " · next try in \(Int(left.rounded())) s" }
         case "needs_attention":
             let why = ["identity_changed": "Its key changed", "revoked": "Access revoked", "ssh": "SSH can't sign in",
@@ -3257,7 +3285,7 @@ struct PopoverView: View {
 
     func reservedList(_ live: [Reservation]) -> some View {
         // a machine that is not connected is shown as of the moment knowledge of it ends
-        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
+        let now = m.isLocal ? wallNow() : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
         let day = m.reservations.filter { ($0.res.ended ?? now) >= now - 86400 }.count
         let capped = live.count > PopoverView.reservationLines
         let shown = capped ? Array(live.prefix(PopoverView.reservationLines - 1)) : live
@@ -3336,7 +3364,7 @@ struct PopoverView: View {
     /// Every live reservation, above the "+N more" line.
     func allReservationsCallout(arrowX: CGFloat) -> some View {
         let live = m.liveReservations
-        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
+        let now = m.isLocal ? wallNow() : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
         let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
         let rows = renderMode ? Array(live.prefix(14)) : live
         return VStack(spacing: 0) {
@@ -3845,7 +3873,7 @@ struct PopoverView: View {
         let t = store.lastUpgradeCheck
         guard t > 0 else { return "" }
         let f = RelativeDateTimeFormatter()
-        return " — last checked " + f.localizedString(for: Date(timeIntervalSince1970: t), relativeTo: Date())
+        return " — last checked " + f.localizedString(for: Date(timeIntervalSince1970: t), relativeTo: wallDate())
     }
 
     var autoCheckToggle: some View {
@@ -4827,7 +4855,7 @@ struct ShareCode {
     var expires: Double
     /// The viewers paired before it was made, and when it was made: a viewer paired since used it.
     var before: Set<String>
-    var made: Double = Date().timeIntervalSince1970
+    var made: Double = wallNow()
 }
 
 /// What the app asks root to do for sharing: a closed set, run by the installed, root-owned CLI
@@ -4877,7 +4905,7 @@ extension Store {
     }
 
     /// The code this app made is still good (not used, not expired).
-    var shareCodeValid: Bool { shareCode.map { Date().timeIntervalSince1970 < $0.expires } ?? false }
+    var shareCodeValid: Bool { shareCode.map { wallNow() < $0.expires } ?? false }
 
     func toggleConnect() {
         if connectShown { connectShown = false } else { openConnect() }
@@ -5180,7 +5208,7 @@ extension Store {
             sharePaired = (new.name?.isEmpty == false ? new.name! : "a viewer")
             shareCode = nil
             shareWaiting = false
-        } else if Date().timeIntervalSince1970 > c.expires {
+        } else if wallNow() > c.expires {
             shareCode = nil
             shareWaiting = false
         }
@@ -5458,7 +5486,7 @@ struct ConnectView: View {
         var bits = [e.transport == "ssh" ? (e.user.map { $0 + "@" } ?? "") + (e.host ?? "") : e.address]
         if let v = e.os_version { bits.append(v) }
         if let r = e.ram_gb { bits.append(String(format: "%.0f GB", r)) }
-        if let t = e.last_connected { bits.append(ConnectInput.ago(t, now: Date().timeIntervalSince1970)) }
+        if let t = e.last_connected { bits.append(ConnectInput.ago(t, now: wallNow())) }
         return bits.joined(separator: " · ")
     }
 
@@ -5712,7 +5740,7 @@ struct ShareView: View {
     }
 
     @ViewBuilder func codeBlock(_ st: ShareStatus) -> some View {
-        if let c = store.shareCode, renderMode || Date().timeIntervalSince1970 < c.expires {
+        if let c = store.shareCode, renderMode || wallNow() < c.expires {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
                     Text("Pairing code").font(.caption).foregroundStyle(.secondary)
@@ -5721,7 +5749,7 @@ struct ShareView: View {
                         Text("9:41 left · \(st.pairing?.left ?? 5) tries").font(.system(size: 10)).foregroundStyle(.secondary)
                     } else {
                         TimelineView(.periodic(from: .now, by: 1)) { _ in
-                            let left = max(0, Int(c.expires - Date().timeIntervalSince1970))
+                            let left = max(0, Int(c.expires - wallNow()))
                             Text(String(format: "%d:%02d left · %d tries", left / 60, left % 60, st.pairing?.left ?? 5))
                                 .font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
                         }
@@ -5757,7 +5785,7 @@ struct ShareView: View {
                     }
                 }
                 if st.pairing?.active == true, let exp = st.pairing?.expires {
-                    Text("A pairing code is active for another \(max(1, Int((exp - Date().timeIntervalSince1970) / 60))) min (it is shown only where it was made).")
+                    Text("A pairing code is active for another \(max(1, Int((exp - wallNow()) / 60))) min (it is shown only where it was made).")
                         .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
@@ -6114,7 +6142,7 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
         store.local.loadIncidents()
         store.applyOpeningRule()
         // a render is the popup just opened (roadmap 01 §3.6); `-openedAgo S` draws it S seconds later
-        let opened: Double = Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: "openedAgo")
+        let opened: Double = wallNow() - UserDefaults.standard.double(forKey: "openedAgo")
         for m in store.machines.dropFirst() { m.refreshCurrent(); m.markOpened(at: opened); m.loadIncidents() }
     }
     if mirror == nil && store.machinesUI { renderConnect(store, ai) }
@@ -6184,7 +6212,7 @@ func renderConnect(_ store: Store, _ ai: String) {
     let d = store.draft
     let parts = ai.split(separator: ":", maxSplits: 1).map(String.init)
     let what = parts.first ?? "", arg = parts.count > 1 ? parts[1] : ""
-    let now = Date().timeIntervalSince1970
+    let now = wallNow()
     let fp = "sha256:328861212bbe5cc89a48359f4426b50b" + String(repeating: "0", count: 32)
     var share = ShareStatus(on: true, port: 6674, networks: [.init(iface: "en0", net: "192.168.1.0/24", router: "192.168.1.1")],
                             any_network: false,
@@ -6368,7 +6396,8 @@ func chartVectors(_ path: String) -> Int32 {
 @main
 struct Main {
     static func main() {
-        // Development aid: `oomph --render-popup out.png [--dark]` draws the popup into a PNG and exits.
+        // Development aid: `oomph --render-popup out.png [--dark] [--fixture DIR] [--now T] [--no-liveness]`
+        // draws the popup into a PNG and exits.
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--chart-vectors"), i + 1 < args.count {
             exit(MainActor.assumeIsolated { chartVectors(args[i + 1]) })
@@ -6377,6 +6406,17 @@ struct Main {
             exit(connectVectors(args[i + 1]))
         }
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
+            // `--now T`, `--no-liveness` and `--fixture DIR` make a render repeat itself (roadmap 02 §8):
+            // `oomph --render-popup out.png --fixture DIR --now T --no-liveness` is byte-identical every time
+            var isDir: ObjCBool = false
+            if args.contains("--now") && frozenNow == nil {
+                FileHandle.standardError.write("oomph: --now takes a time in seconds since 1970\n".data(using: .utf8)!)
+                exit(2)
+            }
+            if let d = fixtureDir, !(FileManager.default.fileExists(atPath: d + "/log", isDirectory: &isDir) && isDir.boolValue) {
+                FileHandle.standardError.write("oomph: --fixture \(d): no log folder in it\n".data(using: .utf8)!)
+                exit(2)
+            }
             let ai = args.firstIndex(of: "--ai").map { args.count > $0 + 1 ? args[$0 + 1] : "" } ?? ""
             let mirror = args.firstIndex(of: "--mirror").flatMap { args.count > $0 + 1 ? args[$0 + 1] : nil }
             MainActor.assumeIsolated { renderPopup(to: args[i + 1], dark: args.contains("--dark"), ai: ai, mirror: mirror) }

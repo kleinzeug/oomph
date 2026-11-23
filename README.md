@@ -266,9 +266,10 @@ your `oomph check` and hook like the system disk's (`unwatch`, `hide`, `unhide` 
 How busy the GPU is says little on its own: an idle desktop keeps it busy half the time, at its
 lowest speed. From 1.9.3 the logger can also record how much of the GPU's capacity at full speed
 was used, from the system's IOReport library, which only a helper process running as `nobody`
-loads (never the logger itself, which runs as root). It is opt-in in this version: put
-`{"ioreport": true}` into the settings file (below) and restart the logger with
-`sudo launchctl kickstart -k system/local.oomph.daemon`. `oomph status` then says "% of full
+loads (never the logger itself, which runs as root). `oomph doctor` says whether it is on by
+default in your version; where it is not, add `"ioreport": true` to the settings file (below) and
+restart the logger with `sudo launchctl kickstart -k system/local.oomph.daemon` (`"no_ioreport": true`
+keeps it off either way). `oomph status` then says "% of full
 speed" instead of "busy … of the time", and `oomph doctor` says whether it works. A helper that
 crashes four times, or whose readings do not fit the Mac, is switched off until the Mac restarts
 or macOS is updated (`/Library/Logs/oomph/ioreport.json` keeps the count).
@@ -405,7 +406,7 @@ What a session gets:
 | `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
 | `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
 | `oomph status --json` | the full latest sample |
-| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` |
+| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident`. A server that outlives an update takes the installed new version at its next request, once the new code has passed a self-check, when the install is root's (a Mac, or Linux's system mode; a Linux user install is restarted with its session); the session keeps the tools it was shown at its start |
 | `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
@@ -591,7 +592,7 @@ write them (`sudo mkdir -p "/Library/Application Support/oomph"`, then edit the 
 
 | Switch | Effect |
 |---|---|
-| `"ioreport": true` | the GPU's figure at full speed, from the IOReport helper (opt-in in 1.9.3; see above) |
+| `"ioreport": true` | the GPU's figure at full speed, from the IOReport helper (from 1.9.3; `false` switches it off; see above) |
 | `"no_ioreport": true` | never start the IOReport helper, also once it is on by default |
 
 ### Privacy
@@ -642,6 +643,7 @@ tools/topfixture.py               the golden frames of `oomph top` (tools/golden
 tools/toptest.py                  `oomph top` in a pseudo-terminal: keys, signals, --ssh; tmux as the oracle
 tools/nettest.py                  the protocol's tests: serve, sync through a pipe, coverage, hostile input
 tools/mirrorfixture.py            another machine's mirror, for `oomph.app --render-popup … --mirror DIR`
+tools/renderfixture.py            renders that repeat themselves: `--render-popup … --fixture DIR --now T --no-liveness`
 tools/spike_role_account.sh       a CI spike: a launchd job under a role account, time to first frame
 DESIGN.md                         the investigation and the design decisions
 docs/index.html                   the website (GitHub Pages, served from /docs)

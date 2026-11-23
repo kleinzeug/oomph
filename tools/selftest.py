@@ -966,6 +966,157 @@ if MAC:  # MCP reservations in a child process: it measures this machine
 else:
     print("skip  MCP reservations in a child process: it measures this machine")
 
+# --- M4 (1.10.6): the MCP server reads its own lines and replaces itself after an update (roadmap 02 §9.3).
+# An installed copy is root's; here the ownership check is injected (OOMPH_MCP_OWNER), and the "install" is a
+# version directory behind a link, as install.sh makes it. Which code answers shows in initialize's version
+# and, for a file changed without a new version, in a marker put into its instructions.
+mcp_dir = tempfile.mkdtemp(prefix="oomph-mcp-")
+mcp_lib = os.path.join(mcp_dir, "oomph-x")
+os.mkdir(mcp_lib)
+os.chmod(mcp_lib, 0o755)  # as install.sh leaves it, whatever the umask (Ubuntu's 002 makes it group-writable)
+for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_linux.py"):
+    shutil.copy(os.path.join(ROOT, "daemon", f), mcp_lib)
+mcp_src = open(os.path.join(ROOT, "daemon", "oomph.py")).read()
+
+
+def mcp_stamp(version, marker="", tail="", mode=0o644):
+    """Installs oomph.py stamped `version` by a rename, as an install's files appear at once."""
+    t = mcp_src.replace('VERSION = "dev"', 'VERSION = "%s"' % version, 1)
+    t = t.replace('"%s reports %s memory', '"' + marker + '%s reports %s memory', 1) + tail
+    tmp = os.path.join(mcp_lib, ".oomph.py.new")
+    open(tmp, "w").write(t)
+    os.chmod(tmp, mode)
+    os.rename(tmp, os.path.join(mcp_lib, "oomph.py"))
+
+
+mcp_stamp("9.0.1")
+mcp_link = os.path.join(mcp_dir, "oomph")
+os.symlink(os.path.join(mcp_lib, "oomph.py"), mcp_link)
+mcp = subprocess.Popen([sys.executable, "-I", "-B", mcp_link, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, bufsize=0,  # unbuffered: select() and our own lines agree
+                       env=dict(os.environ, OOMPH_MCP_OWNER=str(os.getuid()), OOMPH_MCP_SELFCHECK_S="30"))
+mcp_buf, mcp_got = bytearray(), {}  # bytes read and not yet a line; answers read, by id
+
+
+def mcp_answer(rid, wait=20):
+    """The answer with id `rid` (None after `wait` s): lines split from os.read here, never a buffered
+    reader that select() cannot see into, and matched by id, so one late answer shifts nothing."""
+    end = time.time() + wait
+    while rid not in mcp_got:
+        nl = mcp_buf.find(b"\n")
+        if nl >= 0:
+            mcp_line = bytes(mcp_buf[:nl])
+            del mcp_buf[:nl + 1]
+            try:
+                mcp_msg = json.loads(mcp_line)
+            except ValueError:
+                continue
+            if isinstance(mcp_msg, dict):
+                mcp_got[mcp_msg.get("id")] = mcp_msg
+            continue
+        left = end - time.time()
+        if left <= 0 or not select.select([mcp.stdout], [], [], left)[0]:
+            return None
+        mcp_chunk = os.read(mcp.stdout.fileno(), 65536)
+        if not mcp_chunk:
+            return None
+        mcp_buf.extend(mcp_chunk[:1 << 20])
+    return mcp_got.pop(rid)
+
+
+def mcp_ask(*msgs, raw=None):
+    """Sends `msgs` in one write (or `raw` bytes in pieces) and returns the answer to each request, by id."""
+    for mcp_piece in raw or [b"".join(json.dumps(m).encode() + b"\n" for m in msgs)]:
+        mcp.stdin.write(mcp_piece)
+        mcp.stdin.flush()
+        time.sleep(0.2 if raw else 0)
+    return [mcp_answer(m["id"]) for m in msgs if "id" in m]
+
+
+def mcp_init(i):
+    return {"jsonrpc": "2.0", "id": i, "method": "initialize", "params": {}}
+
+
+def mcp_who(r):
+    """(version, instructions start) of an initialize answer."""
+    mcp_res = (r or {}).get("result") or {}
+    return (mcp_res.get("serverInfo") or {}).get("version"), (mcp_res.get("instructions") or "")[:8]
+
+
+mcp_list = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+try:
+    mcp_first = mcp_ask(mcp_init(1), {"jsonrpc": "2.0", "method": "notifications/initialized"}, mcp_list)
+    mcp_half = json.dumps(mcp_init(3)).encode() + b"\n"
+    mcp_split = mcp_ask(mcp_init(3), raw=[mcp_half[:17], mcp_half[17:]])  # one request in two writes
+    mcp_stamp("9.0.2")
+    mcp_swapped = mcp_ask(mcp_init(4), dict(mcp_list, id=5), {"jsonrpc": "2.0", "id": 6, "method": "ping"})
+    try:  # the same process, now running other code: its arguments say so
+        mcp_argv = open("/proc/%d/cmdline" % mcp.pid).read().replace("\0", " ")
+    except OSError:
+        mcp_argv = subprocess.run(["ps", "-o", "args=", "-p", str(mcp.pid)], capture_output=True, text=True).stdout
+    mcp_stamp("9.0.2", marker="SAME")  # changed, same version: no replacement
+    mcp_same = mcp_ask(mcp_init(7))
+    mcp_stamp("dev", marker="DEVV")    # a checkout's file: no replacement
+    mcp_dev = mcp_ask(mcp_init(8))
+    mcp_stamp("9.0.3", marker="BADX", tail="\ndef (\n")  # fails its self-check: the old code keeps answering
+    mcp_broken = mcp_ask(mcp_init(9))
+    mcp_stamp("9.0.4", marker="OPEN", mode=0o666)  # writable by others: never an installed copy
+    mcp_loose = mcp_ask(mcp_init(10))
+    mcp_stamp("9.0.4")
+    mcp.stdin.write(json.dumps(mcp_init(11)).encode())  # a last line without a newline, then the end of input
+    mcp.stdin.close()
+    mcp_fixed = [mcp_answer(11)]
+    mcp_rc = mcp.wait(10)
+except Exception as mcp_err:
+    mcp.kill()
+    mcp_first = mcp_split = mcp_swapped = mcp_same = mcp_dev = mcp_broken = mcp_loose = mcp_fixed = [None]
+    mcp_argv, mcp_rc = repr(mcp_err), None
+finally:
+    shutil.rmtree(mcp_dir, ignore_errors=True)
+mcp_tools0 = ((mcp_first[1] or {}).get("result") or {}).get("tools") if len(mcp_first) > 1 else None
+check(mcp_who(mcp_first[0])[0] == "9.0.1" and mcp_tools0 and mcp_who(mcp_split[0])[0] == "9.0.1",
+      "MCP: an installed 9.0.1 answers, also a request split over two writes (%s, %s)" % (
+          mcp_who(mcp_first[0]), mcp_who(mcp_split[0])))
+check(len(mcp_swapped) == 3 and mcp_who(mcp_swapped[0])[0] == "9.0.2" and
+      ((mcp_swapped[1] or {}).get("result") or {}).get("tools") == mcp_tools0 and
+      (mcp_swapped[2] or {}).get("result") == {} and
+      "--resume-fd" in mcp_argv,
+      "MCP: after an update to 9.0.2 the next request is answered by the new code in the same process, and the "
+      "two sent with it in one write too, the tool list unchanged (%s; %s)" % (
+          [mcp_who(x) for x in mcp_swapped[:1]], mcp_argv.strip()[-60:]))
+check([mcp_who(x[0]) for x in (mcp_same, mcp_dev, mcp_broken, mcp_loose)] == [("9.0.2", "oomph re")] * 4,
+      "MCP: no replacement for a file changed without a new version, one stamped dev, one that fails its "
+      "self-check, or one others may write (%s)" % [mcp_who(x[0]) for x in (mcp_same, mcp_dev, mcp_broken, mcp_loose)])
+check(mcp_who(mcp_fixed[0])[0] == "9.0.4" and mcp_rc == 0,
+      "MCP: a good 9.0.4 after the broken 9.0.3 is taken at once; a last line without a newline is answered; "
+      "the end of input ends the server (%s, exit %s)" % (mcp_who(mcp_fixed[0]), mcp_rc))
+mcp_dir = tempfile.mkdtemp(prefix="oomph-mcp-")  # a file swapped between the check and the exec is not run
+os.chmod(mcp_dir, 0o755)
+mcp_file = os.path.join(mcp_dir, "oomph.py")
+for mcp_v in ("9.0.5", "9.0.6"):
+    open(mcp_file + ".new", "w").write('VERSION = "%s"\nraise SystemExit(0)\n' % mcp_v)
+    os.chmod(mcp_file + ".new", 0o644)
+    os.rename(mcp_file + ".new", mcp_file)
+    if mcp_v == "9.0.5":
+        mcp_sr = oomph._SelfReplace(mcp_file)
+        mcp_sr.owner, mcp_sr.got = os.getuid(), oomph._stamped(mcp_file, os.getuid())
+mcp_pid = os.fork()
+if mcp_pid == 0:  # the child: hand_over must return; had it exec'd, the file's code exits 0
+    try:
+        os.dup2(os.open(os.devnull, os.O_RDONLY), 0)
+        mcp_sr.hand_over(mcp_file, b"")
+        os._exit(7 if mcp_sr.failed and mcp_sr.failed[1] == "9.0.5" else 1)
+    finally:
+        os._exit(1)
+mcp_rc = os.waitpid(mcp_pid, 0)[1]
+shutil.rmtree(mcp_dir, ignore_errors=True)
+check(os.WIFEXITED(mcp_rc) and os.WEXITSTATUS(mcp_rc) == 7 and mcp_sr.got[1] == "9.0.5",
+      "MCP: a file swapped after its check and self-check is not exec'd; it counts as a failed attempt (%s)" % mcp_rc)
+mcp_st0 = os.stat(os.path.join(ROOT, "daemon", "oomph.py"))
+check(oomph._stamped(os.path.join(ROOT, "daemon", "oomph.py"), owner=mcp_st0.st_uid)[1] in ("dev", None) and
+      oomph._stamped(os.path.join(ROOT, "daemon", "oomph.py"))[0] is None and not oomph.STAMPED,
+      "MCP: a checkout never replaces itself (it is not stamped, and not root's)")
+
 # --- N1: one name for people (BRAND), one for machines (CMD, paths, labels), kept apart
 src = {f: open(os.path.join(ROOT, "daemon", f)).read() for f in ("oomph.py", "oomph_upgrade.py", "oomphd.py")}
 mac_paths = oomph.PATHS["darwin"]
@@ -1929,7 +2080,10 @@ for what, args in (("residency in P14, which has no frequency", (gpuph(OFF=900, 
     r = oomphd.full_speed(*args)
     check(r[0] is None and isinstance(r[1], str), "full speed: %s falls back to busy time (%s)" % (what, r[1]))
 
-# opt-in: off unless the root-owned config or OOMPH_IOREPORT says so; OOMPH_NO_IOREPORT wins
+# opt-in: off unless the root-owned config or OOMPH_IOREPORT says so; OOMPH_NO_IOREPORT wins. Checked with the
+# default off and, below, on (IOREPORT_DEFAULT, the one constant that switches it on for everybody: 1.10.6)
+io_default = oomph.IOREPORT_DEFAULT
+oomph.IOREPORT_DEFAULT = False
 os.environ.pop("OOMPH_IOREPORT")
 wanted = [oomph.ioreport_wanted(config=c) for c in ({}, {"ioreport": True}, {"ioreport": "yes"}, {"ioreport": 0},
                                                        {"ioreport": True, "no_ioreport": True})]
@@ -1943,6 +2097,36 @@ wanted.append(oomph.ioreport_wanted(config={"ioreport": True}))
 check(wanted == [False, True, True, False, False, True, False, False] and oomphd.full_speed_rung(P) is None and
       oomphd.full_speed_rung(StubPlat()) is None,
       "full speed is opt-in: only \"ioreport\": true in the config or OOMPH_IOREPORT=1 starts it; no_ioreport wins (%s)" % wanted)
+oomph.IOREPORT_DEFAULT = True  # what the owner's switch does, as if it were thrown
+os.environ.pop("OOMPH_IOREPORT")
+wanted = [oomph.ioreport_wanted(config=c) for c in ({}, {"ioreport": True}, {"ioreport": False}, {"ioreport": 0},
+                                                       {"no_ioreport": True}, {"ioreport": True, "no_ioreport": True})]
+rung = oomphd.full_speed_rung(P, log_dir=tempfile.mkdtemp(prefix="oomph-ioreport-")) if MAC else None
+os.environ["OOMPH_IOREPORT"] = "0"
+wanted.append(oomph.ioreport_wanted(config={}))
+os.environ.pop("OOMPH_IOREPORT")
+os.environ["OOMPH_NO_IOREPORT"] = "1"
+wanted.append(oomph.ioreport_wanted(config={}))
+os.environ.pop("OOMPH_NO_IOREPORT")
+nfs = oomph._no_full_speed
+oomph._no_full_speed = lambda: False
+dg_on = oomph._doctor_gpu(None, "kick")
+oomph._no_full_speed = lambda: True
+dg_none = oomph._doctor_gpu(None, "kick")
+oomph._no_full_speed = lambda: False
+os.environ["OOMPH_IOREPORT"] = "0"
+dg_off = oomph._doctor_gpu(None, "kick")
+oomph._no_full_speed = nfs
+oomph.IOREPORT_DEFAULT = False  # the opt-in's doctor lines below
+check(wanted == [True, True, False, False, False, False, False, False] and
+      (not MAC or isinstance(rung, oomphd.FullSpeed)) and oomphd.full_speed_rung(StubPlat()) is None,
+      "full speed on by default (the switch thrown): no setting starts it; \"ioreport\": false, OOMPH_IOREPORT=0 or "
+      "no_ioreport stops it (%s; the logger's rung: %s)" % (wanted, type(rung).__name__))
+check("on by default" in dg_on[2] and not any("sudo" in str(x) for x in dg_on) and "not available here" in dg_none[2]
+      and "switched off" in dg_off[2] and len(dg_off) == 3,
+      "doctor with full speed on by default: says so and offers no sudo command; where it cannot work, says that; "
+      "switched off, says by what (%s | %s)" % (dg_on[2], dg_off[2]))
+print("note  full speed for everybody (IOREPORT_DEFAULT) is %s in this version" % ("on" if io_default else "off"))
 
 # doctor: a designed state is a note, a broken one a warning; no "switch it on" where the figure cannot work
 nfs = oomph._no_full_speed
@@ -1956,6 +2140,7 @@ check([d[1] for d in dg] == ["note", "note", "warn", "warn"] and "reinstall" in 
       len(no_table) == 3 and "not available here" in no_table[2] and len(table) == 4 and "sudo" in table[3],
       "doctor: no table or channel is a note, a missing helper or bad readings a warning; the opt-in is offered only "
       "where the figure can work")
+oomph.IOREPORT_DEFAULT = io_default
 
 # the helper's protocol, with stand-ins for it: a good one, one that crashes four ways, one whose readings never fit
 ird = tempfile.mkdtemp(prefix="oomph-ioreport-")
