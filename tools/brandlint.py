@@ -145,6 +145,8 @@ def why_ok(s, i):
     m = re.match(r" ([a-z][a-z-]*)\b", after)
     if m and m.group(1) in SUBCOMMANDS:
         return "a command (oomph %s)" % m.group(1)
+    if re.match(r" --machine\b", after):
+        return "a command (oomph --machine NAME …)"
     if m and m.group(1) == "skill":
         return "the skill's name"
     if re.search(r"\bclaude mcp \w+( --scope \w+)? $", before) or re.search(r"\bMCP +$", before):

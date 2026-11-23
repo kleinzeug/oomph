@@ -559,6 +559,36 @@ silent logger), and `--no-connect` shows the mirrors without connecting (`oomph 
 always runs so on the far side); `oomph top --once --machine NAME` prints that tab's frame. On a Mac for now:
 a Linux machine becomes a viewer in a later release.
 
+**Reading another machine** (1.10.6). `check`, `status`, `reservations`, `incidents`, `incident`,
+`report`, `html`, `ai-report` and `top` take `--machine NAME` (a name `oomph remote list` shows),
+before the command or after it:
+
+```sh
+oomph --machine studio check [--json]    # its verdict and reservations; exit 3 when it can't be reached
+                                         # and its latest sample is old (so a script tells it from tight),
+                                         # 4 when its data is not one this oomph reads,
+                                         # 64 when no machine has that name here
+oomph --machine studio status | reservations | incidents | report --last 2h
+oomph --machine studio html --last 6h --open          # a report of it, drawn here
+oomph --machine studio incident 20261120-120000 --html
+```
+
+Unless its link is live already (or `--no-connect`), the command connects once first and catches up
+its current sample, ledger and incidents. A report always connects (unless `--no-connect`) to fetch
+the full samples of its window (its last day at most), kept a day in its mirror's `full/`; an AI
+analysis also fetches the system logs of the latest incidents in its window. Reports are drawn **on this machine** by this machine's code: a page another machine
+wrote is never opened. Without `-o` a page goes to `reports/` in oomph's state folder. What came from the other machine (process names, paths, purposes) is said
+to be its text: a line above the output, `"origin": "remote:studio"` and the list of such fields in
+the JSON, and a sentence in the AI analysis's prompt and tool results. Nothing is measured here
+and nothing written there: `reserve`, `run`, `release`, `amend`, `wait`, `hook` and the others
+are refused with `--machine`, and so are `ps`, `resources`, `volumes`, `session` and `doctor`, which
+measure the machine they run on. In the app (with `machinesUI`) Report and an incident's row do the
+same for the selected tab, and `o` in `oomph top`.
+
+**Links** (1.10.6): the app opens `oomph://CODE@HOST` links (from a message, a page or
+`open 'oomph://…'`). With `machinesUI` on, the popup opens at the + with the link filled in, at the
+code step with the host shown; nothing is sent until Pair. Without the switch a link does nothing.
+
 ## Files
 
 | Path | What |
@@ -624,7 +654,7 @@ daemon/oomph_ioreport.py          the IOReport helper: the GPU's performance sta
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)
-daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer
+daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer; `--machine`
 daemon/local.oomph.daemon.plist   the LaunchDaemon job
 app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Charts)
 app/Info.plist

@@ -286,7 +286,7 @@ check(html.count("<svg") >= 3, "HTML report contains its charts")
 check("by %s %s</p>" % (oomph.BRAND, oomph.VERSION) in html and "id=oomph-data" in html,
       "HTML report: the footer names BRAND, the data element keeps its id")
 blob = re.search(r'<script type="application/json" id=oomph-data>(.*?)</script>', html, re.S)
-rd = json.loads(blob.group(1).replace("<\\/", "</")) if blob else {}
+rd = json.loads(blob.group(1)) if blob and "<" not in blob.group(1) else {}  # every < escaped (1.10.6)
 vw = rd.get("views") or {}
 first = next(iter(vw.values()), {})
 check(first.get("procs") and first.get("apps") is not None and isinstance(rd.get("events"), list),
@@ -2771,6 +2771,16 @@ for line in r.stdout.splitlines():
         print("    share: " + line)
 check(r.returncode == 0, "remote machines (tools/sharetest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                       + r.stderr[-400:]))
+
+# another machine read here (1.10.6, R2): full samples and incident files, `--machine`, reports drawn here, and the
+# gate: a report over hostile strings has only the template's elements (tools/reporttest.py, a file of its own)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "reporttest.py")], capture_output=True, text=True,
+                   timeout=600, env={k: v for k, v in os.environ.items() if not k.startswith("OOMPH_")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("   report: " + line)
+check(r.returncode == 0, "another machine read here (tools/reporttest.py): %s" % (
+    (r.stdout.strip().splitlines() or [""])[-1] + r.stderr[-400:]))
 
 # Linux for agents (1.9.4): the Linux backend on recorded machines, here too; the exit codes of the CLI on this
 # system (the same table on a Mac and on Linux); on Linux the live backend and linux/install.sh (tools/linuxtest.py)

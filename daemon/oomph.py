@@ -59,6 +59,13 @@ other machines (read-only, Mac to Mac over TLS, or anything with `oomph` over ss
   oomph remote sync [--json]        keep the watched machines' mirrors live (what the app runs)
   oomph remote sync --once [NAME]   catch up once, then exit
   oomph serve --stdio               answer for this machine on stdin/stdout, read only (what ssh runs)
+  oomph --machine NAME check|status|reservations|incidents|incident|report|html|ai-report [--no-connect]
+                                    the same for a machine `remote list` shows, read only: it catches up
+                                    first unless the link is live; its names, paths and purposes are that
+                                    machine's text; reports are drawn here from its data (check: exit 3
+                                    when it can't be reached and its data is old, 4 when its data
+                                    can't be read here; any: 64 when no machine has that name here);
+                                    the option may also follow the command
 """
 import datetime
 import functools
@@ -194,6 +201,14 @@ def _path(kind):
 
 STATE_DIR = os.environ.get("OOMPH_STATE_DIR") or _path("state")
 LOG_DIR = os.environ.get("OOMPH_DIR", PATHS_HERE["log"])
+# `oomph --machine NAME …` (roadmap 01 §4.8, §9; oomph_sync.cmd_machine) points LOG_DIR and LEDGER_DIR at
+# another machine's mirror and sets these: what it is (None: this machine), its clock against this one's,
+# and where the full samples fetched for a report are (FULL_DIR, covering FULL_SPANS of its time).
+REMOTE = None
+CLOCK_S = 0.0
+DAY_PAD = 0          # days read on either side of a window: another machine names its files by its own dates
+FULL_DIR = None
+FULL_SPANS = ()
 
 # What the daemon reads from the unified log. On macOS 27 memory kills show up as
 # launchd exits with OS_REASON_JETSAM and as ReportSystemMemory batch lines
@@ -272,8 +287,8 @@ def term_text(x):
 
 
 def _day_range(since, until):
-    d = datetime.date.fromtimestamp(since)
-    end = datetime.date.fromtimestamp(until)
+    d = datetime.date.fromtimestamp(since) - datetime.timedelta(days=DAY_PAD)
+    end = datetime.date.fromtimestamp(until) + datetime.timedelta(days=DAY_PAD)
     while d <= end:
         yield d.isoformat()
         d += datetime.timedelta(days=1)
@@ -289,32 +304,61 @@ def _read_lines(path):
         return
 
 
+def _sources(since, until):
+    """(directory, from, to) to read a window's samples from: LOG_DIR, except where FULL_DIR holds the
+    full samples fetched from another machine for a report (FULL_SPANS), which then stand in for the
+    mirror's slim ones (roadmap 01 §4.8)."""
+    out, at = [], since
+    for a, b in sorted(FULL_SPANS) if FULL_DIR else ():
+        a, b = max(a, at), min(b, until)
+        if a > b:
+            continue
+        if a > at:
+            out.append((LOG_DIR, at, math.nextafter(a, -math.inf)))
+        out.append((FULL_DIR, a, b))
+        at = math.nextafter(b, math.inf)
+    if at <= until:
+        out.append((LOG_DIR, at, until))
+    return out
+
+
+def _day_paths(d, since, until):
+    return [p for day in _day_range(since, until)
+            for p in (os.path.join(d, "samples-%s.jsonl.gz" % day), os.path.join(d, "samples-%s.jsonl" % day))
+            if os.path.exists(p)]
+
+
+def _retyped(d):
+    """Whether the samples read from `d` are retyped as they are read: another machine's summary samples
+    (R2). Its full samples were rebuilt with their types as they were fetched (oomph_sync.fetch_full)."""
+    return REMOTE is not None and d != FULL_DIR
+
+
 def load_samples(since, until):
     out = []
-    for day in _day_range(since, until):
-        for path in (os.path.join(LOG_DIR, "samples-%s.jsonl.gz" % day),
-                     os.path.join(LOG_DIR, "samples-%s.jsonl" % day)):
-            if not os.path.exists(path):
-                continue
+    for d, a, b in _sources(since, until):
+        typed = _retyped(d)
+        for path in _day_paths(d, a, b):
             for line in _read_lines(path):
                 try:
                     s = json.loads(line)
                 except ValueError:
                     continue
-                if since <= s.get("t", 0) <= until:
-                    out.append(s)
+                if isinstance(s, dict) and _t(s.get("t")) and a <= s["t"] <= b:
+                    # another machine's: with the types the readers here rely on (R2)
+                    out.append(typed_sample(s) if typed else s)
     out.sort(key=lambda s: s["t"])
     return out
 
 
-def _samples_in(path, since, until):
+def _samples_in(path, since, until, typed=False):
     for line in _read_lines(path):
         try:
             s = json.loads(line)
         except ValueError:
             continue
-        if since <= s.get("t", 0) <= until:
-            yield s
+        if isinstance(s, dict) and _t(s.get("t")) and since <= s["t"] <= until:
+            yield typed_sample(s) if typed else s
 
 
 def iter_samples(since, until):
@@ -323,10 +367,9 @@ def iter_samples(since, until):
     the files gives load_samples' order without sorting them all. Only a wall clock set
     back makes a file go back in time; its samples then come in the order they were
     written, which moves a summary's from/to and a chart point or two, nothing more."""
-    paths = [p for day in _day_range(since, until)
-             for p in (os.path.join(LOG_DIR, "samples-%s.jsonl.gz" % day), os.path.join(LOG_DIR, "samples-%s.jsonl" % day))
-             if os.path.exists(p)]
-    return heapq.merge(*[_samples_in(p, since, until) for p in paths], key=lambda s: s["t"])
+    return heapq.merge(*[_samples_in(p, a, b, _retyped(d)) for d, a, b in _sources(since, until)
+                         for p in _day_paths(d, a, b)],
+                       key=lambda s: s["t"])
 
 
 class SampleWindow:
@@ -340,16 +383,31 @@ class SampleWindow:
         return iter_samples(self.since, self.until)
 
 
+def _event(e):
+    """An event with the types its readers rely on (another machine's may have anything, R2): a time,
+    a kind and an iso string; a pressure change's levels small integers, else not one."""
+    if not (isinstance(e, dict) and _t(e.get("t"))):
+        return None
+    if not isinstance(e.get("iso"), str):
+        e["iso"] = datetime.datetime.fromtimestamp(e["t"]).astimezone().isoformat(timespec="seconds")
+    if not isinstance(e.get("kind"), str):
+        e["kind"] = "?"
+    if e["kind"] == "pressure_change" and not all(isinstance(e.get(k), int) and not isinstance(e.get(k), bool)
+                                                  for k in ("old", "new")):
+        e["kind"] = "pressure"
+    return e
+
+
 def load_events(since, until):
     out = []
     for path in (os.path.join(LOG_DIR, "events.jsonl.1"), os.path.join(LOG_DIR, "events.jsonl")):
         if os.path.exists(path):
             for line in _read_lines(path):
                 try:
-                    e = json.loads(line)
+                    e = _event(json.loads(line))
                 except ValueError:
                     continue
-                if since <= e.get("t", 0) <= until:
+                if e is not None and since <= e["t"] <= until:
                     out.append(e)
     out.sort(key=lambda e: e["t"])
     return out
@@ -400,6 +458,9 @@ FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "p
               "top_gpu": (5, ("pid", "name", "g", "s", "gpu")),
               "top_io": (5, ("pid", "name", "g", "s", "w")),
               "cpu_names": (5, ("name", "cpu", "n"))}
+# ... and in the full samples of a report window another machine asks for (R2, roadmap 01 §4.8), the disks
+# with what a report's panels draw: names and sizes, never mount paths
+REPORT_DISKS = (16, ("id", "name", "kind", "total_gb", "free_gb", "low_gb", "crit_gb", "watch", "roles"))
 FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root")
 FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
 
@@ -504,6 +565,146 @@ def full_sample(s):
                 mm["measures"] = {k[:SLIM_STR]: _scalar(v, SLIM_STR) for k, v in list(m["measures"].items())[:32]
                                   if isinstance(k, str) and _scalar(v, SLIM_STR) is not _NOT}
             out["daemon"]["machine"] = mm
+    return out
+
+
+def report_sample(s):
+    """A logged sample as it may leave the machine for a report rendered elsewhere (`samples` with
+    `full`, R2): the full sample's named fields, plus the disks (REPORT_DISKS)."""
+    out = full_sample(s)
+    cap, keys = REPORT_DISKS
+    v = _block(s.get("disks"), cap, keys, LIMITS["str"])
+    if v is not _NOT:
+        out["disks"] = v
+    return out
+
+
+# The types the readers of a sample rely on, by field name (R2: another machine's sample may come from
+# an older or newer oomph, or a hostile one, and the code here was written for this machine's own; 01 §4.8).
+TYPED_INT = frozenset(("pid", "ppid", "uid", "s"))
+TYPED_NUM = frozenset(("t", "mb", "rss_mb", "own_mb", "cpu", "gpu", "w", "n", "pressure", "free_pct", "swapfiles",
+                       "swapins", "swapouts", "jetsam_kills", "busy", "user", "sys", "p", "e", "p_busy", "e_busy",
+                       "therm", "util", "active", "now", "interval", "started", "cpus", "idle_s", "for_min",
+                       "expires_in_min", "waiting_min", "r_mb_s", "w_mb_s", "some", "mem_some", "mem_full",
+                       "mem_some60", "mem_full60", "cpu_some", "io_some", "io_full", "commit_pct", "overcommit"))
+TYPED_STR = frozenset(("name", "g", "pn", "cwd", "purpose", "project", "iso", "os", "id", "state", "kind", "by", "src",
+                       "version", "incident", "arch", "os_version", "kernel", "virt", "level", "dev", "fs", "mount"))
+TYPED_STRS = frozenset(("sleep_preventers", "roles", "cgroups"))   # lists of strings
+TYPED_DICT = frozenset(("cpu", "io", "psi", "scope", "linux", "away", "daemon", "machine", "measures", "limit"))
+TYPED_LIST = frozenset(("gpu", "disks", "killed", "top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu",
+                        "top_io", "cpu_names", "load"))
+# what an item of a list (or `biggest`) is known by: without it, it is dropped
+TYPED_NEEDS = {"top": ("pid", "name", "mb"), "groups": ("name", "mb", "n"), "claude": ("pid", "mb"),
+               "gone": ("pid", "name", "mb"), "top_cpu": ("pid", "name", "cpu"), "top_gpu": ("pid", "name", "gpu"),
+               "top_io": ("pid", "name", "w"), "cpu_names": ("name", "cpu"), "leases": ("id", "state", "gb"),
+               "killed": ("name",), "disks": ("id", "free_gb"), "gpu": ("id",), "biggest": ("pid", "name", "mb")}
+# ... and what a current sample is judged by (check, status): without one of these it is no sample
+TYPED_CURRENT = ("t", "pressure", "ram_gb", "app_gb", "wired_gb", "compressed_gb", "cached_gb", "free_gb")
+
+
+def _retype(v, key, top, depth=0):
+    """v typed as its name says (TYPED_*), or _NOT. `top`: v is a field of the sample itself, where
+    `cpu` and `gpu` are blocks; below, they are numbers."""
+    if depth > 8:
+        return _NOT
+    if key == "measures":  # the logger's words for how it measures: names of methods, flags (daemon.machine)
+        return {k: x for k, x in list(v.items())[:64] if isinstance(k, str) and (
+            x is None or isinstance(x, (str, bool)) or _fin(x))} if isinstance(v, dict) else _NOT
+    if top and key in TYPED_DICT or not top and key in TYPED_DICT - {"cpu"}:
+        if not isinstance(v, dict):
+            return _NOT
+    elif top and key in TYPED_LIST or not top and key in TYPED_LIST - {"gpu"}:
+        if not isinstance(v, list):
+            return _NOT
+    elif key in TYPED_STRS:
+        return [x for x in v[:64] if isinstance(x, str)] if isinstance(v, list) else _NOT
+    elif key in TYPED_INT:
+        return v if v is None or isinstance(v, int) and not isinstance(v, bool) and abs(v) < 2 ** 53 else _NOT
+    elif key in TYPED_NUM or key.endswith("_gb"):
+        return v if v is None or _fin(v) else _NOT
+    elif key in TYPED_STR:
+        return v if v is None or isinstance(v, str) else _NOT
+    if isinstance(v, dict):
+        out = _retype_dict(v, depth)
+        need = TYPED_NEEDS.get(key) if key == "biggest" else None
+        return None if need and any(out.get(k) is None for k in need) else out
+    if isinstance(v, list):
+        need = TYPED_NEEDS.get(key)
+        items = [_retype_dict(x, depth + 1) if isinstance(x, dict) else _retype(x, "", False, depth + 1) for x in v[:4096]]
+        return [x for x in items if x is not _NOT and (not need or isinstance(x, dict) and
+                                                       all(x.get(k) is not None for k in need))]
+    return v if v is None or isinstance(v, (str, bool)) or _fin(v) else _NOT
+
+
+def _retype_dict(v, depth):
+    out = {}
+    for k, x in v.items():
+        x = _retype(x, k, False, depth + 1) if isinstance(k, str) else _NOT
+        if x is not _NOT:
+            out[k] = x
+    return out
+
+
+def typed_sample(s):
+    """A sample with the types its readers rely on (TYPED_*): a field of the wrong type is dropped (a
+    number that is null at the top too, so `.get(k, default)` holds), a list item without its pid,
+    name or size goes. None for what is not a sample at all."""
+    if not (isinstance(s, dict) and _t(s.get("t"))):
+        return None
+    out = {}
+    for k, v in s.items():
+        v = _retype(v, k, True) if isinstance(k, str) else _NOT
+        if v is not _NOT and not (v is None and (k in TYPED_NUM or k.endswith("_gb"))):
+            out[k] = v
+    return out
+
+
+def typed_current(s):
+    """typed_sample of a current sample, or None when one of what it is judged by (TYPED_CURRENT) is
+    missing, or its pressure is not a level."""
+    s = typed_sample(s)
+    ok = s is not None and all(_fin(s.get(k)) for k in TYPED_CURRENT) and \
+        isinstance(s["pressure"], int) and 0 <= s["pressure"] <= 4
+    return s if ok else None
+
+
+def typed_incident(inc):
+    """An incident record with the types its readers rely on (another machine's may hold anything, R2):
+    a string id and a start time, else None; end and last_trigger times or absent, reasons dicts with a
+    time, kind and description, a summary an object."""
+    if not (isinstance(inc, dict) and isinstance(inc.get("id"), str) and _t(inc.get("start"))):
+        return None
+    out = dict(inc)
+    for k in ("end", "last_trigger"):
+        if k in out and not _t(out[k]):
+            del out[k]
+    rs = out.get("reasons") if isinstance(out.get("reasons"), list) else []
+    out["reasons"] = [dict(r, kind=r["kind"] if isinstance(r.get("kind"), str) else "?",
+                           desc=r["desc"] if isinstance(r.get("desc"), str) else "")
+                      for r in rs[:200] if isinstance(r, dict) and _t(r.get("t"))]
+    out["summary"] = _typed_summary(out.get("summary")) if isinstance(out.get("summary"), dict) else {}
+    out["open"] = out.get("open") is True
+    return out
+
+
+def _typed_summary(summ):
+    """An incident's summary (summarize()) typed as a sample's fields are, but for the two of its own
+    whose names would say otherwise: `onset.pressure` is a level's name, `min_free_gb` a map of disk
+    id to GB."""
+    out = {}
+    for k, v in summ.items():
+        if k == "min_free_gb":
+            v = {d: x for d, x in list(v.items())[:64] if isinstance(d, str) and _fin(x)} \
+                if isinstance(v, dict) else _NOT
+        elif k == "onset" and isinstance(v, dict):
+            p = v.get("pressure")
+            v = _retype_dict({x: y for x, y in v.items() if x != "pressure"}, 0)
+            if p is None or isinstance(p, str):
+                v["pressure"] = p
+        else:
+            v = _retype(v, k, False) if isinstance(k, str) else _NOT
+        if v is not _NOT:
+            out[k] = v
     return out
 
 
@@ -851,6 +1052,8 @@ def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB
     W, H, L, R, T, B = 960, height, 48, 10, 10, 26
     if not samples:
         return "<p class=sub>No samples.</p>"
+    if not series:  # e.g. no app groups: another machine's summary samples hold none (R2)
+        return "<p class=sub>Not in these samples.</p>"
     t0 = samples[0]["t"] if t0 is None else min(t0, samples[0]["t"])
     t1 = samples[-1]["t"] if t1 is None else max(t1, samples[-1]["t"])
     if t1 == t0:
@@ -1419,7 +1622,9 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
     def seg(target):
         return ('<div class=seg data-for="%s"><button class=on data-mode=list>List</button>'
                 '<button data-mode=tree>Tree</button></div>' % target)
-    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    # no `<` at all in the data block: neither `</script>` nor `<!--<script` (which would run the block on
+    # past the page's own script) can come from a name in it, this machine's or another's (R2)
+    blob = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
         "<title>%s</title><style>%s%s%s</style></head><body data-view=\"%s\"><main>" % (_e(title), CSS, view_css, extra_css, first),
@@ -1447,17 +1652,17 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
     return "".join(parts)
 
 
-def incident_html(inc):
+def incident_html(inc, title=None, intro_html=""):
     """An incident's report: the incident itself (from 15 min before it opened), plus the
     24h / 6h / 1h before it settled (its last trigger, plus the time it takes to close)."""
     start = inc["start"]
-    end = inc.get("end") or time.time()
+    end = inc.get("end") or time.time() + CLOCK_S
     anchor = end if inc.get("open") else min(end, inc.get("last_trigger", end) + 180)
     lo = min(start - 900, anchor - 86400)
     samples, events = SampleWindow(lo, end), load_events(lo, end)
     views = [("incident", "Incident", start - 900, end)] + [(k, k, anchor - sec, anchor) for k, sec in VIEW_SPANS]
-    title = "Memory incident %s%s" % (inc["id"], " (open)" if inc.get("open") else "")
-    return render_html(samples, events, title, inc, views)
+    title = title or "Memory incident %s%s" % (inc["id"], " (open)" if inc.get("open") else "")
+    return render_html(samples, events, title, inc, views, intro_html=intro_html)
 
 
 REPORT_JS = r"""
@@ -1761,7 +1966,7 @@ def parse_time(s):
 
 
 def window(args, default="2h"):
-    until = time.time()
+    until = time.time() + CLOCK_S  # another machine's now, by its clock (--machine)
     since = None
     i = 0
     while i < len(args):
@@ -1835,15 +2040,16 @@ def wrap(text, width=None, first="", indent=2):
                                     break_long_words=False, break_on_hyphens=False)) or first.rstrip()
 
 
-def cmd_status():
+def cmd_status(c=None):
+    """`oomph status` from the logger's current sample; `c`: another machine's, typed (--machine, R2)."""
     p = os.path.join(LOG_DIR, "current.json")
-    if not os.path.exists(p) and sys.platform.startswith("linux"):
+    if c is None and not os.path.exists(p) and sys.platform.startswith("linux"):
         return cmd_status_live()
-    if not os.path.exists(p):
+    if c is None and not os.path.exists(p):
         print("oomph: no data in %s — daemon not installed or not running" % LOG_DIR)
         return 1
-    c = json.load(open(p))
-    age = time.time() - c["t"]
+    c = json.load(open(p)) if c is None else c
+    age = time.time() + CLOCK_S - c["t"]
     d = c.get("daemon", {})
     alive = age < 3 * (d.get("interval") or 30) + 10
     a = c.get("away") or {}
@@ -1852,24 +2058,28 @@ def cmd_status():
     def line(label, text):
         print(wrap(text, w, "%-11s" % label, 11))
     line("daemon", "%s (pid %s, v%s, sample %ds ago, interval %ss%s)" % (
-        "running" if alive else "NOT RUNNING", d.get("pid"), d.get("version"), age, d.get("interval"),
+        "running" if alive else "not connected" if REMOTE and REMOTE.get("stale") else "NOT RUNNING",
+        d.get("pid"), d.get("version"), age, d.get("interval"),
         ", root" if d.get("root") else ", NOT root"))
     line("pressure", "%s   free %s%%" % (PRESSURE.get(c["pressure"], c["pressure"]), c.get("free_pct")))
     line("memory", "RAM %.0f GB · app %.1f · wired %.1f · compressed %.1f · cached %.1f · free %.1f GB" % (
         c["ram_gb"], c["app_gb"], c["wired_gb"], c["compressed_gb"], c["cached_gb"], c["free_gb"]))
-    line("swap", "%.1f / %.1f GB used (%d swapfiles)" % (c["swap_used_gb"], c["swap_total_gb"], c["swapfiles"]))
+    line("swap", "%.1f / %.1f GB used (%d swapfiles)" % (c.get("swap_used_gb") or 0, c.get("swap_total_gb") or 0,
+                                                       c.get("swapfiles") or 0))
     u = unowned_gb(c)
     if u is not None:
         line("unowned", "%.1f GB held outside any process%s" % (
             u, "  <- LEAK? only a restart frees it" if u >= unowned_limit_gb(c["ram_gb"]) else ""))
-    res = resource_lines(c, *volume_prefs(), io=True)
-    if not c.get("disks"):  # a logger before 1.9.1
+    # this user's disk choices are this machine's disks' (another's are shown as its logger has them)
+    res = resource_lines(c, *(volume_prefs() if REMOTE is None else (set(), set())), io=True)
+    if not c.get("disks") and _num(c.get("disk_free_gb")):  # a logger before 1.9.1
         line("disk", "%.0f GB free" % c["disk_free_gb"])
-    for label, text in res if logger_measures(c) else ():
-        line(label, text)
-    line("you", "idle %ss · display %s · %s · sleep held by %s" % (
-        a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
-        ", ".join(a.get("sleep_preventers") or []) or "nobody"))
+    for label, text in res if logger_measures(c) else ():  # `check --measure` would measure this machine
+        line(label, "not in its latest sample" if REMOTE is not None and "--measure" in text else text)
+    you = ["idle %ss" % a["idle_s"]] if _n(a.get("idle_s")) is not None else []  # none on Linux (no display session)
+    you += ["display %s" % ("on" if a["display_on"] else "off")] if a.get("display_on") is not None else []
+    line("you", " · ".join(you + ["locked" if a.get("locked") else "unlocked", "sleep held by %s" % (
+        ", ".join(a.get("sleep_preventers") or []) or "nobody")]))
     if d.get("incident"):
         line("INCIDENT", "open: %s" % d["incident"])
     print("\ntop apps:")
@@ -2012,7 +2222,7 @@ def cmd_report(args):
     if notable:
         print("\nevents:")
         for e in notable[-30:]:
-            print("  %s  %-16s %s" % (term_text(e["iso"][11:19]), term_text(e["kind"])[:40],
+            print("  %s  %-16s %s" % (term_text(str(e.get("iso") or "")[11:19]), term_text(str(e.get("kind")))[:40],
                                       cut_end(term_text(_event_detail(e)), w - 29)))
     return 0
 
@@ -2051,11 +2261,12 @@ def list_incidents():
     out = []
     for f in sorted(glob.glob(os.path.join(LOG_DIR, "incidents", "*", "incident.json"))):
         try:
-            inc = json.load(open(f))
+            inc = typed_incident(json.load(open(f)))
         except Exception:
             continue
-        inc["dir"] = os.path.dirname(f)
-        out.append(inc)
+        if inc is not None:
+            inc["dir"] = os.path.dirname(f)
+            out.append(inc)
     return out
 
 
@@ -2072,7 +2283,7 @@ def cmd_incidents():
     w = max(80, term_width())
     print(INCIDENT_ROW % ("incident", "took", "state", "kills", "headline"))
     for i in incs:
-        dur = ("%dm" % ((i.get("end", time.time()) - i["start"]) // 60))
+        dur = ("%dm" % ((i.get("end", time.time() + CLOCK_S) - i["start"]) // 60))
         kills = (i.get("summary") or {}).get("jetsam_kills")
         head = (i.get("reasons") or [{}])[0].get("desc", "")
         print(wrap(head, w, INCIDENT_ROW % (i["id"], dur, "OPEN" if i.get("open") else "",
@@ -2169,6 +2380,8 @@ def _daemon_sample(max_age=45):
 
 
 def live_sample(with_procs=True):
+    if REMOTE is not None:  # never measure this machine and report it under another's name (01 §9)
+        raise Unsupported("%s is another machine: nothing of it is measured here" % REMOTE.get("label"))
     P = plat()
     s = {"t": round(time.time(), 1), "iso": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
          "source": "live", "os": P.OS}
@@ -2335,17 +2548,19 @@ def verdict(s):
     return v
 
 
-def verdict_line(v, width=None, lines=()):
+def verdict_line(v, width=None, lines=(), there=None):
     """The verdict as `oomph check` and the hook print it, wrapped at `width` (the terminal's);
-    `lines`: (label, text) of the other resources, which `check` prints before the advice."""
+    `lines`: (label, text) of the other resources, which `check` prints before the advice. `there`:
+    another machine's name (--machine): its reservations are all others', and it is named."""
     w = width or term_width()
     lin = v.get("os") == "linux"
+    who = "%s (%s): " % (CMD, there) if there else CMD + ": "
     if lin:  # 03 F5: "available", no disk (it does not enter the Linux verdict)
-        out = [wrap("oomph: %s — %.1fG available of %s · pressure %s · swap %.1f/%.1fG" % (
+        out = [wrap(who + "%s — %.1fG available of %s · pressure %s · swap %.1f/%.1fG" % (
             v["level"].upper(), v["free_gb"], ("%.0fG" if v["ram_gb"] >= 10 else "%.1fG") % v["ram_gb"], v["pressure"],
             v["swap_used_gb"] or 0, v["swap_total_gb"] or 0), w)]
     else:
-        out = [wrap("oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
+        out = [wrap(who + "%s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
             v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
             v["swap_total_gb"] or 0, v["disk_free_gb"]), w)]
     sc = v.get("scope") or {}
@@ -2359,9 +2574,14 @@ def verdict_line(v, width=None, lines=()):
     if c.get("others") or c.get("mine"):
         g = [o for o in c["others"] if o["state"] == "granted"]
         q = [o for o in c["others"] if o["state"] == "queued"]
-        out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG %s"
-                        % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"],
-                           "left for you" if lin else "available to you"), w, "  reservations: "))
+        if there:
+            out.append(wrap("%d held there (%.1fG not yet used), %d waiting · %.1fG %s there"
+                            % (len(g), c["reserved_by_others_gb"], len(q), c["available_to_me_gb"],
+                               "left to grant" if lin else "available"), w, "  reservations: "))
+        else:
+            out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG %s"
+                            % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"],
+                               "left for you" if lin else "available to you"), w, "  reservations: "))
     led = c.get("ledger") or {}
     if lin and led.get("kind") == "user":
         out.append(wrap("your own sessions only (%s)" % _home_short(led.get("path") or ""), w, "  ledger: "))
@@ -4620,7 +4840,7 @@ def _span(rec, now):
 def reservation_history(since_s=24 * 3600, limit=50):
     """Finished reservations from the history log (last `since_s` seconds) plus the live ones,
     newest first: what each reserved, what it really used at its peak, and how it ended."""
-    now = time.time()
+    now = time.time() + CLOCK_S  # another machine's now, by its clock (--machine)
     last = {rec["key"]: rec for rec in merge_history(read_history()) if _rec_time(rec) >= now - since_s}
     for h in read_ledger()["history"]:  # finished before the log existed
         if h.get("ended", 0) >= now - since_s:
@@ -4743,7 +4963,7 @@ def ledger_snapshot(procs=None):
         L = read_ledger()
     except Exception:
         return []
-    now = time.time()
+    now = time.time() + CLOCK_S  # another machine's ledger is judged by its clock (--machine)
     out = []
     for r in L["leases"]:
         if procs is not None and _holder_gone(r, procs, now):
@@ -5789,10 +6009,32 @@ def main(argv):
         return 1
 
 
+def _machine_opt(argv):
+    """(NAME, the command and its arguments) when `--machine NAME` (or `--machine=NAME`) stands anywhere
+    before a `--`, which it is a global option of (01 §9): `oomph check --machine studio` must never
+    answer for this machine. None without it, and for `top`, which takes it as its own option."""
+    if not argv or argv[0] == "top":
+        return None
+    for i, a in enumerate(argv):
+        if a == "--":
+            return None
+        if a == "--machine" or a.startswith("--machine="):
+            name = a.split("=", 1)[1] if "=" in a else (argv[i + 1] if i + 1 < len(argv) else "")
+            return name, argv[:i] + argv[i + (1 if "=" in a else 2):]
+    return None
+
+
 def _main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(usage(__doc__))
         return 0
+    m = _machine_opt(argv)
+    if m is not None:  # another machine's mirror, read only (roadmap 01 §9)
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        sys.modules.setdefault(CMD, sys.modules[__name__])  # one copy of this module: the globals it sets count
+        import oomph_sync
+        return oomph_sync.cmd_machine(*m)
     c, rest = argv[0], argv[1:]
     if c == "status":
         return cmd_status_json() if "--json" in rest else cmd_status()

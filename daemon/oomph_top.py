@@ -957,6 +957,16 @@ class Machines:
                 self.opened[mid] = (wall, self.was_live(mid, wall))
         return changed
 
+    def cli_name(self, e):
+        """What a hint tells `oomph --machine` for this machine: its label where that is a plain word the
+        command finds this machine by (Book.find's order), else its mirror id."""
+        lab = self.S.label(e)
+        ok = isinstance(lab, str) and len(lab) <= 32 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", lab) and \
+            not self.S.MID.fullmatch(lab)
+        hit = next((x for keys in (("mid", "id"), ("label",), ("name",), ("host",)) for x in self.entries
+                    if any(x.get(k) == lab for k in keys)), None) if ok else None
+        return lab if hit is not None and hit["mid"] == e["mid"] else e["mid"]
+
     def was_live(self, mid, wall):
         """01 §3.6: what status.json says the link was when this opening began."""
         st = self.files.get((mid, "status.json"))
@@ -983,7 +993,8 @@ class Machines:
         if not system and (mj.get("os") or e.get("os")) == "linux":
             system = "Linux"
         version = mj.get("version") if isinstance(mj.get("version"), str) else e.get("version")
-        return dict(mid=mid, local=False, label=S.label(e), addr=S.show_target(e), transport=e["transport"],
+        return dict(mid=mid, local=False, label=S.label(e), cli=self.cli_name(e), addr=S.show_target(e),
+                    transport=e["transport"],
                     status=st, pid_alive=self.alive.get(mid, False), cur=cur_summary(f("current.json"), wall + off),
                     sync=dict(offset_s=off, synced=sy.get("synced") if isinstance(sy.get("synced"), dict) else {},
                               have=[tuple(x) for x in have], gone=[tuple(x) for x in gone],
@@ -2887,9 +2898,20 @@ class App:
         """o: the incident's report, or with nothing selected the report for the span on screen; where
         no browser can open (over SSH, as root) the dashboard says where it is instead."""
         me = self.me
-        if getattr(self, "mid", "local") != "local":        # another machine's reports are written there
-            self.note("a report of %s: %s incident%s --html there" % (
-                view.fit(self.model.get("host") or "?", 16), oomph.CMD, " " + inc["id"] if inc else ""), "dim", 8.0)
+        mid = getattr(self, "mid", "local")
+        if mid != "local":  # another machine's report is drawn here from its data (01 §4.8, R2): --machine
+            me = me + ["--machine", mid]
+            if not (self.local_desktop() and sys.platform == "darwin"):
+                name = next((t.get("cli") for t in self.tabs() if t.get("mid") == mid), None) or mid
+                self.note("for a report: %s --machine %s %s" % (oomph.CMD, name, "incident %s --html" % inc["id"]
+                          if inc else "html --last %s -o report.html" % REPORT_LAST[self.ui["span"]]), "dim", 8.0)
+                return
+            if any(k == "report" for _, k, _, _ in self.children):
+                self.note("a report is still being written…")
+            elif self.spawn(me + (["incident", inc["id"], "--html"] if inc else
+                                  ["html", "--last", REPORT_LAST[self.ui["span"]], "--open"]), "report",
+                            "%s --machine" % oomph.CMD):
+                self.note("fetching %s's data for the report…" % view.fit(self.model.get("host") or mid, 16))
             return
         local = self.local_desktop()
         if local and any(k == "report" for _, k, _, _ in self.children):

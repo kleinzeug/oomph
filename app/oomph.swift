@@ -1492,9 +1492,13 @@ final class Store: ObservableObject {
     }
 
     func open(_ inc: Incident) {
-        // always re-render, so old incidents show in the current report design
-        runCLI(["incident", inc.id, "--html"])
+        // always re-render, so old incidents show in the current report design; another machine's is
+        // drawn here from its data, fetched for it (R2, roadmap 01 §4.8)
+        runCLI(machineArgs + ["incident", inc.id, "--html"])
     }
+
+    /// The CLI's words for the selected tab: nothing for This Mac, `--machine <mirror>` for another one.
+    var machineArgs: [String] { machine.isLocal ? [] : ["--machine", machine.mid] }
 
     // Reports are drawn by the CLI bundled with this app (reading the logs needs no
     // privileges), so they always match the app's version, even before Update.
@@ -1870,19 +1874,20 @@ final class Store: ObservableObject {
     }
 
     func runReport() {
-        if aiRunning || !machine.isLocal { return }  // another machine's reports come in R2 (1.10.3)
-        if aiConnected { runAIReport() } else { runCLI(["html", "--last", "24h", "--open"]) }
+        if aiRunning { return }
+        // another machine's report is drawn here from its data (R2); its AI analysis only where it allows it (D7)
+        if aiConnected && machine.allowsAI { runAIReport() } else { runCLI(machineArgs + ["html", "--last", "24h", "--open"]) }
     }
 
     func runAIReport() {
         aiError = nil   // a second identical failure is news again
         guard let token = reportToken(aiProvider) else {
-            if !aiOn { runCLI(["html", "--last", "24h", "--open"]) }  // the key is gone: the plain report still opens
+            if !aiOn { runCLI(machineArgs + ["html", "--last", "24h", "--open"]) }  // the key is gone: the plain report still opens
             return
         }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
-        var args = ["-I", "-B", cliPath, "ai-report", "--provider", aiProvider.rawValue, "--last", "24h", "--open"]
+        var args = ["-I", "-B", cliPath] + machineArgs + ["ai-report", "--provider", aiProvider.rawValue, "--last", "24h", "--open"]
         let model = aiModel(aiProvider)
         if !model.isEmpty { args += ["--model", model] }
         if aiProvider == .ollama { args += ["--base-url", ollamaURL] }
@@ -3531,11 +3536,11 @@ struct PopoverView: View {
                 ScrollView {
                     VStack(spacing: 2) {
                         ForEach(m.incidents) { inc in
-                            // another machine's report is rendered there, not here (R2): no click yet
-                            Button { if m.isLocal { store.open(inc) } } label: { row(inc) }
+                            // another machine's report is drawn here from its data (R2)
+                            Button { store.open(inc) } label: { row(inc) }
                                 .buttonStyle(.plain)
                                 .contextMenu {
-                                    if m.isLocal { Button("Open report") { store.open(inc) } }
+                                    Button("Open report") { store.open(inc) }
                                     Button("Copy path") {
                                         NSPasteboard.general.clearContents()
                                         NSPasteboard.general.setString(inc.dir, forType: .string)
@@ -4017,7 +4022,8 @@ struct PopoverView: View {
 
     var reportPair: some View {
         let running = store.aiRunning
-        let lit = store.aiConnected
+        let lit = store.aiConnected && store.machine.allowsAI  // another machine's data goes to AI only where it allows it (D7)
+        let of = store.machine.isLocal ? "" : " of \(store.machine.title), drawn here from its data"
         return HStack(spacing: 0) {
             Button { store.runReport() } label: {
                 ZStack {
@@ -4032,7 +4038,7 @@ struct PopoverView: View {
             .focusable(false)
             .foregroundStyle(running ? .secondary : .primary)
             .help(running ? store.aiTooltip
-                  : lit ? "AI report of the last 24 h with \(store.aiSummary)" : "Open an HTML report of the last 24 h")
+                  : lit ? "AI report of the last 24 h\(of) with \(store.aiSummary)" : "Open an HTML report of the last 24 h\(of)")
 
             Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14)
 
@@ -4063,6 +4069,7 @@ struct PopoverView: View {
             .help(running ? "Stop the AI report"
                   : store.aiConnecting ? "Checking the connection to \(store.aiProvider.title)…"
                   : lit ? "Reports include an AI analysis by \(store.aiSummary). Click to see or disconnect."
+                  : store.aiConnected ? "\(store.machine.title) does not allow AI analysis of its data: its report comes without one. Click to see the connection."
                   : "Add an AI analysis to reports")
 
             Rectangle().fill(Color.primary.opacity(0.15)).frame(width: 1, height: 14)
@@ -4261,9 +4268,18 @@ struct PopoverView: View {
         HStack {
             if !m.isLocal {
                 // another machine's pane: read-only, its own version and system, nothing of this Mac's
-                Text(["Read-only", m.info?.version.map { brand + " " + $0 }, m.info?.os_version].compactMap { $0 }.joined(separator: " · "))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
-                    .tourAnchor("actions")
+                // as much of the line as fits beside the Report group: its system goes first, then its version
+                let parts: [String] = ["Read-only", m.info?.version.map { brand + " " + $0 }, m.info?.os_version].compactMap { $0 }
+                ViewThatFits(in: .horizontal) {
+                    ForEach((1...parts.count).reversed(), id: \.self) { n in
+                        Text(parts.prefix(n).joined(separator: " · ")).lineLimit(1).fixedSize()
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                .help(parts.joined(separator: " · "))
+                .tourAnchor("actions")
+                // its reports are drawn here from its data (R2; 01 §3: in the same place as This Mac's)
+                reportPair.tourAnchor("report")
                 upgradeButtonView
             } else {
             HStack {
@@ -4859,6 +4875,27 @@ enum ShareAction {
 extension Store {
     /// The share switch and its codes run the installed CLI as root: never the bundle's copy.
     static let installedCLI = "/usr/local/libexec/oomph/oomph.py"
+
+    /// An `oomph://` link opened from elsewhere (the URL scheme, R2): it only fills the popover in, at the
+    /// code step, with the host shown; nothing is sent until Pair (roadmap 01 §7.3). Without machinesUI
+    /// it is ignored. A draft being typed, or at a step past the start, is not replaced: the popover
+    /// shows it and the link goes unused. Returns whether the popover is to be shown.
+    @discardableResult
+    func openLink(_ raw: String) -> Bool {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let n = ConnectInput.scheme.count
+        // the scheme in any case (a URL's scheme is case-insensitive); ConnectInput reads it in lower case
+        guard machinesUI, t.count <= 400, t.count > n, t.prefix(n).lowercased() == ConnectInput.scheme else { return false }
+        if busy || addProcess != nil { return false }  // an admin prompt or a pairing under way is not replaced
+        let link = ConnectInput.scheme + String(t.dropFirst(n))
+        let typed = draft.step == .start ? !draft.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            : draft.step != .paired
+        if draft.alive && typed && draft.text != link { return true }
+        draft.reset()
+        draft.text = link
+        connectTyped()
+        return true
+    }
 
     /// The + (and ⌘N): the popover, at the step the draft is at. `share` opens Share this Mac.
     func openConnect(share: Bool = false) {
@@ -5904,6 +5941,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         }
     }
 
+    /// `oomph://CODE@HOST` from a browser, a message or `open` (the app's URL scheme, R2): the popup opens
+    /// on the + with the link filled in; nothing is sent until Pair. Without machinesUI nothing happens.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let u = urls.first(where: { $0.absoluteString.lowercased().hasPrefix(ConnectInput.scheme) }) else { return }
+        guard store.openLink(u.absoluteString) else { return }
+        if !isShown { toggle() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.store.openConnect() }
+    }
+
     func tick() {
         store.local.refreshCurrent()
         store.local.loadIncidents()
@@ -6176,7 +6222,7 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
 }
 
 /// The + and its popover in a render (roadmap 01 §3.13), with `-machinesUI YES`: `--ai add`, `addhover`,
-/// `addtype[:TEXT]`, `addssh[:TARGET]`, `pair[:link]`, `addconnecting`, `adderr:CODE`, `ask`, `paired[:other]`,
+/// `addtype[:TEXT]`, `addssh[:TARGET]`, `pair[:link]`, `link[:URL]`, `addconnecting`, `adderr:CODE`, `ask`, `paired[:other]`,
 /// `share[:off|update|activate]`, `sharecode`. Recents come from OOMPH_MACHINES_DIR; everything else here
 /// is invented. `--ai tour:4` is the tour's Machines step.
 @MainActor
@@ -6206,6 +6252,8 @@ func renderConnect(_ store: Store, _ ai: String) {
     case "pair":
         d.step = .code; d.target = "studio.local"; d.fp = fp; d.fpShort = "3288 6121 2BBE 5CC8"
         if arg == "link" { d.code = "K7QF-2M9X-D4TR"; d.fp = nil; d.fpShort = "" }  // a link sends nothing before Pair
+    case "link":  // an oomph:// link opened through the URL scheme (R2): the code step, filled in, nothing sent
+        store.openLink(arg.isEmpty ? "oomph://K7QF-2M9X-D4TR@studio.local" : arg)
     case "addconnecting":
         d.step = .connecting; d.target = "studio.local"
     case "adderr":
