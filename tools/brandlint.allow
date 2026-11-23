@@ -1,3 +1,4 @@
 # Literals that say `oomph` in a sentence and are accepted for good: the exact text of one
 # string literal (as tools/brandlint.py prints it) per line, then two spaces and `#` with why.
 oomph couldn't run for %d s while the Mac was awake — the system is starved for memory  # the root logger's stall event names the logger process (a program); root's code never uses the brand
+Address, name or oomph:// link  # the connect popover's placeholder names the pairing link's URL scheme, an identifier

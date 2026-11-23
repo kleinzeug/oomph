@@ -2,7 +2,7 @@
 """Mirror fixtures for the popup (roadmap 01 §3.4, §3.5, §12): another machine's mirror, made the
 way the app will get one, so `--render-popup … --mirror DIR` can draw each state of a link.
 
-    tools/mirrorfixture.py DIR [live|offline|fetching|machines]
+    tools/mirrorfixture.py DIR [live|offline|fetching|machines|recents]
 
 writes a made-up machine ("studio": the week of tools/topfixture.py, moved so that it ends now)
 into DIR/source, mirrors it through a pipe with the real `oomph remote sync --once` into
@@ -16,7 +16,9 @@ DIR/mirror, and then sets the scene:
               pins studio (live), mini-ci (not connected), gpu-box (its key changed), lab-mini
               (Blocked by macOS: Local Network) and air (live when the popup last closed, 40 minutes
               ago: an opening draws its grace, then Connecting…, never Not connected; -openedAgo 2
-              renders the second step), and atlas, a Linux machine, which gets no tab
+              renders the second step), and atlas, a Linux machine, which gets no tab; render-01 and
+              build-box (over ssh) are Recents (not tabs), for the + and its popover (1.10.2)
+    recents   the + on the line (R1b): DIR/machines knows render-01 and build-box as Recents only
 
 Then: <app>/Contents/MacOS/oomph --render-popup out.png --mirror DIR/mirror [--dark] [--ai log], or
 for the tabs OOMPH_MACHINES_DIR=DIR/machines <app> --render-popup out.png -machinesUI YES
@@ -117,11 +119,11 @@ def main(argv):
         print(__doc__.strip())
         return 2
     out, scene = argv[0], (argv[1] if len(argv) > 1 else "offline")
-    if scene not in ("live", "offline", "fetching", "machines"):
+    if scene not in ("live", "offline", "fetching", "machines", "recents"):
         print(__doc__.strip())
         return 2
-    if scene == "machines":
-        return machines(out)
+    if scene in ("machines", "recents"):
+        return machines(out, tabs=scene == "machines")
     now = time.time()
     drop = now - 40 * 60 if scene == "offline" else now
     src, mir = os.path.join(out, "source"), os.path.join(out, "mirror")
@@ -173,9 +175,28 @@ def main(argv):
     return 0
 
 
-def machines(out):
-    """Five pinned machines (and a Linux one) in an OOMPH_MACHINES_DIR, as `oomph remote add` leaves them."""
+def recent_entries(now):
+    """Two machines this Mac was paired with that are not tabs now: Recents in the connect popover."""
+    return [{"mid": "m-5a6b7c8d9e0f1a2b", "id": "m-5a6b7c8d9e0f1a2b", "name": "render-01", "label": None, "transport": "tcp",
+             "host": "render-01.local", "port": 6674, "user": None, "addrs": ["10.0.4.23"], "fp": "sha256:" + "%064x" % 77,
+             "client": "c-00000077", "os": "macos", "os_version": "macOS 26.4", "ram_gb": 192, "version": "1.10.0", "caps": [],
+             "added": now - 20 * 86400, "last_connected": now - 2 * 86400, "pinned": False, "order": 20},
+            {"mid": "m-6b7c8d9e0f1a2b3c", "id": "m-6b7c8d9e0f1a2b3c", "name": "build-box", "label": None, "transport": "ssh",
+             "host": "build-box", "port": None, "user": "sam", "addrs": [], "fp": None, "client": None, "os": "macos",
+             "os_version": "macOS 27.1", "ram_gb": 32, "version": "1.10.0", "caps": [], "added": now - 9 * 86400,
+             "last_connected": now - 5 * 86400, "pinned": False, "order": 21}]
+
+
+def machines(out, tabs=True):
+    """Five pinned machines (and a Linux one) in an OOMPH_MACHINES_DIR, as `oomph remote add` leaves them,
+    and two Recents; with tabs False only the Recents (the + on the line)."""
     shutil.rmtree(out, ignore_errors=True)
+    if not tabs:
+        base = os.path.join(out, "machines")
+        os.makedirs(base, mode=0o700)
+        json.dump({"v": 1, "machines": recent_entries(time.time())}, open(os.path.join(base, "machines.json"), "w"), indent=1)
+        print("recents: %s (render-01 and build-box, no tab)" % base)
+        return 0
     main([os.path.join(out, "live"), "live"])
     main([os.path.join(out, "offline"), "offline"])
     base = os.path.join(out, "machines")
@@ -205,6 +226,7 @@ def machines(out):
                         "port": 6674, "user": None, "addrs": [], "fp": "sha256:" + "%064x" % (i + 1),
                         "client": "c-0000000%d" % i, "os": osname, "version": "1.10.0", "caps": [],
                         "added": now - 86400 * (3 - i), "pinned": True, "order": i + 1})
+    entries += recent_entries(now)
     json.dump({"v": 1, "machines": entries}, open(os.path.join(base, "machines.json"), "w"), indent=1)
     print("machines: %s (studio live, mini-ci not connected, gpu-box needs attention, lab-mini blocked by macOS, "
           "air reconnecting, atlas Linux: no tab)" % base)

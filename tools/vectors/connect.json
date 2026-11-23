@@ -1,0 +1,775 @@
+{
+ "expected": {
+  "ago": [
+   "just now",
+   "just now",
+   "2 min ago",
+   "59 min ago",
+   "1 h ago",
+   "23 h ago",
+   "yesterday",
+   "2 days ago",
+   "30 days ago",
+   "just now"
+  ],
+  "code": [
+   "K7QF2M9XD4TR",
+   "K7QF2M9XD4TR",
+   "011100000000",
+   null,
+   null,
+   null,
+   "K7QF2M9XD4TR",
+   null
+  ],
+  "host": [
+   "studio.local",
+   "studio.local",
+   "fe80::1%en0",
+   "atlas",
+   "atlas",
+   "::1",
+   "render-01"
+  ],
+  "kind": [
+   "tcp",
+   "tcp",
+   "tcp",
+   "ssh",
+   "ssh",
+   "ssh",
+   "tcp",
+   "link",
+   "tcp"
+  ],
+  "link": [
+   [
+    "studio.local:6674",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "studio.local",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "10.0.4.23",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "studio:7000",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "[fe80::1%en0]:6674",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "mini",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "studio",
+    "01112M9XD4TR"
+   ],
+   null,
+   null,
+   null,
+   null,
+   null,
+   [
+    "studio:",
+    "K7QF2M9XD4TR"
+   ],
+   null,
+   null,
+   null,
+   null,
+   [
+    "studio..local",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "::1",
+    "K7QF2M9XD4TR"
+   ],
+   [
+    "[::1]:6674",
+    "K7QF2M9XD4TR"
+   ],
+   null
+  ],
+  "matches": [
+   [
+    [
+     "m-7f3a9c1e5b2d4a68",
+     "studio"
+    ]
+   ],
+   [
+    [
+     "m-7f3a9c1e5b2d4a68",
+     "studio.local"
+    ]
+   ],
+   [
+    [
+     "m-5a6b7c8d9e0f1a2b",
+     "10.0.4.23"
+    ],
+    [
+     "m-1b2c3d4e5f607182",
+     "10.0.4.31"
+    ]
+   ],
+   [
+    [
+     "m-5a6b7c8d9e0f1a2b",
+     "render-01"
+    ]
+   ],
+   [
+    [
+     "m-1b2c3d4e5f607182",
+     "Mini CI"
+    ]
+   ],
+   [],
+   [],
+   [
+    [
+     "m-7f3a9c1e5b2d4a68",
+     "studio"
+    ]
+   ],
+   [
+    [
+     "m-7f3a9c1e5b2d4a68",
+     "192.168.1.20"
+    ]
+   ]
+  ],
+  "message": [
+   "studio.local answered, but sharing is off there. On studio: + › Share this Mac, or `sudo oomph share on`. This step is kept while you do that.",
+   "studio.local closed the connection right away. Sharing there is limited to the networks it was turned on for: if studio moved, run `sudo oomph share on` there. (It also does this when too many machines knock at once.)",
+   "macOS is not letting oomph reach your local network. Turn oomph on in System Settings › Privacy & Security › Local Network, then try again.",
+   "No answer from 10.0.4.23. Is it awake and on this network?",
+   "Can't find “studoi.local”.",
+   "Something answers on port 7000 there, but it isn't oomph.",
+   "oomph is not installed on atlas. Install it there, then try again.",
+   "The oomph on atlas is too old for remote access. Update it there.",
+   "That code wasn't accepted. Codes work once, for 10 minutes, and five wrong tries void them. Get a new one there.",
+   "studio's oomph is too old for remote access. Update it there.",
+   "studio's oomph is newer than this app understands. Upgrade oomph on this Mac.",
+   "studio's oomph and this app can't talk to each other. Update the older one.",
+   "Twelve machines are connected. Disconnect one to add another.",
+   "studio has as many viewers as it serves at once. Try again in a minute.",
+   "ssh could not sign in to atlas without asking for something, and oomph never types a password. Try it in a terminal: ssh sam@atlas",
+   "studio.local answered with another key than the one shown: nothing was sent. Try again, and compare the key with `oomph share status` there.",
+   "studio no longer knows this Mac: its access was revoked, or sharing was reset there. Pair again with a new code.",
+   "That isn't an address. Type a host name, host:port or user@host, or paste a pairing link.",
+   "Nothing was added. The pairing made just now was given back there and its code is used up: get a new one there to try again.",
+   "it closed"
+  ],
+  "ssh_command": [
+   "ssh -l sam -- atlas oomph serve --stdio",
+   "ssh -l sam -p 2222 -- atlas oomph serve --stdio",
+   "ssh -l deploy -- build-box oomph serve --stdio",
+   "ssh -l ann -p 22 -- fe80::1 oomph serve --stdio"
+  ]
+ },
+ "inputs": {
+  "ago": [
+   {
+    "now": 1795180000.0,
+    "t": 1795180000.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795179910.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795179880.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795176401.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795176400.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795093601.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795093600.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795007195.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1792588000.0
+   },
+   {
+    "now": 1795180000.0,
+    "t": 1795180050.0
+   }
+  ],
+  "code": [
+   {
+    "s": "K7QF-2M9X-D4TR"
+   },
+   {
+    "s": "k7qf 2m9x d4tr"
+   },
+   {
+    "s": "O1IL00000000"
+   },
+   {
+    "s": "K7QF2M9XD4T"
+   },
+   {
+    "s": "K7QF2M9XD4TU"
+   },
+   {
+    "s": ""
+   },
+   {
+    "s": "K7QF-2M9X-D4TR-"
+   },
+   {
+    "s": "ÄBCD-EFGH-JKMN"
+   }
+  ],
+  "host": [
+   {
+    "s": "studio.local"
+   },
+   {
+    "s": "studio.local:7000"
+   },
+   {
+    "s": "[fe80::1%en0]:6674"
+   },
+   {
+    "s": "sam@atlas"
+   },
+   {
+    "s": "ssh://sam@atlas:2222"
+   },
+   {
+    "s": "::1"
+   },
+   {
+    "s": "render-01"
+   }
+  ],
+  "kind": [
+   {
+    "s": "studio.local"
+   },
+   {
+    "s": "studio:7000"
+   },
+   {
+    "s": "10.0.4.23"
+   },
+   {
+    "s": "sam@atlas"
+   },
+   {
+    "s": "ssh://atlas"
+   },
+   {
+    "s": "ssh://sam@atlas:2222"
+   },
+   {
+    "s": "[fe80::1]:6674"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@studio"
+   },
+   {
+    "s": "render-01"
+   }
+  ],
+  "link": [
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@studio.local:6674"
+   },
+   {
+    "s": "oomph://k7qf2m9xd4tr@studio.local"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@10.0.4.23/"
+   },
+   {
+    "s": "  oomph://K7QF-2M9X-D4TR@studio:7000  "
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@[fe80::1%en0]:6674"
+   },
+   {
+    "s": "oomph://K7QF 2M9X D4TR@mini"
+   },
+   {
+    "s": "oomph://O1IL-2M9X-D4TR@studio"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4T@studio"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TU@studio"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@sam@atlas"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@-oProxyCommand=x"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@studio:99999"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@studio:"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@a b"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@studio/x"
+   },
+   {
+    "s": "https://K7QF-2M9X-D4TR@studio"
+   },
+   {
+    "s": "oomph://@studio"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@studio..local"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@::1"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@[::1]:6674"
+   },
+   {
+    "s": "oomph://K7QF-2M9X-D4TR@[nothex]:6674"
+   }
+  ],
+  "matches": [
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "stu"
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "STUDIO.L"
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "10.0.4"
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "ren"
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "mini"
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "x"
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": ""
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "  stu "
+   },
+   {
+    "known": [
+     {
+      "mid": "m-7f3a9c1e5b2d4a68",
+      "names": [
+       "studio",
+       "studio.local",
+       "192.168.1.20"
+      ]
+     },
+     {
+      "mid": "m-5a6b7c8d9e0f1a2b",
+      "names": [
+       "render-01",
+       "render-01.local",
+       "10.0.4.23"
+      ]
+     },
+     {
+      "mid": "m-1b2c3d4e5f607182",
+      "names": [
+       "Mini CI",
+       "mini-ci",
+       "mini-ci.local",
+       "10.0.4.31"
+      ]
+     }
+    ],
+    "text": "192.168.1.2"
+   }
+  ],
+  "message": [
+   {
+    "code": "refused",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "turned_away",
+    "detail": "",
+    "side": null,
+    "target": "studio.local:7000"
+   },
+   {
+    "code": "local_network_denied",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "timeout",
+    "detail": "",
+    "side": null,
+    "target": "10.0.4.23"
+   },
+   {
+    "code": "dns",
+    "detail": "",
+    "side": null,
+    "target": "studoi.local"
+   },
+   {
+    "code": "not_oomph",
+    "detail": "",
+    "side": null,
+    "target": "studio.local:7000"
+   },
+   {
+    "code": "not_oomph",
+    "detail": "oomph is not installed on atlas",
+    "side": null,
+    "target": "sam@atlas"
+   },
+   {
+    "code": "not_oomph",
+    "detail": "unknown command",
+    "side": null,
+    "target": "sam@atlas"
+   },
+   {
+    "code": "pair_failed",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "incompatible",
+    "detail": "",
+    "side": "old",
+    "target": "studio.local"
+   },
+   {
+    "code": "incompatible",
+    "detail": "",
+    "side": "new",
+    "target": "studio.local"
+   },
+   {
+    "code": "incompatible",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "too_many",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "busy",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "ssh",
+    "detail": "",
+    "side": null,
+    "target": "sam@atlas"
+   },
+   {
+    "code": "identity_changed",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "revoked",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "bad_address",
+    "detail": "",
+    "side": null,
+    "target": "a b"
+   },
+   {
+    "code": "ask",
+    "detail": "",
+    "side": null,
+    "target": "studio.local"
+   },
+   {
+    "code": "closed",
+    "detail": "it closed",
+    "side": null,
+    "target": "studio.local"
+   }
+  ],
+  "ssh_command": [
+   {
+    "s": "sam@atlas"
+   },
+   {
+    "s": "ssh://sam@atlas:2222"
+   },
+   {
+    "s": "ssh://deploy@build-box/"
+   },
+   {
+    "s": "ann@[fe80::1]:22"
+   }
+  ]
+ }
+}

@@ -11,7 +11,10 @@ it. All data is invented.
 """
 import atexit
 import base64
+import contextlib
+import errno
 import hashlib
+import io
 import json
 import os
 import random
@@ -252,6 +255,165 @@ def run_root():
 
 
 RUN_NAMES = ("clients.json", "pairing.json", "summary.json", "network.json", "lock")
+
+
+def popover(tmp):
+    """What the app's connect popover and Share this Mac run (roadmap 01 §3.7, §3.10; 1.10.2): the link
+    share prints, the key in share status, needs_code with that key, a pairing bound to the key shown,
+    the link as a target, no first sync (the tab fills live), the identity question over a pipe."""
+    saved = os.environ.get("OOMPH_MACHINES_DIR")
+    os.environ["OOMPH_MACHINES_DIR"] = os.path.join(tmp, "popover", "machines")
+    share, share2 = os.path.join(tmp, "popover", "share"), os.path.join(tmp, "popover", "share2")
+    env, env2 = {"OOMPH_SHARE_DIR": share}, {"OOMPH_SHARE_DIR": share2}
+    try:
+        bad = ["oomph://K7QF@studio", "oomph://K7QF-2M9X-D4TR@sam@atlas", "oomph://K7QF-2M9X-D4TR@-oProxyCommand=x",
+               "oomph://K7QF-2M9X-D4TR@a b", "oomph://K7QF-2M9X-D4TU@studio", "https://K7QF-2M9X-D4TR@studio"]
+
+        def link_ok(s):
+            try:
+                return sync.parse_link(s)
+            except ValueError:
+                return None
+        check(link_ok("oomph://k7qf-2m9x-d4tr@studio.local:6674/") == ("studio.local:6674", "K7QF2M9XD4TR") and
+              link_ok("oomph://K7QF2M9XD4TR@[fe80::1%en0]:7000") == ("[fe80::1%en0]:7000", "K7QF2M9XD4TR") and
+              not any(map(link_ok, bad)), "pairing links: code and address in one paste; ssh logins, options and "
+                                          "wrong codes refused")
+        r = cli("share", "on", "--pair", "--json", env=env)
+        last = json.loads(r.stdout.strip().splitlines()[-1]) if r.returncode == 0 else {}
+        code = last.get("code", "")
+        check(r.returncode == 0 and last.get("link") == "oomph://%s@%s" % (code, net.local_name()) and
+              last.get("host", "").endswith(".local") and last.get("port") == net.PORT,
+              "share on --pair --json: the code with its link, the name viewers reach this Mac by (%s)" % last.get("link"))
+        st = json.loads(cli("share", "status", "--json", env=env).stdout)
+        fp = st.get("fp") or ""
+        der = ssl.PEM_cert_to_DER_cert(open(os.path.join(share, "cert.pem")).read())
+        check(fp == "sha256:" + hashlib.sha256(der).hexdigest() and st.get("host") == net.local_name(),
+              "share status --json names this machine's key (the certificate's SHA-256), no prompt needed")
+        srv = Listener(share)
+        r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--json", "--no-mirror")
+        res = json.loads(r.stdout or "{}")
+        check(r.returncode == 1 and res.get("error") == "needs_code" and res.get("fp") == fp and
+              res.get("fp_short") == " ".join(fp[7 + i:11 + i].upper() for i in range(0, 16, 4)) and
+              res.get("revoked") is False, "a new machine: needs_code with the key it presented, to show beside the code")
+        r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--json", "--code", "-", "--fp", "sha256:" + "0" * 64,
+                input=code + "\n")
+        st = json.loads(cli("share", "status", "--json", env=env).stdout)
+        check(r.returncode == 1 and json.loads(r.stdout)["error"] == "identity_changed" and not st["clients"] and
+              st["pairing"]["active"], "--fp: another key than the one shown pairs nothing and spends no try of the code")
+        t0 = time.time()
+        r = cli("remote", "add", "oomph://%s@127.0.0.1:%d" % (code.lower(), srv.port), "--json", "--no-mirror",
+                "--fp", fp)
+        res = json.loads(r.stdout or "{}")
+        mid = (res.get("machine") or {}).get("mid", "")
+        mirror = os.path.join(os.environ["OOMPH_MACHINES_DIR"], mid)
+        stj = json.load(open(os.path.join(mirror, "status.json"))) if mid else {}
+        mlog = os.path.join(mirror, "log")
+        synced = os.path.isdir(mlog) and [n for n in os.listdir(mlog) if n.startswith("samples-")]
+        check(r.returncode == 0 and res.get("new") is True and res["counts"]["samples"] == 0 and res["machine"]["pinned"]
+              and os.path.exists(os.path.join(mirror, "machine.json")) and stj.get("state") == "idle" and not synced,
+              "a pasted link pairs (the code from the link), --no-mirror: a tab at once, nothing synced yet (%.1f s; %s)"
+              % (time.time() - t0, r.stdout.strip()[-120:] if r.returncode else "ok"))
+        r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--json", "--no-mirror")
+        res = json.loads(r.stdout or "{}")
+        check(r.returncode == 0 and res.get("new") is False and res["machine"]["mid"] == mid,
+              "a machine already paired, typed again: no code, the same tab (new: false)")
+        cli("share", "revoke", json.loads(cli("share", "status", "--json", env=env).stdout)["clients"][0]["id"], env=env)
+        r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--json", "--no-mirror")
+        res = json.loads(r.stdout or "{}")
+        check(r.returncode == 1 and res.get("error") == "revoked" and res.get("fp") == fp,
+              "revoked there: the popover's code step gets the key it presented, to pair again against")
+        # the same machine id behind another key: the question goes out as a line, its answer comes in
+        cli("share", "on", "--json", env=env2)
+        srv2 = Listener(share2)
+        code2 = json.loads(cli("share", "pair", "--json", env=env2).stdout)["code"]
+        r = cli("remote", "add", "127.0.0.1:%d" % srv2.port, "--json", "--no-mirror", "--ask", "--code", "-",
+                input=code2 + "\n\n")
+        lines = [json.loads(x) for x in r.stdout.strip().splitlines()]
+        st2 = json.loads(cli("share", "status", "--json", env=env2).stdout)
+        check(r.returncode == 1 and len(lines) == 2 and lines[0].get("ev") == "ask" and lines[0]["known"]["mid"] == mid
+              and lines[1]["error"] == "ask" and lines[1]["known"]["mid"] == mid and not st2["clients"],
+              "--ask: the identity question as a JSON line; no answer: cancelled, the fresh pairing given back there")
+        r = cli("remote", "add", "127.0.0.1:%d" % srv2.port, "--json", "--no-mirror", "--ask", "--code", "-",
+                input="%s\nreplace:m-ffffffffffffffff\n" % json.loads(cli("share", "pair", "--json", env=env2).stdout)["code"])
+        check(r.returncode == 1 and json.loads(r.stdout.strip().splitlines()[-1])["error"] == "ask",
+              "--ask: an answer naming another machine than the one asked about is not taken")
+        code2 = json.loads(cli("share", "pair", "--json", env=env2).stdout)["code"]
+        r = cli("remote", "add", "127.0.0.1:%d" % srv2.port, "--json", "--no-mirror", "--ask", "--code", "-",
+                input=code2 + "\nnew\n")
+        lines = [json.loads(x) for x in r.stdout.strip().splitlines()]
+        mids = sorted(x["mid"] for x in sync.Book().machines)
+        check(r.returncode == 0 and lines[0].get("ev") == "ask" and lines[-1].get("ok") and lines[-1]["new"] and
+              len(mids) == 2 and lines[-1]["machine"]["mid"] != mid, "--ask answered new: a second tab of its own (%s)" % mids)
+        srv.stop()
+        srv2.stop()
+        held = subprocess.Popen([PY, "-I", "-B", "-c", "import sys; sys.path.insert(0, %r); import oomph_sync as s, time; "
+                                 "t = time.monotonic(); a = s.stdin_line(200, 0.5); print(repr(a), time.monotonic() - t)"
+                                 % os.path.join(ROOT, "daemon")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        # stdin stays open (and silent) until it has answered
+        out = held.stdout.readline().split() if select.select([held.stdout], [], [], 20)[0] else []
+        held.stdin.close()
+        if not out:
+            held.kill()
+        held.wait(20)
+        check(out[:1] == ["''"] and float(out[1]) < 5, "the identity question's answer is waited for until its deadline, "
+                                                        "not for ever: stdin held open and silent ends it (%s)" % out)
+
+        def hello_against(data):
+            """Link.hello against a stub that refuses the protocol with `data`: the SyncError's side."""
+            a, b = socket.socketpair()
+
+            def stub():
+                f = b.makefile("rb")
+                rid = json.loads(f.readline(65536) or b"{}").get("id")
+                b.sendall(json.dumps({"jsonrpc": "2.0", "id": rid, "error": {
+                    "code": net.ERR["proto"], "message": "protocol not supported", "data": data}}).encode() + b"\n")
+            threading.Thread(target=stub, daemon=True).start()
+            lk = sync.Link(sock=a)
+            try:
+                lk.hello()
+                return None
+            except sync.SyncError as err:
+                return err.code, err.extra.get("side")
+            finally:
+                lk.close()
+                b.close()
+        lo, hi = net.PROTO
+        check(hello_against({"min": 0, "max": lo - 1}) == ("incompatible", "old") and
+              hello_against({"min": hi + 1, "max": hi + 3}) == ("incompatible", "new") and
+              hello_against({"min": "x"}) == ("incompatible", None), "a protocol refused: `side` says which end is "
+                                                                    "older (the popover's message picks by it)")
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        r = cli("remote", "add", "127.0.0.1:%d" % port, "--json", "--no-mirror")
+        res = json.loads(r.stdout or "{}")
+        check(r.returncode == 1 and res.get("error") == "refused" and res.get("ok") is False and res.get("detail") and
+              "fast" not in res, "a closed port: refused in the JSON, no Local Network probe (refused is an answer)")
+        class Unreachable(socket.socket):
+            def connect(self, sa):
+                raise OSError(errno.EHOSTUNREACH, "No route to host")
+        real, socket.socket = socket.socket, Unreachable
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = sync.cmd_remote(["add", "127.0.0.1:9", "--json", "--no-mirror"])
+        finally:
+            socket.socket = real
+        res = json.loads(buf.getvalue().strip().splitlines()[-1] or "{}")
+        check(rc == 1 and res.get("ok") is False and res.get("error") == "timeout" and
+              res.get("fast") is (True if sys.platform == "darwin" else None),
+              "a connection that fails at once: `fast` merged into the JSON on macOS (the app's Local Network probe)")
+        r1 = cli("remote", "add", "studio", "--fp", "abc", "--json")
+        r2 = cli("remote", "add", "studio", "--ask")
+        r3 = cli("remote", "add", "oomph://K7QF@studio", "--json")
+        check(r1.returncode == 2 and r2.returncode == 2 and json.loads(r3.stdout)["error"] == "bad_address",
+              "remote add: --fp takes a sha256 key, --ask goes with --json, a broken link is a bad address")
+    finally:
+        if saved is None:
+            os.environ.pop("OOMPH_MACHINES_DIR", None)
+        else:
+            os.environ["OOMPH_MACHINES_DIR"] = saved
 
 
 def planted(tmp, log, led):
@@ -1242,6 +1404,7 @@ def main():
     check(r.returncode == 0 and sync.Book().get(atlas) is None and not os.path.exists(os.path.join(mbase, atlas)),
           "remote forget: the entry, the token and the mirror are gone")
 
+    popover(tmp)
     planted(tmp, log, led)
     skew(tmp)
     shutil.rmtree(tmp, ignore_errors=True)

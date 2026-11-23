@@ -490,7 +490,8 @@ from the terminal, with tabs in the app behind a switch (below).
 ```sh
 # on the Mac to be watched (an administrator; off by default)
 sudo oomph share on --pair        # share it on the networks it is on now, and print a pairing code
-sudo oomph share pair             # a new one-time code (10 minutes, five tries) for the next viewer
+sudo oomph share pair             # a new one-time code (10 minutes, five tries) for the next viewer,
+                                  # and its link, oomph://CODE@HOST (share on --pair prints both too)
 oomph share status                # on which networks, who is paired, who is reading now
 sudo oomph share revoke c-4f2a9d10   # end one viewer's access (its live connection ends within seconds)
 sudo oomph share ai on            # let viewers send this Mac's data to their AI analysis (off by default)
@@ -498,6 +499,8 @@ sudo oomph share off [--forget]   # stop sharing (--forget: a new key, every vie
 
 # on the Mac you sit at (no sudo)
 oomph remote add studio.local    # asks for the code `share pair` showed, pairs, then mirrors its 14 days
+oomph remote add 'oomph://K7QF-2M9X-D4TR@studio.local'   # or the link: code and address in one (the code is
+                                  # then on the command line, where ps shows it; the address alone asks for it)
 oomph remote add sam@atlas        # or over ssh: nothing to set up there but oomph
 oomph remote list                 # the machines watched, and how each link is
 oomph remote sync                 # follow them live in this terminal (the app does this while its popup is open)
@@ -523,6 +526,18 @@ self-built app is tried on a second Mac. To switch them on:
 popup then has a tab per machine added with `oomph remote add`: the header and everything below
 belong to the selected tab, the menu-bar chip stays this Mac's, and the popup opens on the tab
 it was closed on unless this Mac is critical, has an incident or its logger is silent.
+
+With the switch on (1.10.2), a **+** sits on the line under the header (at the end of the tabs
+once there are some). It opens a popover: type an address, a name or `user@host`, or paste the
+link Share this Mac shows (`oomph://K7QF-2M9X-D4TR@studio.local`); Recents brings back a machine
+paired before with one click (the trash forgets it). A pasted link only fills in the code step:
+nothing is sent until Pair, and the pairing proof itself makes sure no machine in between can
+pair. A typed address is reached first, and the code step shows the key the other machine
+presented; Pair binds the pairing to it. Closing the popup keeps the step for 15 minutes. **Share this Mac…** (in the popover, and on the This Mac tab) shows the switch, the
+key, the networks and the paired machines; turning it on, a new pairing code and each revoke ask
+for the administrator password, and a fresh code keeps the popup up until it is used or Done. If
+the popover misbehaves inside the popup, `defaults write local.oomph.menubar connectSheet -bool YES`
+shows it as a sheet.
 
 ## Files
 

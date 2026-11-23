@@ -2755,6 +2755,12 @@ for line in r.stdout.splitlines():
 check(r.returncode == 0, "the protocol core (tools/nettest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                       + r.stderr[-400:]))
 
+# the connect popover's reading of what is typed or pasted agrees with the CLI's (1.10.2, tools/vectors/connect.json)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "connectvectors.py")], capture_output=True,
+                   text=True, timeout=60)
+check(r.returncode == 0, "the popover reads links, codes and addresses as the CLI does (tools/connectvectors.py): %s"
+      % ([x for x in r.stdout.splitlines() if "FAIL" in x] or r.stdout.strip().splitlines()[-1:] or [r.stderr[-300:]])[0])
+
 # remote machines (1.10.0): the peer gate, pairing and tokens, TLS, the share commands, remote over TCP and ssh,
 # the engine (tools/sharetest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "sharetest.py")], capture_output=True, text=True,

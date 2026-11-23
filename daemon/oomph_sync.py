@@ -63,9 +63,9 @@ MAX_PAGES = 20000              # requests per run, whatever the other end says
 class SyncError(Exception):
     """The sync failed; `code` is one of status.json's errors (roadmap 01 §5.7)."""
 
-    def __init__(self, code, detail):
+    def __init__(self, code, detail, **extra):
         Exception.__init__(self, detail)
-        self.code, self.detail = code, detail
+        self.code, self.detail, self.extra = code, detail, extra
 
 
 # ------------------------------------------------------------------ coverage
@@ -516,8 +516,11 @@ class Link:
         if "error" in msg:
             e = msg["error"] if isinstance(msg["error"], dict) else {}
             if e.get("code") == net.ERR["proto"]:
+                d = e.get("data") if isinstance(e.get("data"), dict) else {}
+                side = "old" if oomph._num(d.get("max"), 0, net.PROTO[0] - 1) else \
+                    "new" if oomph._num(d.get("min"), net.PROTO[1] + 1, 1e6) else None
                 raise SyncError("incompatible", "its protocol versions %s do not overlap ours %s"
-                                % (net.clean(json.dumps(e.get("data")), 60), list(net.PROTO)))
+                                % (net.clean(json.dumps(e.get("data")), 60), list(net.PROTO)), side=side)
             raise SyncError("not_oomph", "hello refused: %s" % net.clean(str(e.get("message")), 120))
         r = msg["result"]
         if not (isinstance(r, dict) and r.get("proto") in range(net.PROTO[0], net.PROTO[1] + 1)):
@@ -1002,6 +1005,7 @@ TRIGGERS = ("events", "ledger", "incident", "machine", "bye")   # ... and past t
 LINK_RSS_CAP = 256 << 20                   # a link process that grew by this much leaves (and retries)
 PING_S, SILENT_S = 20, 45                  # ping after this long without a frame; give up after this
 FORGET_S = 30                              # forget's unpairing there may take this long
+ASK_S = 15 * 60                            # the identity question waits for its answer this long (01 §3.8 rule 4)
 HEARTBEAT_S = 5                            # a live link rewrites status.json this often (the app's 10 s rule)
 LIVE_RESET_S = 30                          # a connection that lasted this long resets the backoff
 BACKOFF = (1, 2, 4, 8, 15, 30, 60)
@@ -1050,6 +1054,31 @@ def parse_target(s):
         port = int(port)
     return {"transport": "ssh" if ssh else "tcp", "user": user, "host": host,
             "port": port if port or ssh else net.PORT}
+
+
+LINK = re.compile(r"oomph://([A-Za-z0-9 -]{12,24})@([^/@\s]{1,300})/?")
+
+
+def parse_link(s):
+    """A pairing link (`oomph://K7QF-2M9X-D4TR@studio.local:6674`, what Share this Mac shows): (the
+    target, HOST[:PORT] as parse_target takes it for a shared Mac, and the code's 12 characters).
+    ValueError for anything else. A link only fills in: whoever reads it still decides to pair."""
+    m = LINK.fullmatch(s.strip()) if isinstance(s, str) else None
+    if not m:
+        raise ValueError("not a pairing link")
+    code, target = net.norm_code(m.group(1)), m.group(2)
+    if code is None:
+        raise ValueError("not a pairing code")
+    if parse_target(target)["transport"] != "tcp":
+        raise ValueError("a pairing link names a shared Mac, not an ssh login")
+    return target, code
+
+
+def short_fp(fp):
+    """The first 16 hex digits of a key's fingerprint in groups of four, for people to compare with
+    `oomph share status` there."""
+    h = fp[7:] if isinstance(fp, str) and fp.startswith("sha256:") else ""
+    return " ".join(h[i:i + 4].upper() for i in range(0, 16, 4)) if len(h) >= 16 else ""
 
 
 def show_target(e):
@@ -1261,7 +1290,8 @@ class Ask(SyncError):
         SyncError.__init__(self, "ask", "it reports the same machine id as %s, but has a different key or "
                            "address. That is normal after reinstalling %s or resetting sharing there, and for "
                            "cloned systems. Add it again with --as new (two tabs) or --as replace:%s (keep %s's "
-                           "history and trust the new key)." % (label(known), oomph.BRAND, known["mid"], label(known)))
+                           "history and trust the new key)." % (label(known), oomph.BRAND, known["mid"], label(known)),
+                           known={"mid": known["mid"], "label": net.clean(str(label(known)), 64)})
         self.known = known
 
 
@@ -1311,6 +1341,8 @@ def tcp_connect(host, port, addrs=(), tried=None, deadline=None):
             s.close()
     err = SyncError(*(why or ("timeout", "no answer from %s" % net.clean(host, 64))))
     err.fast = fast_any and sys.platform == "darwin"  # the app then asks macOS (Local Network, roadmap 01 §7.6)
+    if err.fast:
+        err.extra["fast"] = True
     raise err
 
 
@@ -2085,7 +2117,9 @@ def edit(cmd, mid, new_label=None, unpair=True):
 # ------------------------------------------------------------------ oomph remote …
 REMOTE_USAGE = """usage: oomph remote add HOST[:PORT] [--code CODE] [--name LABEL] [--as new|replace:MID] [--json]
                                   a shared Mac (the first time with the code `sudo oomph share pair` showed
-                                  there; --code - reads it from stdin)
+                                  there; --code - reads it from stdin; a link `oomph://CODE@HOST[:PORT]` carries
+                                  both; --fp KEY pairs only with the key shown; --no-mirror leaves the first
+                                  sync to the app; --ask with --json: a question as a line out, its answer in)
        oomph remote add USER@HOST | ssh://[USER@]HOST[:PORT] [--name LABEL]
                                   any machine with `oomph` installed, over your ssh (keys or an agent)
        oomph remote list [--json]       the machines this account watches, and their links
@@ -2098,17 +2132,20 @@ REMOTE_USAGE = """usage: oomph remote add HOST[:PORT] [--code CODE] [--name LABE
                                   COMMAND starts (default: this one) into DIR"""
 
 
-def add_machine(target, code=None, name=None, as_=None, ask=None):
+def add_machine(target, code=None, name=None, as_=None, ask=None, expect_fp=None, mirror_now=True):
     """`remote add`: reach the machine, pair (TCP, first time) or sign in (TCP, a known key at a
-    new address; ssh), place it (§4.5), keep it, mirror it once. Returns its entry. A question of
-    §4.5 (Ask) goes to `ask` (a terminal's prompt: "new", "replace:MID" or None) while the link
-    stays open, so a fresh pairing is kept; without an answer that pairing is given back there
-    before the question is raised."""
+    new address; ssh), place it (§4.5), keep it, mirror it once (not with mirror_now False: the
+    app's tab then fills it live). Returns (its entry, the first sync or None, whether it is new
+    here). A question of §4.5 (Ask) goes to `ask` (a terminal's prompt, or the app's popover: "new",
+    "replace:MID" or None) while the link stays open, so a fresh pairing is kept; without an answer
+    that pairing is given back there before the question is raised. `expect_fp` is the key the
+    person was shown (the popover's confirmation): another key there pairs nothing."""
     t = parse_target(target)
     book = Book()
     if len(book.pinned()) >= MAX_MACHINES:
         raise SyncError("too_many", "Twelve machines are watched. Remove one to add another.")
     client = token = fp_hex = None
+    before = list(book.machines)
     if t["transport"] == "ssh":
         link = Link(argv=ssh_argv(t["host"], t["user"], t["port"]))
         try:
@@ -2126,6 +2163,11 @@ def add_machine(target, code=None, name=None, as_=None, ask=None):
     else:
         tls, fp, peer = tls_connect(t["host"], t["port"])
         fp_hex = "sha256:" + fp.hex()
+        if expect_fp is not None and fp_hex != expect_fp:
+            tls.close()
+            raise SyncError("identity_changed", "%s answered with another key than the one shown a moment ago: "
+                            "nothing was sent. Try again, and compare the key with oomph share status there"
+                            % show_target(t), fp=fp_hex, fp_short=short_fp(fp_hex))
         link = Link(sock=tls)
         known = book.by_fp(fp_hex)
         try:
@@ -2137,15 +2179,19 @@ def add_machine(target, code=None, name=None, as_=None, ask=None):
                 if not code:
                     raise SyncError("needs_code", "%s needs a pairing code: run `sudo oomph share pair` there, then: "
                                     "oomph remote add %s in a terminal (it asks), or with --code - (the code on "
-                                    "standard input)" % (show_target(t), show_target(t)))
+                                    "standard input)" % (show_target(t), show_target(t)),
+                                    fp=fp_hex, fp_short=short_fp(fp_hex), revoked=bool(known))
                 machine, client, token = tls_pair(link, fp, code, socket.gethostname().split(".")[0])
-        except SyncError:
+        except SyncError as err:
             link.close()
+            err.extra.setdefault("fp", fp_hex)  # the key it presented: a code step shows it (revoked, needs_code)
+            err.extra.setdefault("fp_short", short_fp(fp_hex))
             raise
     try:
         while True:
             try:
                 mid, e = keep_machine(book, machine, fp_hex, t, as_, name, client, token)
+                new = not any(x["mid"] == mid for x in before)
                 break
             except Ask as q:
                 as_ = ask(q) if ask is not None and as_ is None else None
@@ -2163,14 +2209,16 @@ def add_machine(target, code=None, name=None, as_=None, ask=None):
         mirror = book.mirror(mid)
         mirror.put_json("", "machine.json", machine)
         remember(book, e, machine, peer)
-        s = Sync(link, mirror, machine)
+        s = Sync(link, mirror, machine) if mirror_now else None
         try:
-            s.run()
+            if s:
+                s.run()
         finally:
-            s.save()
+            if s:
+                s.save()
         write_status(mirror, state="idle", was="live", last_contact=time.time(), transport=t["transport"],
                      connect_ms=machine.get("connect_ms"), pid=None, error=None, detail=None)
-        return book.load().get(mid), s
+        return book.load().get(mid), s, new
     finally:
         link.close()
 
@@ -2204,6 +2252,34 @@ def give_back(link):
         pass
 
 
+def stdin_line(limit=200, secs=None):
+    """One line of standard input, read a byte at a time (nothing waits in a buffer that select
+    would miss), at most `limit` bytes; what came by the end of input or `secs` otherwise."""
+    end, out = (None if secs is None else time.monotonic() + secs), b""
+    while len(out) < limit:
+        if end is not None and not select.select([0], [], [], max(0.0, end - time.monotonic()))[0]:
+            break
+        b = os.read(0, 1)
+        if not b or b == b"\n":
+            break
+        out += b
+    return out.decode("utf-8", "replace").strip()
+
+
+def ask_json(q):
+    """§4.5's question for the app's popover (`remote add --json --ask`): one JSON line out, one
+    answer line in (new | replace:MID; anything else, the end of input, or no answer within ASK_S,
+    is cancel: the pairing there is never held open longer than the popover's draft)."""
+    try:
+        sys.stdout.write(json.dumps({"ev": "ask", "question": "identity", "detail": q.detail,
+                                     "known": {"mid": q.known["mid"], "label": net.clean(str(label(q.known)), 64)}}) + "\n")
+        sys.stdout.flush()
+        a = stdin_line(200, ASK_S)
+    except (OSError, ValueError):
+        return None
+    return a if a == "new" or a == "replace:" + q.known["mid"] else None
+
+
 def ask_as(q):
     """§4.5's question in a terminal: (new | replace:MID | None)."""
     sys.stderr.write(oomph.wrap("oomph: remote add: " + q.detail) + "\n")
@@ -2217,7 +2293,7 @@ def ask_as(q):
 
 def _read_code(arg):
     if arg == "-":
-        return sys.stdin.readline(200).strip()
+        return stdin_line(200)
     if arg:
         return arg
     if sys.stdin.isatty():
@@ -2273,7 +2349,7 @@ def cmd_remote(args):
         return run_link(rest[0], unpair="--unpair" in rest[1:])
     if sub == "sync":
         return cmd_sync(rest)
-    takes = {"add": (("--code", "--name", "--as"), ("--json",), 1), "list": ((), ("--json",), 0),
+    takes = {"add": (("--code", "--name", "--as", "--fp"), ("--json", "--no-mirror", "--ask"), 1), "list": ((), ("--json",), 0),
              "remove": ((), (), 1), "forget": ((), (), 1), "rename": ((), (), 2)}
     if sub not in takes:
         sys.stderr.write(REMOTE_USAGE + "\n")
@@ -2284,37 +2360,48 @@ def cmd_remote(args):
             raise oomph.UsageError("%s takes %d argument%s" % (sub, takes[sub][2], "s" if takes[sub][2] > 1 else ""))
         if "--as" in o and not (o["--as"] == "new" or re.fullmatch(r"replace:" + MID.pattern, o["--as"])):
             raise oomph.UsageError("--as takes new or replace:MID")
+        if "--fp" in o and not re.fullmatch(r"sha256:[0-9a-f]{64}", o["--fp"]):
+            raise oomph.UsageError("--fp takes a key as sha256:<64 hex digits>")
+        if "--ask" in o and "--json" not in o:
+            raise oomph.UsageError("--ask goes with --json")
     except oomph.UsageError as e:
         return oomph._usage_error("remote " + sub, e, REMOTE_USAGE)
     try:
         if sub == "add":
+            target, linked = pos[0], None
             try:
-                parse_target(pos[0])
+                if target.startswith("oomph://"):
+                    target, linked = parse_link(target)
+                parse_target(target)
             except ValueError as e:
-                raise SyncError("bad_address", "%s (an address is HOST[:PORT], USER@HOST or ssh://…)" % e)
-            code = _read_code("-") if o.get("--code") == "-" else o.get("--code")
-            if o.get("--code") not in (None, "-") and sys.stdin.isatty():
+                raise SyncError("bad_address", "%s (an address is HOST[:PORT], USER@HOST, ssh://… or a pairing "
+                                               "link `oomph://CODE@HOST`)" % e)
+            code = _read_code("-") if o.get("--code") == "-" else o.get("--code") or linked
+            if (o.get("--code") not in (None, "-") or linked and "--code" not in o) and sys.stdin.isatty():
                 sys.stderr.write("oomph: note: a code on the command line can be read by other users of this Mac "
                                  "while it runs; leave out --code and it is asked for\n")
-            ask = ask_as if sys.stdin.isatty() and "--json" not in o and o.get("--code") != "-" else None
+            ask = ask_json if "--ask" in o else \
+                ask_as if sys.stdin.isatty() and "--json" not in o and o.get("--code") != "-" else None
+            more = dict(expect_fp=o.get("--fp"), mirror_now="--no-mirror" not in o)
             try:
-                e, s = add_machine(pos[0], code, o.get("--name"), o.get("--as"), ask)
+                e, s, new = add_machine(target, code, o.get("--name"), o.get("--as"), ask, **more)
             except SyncError as err:
-                if err.code == "needs_code" and "--code" not in o and sys.stdin.isatty() and "--json" not in o:
+                if err.code == "needs_code" and not code and sys.stdin.isatty() and "--json" not in o:
                     code = _read_code(None)
                     if not code:
                         raise
-                    e, s = add_machine(pos[0], code, o.get("--name"), o.get("--as"), ask)
+                    e, s, new = add_machine(target, code, o.get("--name"), o.get("--as"), ask, **more)
                 else:
                     raise
+            counts = s.counts if s else {"samples": 0, "incidents": 0, "leases": 0}
             if "--json" in o:
                 print(json.dumps({"ok": True, "machine": {k: e.get(k) for k in ENTRY_KEYS if k != "client"},
-                                  "counts": s.counts}))
+                                  "counts": counts, "new": new}))
             else:
                 print("Added %s (%s, %s): %d samples, %d incidents, %d live reservations mirrored. Follow it live: "
                       "oomph remote sync (the app's tabs: defaults write local.oomph.menubar machinesUI -bool YES)"
-                      % (net.clean(str(label(e)), 64), e["transport"], show_target(e), s.counts["samples"],
-                         s.counts["incidents"], s.counts["leases"]))
+                      % (net.clean(str(label(e)), 64), e["transport"], show_target(e), counts["samples"],
+                         counts["incidents"], counts["leases"]))
                 if e.get("os") not in (None, "macos"):
                     print("It is watched from the terminal for now (oomph remote sync, oomph top); the app gives "
                           "it a tab once it knows that system's words (1.13).")
@@ -2341,7 +2428,7 @@ def cmd_remote(args):
         return 0
     except SyncError as err:
         if "--json" in o:
-            print(json.dumps({"ok": False, "error": err.code, "detail": err.detail}))
+            print(json.dumps(dict(getattr(err, "extra", None) or {}, ok=False, error=err.code, detail=err.detail)))
         else:
             sys.stderr.write(oomph.wrap("oomph: remote %s: %s" % (sub, err.detail)) + "\n")
         return 1

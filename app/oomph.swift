@@ -506,20 +506,36 @@ struct MachineEntry: Decodable {
     var order: Double?
     var caps: [String]?
     var os: String?
+    var os_version: String?
+    var ram_gb: Double?
+    var addrs: [String]?
+    var last_connected: Double?
 
     /// The pinned machines (tabs), in the order they were added; entries whose mirror name is not of
     /// the fixed pattern are skipped, since that name becomes a path. Only Macs (or a machine not yet
     /// reached): the app does not know Linux's words until 1.13, so a Linux machine is watched from
     /// the terminal for now (roadmap G5, the LG row; 01 §4.3: an unknown os is not drawn).
     static func load(_ dir: String) -> [MachineEntry] {
+        loadAll(dir).filter { $0.pinned == true }.sorted { ($0.order ?? 0) < ($1.order ?? 0) }
+    }
+
+    /// Every machine this Mac knows (tabs and Recents), under the same rules as `load`.
+    static func loadAll(_ dir: String) -> [MachineEntry] {
         struct File: Decodable { var machines: [MachineEntry]? }
         guard let d = readShared(dir + "/machines.json", cap: 4 << 20),
               let f = try? JSONDecoder().decode(File.self, from: d) else { return [] }
         return (f.machines ?? []).filter { e in
-            e.pinned == true && (e.os == nil || e.os == "macos")
+            (e.os == nil || e.os == "macos")
                 && e.mid.range(of: #"^m-[0-9a-f]{16}(-[0-9a-f]{8})?$"#, options: .regularExpression) != nil
-        }.sorted { ($0.order ?? 0) < ($1.order ?? 0) }
+        }
     }
+
+    /// Recents (roadmap 01 §3.7): every machine that is not a tab now, the one connected last first.
+    static func recents(_ dir: String) -> [MachineEntry] {
+        loadAll(dir).filter { $0.pinned != true }.sorted { ($0.last_connected ?? 0) > ($1.last_connected ?? 0) }
+    }
+    /// The tab's name as the popover shows it before a store exists.
+    var title: String { label ?? name ?? host ?? mid }
     var address: String {
         let h = host ?? "?"
         if transport == "ssh" { return (user.map { $0 + "@" } ?? "") + h }
@@ -970,6 +986,36 @@ final class Store: ObservableObject {
     var lastSelected: [String: Double] = [:]
     /// A tab just closed with its ×: one click brings it back for six seconds.
     @Published var undoUnpin: (mid: String, title: String)?
+    // the + (R1b): the connect popover, its draft, Share this Mac (roadmap 01 §3.7–§3.10)
+    /// The connect popover is up (an NSPopover on the +; a sheet on the popup with `connectSheet`).
+    @Published var connectShown = false
+    /// What the popover holds: in memory only, kept 15 minutes after the last edit (§3.8 rule 2).
+    let draft = ConnectDraft()
+    /// Every machine of machines.json (tabs and Recents), as the popover lists and completes them.
+    @Published var known: [MachineEntry] = []
+    /// `oomph share status --json` as it was last read (public files, no prompt).
+    @Published var share: ShareStatus?
+    /// The code made in this session, kept until it is spent or expires (§3.8 rule 6).
+    @Published var shareCode: ShareCode?
+    /// A fresh code waits for the other machine: the panel stays where it is (§3.8 rule 3).
+    @Published var shareWaiting = false
+    @Published var sharePaired: String?
+    @Published var shareError: String?
+    /// The tab to select once machines.json names it (a Recents row, a pairing just made).
+    var pendingSelect: String?
+    /// Where the + is, in the popup's coordinates (top left): the popover points at it, also when it
+    /// moves from the line into the strip of tabs (a pairing just made).
+    var plusRect: CGRect = .zero { didSet { if plusRect != oldValue { onPlusMoved?() } } }
+    var onPlusMoved: (() -> Void)?
+    var addProcess: Process?
+    var addIn: FileHandle?
+    var addBuf = Data()
+    var addOpen = 0
+    var addResult: [String: Any]?
+    /// The panel's height follows its content (the tour's strip): AppDelegate places it again.
+    var onResize: (() -> Void)?
+    /// The panel stays up (under the administrator prompt, while a code waits; §3.8 rule 3).
+    var holdsPanel: Bool { machinesUI && (busy || shareWaiting) }
     private var engine: Process?
     private var engineIn: FileHandle?
     private var engineBuf = Data()
@@ -985,6 +1031,7 @@ final class Store: ObservableObject {
             return
         }
         let was = machine.mid
+        known = MachineEntry.loadAll(machinesDir)
         var next: [MachineStore] = [local]
         for e in MachineEntry.load(machinesDir).prefix(12) {
             let dir = machinesDir + "/" + e.mid
@@ -994,6 +1041,10 @@ final class Store: ObservableObject {
         }
         if next.map(\.mid) != machines.map(\.mid) { machines = next }
         selected = machines.firstIndex { $0.mid == was } ?? 0
+        if let p = pendingSelect, let i = machines.firstIndex(where: { $0.mid == p }) {
+            pendingSelect = nil
+            select(i)
+        }
     }
 
     /// This Mac has something to say (D9): critical pressure, an open or unseen incident, or a logger
@@ -1074,6 +1125,27 @@ final class Store: ObservableObject {
         if let w = NSApp.keyWindow { a.beginSheetModal(for: w, completionHandler: done) } else { done(a.runModal()) }
     }
 
+    /// Forget… on a tab (roadmap 01 §3.9): one confirmation, then mirror, key and token go.
+    func confirmForget(_ i: Int) {
+        guard machines.indices.contains(i), i > 0 else { return }
+        let m = machines[i]
+        let a = NSAlert()
+        a.messageText = "Forget \(m.title)?"
+        a.informativeText = "Its history on this Mac is deleted and you'll need a new pairing code to connect again."
+        a.addButton(withTitle: "Forget")
+        a.addButton(withTitle: "Cancel")
+        let done: (NSApplication.ModalResponse) -> Void = { [weak self] r in
+            guard let self, r == .alertFirstButtonReturn else { return }
+            if let j = self.machines.firstIndex(where: { $0.mid == m.mid }) {
+                if self.selected == j { self.selected = 0 } else if self.selected > j { self.selected -= 1 }
+                self.machines.remove(at: j)
+            }
+            self.forget(m.mid)
+            self.sendWatch()
+        }
+        if let w = NSApp.keyWindow { a.beginSheetModal(for: w, completionHandler: done) } else { done(a.runModal()) }
+    }
+
     static func openLocalNetworkSettings() {
         if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork") {
             NSWorkspace.shared.open(u)
@@ -1083,8 +1155,10 @@ final class Store: ObservableObject {
     /// Keys while the popup is open and tabs are on (roadmap 01 §3.2): ⌘1…⌘9 choose a tab, ⌃⇥ and
     /// ⌃⇧⇥ the next and previous one. True when the key was taken.
     func machineKey(_ e: NSEvent) -> Bool {
-        guard machinesUI, machines.count > 1, e.type == .keyDown else { return false }
+        guard machinesUI, e.type == .keyDown else { return false }
         let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == .command, e.charactersIgnoringModifiers == "n" { toggleConnect(); return true }  // ⌘N: the + (R1b)
+        guard machines.count > 1 else { return false }
         if mods == .command, let c = e.charactersIgnoringModifiers, let n = Int(c), (1...9).contains(n) {
             if machines.indices.contains(n - 1) { select(n - 1) }
             return true
@@ -1100,6 +1174,7 @@ final class Store: ObservableObject {
     /// Opening the popup: machines connect only now, and until a minute after it closed (D8).
     func machinesOpened() {
         popupOpen = true
+        if machinesUI { refreshShare() }  // "shared with 2 machines" in the status line
         guard machinesUI, machines.count > 1 else { return }
         for m in machines.dropFirst() { m.refreshCurrent(); m.markOpened(); m.reloadPoints(); m.loadIncidents() }
         startEngine()
@@ -1113,6 +1188,15 @@ final class Store: ObservableObject {
             if let first = m.incidents.first?.id { m.lastSeenIncident = first }
         }
         sendEngine(["cmd": "idle"])
+    }
+
+    /// The engine, started if it is not running (a pin from Recents, a pairing made in the popover).
+    func ensureEngine() { startEngine() }
+
+    /// An edit of machines.json (pin, forget, rename): the engine makes it, so it is started for it.
+    func engineCommand(_ obj: [String: Any]) {
+        if engine == nil { startEngine() }
+        sendEngine(obj)
     }
 
     /// `oomph remote sync --json`, the bundled CLI: the only thing here that talks to other
@@ -2824,7 +2908,17 @@ struct PopoverView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.primary.opacity(0.045))
                 .tourAnchor("header")
-            if store.machinesUI && store.machines.count > 1 { machineTabs } else { Divider() }
+            if store.machinesUI && store.machines.count > 1 {
+                machineTabs
+            } else if store.machinesUI {
+                // one machine: the + on the hairline (roadmap 01 §3.1); it adds no height
+                Divider()
+                    .overlay(alignment: .trailing) { PlusButton(store: store).padding(.trailing, 14) }
+                    .tourAnchor("machines")
+                    .zIndex(2)
+            } else {
+                Divider()
+            }
             VStack(alignment: .leading, spacing: 10) {
                 if let c = m.current, m.showsStats {
                     if m.stale { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") } else { stats(c).opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
@@ -2836,8 +2930,39 @@ struct PopoverView: View {
                 footer.tourAnchor("footer")
             }
             .padding(14)
+            // the tour's bar has a strip of its own under the footer once the + sits where it floated (§3.12)
+            if tourStep != nil && store.machinesUI { Color.clear.frame(height: 34) }
         }
         .frame(width: popupWidth)
+        .onChange(of: tourStep == nil) { _, _ in store.onResize?() }
+        .sheet(isPresented: Binding(get: { store.connectShown && connectAsSheet && !renderMode },
+                                    set: { if !$0 { store.connectShown = false } })) {
+            ConnectView(store: store, draft: store.draft)
+        }
+        .overlayPreferenceValue(PlusAnchorKey.self) { anchor in
+            // a render draws the popover where it opens, under the + (an NSPopover is a window of its own)
+            GeometryReader { geo in
+                if renderMode, store.connectShown, let anchor {
+                    let r = geo[anchor]
+                    let w: CGFloat = store.draft.step == .share ? 316 : 304
+                    let left = min(max(6, r.midX - w + 34), geo.size.width - w - 6)
+                    VStack(spacing: 0) {
+                        CalloutArrow().rotation(Angle(degrees: 180)).fill(Color(nsColor: .windowBackgroundColor))
+                            .frame(width: 18, height: 8).padding(.leading, r.midX - left - 9)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        ConnectView(store: store, draft: store.draft)
+                            .background(Color(nsColor: .windowBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.primary.opacity(0.15), lineWidth: 0.5))
+                    }
+                    .frame(width: w)
+                    .compositingGroup()
+                    .shadow(color: .black.opacity(0.3), radius: 12, y: 4)
+                    .padding(.leading, left)
+                    .padding(.top, r.maxY + 1)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                }
+            }
+        }
         .overlayPreferenceValue(StarAnchorKey.self) { anchor in
             GeometryReader { geo in
                 if showAI, let anchor {
@@ -2947,6 +3072,7 @@ struct PopoverView: View {
                     }
                 }
                 Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    .onTapGesture { if store.machinesUI && store.share?.shared == true { store.openConnect(share: true) } }
             }
             Spacer(minLength: 8)
             if live {
@@ -3025,7 +3151,10 @@ struct PopoverView: View {
             ForEach(fit.visible, id: \.self) { i in
                 MachineTab(store: store, index: i)
             }
-            if !fit.hidden.isEmpty {
+            if !fit.hidden.isEmpty && renderMode {
+                Text("» \(fit.hidden.count)").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                    .frame(height: 24).padding(.horizontal, 6)
+            } else if !fit.hidden.isEmpty {
                 Menu {
                     ForEach(fit.hidden, id: \.self) { i in
                         Button(store.machines[i].title) { store.select(i) }
@@ -3043,11 +3172,13 @@ struct PopoverView: View {
                     .buttonStyle(.link).font(.system(size: 11)).frame(height: 24)
                     .help("Watch \(u.title) again")
             }
+            PlusButton(store: store).frame(height: 24).padding(.leading, 4)
         }
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, minHeight: 27, maxHeight: 27, alignment: .bottomLeading)
         .background(Color.primary.opacity(0.045))
         .overlay(alignment: .bottom) { Divider() }
+        .tourAnchor("machines")
     }
 
     var mirrorStatusLine: String {
@@ -3092,6 +3223,11 @@ struct PopoverView: View {
         let d = m.current?.daemon
         var s = "Logging every \(Int(d?.interval ?? 30)) s"
         if let i = d?.incident { s += " · incident \(i) open" }
+        // a machine that listens says so where its owner looks (roadmap 01 §3.10)
+        if store.machinesUI, let sh = store.share, sh.shared {
+            let n = sh.clients?.count ?? 0
+            s += n == 1 ? " · shared with 1 machine" : " · shared with \(n) machines"
+        }
         return s
     }
 
@@ -3433,7 +3569,10 @@ struct PopoverView: View {
 
     // MARK: Guided tour (click the chip's ? in the header)
 
-    static let tourSteps = ["Right now", "History", "Incidents", "Actions"]
+    /// The tour's steps; with the + (machinesUI) Machines is the fourth of five (roadmap 01 §3.12).
+    var tourSteps: [String] {
+        store.machinesUI ? ["Right now", "History", "Incidents", "Machines", "Actions"] : ["Right now", "History", "Incidents", "Actions"]
+    }
 
     func startTour() {
         NSApp.keyWindow?.makeFirstResponder(nil)
@@ -3462,8 +3601,8 @@ struct PopoverView: View {
         func union(_ ids: [String]) -> CGRect {
             ids.compactMap { r[$0] }.reduce(CGRect.null) { $0.union($1) }
         }
-        switch step {
-        case 0:
+        switch tourSteps[min(max(step, 0), tourSteps.count - 1)] {
+        case "Right now":
             let zone = union(["header", "stats"])
             let chip = r["chip"] ?? .zero, top = r["topapp"] ?? CGRect(x: W - 120, y: zone.maxY - 30, width: 100, height: 30)
             let half = (W - 2 * m - 8) / 2
@@ -3477,7 +3616,7 @@ struct PopoverView: View {
                          left: m + half + 8, width: half, above: false,
                          xs: [top.midX], y: top.maxY + 3, reach: zone.maxY - top.maxY + 10),
             ])
-        case 1:
+        case "History":
             let zone = union(["chart", "leases"])
             let picker = r["picker"] ?? .zero, plot = r["plot"] ?? zone
             let half = (W - 2 * m - 8) / 2
@@ -3504,13 +3643,35 @@ struct PopoverView: View {
                          left: m + half + 8, width: half, above: false,
                          xs: [strip.midX + 60], y: strip.maxY + 2, reach: zone.maxY - strip.maxY + 11),
             ])
-        case 2:
+        case "Incidents":
             let zone = union(["incidents"])
             return (zone, [
                 TourNote(title: "Incidents",
                          text: "Each stretch of high memory pressure, with the apps macOS killed to free memory. Red: still open. Orange: new since you last looked. Click one for its report; right-click to copy its path or show it in Finder.",
                          left: m, width: W * 0.62, above: true,
                          xs: [zone.minX + 40], y: zone.minY - 7),
+            ])
+        case "Machines":
+            // the line and nothing but the line: the strip with tabs; with one machine a band around the
+            // hairline plus a disc around the + (tourLayer draws it as one shape)
+            let line = r["machines"] ?? .zero, plus = r["plus"] ?? .zero
+            let tabs = store.machines.count > 1
+            let zone = tabs ? line : CGRect(x: line.minX, y: line.midY - 4, width: line.width, height: 8)
+            let wide: CGFloat = min(W * 0.62, 300)
+            let underPlus = TourNote(title: tabs ? "Connect or share" : "More machines",
+                                     text: tabs ? "The + connects another machine or shares this one. Point at a tab for × to disconnect it; it stays in Recents under the +."
+                                                : "The + connects another Mac, and each gets a tab on this line. The other side is here too: + › Share this Mac hands out a one-time pairing code.",
+                                     left: W - m - wide, width: wide, above: false,
+                                     xs: [plus.midX], y: (tabs ? line.maxY : plus.maxY + 4) + 3, reach: tabs ? 12 : 10)
+            guard tabs else { return (zone, [underPlus]) }
+            let half = (W - 2 * m - 8) / 2
+            return (zone, [
+                TourNote(title: "A tab per machine",
+                         text: "The dot is that machine's memory pressure; a slashed circle means not connected, an orange triangle that it needs you. Everything under the line belongs to the selected tab.",
+                         left: m, width: half, above: false,
+                         xs: [line.minX + 130], y: line.maxY + 3, reach: 12),
+                TourNote(title: underPlus.title, text: underPlus.text, left: m + half + 8, width: half, above: false,
+                         xs: [plus.midX], y: line.maxY + 3, reach: 12),
             ])
         default:
             let zone = union(["footer"])
@@ -3530,26 +3691,36 @@ struct PopoverView: View {
 
     func tourLayer(step: Int, rects: [String: CGRect], size: CGSize) -> some View {
         let plan = tourPlan(step, rects, size)
+        let machines = tourSteps[min(step, tourSteps.count - 1)] == "Machines"
         let hole = plan.zone.isNull ? CGRect(x: size.width / 2, y: size.height / 2, width: 0, height: 0)
-                                    : plan.zone.insetBy(dx: -4, dy: -4)
-        let spot = TourSpotlight(hole: hole)
+                                    : machines ? plan.zone : plan.zone.insetBy(dx: -4, dy: -4)
+        // with one machine the lit zone is the hairline's band plus a disc around the +
+        let disc = machines && store.machines.count <= 1 ? rects["plus"].map { $0.insetBy(dx: -5, dy: -5) } : nil
+        let spot = TourSpotlight(hole: hole, disc: disc)
         let header = rects["header"] ?? CGRect(x: 0, y: 0, width: size.width, height: 54)
         return ZStack(alignment: .topLeading) {
             // the dim catches clicks; the lit zone stays live (hover the chart, click an incident)
             spot.fill(Color.black.opacity(0.42), style: FillStyle(eoFill: true))
                 .contentShape(spot, eoFill: true)
                 .onTapGesture {}
-            TourSpotlight(hole: hole, frameOnly: true).stroke(Color.white.opacity(0.55), lineWidth: 1)
+            TourSpotlight(hole: hole, disc: disc, frameOnly: true).stroke(Color.white.opacity(0.55), lineWidth: 1)
                 .allowsHitTesting(false)
             ZStack(alignment: .topLeading) {
                 ForEach(Array(plan.notes.enumerated()), id: \.offset) { _, n in tourBubble(n, size: size) }
             }
             .id(step)
             .transition(.opacity)
-            tourBar(step)
-                .padding(.top, header.maxY - 13)
-                .padding(.trailing, 12)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            if store.machinesUI {
+                // the + sits where the bar floated: the bar has its own strip under the footer (§3.12)
+                tourBar(step)
+                    .padding(.bottom, 5)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+            } else {
+                tourBar(step)
+                    .padding(.top, header.maxY - 13)
+                    .padding(.trailing, 12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+            }
         }
         .frame(width: size.width, height: size.height)
     }
@@ -3593,14 +3764,14 @@ struct PopoverView: View {
     }
 
     func tourBar(_ step: Int) -> some View {
-        let last = Self.tourSteps.count - 1
+        let last = tourSteps.count - 1
         return HStack(spacing: 2) {
             Button { goTour(step - 1) } label: {
                 Image(systemName: "chevron.left").frame(width: 24, height: 22).contentShape(Rectangle())
             }
             .disabled(step == 0).keyboardShortcut(.leftArrow, modifiers: []).help("Previous")
             VStack(spacing: 0) {
-                Text(Self.tourSteps[step]).font(.system(size: 11, weight: .semibold))
+                Text(tourSteps[min(step, last)]).font(.system(size: 11, weight: .semibold))
                 Text("\(step + 1) of \(last + 1)").font(.system(size: 9)).foregroundStyle(.secondary).monospacedDigit()
             }
             .frame(width: 70)
@@ -4154,7 +4325,7 @@ struct MachineTab: View {
                             Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
-                        .help("Stop watching \(m.title) · it comes back with: oomph remote add \(m.entry?.address ?? m.mid)")
+                        .help("Disconnect \(m.title) · it stays in Recents under +")
                     } else if !sel && m.incidentOpen {
                         Text("!").font(.system(size: 11, weight: .heavy)).foregroundStyle(.red)
                     } else if !sel && m.hasUnseen {
@@ -4173,6 +4344,9 @@ struct MachineTab: View {
         .onHover { hover = $0 }
         .help(tooltip(m))
         .contextMenu {
+            if m.isLocal {
+                Button("Share this Mac…") { store.openConnect(share: true) }
+            }
             if !m.isLocal {
                 Button("Rename…") { store.rename(index) }
                 Button("Reconnect") { store.reconnect(index) }
@@ -4182,7 +4356,8 @@ struct MachineTab: View {
                 }
                 if m.blocked { Button("Open Local Network settings") { Store.openLocalNetworkSettings() } }
                 Divider()
-                Button("Stop watching") { store.unpin(index) }
+                Button("Disconnect") { store.unpin(index) }
+                Button("Forget…") { store.confirmForget(index) }
             }
         }
     }
@@ -4351,6 +4526,8 @@ extension View {
 /// The tour's dim: the whole panel minus a rounded hole, which glides from zone to zone.
 struct TourSpotlight: Shape {
     var hole: CGRect
+    /// A disc joined to the hole (the + on the hairline, roadmap 01 §3.12): one outline, no seam.
+    var disc: CGRect? = nil
     var frameOnly = false
     var animatableData: AnimatablePair<AnimatablePair<CGFloat, CGFloat>, AnimatablePair<CGFloat, CGFloat>> {
         get { .init(.init(hole.minX, hole.minY), .init(hole.width, hole.height)) }
@@ -4359,7 +4536,23 @@ struct TourSpotlight: Shape {
     func path(in r: CGRect) -> Path {
         var p = Path()
         if !frameOnly { p.addRect(r.insetBy(dx: -2, dy: -2)) }
-        p.addRoundedRect(in: hole, cornerSize: CGSize(width: 8, height: 8), style: .continuous)
+        guard let d = disc, d.width > 0, d.minY < hole.minY, d.maxY > hole.maxY else {
+            p.addRoundedRect(in: hole, cornerSize: CGSize(width: 8, height: 8), style: .continuous)
+            return p
+        }
+        // the band, interrupted by the disc's arcs above and below it
+        let rad: CGFloat = d.width / 2, c = CGPoint(x: d.midX, y: d.midY)
+        let up: CGFloat = c.y - hole.minY, down: CGFloat = hole.maxY - c.y
+        let a1: CGFloat = asin(min(1, up / rad)), a2: CGFloat = asin(min(1, down / rad))
+        p.move(to: CGPoint(x: hole.minX, y: hole.minY))
+        p.addLine(to: CGPoint(x: c.x - rad * cos(a1), y: hole.minY))
+        p.addArc(center: c, radius: rad, startAngle: .radians(Double.pi + Double(a1)), endAngle: .radians(-Double(a1)), clockwise: false)
+        p.addLine(to: CGPoint(x: hole.maxX, y: hole.minY))
+        p.addLine(to: CGPoint(x: hole.maxX, y: hole.maxY))
+        p.addLine(to: CGPoint(x: c.x + rad * cos(a2), y: hole.maxY))
+        p.addArc(center: c, radius: rad, startAngle: .radians(Double(a2)), endAngle: .radians(Double.pi - Double(a2)), clockwise: false)
+        p.addLine(to: CGPoint(x: hole.minX, y: hole.maxY))
+        p.closeSubpath()
         return p
     }
 }
@@ -4380,6 +4573,1237 @@ struct CalloutArrow: Shape {
     }
 }
 
+// MARK: - Connecting and sharing (roadmap 01 §3.7–§3.10, R1b; behind machinesUI)
+
+/// What the popover's field holds, and the words it says (roadmap 01 §3.7). Pure, so that
+/// tools/vectors/connect.json can hold it to the CLI's reading of the same text
+/// (oomph_sync.parse_link, parse_target, oomph_net.norm_code) and to fixed words.
+enum ConnectInput {
+    static let alphabet = Set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    /// The pairing link's scheme (an identifier, like the command).
+    static let scheme = "oomph://"
+
+    static func groups(_ pattern: String, _ s: String) -> [String]? {
+        guard let re = try? NSRegularExpression(pattern: pattern),
+              let m = re.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)) else { return nil }
+        return (0..<m.numberOfRanges).map { i in Range(m.range(at: i), in: s).map { String(s[$0]) } ?? "" }
+    }
+
+    /// A code as someone typed it (any case, dashes and spaces, O for 0, I or L for 1): its 12 characters.
+    static func normCode(_ s: String) -> String? {
+        guard s.count <= 64 else { return nil }
+        let c = String(s.uppercased().filter { $0 != "-" && !$0.isWhitespace }
+            .map { $0 == "O" ? "0" : $0 == "I" || $0 == "L" ? "1" : $0 })
+        return c.count == 12 && c.allSatisfy({ alphabet.contains($0) }) ? c : nil
+    }
+
+    static func showCode(_ c: String) -> String {
+        let a = Array(c)
+        return a.count == 12 ? String(a[0..<4]) + "-" + String(a[4..<8]) + "-" + String(a[8..<12]) : c
+    }
+
+    /// HOST[:PORT] or [IPv6]:PORT as a shared Mac's address (no user, no options): the CLI checks it again.
+    static func tcpTarget(_ s: String) -> Bool {
+        func port(_ p: String) -> Bool { p.isEmpty || (Int(p).map { $0 > 0 && $0 < 65536 } ?? false) && p.count <= 5 }
+        func v6(_ a: String) -> Bool {
+            let parts = a.split(separator: "%", maxSplits: 1).map(String.init)
+            guard let addr = parts.first, addr.count <= 45 else { return false }
+            if parts.count == 2, groups(#"^[A-Za-z0-9._-]{1,16}$"#, parts[1]) == nil { return false }
+            var buf = in6_addr()
+            return inet_pton(AF_INET6, addr, &buf) == 1
+        }
+        if let g = groups(#"^\[([^\]]+)\](?::(\d{1,5}))?$"#, s) { return v6(g[1]) && port(g[2]) }
+        if s.filter({ $0 == ":" }).count >= 2 { return v6(s) }
+        let hp = s.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+        guard groups(#"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$"#, hp[0]) != nil, !hp[0].hasSuffix("..") else { return false }
+        return hp.count == 1 || port(hp[1])  // "studio:" is the default port, as the CLI reads it
+    }
+
+    /// A pairing link, `oomph://K7QF-2M9X-D4TR@studio.local:6674`: (the target HOST[:PORT], the code's
+    /// 12 characters), or nil. A link only fills the popover in: Pair still has to be clicked.
+    static func link(_ raw: String) -> (target: String, code: String)? {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard s.hasPrefix(scheme), let g = groups(#"^([A-Za-z0-9 -]{12,24})@([^/@\s]{1,300})/?$"#, String(s.dropFirst(scheme.count))),
+              let code = normCode(g[1]), tcpTarget(g[2]) else { return nil }
+        return (g[2], code)
+    }
+
+    /// Which way the text goes: "link", "ssh" (user@host, ssh://…), "tcp" (a shared Mac), "" (nothing).
+    static func kind(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        if s.hasPrefix(scheme) { return "link" }
+        return s.hasPrefix("ssh://") || s.contains("@") ? "ssh" : "tcp"
+    }
+
+    /// (user, host, port) of an ssh target; the user is this account's when none is given.
+    static func sshParts(_ raw: String) -> (user: String, host: String, port: String) {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("ssh://") { s = String(s.dropFirst(6)); while s.hasSuffix("/") { s.removeLast() } }
+        var user = NSUserName()
+        if let at = s.lastIndex(of: "@") { user = String(s[..<at]); s = String(s[s.index(after: at)...]) }
+        if let g = groups(#"^\[([^\]]+)\](?::(\d{1,5}))?$"#, s) { return (user, g[1], g[2]) }
+        if s.filter({ $0 == ":" }).count == 1, let c = s.firstIndex(of: ":") {
+            return (user, String(s[..<c]), String(s[s.index(after: c)...]))
+        }
+        return (user, s, "")
+    }
+
+    /// The command the SSH step shows before Connect (roadmap 01 §8: the consent is seeing it).
+    static func sshCommand(_ target: String) -> String {
+        let p = sshParts(target)
+        return "ssh -l \(p.user)" + (p.port.isEmpty ? "" : " -p \(p.port)") + " -- \(p.host) oomph serve --stdio"
+    }
+
+    /// The host as the popover names it: no user, port or brackets.
+    static func host(_ target: String) -> String {
+        if kind(target) == "ssh" { return sshParts(target).host }
+        if let g = groups(#"^\[([^\]]+)\](?::\d{1,5})?$"#, target) { return g[1] }
+        if target.filter({ $0 == ":" }).count == 1, let c = target.firstIndex(of: ":") { return String(target[..<c]) }
+        return target
+    }
+
+    /// The port named in a shared Mac's target, 6674 without one.
+    static func port(_ target: String) -> Int {
+        if let g = groups(#"^\[[^\]]+\]:(\d{1,5})$"#, target) { return Int(g[1]) ?? 6674 }
+        if target.filter({ $0 == ":" }).count == 1, let c = target.firstIndex(of: ":") {
+            return Int(target[target.index(after: c)...]) ?? 6674
+        }
+        return 6674
+    }
+
+    /// When a machine was last connected, as a row says it: "just now", "12 min ago", "3 h ago", "2 days ago".
+    static func ago(_ t: Double, now: Double) -> String {
+        let s: Double = max(0, now - t)
+        if s < 120 { return "just now" }
+        if s < 3600 { return "\(Int(s / 60)) min ago" }
+        if s < 86400 { return "\(Int(s / 3600)) h ago" }
+        let d = Int(s / 86400)
+        return d == 1 ? "yesterday" : "\(d) days ago"
+    }
+
+    /// A machine's short name: a host name without .local, an address as it is.
+    static func shortName(_ host: String) -> String {
+        host.hasSuffix(".local") ? String(host.dropLast(6)) : host
+    }
+
+    /// Completion (roadmap 01 §3.7): the known machines whose name, host name or any remembered
+    /// address starts with the text (ignoring case), each with what matched, in the order given.
+    static func matches(_ raw: String, _ known: [(mid: String, names: [String])]) -> [(mid: String, matched: String)] {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !t.isEmpty else { return [] }
+        return known.compactMap { k in
+            k.names.first { $0.lowercased().hasPrefix(t) }.map { (k.mid, $0) }
+        }
+    }
+
+    /// The popover's words for what `oomph remote add --json` answered (roadmap 01 §3.7's table). No
+    /// message names a release: too old or too new is what the two ends negotiated.
+    static func message(_ code: String, target: String, detail: String = "", side: String? = nil) -> String {
+        let h = host(target), n = shortName(h)
+        switch code {
+        case "refused":
+            return "\(h) answered, but sharing is off there. On \(n): + › Share this Mac, or `sudo oomph share on`. This step is kept while you do that."
+        case "turned_away":
+            return "\(h) closed the connection right away. Sharing there is limited to the networks it was turned on for: if \(n) moved, run `sudo oomph share on` there. (It also does this when too many machines knock at once.)"
+        case "local_network_denied":
+            return "macOS is not letting \(brand) reach your local network. Turn \(brand) on in System Settings › Privacy & Security › Local Network, then try again."
+        case "timeout":
+            return "No answer from \(h). Is it awake and on this network?"
+        case "dns":
+            return "Can't find “\(h)”."
+        case "not_oomph":
+            if kind(target) == "ssh" {
+                return detail.contains("not installed") ? "\(brand) is not installed on \(h). Install it there, then try again."
+                    : "The \(brand) on \(h) is too old for remote access. Update it there."
+            }
+            return "Something answers on port \(port(target)) there, but it isn't oomph."
+        case "pair_failed":
+            return "That code wasn't accepted. Codes work once, for 10 minutes, and five wrong tries void them. Get a new one there."
+        case "incompatible":
+            return side == "old" ? "\(n)'s \(brand) is too old for remote access. Update it there."
+                : side == "new" ? "\(n)'s \(brand) is newer than this app understands. Upgrade \(brand) on this Mac."
+                : "\(n)'s \(brand) and this app can't talk to each other. Update the older one."
+        case "too_many":
+            return "Twelve machines are connected. Disconnect one to add another."
+        case "busy":
+            return "\(n) has as many viewers as it serves at once. Try again in a minute."
+        case "ssh":
+            return "ssh could not sign in to \(h) without asking for something, and \(brand) never types a password. Try it in a terminal: ssh \(target)"
+        case "identity_changed":
+            return "\(h) answered with another key than the one shown: nothing was sent. Try again, and compare the key with `oomph share status` there."
+        case "revoked":
+            return "\(n) no longer knows this Mac: its access was revoked, or sharing was reset there. Pair again with a new code."
+        case "bad_address":
+            return "That isn't an address. Type a host name, host:port or user@host, or paste a pairing link."
+        case "ask":
+            return "Nothing was added. The pairing made just now was given back there and its code is used up: get a new one there to try again."
+        default:
+            return detail.isEmpty ? "Connecting to \(h) failed." : detail
+        }
+    }
+}
+
+/// The connect popover's state (roadmap 01 §3.8 rule 2): in the app's memory only, never on disk,
+/// kept for 15 minutes after the last edit; Cancel, success and time discard it.
+final class ConnectDraft: ObservableObject {
+    enum Step: String { case start, connecting, code, ssh, ask, paired, share }
+    @Published var step: Step = .start { didSet { touch() } }
+    @Published var text = "" { didSet { touch() } }
+    @Published var code = "" { didSet { touch() } }
+    /// What Connect and Pair run: HOST[:PORT], USER@HOST or ssh://…
+    @Published var target = ""
+    /// The step an error goes back to.
+    var from: Step = .start
+    /// The key the code step showed (sha256:…): Pair binds the pairing to it (`--fp`).
+    @Published var fp: String?
+    @Published var fpShort = ""
+    @Published var error: String?
+    @Published var errorCode: String?
+    /// macOS denies the local network (the app's own probe): the error offers the settings.
+    @Published var blocked = false
+    /// The pairing there was revoked, or sharing reset: a new code is needed.
+    @Published var revoked = false
+    @Published var askMid = ""
+    @Published var askLabel = ""
+    @Published var pairedMid = ""
+    @Published var pairedName = ""
+    @Published var pairedAbout = ""
+    /// Added, but not a Mac (Linux over ssh): no tab until 1.13, the terminal watches it.
+    @Published var pairedOther = false
+    @Published var tabName = "" { didSet { touch() } }
+    @Published var started: Date?
+    /// A Recents row asking "Forget …?".
+    @Published var forgetting: String?
+    var edited = Date.distantPast
+
+    func touch() { edited = Date() }
+    var alive: Bool { Date().timeIntervalSince(edited) < 15 * 60 }
+    var host: String { ConnectInput.host(target) }
+
+    func reset() {
+        step = .start; text = ""; code = ""; target = ""; from = .start; fp = nil; fpShort = ""
+        error = nil; errorCode = nil; blocked = false; revoked = false; askMid = ""; askLabel = ""
+        pairedMid = ""; pairedName = ""; pairedAbout = ""; pairedOther = false; tabName = ""; started = nil; forgetting = nil
+        edited = .distantPast
+    }
+}
+
+/// `oomph share status --json`, read as this user (public files; roadmap 01 §5.9).
+struct ShareStatus: Decodable {
+    struct Net: Decodable {
+        var iface: String?
+        var net: String?
+        var router: String?
+        enum CodingKeys: String, CodingKey { case iface = "if", net, router }
+    }
+    struct Client: Decodable, Identifiable {
+        var id: String
+        var name: String?
+        var paired: Double?
+        var last_seen: Double?
+        var last_addr: String?
+    }
+    struct Reading: Decodable { var client: String; var peer: String?; var since: Double? }
+    struct Pairing: Decodable { var active: Bool?; var expires: Double?; var left: Int? }
+    var on: Bool
+    var port: Int?
+    var networks: [Net]?
+    var any_network: Bool?
+    var clients: [Client]?
+    var reading: [Reading]?
+    var pairing: Pairing?
+    var fp: String?
+    var host: String?
+    var service: Bool?
+    var more: Int?
+    var shared: Bool { on && service != false }
+}
+
+/// A pairing code made in this session (§3.8 rule 6): shown until it is spent or expires.
+struct ShareCode {
+    var code: String
+    var link: String
+    var expires: Double
+    /// The viewers paired before it was made, and when it was made: a viewer paired since used it.
+    var before: Set<String>
+    var made: Double = Date().timeIntervalSince1970
+}
+
+/// What the app asks root to do for sharing: a closed set, run by the installed, root-owned CLI
+/// (roadmap 01 §4.4); an id only after it matched its pattern, and then quoted.
+enum ShareAction {
+    case on, off, pair, revoke(String, String)
+    var args: [String]? {
+        switch self {
+        case .on: return ["share", "on", "--pair", "--json"]
+        case .off: return ["share", "off"]
+        case .pair: return ["share", "pair", "--json"]
+        case .revoke(let id, _):
+            return id.range(of: #"^c-[0-9a-f]{8}$"#, options: .regularExpression) != nil ? ["share", "revoke", id] : nil
+        }
+    }
+    var prompt: String {
+        switch self {
+        case .on: return "\(brand) needs administrator rights to share this Mac with other machines and make a pairing code."
+        case .off: return "\(brand) needs administrator rights to stop sharing this Mac."
+        case .pair: return "\(brand) needs administrator rights to make a pairing code for another machine."
+        case .revoke(_, let name):
+            // the name goes into AppleScript's source: letters, digits and . _ - only
+            let safe = String(name.filter { $0.isASCII && ($0.isLetter || $0.isNumber || "._- ".contains($0)) }.prefix(40))
+            return "\(brand) needs administrator rights to end the access of \(safe.isEmpty ? "a viewer" : safe) to this Mac."
+        }
+    }
+}
+
+extension Store {
+    /// The share switch and its codes run the installed CLI as root: never the bundle's copy.
+    static let installedCLI = "/usr/local/libexec/oomph/oomph.py"
+
+    /// The + (and ⌘N): the popover, at the step the draft is at. `share` opens Share this Mac.
+    func openConnect(share: Bool = false) {
+        guard machinesUI else { return }
+        if !draft.alive { endAdd(); draft.reset() }
+        known = MachineEntry.loadAll(machinesDir)
+        if share || draft.step == .share { showShare() }
+        connectShown = true
+    }
+
+    /// Share this Mac: a code that is still good is shown again, and waited for again (§3.8 rule 6).
+    func showShare() {
+        draft.step = .share
+        if shareCodeValid, !renderMode { shareWaiting = true }
+        refreshShare { [weak self] in self?.pollShare() }
+    }
+
+    /// The code this app made is still good (not used, not expired).
+    var shareCodeValid: Bool { shareCode.map { Date().timeIntervalSince1970 < $0.expires } ?? false }
+
+    func toggleConnect() {
+        if connectShown { connectShown = false } else { openConnect() }
+    }
+
+    /// Cancel, Esc, success: the draft goes (and a connection still under way is ended).
+    func closeConnect(discard: Bool) {
+        if discard {
+            endAdd()
+            shareWaiting = false
+            draft.reset()
+        }
+        connectShown = false
+    }
+
+    /// A `remote add` still under way is ended and let go of at once, so a retry starts straight
+    /// away (its late end is not read). At the question the pairing is made already: "no" gives it
+    /// back there; anywhere else the attempt stops.
+    func endAdd() {
+        guard let p = addProcess else { return }
+        if draft.step == .ask { try? addIn?.write(contentsOf: Data("\n".utf8)) } else { p.terminate() }
+        try? addIn?.close()
+        addProcess = nil; addIn = nil; addBuf = Data(); addResult = nil; addOpen = 0
+    }
+
+    /// A `remote add` lives no longer than its draft (§3.8 rule 4): one still waiting (at the
+    /// question, the popup closed and nobody back) when the draft expires is ended.
+    private func expireAdd(_ id: ObjectIdentifier) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
+            guard let self, self.addProcess.map(ObjectIdentifier.init) == id else { return }
+            if self.draft.alive { self.expireAdd(id); return }
+            self.endAdd()
+            self.draft.reset()
+            self.connectShown = false
+        }
+    }
+
+    /// The machines of machines.json the field can complete to: their names and addresses.
+    var completions: [(mid: String, names: [String])] {
+        known.map { e in (e.mid, [e.label, e.name, e.host].compactMap { $0 } + (e.addrs ?? [])) }
+    }
+
+    /// ↵, "Connect to … as typed", a link pasted: what the text names. A machine this Mac knows by that
+    /// name or address is its tab, or comes back from Recents; a link and an address are reached
+    /// (nothing is paired yet); user@host shows the SSH step first.
+    func connectTyped() {
+        let t = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        draft.error = nil; draft.errorCode = nil; draft.blocked = false
+        guard !t.isEmpty else { return }
+        if let e = known.first(where: { e in
+            [e.label, e.name, e.host].compactMap { $0?.lowercased() }.contains(t.lowercased()) || (e.addrs ?? []).contains(t)
+        }) {
+            useKnown(e)
+            return
+        }
+        switch ConnectInput.kind(t) {
+        case "link":
+            // a link only fills in the code step: nothing is sent until Pair (01 §3.7, §7.3), whose
+            // proof over the key presented keeps a machine in between out
+            guard let l = ConnectInput.link(t) else { fail("bad_address"); return }
+            draft.target = l.target
+            draft.code = ConnectInput.showCode(l.code)
+            draft.fp = nil; draft.fpShort = ""; draft.revoked = false
+            draft.from = .start
+            draft.step = .code
+        case "ssh":
+            draft.target = t
+            draft.step = .ssh
+        default:
+            guard ConnectInput.tcpTarget(t) else { fail("bad_address"); return }
+            draft.target = t
+            draft.code = ""
+            runAdd(code: nil)
+        }
+    }
+
+    private func fail(_ code: String, detail: String = "", side: String? = nil) {
+        draft.errorCode = code
+        draft.error = ConnectInput.message(code, target: draft.target.isEmpty ? draft.text : draft.target, detail: detail, side: side)
+    }
+
+    /// A remembered machine always becomes a tab, reachable or not (§3.7); a tab is just selected.
+    func useKnown(_ e: MachineEntry) {
+        if e.pinned == true, let i = machines.firstIndex(where: { $0.mid == e.mid }) {
+            select(i)
+        } else {
+            pendingSelect = e.mid
+            engineCommand(["cmd": "pin", "id": e.mid])
+        }
+        closeConnect(discard: true)
+    }
+
+    /// Forget (the trash of a Recents row, after its question): mirror, key and token go, and the
+    /// machine is told to drop this viewer when it can be reached.
+    func forget(_ mid: String) {
+        engineCommand(["cmd": "forget", "id": mid])
+        known.removeAll { $0.mid == mid }
+        draft.forgetting = nil
+    }
+
+    /// `oomph remote add TARGET --json --no-mirror --ask`, the bundled CLI as this user: reaches the
+    /// machine, and pairs with the code (on stdin, never in an argument other users could read) bound
+    /// to the key the code step showed. The tab fills live afterwards (no first sync here). The
+    /// identity question comes as a line and is answered on stdin.
+    func runAdd(code: String?) {
+        guard addProcess == nil else { return }
+        draft.from = draft.step == .connecting ? draft.from : (draft.step == .ask ? .code : draft.step)
+        var args = ["-I", "-B", cliPath, "remote", "add", draft.target, "--json", "--no-mirror", "--ask"]
+        if code != nil { args += ["--code", "-"] }
+        if code != nil, let fp = draft.fp { args += ["--fp", fp] }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = args
+        let inp = Pipe(), out = Pipe()
+        p.standardInput = inp
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        addBuf = Data()
+        addResult = nil
+        addOpen = 2  // its output and the process: the answer is read when both have ended
+        let id = ObjectIdentifier(p)  // a run let go of (Cancel, a retry) is no longer listened to
+        out.fileHandleForReading.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            if d.isEmpty { h.readabilityHandler = nil; DispatchQueue.main.async { self?.addEnded(id) }; return }
+            DispatchQueue.main.async { self?.addData(d, id) }
+        }
+        p.terminationHandler = { [weak self] _ in
+            DispatchQueue.main.async { self?.addEnded(id) }
+        }
+        draft.error = nil; draft.errorCode = nil; draft.blocked = false
+        draft.step = .connecting
+        draft.started = Date()
+        do { try p.run() } catch { draft.step = draft.from; fail("", detail: "can't start the `oomph` command"); return }
+        addProcess = p
+        addIn = inp.fileHandleForWriting
+        if let c = code { try? addIn?.write(contentsOf: Data((c + "\n").utf8)) }
+        expireAdd(id)
+    }
+
+    /// The identity question answered: "new", "replace:MID", or "" (cancel).
+    func answerAsk(_ a: String) {
+        if a.isEmpty { closeConnect(discard: true); return }
+        try? addIn?.write(contentsOf: Data((a + "\n").utf8))
+        draft.step = .connecting
+    }
+
+    private func addData(_ d: Data, _ id: ObjectIdentifier) {
+        guard addProcess.map(ObjectIdentifier.init) == id else { return }
+        addBuf.append(d)
+        if addBuf.count > 1 << 20 { addBuf.removeAll() }
+        while let i = addBuf.firstIndex(of: 0x0A) {
+            let line = addBuf.subdata(in: addBuf.startIndex..<i)
+            addBuf.removeSubrange(addBuf.startIndex...i)
+            guard let o = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
+            if o["ev"] as? String == "ask", let k = o["known"] as? [String: Any], let mid = k["mid"] as? String {
+                draft.askMid = mid
+                draft.askLabel = (k["label"] as? String) ?? mid
+                draft.step = .ask
+            } else {
+                addResult = o
+            }
+        }
+    }
+
+    private func addEnded(_ id: ObjectIdentifier) {
+        guard addProcess.map(ObjectIdentifier.init) == id else { return }
+        addOpen -= 1
+        guard addOpen <= 0 else { return }
+        addProcess = nil
+        try? addIn?.close()
+        addIn = nil
+        let o = addResult ?? [:]
+        addResult = nil
+        guard draft.step == .connecting else { return }
+        if o["ok"] as? Bool == true, let m = o["machine"] as? [String: Any], let mid = m["mid"] as? String {
+            // a machine that is not a Mac (Linux over ssh) is watched from the terminal until 1.13: no tab yet
+            let other = (m["os"] as? String).map { $0 != "macos" } ?? false
+            if !other { machineAdded(mid) }
+            if o["new"] as? Bool == true || other {
+                let name = (m["name"] as? String) ?? draft.host
+                draft.pairedOther = other
+                draft.pairedMid = mid
+                draft.pairedName = name
+                var about: [String] = []
+                if let v = m["os_version"] as? String { about.append(v) }
+                if let r = (m["ram_gb"] as? NSNumber)?.doubleValue { about.append(String(format: "%.0f GB", r)) }
+                if let v = m["version"] as? String { about.append(brand + " " + v) }
+                draft.pairedAbout = about.joined(separator: " · ")
+                draft.tabName = ConnectInput.shortName(name)
+                draft.step = .paired
+            } else {
+                closeConnect(discard: true)
+            }
+            return
+        }
+        let code = (o["error"] as? String) ?? "", detail = (o["detail"] as? String) ?? ""
+        switch code {
+        case "needs_code":
+            draft.fp = o["fp"] as? String
+            draft.fpShort = (o["fp_short"] as? String) ?? ""
+            draft.revoked = o["revoked"] as? Bool == true
+            draft.step = .code
+        case "revoked":
+            draft.fp = o["fp"] as? String
+            draft.fpShort = (o["fp_short"] as? String) ?? ""
+            draft.revoked = true
+            draft.step = .code
+        case "identity_changed" where draft.from == .code && o["fp"] is String:
+            // Pair met another key than the one shown: the key it presented now is shown, and the
+            // next Pair binds to that one (not again to the stale one)
+            draft.fp = o["fp"] as? String
+            draft.fpShort = (o["fp_short"] as? String) ?? ""
+            draft.step = .code
+            fail(code, detail: detail)
+        default:
+            draft.step = draft.from
+            fail(code, detail: detail, side: o["side"] as? String)
+            if o["fast"] as? Bool == true, ConnectInput.kind(draft.target) != "ssh" { probeLocalNetwork() }
+        }
+    }
+
+    /// A connection that failed at once: is it macOS (Local Network privacy)? The app's own probe,
+    /// as for a tab (roadmap 01 §7.6): only `localNetworkDenied` says so.
+    private func probeLocalNetwork() {
+        guard !renderMode, let port = NWEndpoint.Port(rawValue: UInt16(clamping: ConnectInput.port(draft.target))) else { return }
+        let c = NWConnection(host: NWEndpoint.Host(draft.host), port: port, using: .tcp)
+        let target = draft.target
+        c.stateUpdateHandler = { [weak self] st in
+            DispatchQueue.main.async {
+                guard let self else { c.cancel(); return }
+                switch st {
+                case .waiting, .failed:
+                    if c.currentPath?.unsatisfiedReason == .localNetworkDenied, self.draft.target == target {
+                        self.draft.blocked = true
+                        self.fail("local_network_denied")
+                    }
+                    c.stateUpdateHandler = nil; c.cancel()
+                case .ready:
+                    c.stateUpdateHandler = nil; c.cancel()
+                default: break
+                }
+            }
+        }
+        c.start(queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { c.cancel() }
+    }
+
+    /// Pair (the code step): the code typed or from the link, bound to the key shown.
+    func pair() {
+        guard let c = ConnectInput.normCode(draft.code) else { return }
+        draft.step = .code
+        runAdd(code: c)
+    }
+
+    /// The last step of pairing: the tab's name (a label of its own only when it differs).
+    func addTab() {
+        let name = draft.tabName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !name.isEmpty, name != ConnectInput.shortName(draft.pairedName), name != draft.pairedName {
+            engineCommand(["cmd": "rename", "id": draft.pairedMid, "label": String(name.prefix(64))])
+        }
+        closeConnect(discard: true)
+    }
+
+    /// A machine was added from the popover: it becomes a tab, selected, and the engine connects it.
+    func machineAdded(_ mid: String) {
+        pendingSelect = mid
+        reloadMachines()
+        if machines.count > 1 { ensureEngine() }
+    }
+
+    // MARK: Share this Mac
+
+    /// `share status --json` as this user, in the background (no prompt).
+    func refreshShare(then: (() -> Void)? = nil) {
+        guard !renderMode else { return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-I", "-B", cliPath, "share", "status", "--json"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard (try? p.run()) != nil else { return }
+            let d = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let st = try? JSONDecoder().decode(ShareStatus.self, from: d)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.share = st
+                self.checkCode()
+                then?()
+            }
+        }
+    }
+
+    /// Whether the code on screen was used (a viewer that was not there when it was made) or expired.
+    private func checkCode() {
+        guard let c = shareCode else { return }
+        if let new = (share?.clients ?? []).first(where: { !c.before.contains($0.id) && ($0.paired ?? 0) >= c.made - 60 }) {
+            sharePaired = (new.name?.isEmpty == false ? new.name! : "a viewer")
+            shareCode = nil
+            shareWaiting = false
+        } else if Date().timeIntervalSince1970 > c.expires {
+            shareCode = nil
+            shareWaiting = false
+        }
+    }
+
+    /// The switch, a new code, a revoke: one administrator prompt each (01 §14.5), through the
+    /// installed CLI. The popup stays under the prompt (§3.8 rule 3), and a code is shown until it is
+    /// spent: while it waits, the panel stays where it is.
+    func shareRun(_ a: ShareAction) {
+        guard let args = a.args, !busy else { return }
+        let before = Set((share?.clients ?? []).map(\.id))
+        shareError = nil
+        sharePaired = nil
+        busy = true
+        let words = args.map { w in w.range(of: #"^[a-z0-9-]+$"#, options: .regularExpression) != nil ? w : "" }
+        let cmd = "/usr/bin/python3 -I -B " + "'\(Store.installedCLI)' " + words.dropLast(a.isRevoke ? 1 : 0).joined(separator: " ")
+        let tail = a.isRevoke ? " & \" \" & quoted form of \"\(words.last ?? "")\"" : ""
+        DispatchQueue.global().async {
+            var err: NSDictionary?
+            let src = "do shell script \"\(cmd)\"\(tail) with prompt \"\(a.prompt)\" with administrator privileges"
+            let out = NSAppleScript(source: src)?.executeAndReturnError(&err)
+            let text = out?.stringValue ?? ""
+            DispatchQueue.main.async {
+                self.busy = false
+                if let e = err {
+                    if (e[NSAppleScript.errorNumber] as? Int) != -128 {
+                        self.shareError = (e[NSAppleScript.errorMessage] as? String) ?? "failed"
+                    }
+                } else if case .on = a, let c = Store.parseCode(text, before: before) {
+                    self.shareCode = c; self.shareWaiting = true; self.draft.touch()
+                } else if case .pair = a, let c = Store.parseCode(text, before: before) {
+                    self.shareCode = c; self.shareWaiting = true; self.draft.touch()
+                } else if case .off = a {
+                    self.shareCode = nil; self.shareWaiting = false
+                }
+                self.refreshShare()
+                if self.popupOpen { self.connectShown = true }
+                self.pollShare()
+            }
+        }
+    }
+
+    /// The code's line of `share on --pair --json` / `share pair --json` (the last line of the output).
+    static func parseCode(_ text: String, before: Set<String>) -> ShareCode? {
+        guard let last = text.split(whereSeparator: \.isNewline).last,
+              let o = (try? JSONSerialization.jsonObject(with: Data(last.utf8))) as? [String: Any],
+              let code = o["code"] as? String, ConnectInput.normCode(code) != nil,
+              let link = o["link"] as? String, let exp = (o["expires"] as? NSNumber)?.doubleValue else { return nil }
+        return ShareCode(code: code, link: link, expires: exp, before: before)
+    }
+
+    /// While a code waits, Share this Mac looks every 2 s whether it was used.
+    func pollShare() {
+        guard shareWaiting, !renderMode else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self, self.shareWaiting else { return }
+            self.refreshShare { self.pollShare() }
+        }
+    }
+
+    /// Done, Back, Esc: the code stays known (and is shown again when Share this Mac is), the panel
+    /// goes back to its own rule, and the popover no longer comes back by itself at this step.
+    func shareDone() {
+        shareWaiting = false
+        sharePaired = nil
+        if draft.step == .share { draft.step = .start }
+    }
+}
+
+extension ShareAction {
+    var isRevoke: Bool { if case .revoke = self { return true } else { return false } }
+}
+
+/// The + of roadmap 01 §3.1: on the hairline under the header (one machine) or at the end of the
+/// tab strip; it opens the connect popover, and Share this Mac is in it.
+struct PlusButton: View {
+    @ObservedObject var store: Store
+    @State private var hover = false
+
+    var body: some View {
+        let lit = hover || store.connectShown
+        Button { store.toggleConnect() } label: {
+            Image(systemName: "plus").font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(lit ? Color.accentColor : Color.secondary)
+                .frame(width: 20, height: 20)
+                .background(Circle().fill(Color(nsColor: .windowBackgroundColor)))
+                .overlay(Circle().stroke(lit ? Color.accentColor : Color.primary.opacity(0.2), lineWidth: 0.75))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain).focusable(false)
+        .background {
+            if !renderMode {
+                GeometryReader { g in
+                    Color.clear
+                        .onAppear { store.plusRect = g.frame(in: .global) }
+                        .onChange(of: g.frame(in: .global)) { _, f in store.plusRect = f }
+                }
+            }
+        }
+        .onHover { h in withAnimation(.easeOut(duration: 0.12)) { hover = h } }
+        .help("Connect to another machine, or share this Mac")
+        .tourAnchor("plus")
+        .anchorPreference(key: PlusAnchorKey.self, value: .bounds) { $0 }
+    }
+}
+
+struct PlusAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
+}
+
+/// A text field, or in a render its look (a static render draws no AppKit field).
+struct ConnectField: View {
+    let placeholder: String
+    @Binding var text: String
+    var mono = false
+    var size: CGFloat = 12
+    var onSubmit: () -> Void = {}
+
+    var body: some View {
+        if renderMode {
+            Text(text.isEmpty ? placeholder : text)
+                .font(mono ? .system(size: size, design: .monospaced) : .system(size: size))
+                .foregroundStyle(text.isEmpty ? Color.secondary.opacity(0.7) : Color.primary)
+                .lineLimit(1)
+                .padding(.horizontal, 6).padding(.vertical, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 5))
+                .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.primary.opacity(0.2), lineWidth: 0.5))
+        } else {
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(mono ? .system(size: size, design: .monospaced) : .system(size: size))
+                .onSubmit(onSubmit)
+        }
+    }
+}
+
+/// A spinner, or in a render a static mark (Reduce Motion's "…" of roadmap 01 §3.13).
+struct ConnectSpinner: View {
+    var body: some View {
+        if renderMode { Image(systemName: "ellipsis").font(.system(size: 11, weight: .bold)).foregroundStyle(.secondary) }
+        else { ProgressView().controlSize(.small).scaleEffect(0.7).frame(width: 16, height: 16) }
+    }
+}
+
+/// The connect popover's content (roadmap 01 §3.7): connecting, pairing and sharing alike. 304 pt
+/// wide (316 for sharing). Errors stay in it, in plain words, and are kept with the draft.
+struct ConnectView: View {
+    @ObservedObject var store: Store
+    @ObservedObject var draft: ConnectDraft
+    @State private var hoverRow: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            switch draft.step {
+            case .start: start
+            case .connecting: connecting
+            case .code: codeStep
+            case .ssh: sshStep
+            case .ask: askStep
+            case .paired: paired
+            case .share: ShareView(store: store, draft: draft)
+            }
+        }
+        .padding(14)
+        .frame(width: draft.step == .share ? 316 : 304, alignment: .leading)
+        .onExitCommand {
+            // at Share this Mac, Esc is Done: a fresh code is kept, the panel no longer held
+            if draft.step == .share { store.shareDone(); store.closeConnect(discard: false) } else { store.closeConnect(discard: true) }
+        }
+    }
+
+    func title(_ s: String) -> some View {
+        Text(s).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
+    }
+
+    func note(_ s: String) -> some View {
+        Text((try? AttributedString(markdown: s)) ?? AttributedString(s))
+            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder var errorBox: some View {
+        if let e = draft.error {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: draft.blocked ? "hand.raised.fill" : "exclamationmark.triangle.fill")
+                        .font(.system(size: 11)).foregroundStyle(.orange)
+                    Text((try? AttributedString(markdown: e)) ?? AttributedString(e))
+                        .font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    if draft.blocked { Button("Open Local Network settings") { Store.openLocalNetworkSettings() } }
+                    Spacer()
+                    Button("Try again") { draft.step == .code ? store.pair() : draft.step == .ssh ? store.runAdd(code: nil) : store.connectTyped() }
+                }
+                .controlSize(.small)
+            }
+            .padding(8)
+            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+        }
+    }
+
+    // the first step: the field, Recents or the matches, Share this Mac
+    var start: some View {
+        let recents = store.known.filter { $0.pinned != true }.sorted { ($0.last_connected ?? 0) > ($1.last_connected ?? 0) }
+        let typed = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let found = ConnectInput.matches(typed, store.completions)
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                ConnectField(placeholder: "Address, name or oomph:// link", text: $draft.text) { store.connectTyped() }
+                    .onChange(of: draft.text) { old, new in
+                        // a link pasted (⌘V) goes straight on to its confirmation
+                        if ConnectInput.link(new) != nil, ConnectInput.link(old) == nil, new.count - old.count > 12 { store.connectTyped() }
+                    }
+                    .onKeyPress(.tab) {
+                        guard let f = found.first else { return .ignored }
+                        draft.text = f.matched
+                        return .handled
+                    }
+                Button("Paste") {
+                    if let s = NSPasteboard.general.string(forType: .string) {
+                        draft.text = String(s.trimmingCharacters(in: .whitespacesAndNewlines).prefix(400))
+                        if ConnectInput.link(draft.text) != nil { store.connectTyped() }
+                    }
+                }
+                .controlSize(.small)
+            }
+            errorBox
+            if !typed.isEmpty {
+                VStack(alignment: .leading, spacing: 0) {
+                    ForEach(found.prefix(5), id: \.mid) { f in
+                        if let e = store.known.first(where: { $0.mid == f.mid }) { matchRow(e, matched: f.matched, typed: typed) }
+                    }
+                    Button { store.connectTyped() } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.right.circle").foregroundStyle(.secondary).frame(width: 18)
+                            Text("Connect to “\(typed)” as typed").font(.system(size: 12)).lineLimit(1).truncationMode(.middle)
+                            Spacer()
+                        }
+                        .padding(.vertical, 5).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            } else if recents.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    note("**On the other machine:** open \(brand), click + › Share this Mac and turn sharing on. It shows a pairing code. (Terminal: `sudo oomph share on --pair`.)")
+                    note("**Here:** paste the link it shows, or type its address.")
+                    note("The first time, macOS asks whether \(brand) may find devices on your local network. Choose Allow: that is how the dashboard reaches the machine.")
+                        .foregroundStyle(.tertiary)
+                }
+            } else {
+                Text("Recents").font(.caption).foregroundStyle(.secondary)
+                let rows = VStack(alignment: .leading, spacing: 0) { ForEach(recents, id: \.mid) { recentRow($0) } }
+                if recents.count > 5 && !renderMode { ScrollView { rows }.frame(height: 5 * 38) } else { rows }
+            }
+            Divider()
+            Button { store.showShare() } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "dot.radiowaves.left.and.right").foregroundStyle(.secondary).frame(width: 18)
+                    Text("Share this Mac…").font(.system(size: 12))
+                    Spacer()
+                    if store.share?.shared == true {
+                        Text("on · \(store.share?.clients?.count ?? 0) paired").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                    Image(systemName: "chevron.right").font(.system(size: 10)).foregroundStyle(.tertiary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    func entryLine(_ e: MachineEntry) -> String {
+        var bits = [e.transport == "ssh" ? (e.user.map { $0 + "@" } ?? "") + (e.host ?? "") : e.address]
+        if let v = e.os_version { bits.append(v) }
+        if let r = e.ram_gb { bits.append(String(format: "%.0f GB", r)) }
+        if let t = e.last_connected { bits.append(ConnectInput.ago(t, now: Date().timeIntervalSince1970)) }
+        return bits.joined(separator: " · ")
+    }
+
+    func recentRow(_ e: MachineEntry) -> some View {
+        let hover = hoverRow == e.mid || (renderMode && e.mid == store.known.first(where: { $0.pinned != true })?.mid && renderRowHover)
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Image(systemName: e.transport == "ssh" ? "terminal" : "desktopcomputer").foregroundStyle(.secondary).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(e.title).font(.system(size: 12, weight: .medium)).lineLimit(1).truncationMode(.middle)
+                    Text(entryLine(e)).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1).truncationMode(.tail)
+                }
+                Spacer(minLength: 4)
+                if hover {
+                    Button { draft.forgetting = e.mid } label: { Image(systemName: "trash").font(.system(size: 11)).foregroundStyle(.secondary) }
+                        .buttonStyle(.plain).help("Forget \(e.title)…")
+                }
+            }
+            if draft.forgetting == e.mid {
+                VStack(alignment: .leading, spacing: 6) {
+                    note("Forget \(e.title)? Its history on this Mac is deleted and you'll need a new pairing code to connect again.")
+                    HStack {
+                        Spacer()
+                        Button("Cancel") { draft.forgetting = nil }
+                        Button("Forget") { store.forget(e.mid) }
+                    }
+                    .controlSize(.small)
+                }
+                .padding(8).background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+        .padding(.vertical, 4).padding(.horizontal, 4)
+        .background(hover ? Color.primary.opacity(0.06) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+        .contentShape(Rectangle())
+        .onTapGesture { if draft.forgetting == nil { store.useKnown(e) } }
+        .onHover { hoverRow = $0 ? e.mid : (hoverRow == e.mid ? nil : hoverRow) }
+        .contextMenu { Button("Forget…") { draft.forgetting = e.mid } }
+    }
+
+    func matchRow(_ e: MachineEntry, matched: String, typed: String) -> some View {
+        let tab = e.pinned == true
+        // the address that matched, its matching part bold; a match on the name shows the address plainly
+        var shown = AttributedString(matched == e.title ? entryLine(e) : matched)
+        if matched != e.title, let r = shown.range(of: String(matched.prefix(typed.count))) {
+            shown[r].inlinePresentationIntent = .stronglyEmphasized
+        }
+        return Button { store.useKnown(e) } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "desktopcomputer").foregroundStyle(.secondary).frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(e.title).font(.system(size: 12, weight: .medium)).lineLimit(1)
+                    Text(shown).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer()
+                Text(tab ? "connected" : "recent").font(.system(size: 10)).foregroundStyle(.tertiary)
+            }
+            .padding(.vertical, 4).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    var connecting: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            title("Connecting to \(draft.host)")
+            HStack(spacing: 8) {
+                ConnectSpinner()
+                if renderMode {
+                    Text("\(draft.target) · 3 s").font(.system(size: 11)).foregroundStyle(.secondary)
+                } else {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in
+                        Text("\(draft.target) · \(Int(Date().timeIntervalSince(draft.started ?? Date()))) s")
+                            .font(.system(size: 11)).foregroundStyle(.secondary).monospacedDigit()
+                    }
+                }
+            }
+            HStack { Spacer(); Button("Cancel") { store.closeConnect(discard: true) }.keyboardShortcut(.cancelAction) }
+        }
+    }
+
+    var codeStep: some View {
+        let n = ConnectInput.shortName(draft.host)
+        return VStack(alignment: .leading, spacing: 10) {
+            title(draft.host)
+            if draft.revoked {
+                note("\(n) no longer knows this Mac: its access was revoked, or sharing was reset there. Pair again with a new code.")
+            }
+            note("Paste the link that Share this Mac, or `sudo oomph share pair`, shows on \(n), or type its pairing code.")
+            ConnectField(placeholder: "XXXX-XXXX-XXXX", text: $draft.code, mono: true, size: 17) { store.pair() }
+                .onChange(of: draft.code) { _, new in
+                    if let l = ConnectInput.link(new) { draft.code = ConnectInput.showCode(l.code) }
+                }
+            if !draft.fpShort.isEmpty {
+                HStack(spacing: 6) {
+                    Text("Key").font(.system(size: 10)).foregroundStyle(.secondary)
+                    Text(draft.fpShort).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                .help("Compare with `oomph share status` on \(n): the pairing is bound to this key")
+            }
+            Text("This step is kept while you fetch it: if the popup closes, the menu-bar icon brings it back as you left it.")
+                .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            errorBox
+            HStack {
+                Spacer()
+                Button("Cancel") { store.closeConnect(discard: true) }.keyboardShortcut(.cancelAction)
+                Button("Pair") { store.pair() }.keyboardShortcut(.defaultAction)
+                    .disabled(ConnectInput.normCode(draft.code) == nil)
+            }
+        }
+    }
+
+    var sshStep: some View {
+        let p = ConnectInput.sshParts(draft.target)
+        return VStack(alignment: .leading, spacing: 10) {
+            title("\(p.host) over SSH")
+            Text(verbatim: ConnectInput.sshCommand(draft.target))
+                .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                .padding(6).frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
+            note("Whoever can sign in to \(p.host) as \(p.user) can read what \(brand) logs there; no pairing code is asked.")
+            note("It uses your SSH keys or agent and never asks for a password; \(brand) must be installed there.")
+            errorBox
+            HStack {
+                Spacer()
+                Button("Cancel") { store.closeConnect(discard: true) }.keyboardShortcut(.cancelAction)
+                Button("Connect") { store.runAdd(code: nil) }.keyboardShortcut(.defaultAction)
+            }
+        }
+    }
+
+    var askStep: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            title("Is this \(draft.askLabel)?")
+            note("\(draft.host) reports the same machine id as \(draft.askLabel), but has a different key or address. That is normal after reinstalling \(brand) or resetting sharing there, and for cloned systems.")
+            HStack {
+                Button("Cancel") { store.answerAsk("") }.keyboardShortcut(.cancelAction)
+                Spacer()
+                // nothing is merged without a click: Return keeps both (01 §4.5, §7.3)
+                Button("Replace") { store.answerAsk("replace:" + draft.askMid) }
+                    .help("Replace \(draft.askLabel): keep its history and trust the new key")
+                Button("Add separately") { store.answerAsk("new") }.keyboardShortcut(.defaultAction)
+                    .help("A tab and a history of its own; \(draft.askLabel) stays as it is")
+            }
+        }
+    }
+
+    var paired: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                title("Paired with \(ConnectInput.shortName(draft.pairedName))")
+            }
+            if !draft.pairedAbout.isEmpty { note(draft.pairedAbout) }
+            if draft.pairedOther {
+                note("It is watched from the terminal for now (`oomph remote sync`, `oomph top`); the app gives it a tab in a later release.")
+                HStack { Spacer(); Button("Done") { store.closeConnect(discard: true) }.keyboardShortcut(.defaultAction) }
+            } else {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Tab name").font(.caption).foregroundStyle(.secondary)
+                    ConnectField(placeholder: ConnectInput.shortName(draft.pairedName), text: $draft.tabName) { store.addTab() }
+                }
+                HStack { Spacer(); Button("Add tab") { store.addTab() }.keyboardShortcut(.defaultAction) }
+            }
+        }
+    }
+}
+
+/// Share this Mac (roadmap 01 §3.10): opens without a prompt and shows what is; the switch, a new
+/// code and each revoke ask for the administrator password once each.
+struct ShareView: View {
+    @ObservedObject var store: Store
+    @ObservedObject var draft: ConnectDraft
+
+    /// What has to happen first: "activate" (no logger), "update" (the logger is older than the app), or nil.
+    var gate: String? {
+        if let g = renderShareGate { return g.isEmpty ? nil : g }
+        return !store.installed ? "activate" : store.needsUpdate ? "update" : nil
+    }
+
+    var body: some View {
+        let st = store.share
+        let on = st?.shared == true
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Button { store.shareDone() } label: { Image(systemName: "chevron.left").font(.system(size: 11, weight: .semibold)) }
+                    .buttonStyle(.plain).help("Back")
+                Text("Share this Mac").font(.system(size: 13, weight: .semibold))
+                Spacer()
+                shareSwitch(on: on).disabled(gate != nil || store.busy)
+            }
+            if gate == "activate" {
+                gateBox("Activate first. This Mac is not logging, so there is nothing to share yet.", "Activate") {
+                    store.runPrivileged("install.sh") { e in if let e { store.shareError = e } }
+                }
+            } else if gate == "update" {
+                gateBox("Update the logger first. The logger installed on this Mac is older than this app and cannot share yet.", "Update logger") {
+                    store.runPrivileged("install.sh") { e in if let e { store.shareError = e } }
+                }
+            }
+            Text("Paired machines can read this Mac's memory history, reservations and incidents, process names, project folders and purposes included. Read-only; only on the networks it is turned on for.")
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let e = store.shareError {
+                Text(e).font(.system(size: 11)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if on, let st {
+                VStack(alignment: .leading, spacing: 2) {
+                    row("Address", (st.host ?? "this Mac") + ((st.port ?? 6674) == 6674 ? "" : ":\(st.port!)"))
+                    if let fp = st.fp { row("Key", shortKey(fp), mono: true) }
+                    row("Networks", st.any_network == true ? "every network this Mac is on" :
+                            (st.networks ?? []).map { ($0.iface ?? "") + " " + ($0.net ?? "") }.joined(separator: ", "))
+                }
+                codeBlock(st)
+                pairedList(st)
+            }
+        }
+    }
+
+    func shortKey(_ fp: String) -> String {
+        let h = fp.hasPrefix("sha256:") ? String(fp.dropFirst(7)) : fp
+        return stride(from: 0, to: min(16, h.count), by: 4).map { i -> String in
+            let a = h.index(h.startIndex, offsetBy: i), b = h.index(a, offsetBy: min(4, h.count - i))
+            return String(h[a..<b]).uppercased()
+        }.joined(separator: " ")
+    }
+
+    @ViewBuilder func shareSwitch(on: Bool) -> some View {
+        let binding = Binding(get: { on }, set: { v in store.shareRun(v ? .on : .off) })
+        if renderMode {
+            Capsule().fill(on ? Color.accentColor : Color.primary.opacity(0.15)).frame(width: 32, height: 18)
+                .overlay(alignment: on ? .trailing : .leading) { Circle().fill(Color.white).frame(width: 15, height: 15).padding(1.5).shadow(radius: 0.5) }
+                .opacity(gate != nil ? 0.4 : 1)
+        } else {
+            Toggle("", isOn: binding).toggleStyle(.switch).controlSize(.small).labelsHidden()
+                .help(on ? "Stop sharing this Mac (asks for your password)" : "Share this Mac and make a pairing code (asks for your password)")
+        }
+    }
+
+    func gateBox(_ text: String, _ button: String, action: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(text).font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+            HStack { Spacer(); Button(button, action: action).controlSize(.small).disabled(store.busy) }
+        }
+        .padding(8).background(Color.blue.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    func row(_ k: String, _ v: String, mono: Bool = false) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(k).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 56, alignment: .leading)
+            Text(v).font(mono ? .system(size: 10, design: .monospaced) : .system(size: 11)).lineLimit(1).truncationMode(.middle)
+                .textSelection(.enabled)
+        }
+    }
+
+    @ViewBuilder func codeBlock(_ st: ShareStatus) -> some View {
+        if let c = store.shareCode, renderMode || Date().timeIntervalSince1970 < c.expires {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Pairing code").font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    if renderMode {
+                        Text("9:41 left · \(st.pairing?.left ?? 5) tries").font(.system(size: 10)).foregroundStyle(.secondary)
+                    } else {
+                        TimelineView(.periodic(from: .now, by: 1)) { _ in
+                            let left = max(0, Int(c.expires - Date().timeIntervalSince1970))
+                            Text(String(format: "%d:%02d left · %d tries", left / 60, left % 60, st.pairing?.left ?? 5))
+                                .font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+                        }
+                    }
+                }
+                Text(c.code).font(.system(size: 22, weight: .semibold, design: .monospaced)).textSelection(.enabled)
+                HStack(spacing: 6) {
+                    Text(c.link).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                        .lineLimit(1).truncationMode(.middle).textSelection(.enabled)
+                    Spacer(minLength: 4)
+                    Button("Copy link") {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(c.link, forType: .string)
+                    }
+                    .controlSize(.small)
+                }
+                HStack(spacing: 6) {
+                    ConnectSpinner()
+                    Text("Waiting for the other machine…").font(.system(size: 11))
+                }
+                Text("While this code waits, the popup stays where it is, also when you switch apps. Done or the menu-bar icon puts it away; the code is kept and shown again.")
+                    .font(.system(size: 10)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+                HStack { Spacer(); Button("Done") { store.shareDone(); store.closeConnect(discard: false) }.keyboardShortcut(.defaultAction) }
+            }
+            .padding(10)
+            .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                if let p = store.sharePaired {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        Text("Paired with \(p).").font(.system(size: 11))
+                    }
+                }
+                if st.pairing?.active == true, let exp = st.pairing?.expires {
+                    Text("A pairing code is active for another \(max(1, Int((exp - Date().timeIntervalSince1970) / 60))) min (it is shown only where it was made).")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                HStack {
+                    Spacer()
+                    Button("New pairing code") { store.shareRun(.pair) }.controlSize(.small).disabled(store.busy)
+                        .help("A code for one more machine (asks for your password)")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder func pairedList(_ st: ShareStatus) -> some View {
+        let clients = st.clients ?? []
+        let reading = Set((st.reading ?? []).map(\.client))
+        VStack(alignment: .leading, spacing: 3) {
+            Text(clients.isEmpty ? "No machine is paired yet" : "Paired machines").font(.caption).foregroundStyle(.secondary)
+            let rows = VStack(alignment: .leading, spacing: 2) {
+                ForEach(clients) { c in
+                    HStack(spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(c.name?.isEmpty == false ? c.name! : "viewer").font(.system(size: 12, weight: .medium)).lineLimit(1)
+                            Text([c.last_addr ?? "", reading.contains(c.id) ? "reading now" : c.last_seen.map { "last seen " + MemoryChart.when($0) } ?? "never seen"]
+                                .filter { !$0.isEmpty }.joined(separator: " · "))
+                                .font(.system(size: 10)).foregroundStyle(reading.contains(c.id) ? Color.green : Color.secondary).lineLimit(1)
+                        }
+                        Spacer()
+                        Button("Revoke") { store.shareRun(.revoke(c.id, c.name ?? c.id)) }.controlSize(.small).disabled(store.busy)
+                            .help("End this machine's access (\(c.id); asks for your password)")
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            if clients.count > 5 && !renderMode { ScrollView { rows }.frame(height: 5 * 34) } else { rows }
+            if let more = st.more, more > 0 { Text("… and \(more) more: oomph share status").font(.system(size: 10)).foregroundStyle(.tertiary) }
+        }
+    }
+}
+
+/// `--ai share:STATE` draws Share this Mac's gates without this Mac's own install state.
+var renderShareGate: String?
+/// `--ai addhover` draws the first Recents row hovered (its trash).
+var renderRowHover = false
+/// The fallback if the NSPopover misbehaves inside the borderless panel (roadmap 01 Appendix A: never
+/// tried): `defaults write local.oomph.menubar connectSheet -bool YES` shows the same content as a sheet.
+var connectAsSheet: Bool { UserDefaults.standard.bool(forKey: "connectSheet") }
+
 // MARK: - App delegate / status item
 
 /// Borderless panel used instead of NSPopover, positioned explicitly below the status item.
@@ -4393,7 +5817,7 @@ final class PopupPanel: NSPanel {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
     let store = Store()
     var item: NSStatusItem!
     var panel: PopupPanel!
@@ -4401,6 +5825,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var timer: Timer?
     var clickMonitor: Any?
     var lastClose = Date.distantPast
+    /// The connect popover (roadmap 01 §3.7): an NSPopover anchored to the +, a window of its own, so
+    /// it is not clipped by the panel. Built and shown only with machinesUI.
+    var popover: NSPopover?
+    var watchers: [AnyCancellable] = []
 
     var isShown: Bool { panel?.isVisible ?? false }
 
@@ -4441,6 +5869,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         store.local.loadIncidents()
         updateIcon()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
+        store.onResize = { [weak self] in DispatchQueue.main.async { if self?.isShown == true { self?.position() } } }
+        store.onPlusMoved = { [weak self] in
+            guard let self, let p = self.popover, p.isShown else { return }
+            DispatchQueue.main.async { p.positioningRect = self.plusAnchorRect }
+        }
+        // the popover's own window giving up the keyboard (to another app) closes the popup as well
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] n in
+            guard let self, let w = n.object as? NSWindow, w === self.popover?.contentViewController?.view.window else { return }
+            self.keyMoved()
+        }
+        watchers = [
+            store.$connectShown.removeDuplicates().sink { [weak self] on in DispatchQueue.main.async { self?.showConnect(on) } },
+            // under the administrator prompt and while a fresh code waits, the panel stays and sits
+            // below menus and system dialogs (roadmap 01 §3.8 rule 3)
+            store.$busy.combineLatest(store.$shareWaiting).sink { [weak self] _ in
+                DispatchQueue.main.async { self?.panel.level = self?.store.holdsPanel == true ? .floating : .popUpMenu }
+            },
+        ]
 
         // Relaunched by an upgrade: show the popup and go straight on to the logger update.
         if CommandLine.arguments.contains("--after-upgrade") {
@@ -4479,7 +5925,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         DispatchQueue.main.async { self.panel.makeFirstResponder(nil) }
         DispatchQueue.main.async { self.position() }  // SwiftUI may settle its size one pass later
         clickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
-            self?.close()
+            if self?.store.holdsPanel != true { self?.close() }
+        }
+        // a draft outlives a close: the popover comes back at its step (roadmap 01 §3.8 rule 2)
+        // (Share this Mac only while a code it made is still good: after Done it no longer comes back)
+        let d = store.draft
+        if store.machinesUI && (store.shareWaiting || d.step == .share && store.shareCodeValid ||
+                                d.alive && (d.step != .start && d.step != .share || !d.text.isEmpty)) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in self?.store.openConnect() }
+        }
+    }
+
+    /// The popover on the +, or away. With `connectSheet` the popup shows a sheet instead (PopoverView).
+    func showConnect(_ on: Bool) {
+        guard !connectAsSheet else { return }
+        if !on || !isShown || !store.machinesUI {
+            if popover?.isShown == true { popover?.performClose(nil) }
+            return
+        }
+        guard store.plusRect.width > 0, hosting.window != nil else { store.connectShown = false; return }
+        if popover == nil {
+            let p = NSPopover()
+            p.behavior = .applicationDefined
+            p.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            let host = NSHostingController(rootView: ConnectView(store: store, draft: store.draft))
+            host.sizingOptions = .preferredContentSize
+            p.contentViewController = host
+            p.delegate = self
+            popover = p
+        }
+        if popover?.isShown != true {
+            popover?.show(relativeTo: plusAnchorRect, of: hosting, preferredEdge: hosting.isFlipped ? .maxY : .minY)
+        }
+    }
+
+    /// The + in the hosting view's own coordinates (SwiftUI measures from the top left).
+    var plusAnchorRect: NSRect {
+        let r = store.plusRect
+        return hosting.isFlipped ? r : NSRect(x: r.minX, y: hosting.bounds.height - r.maxY, width: r.width, height: r.height)
+    }
+
+    func popoverDidClose(_ n: Notification) {
+        if store.connectShown { store.connectShown = false }
+    }
+
+    /// The panel or the popover lost the keyboard: it closes, unless the keyboard went from one to the
+    /// other, or the panel is held (the administrator prompt, a code that waits).
+    func keyMoved() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.isShown else { return }
+            let key = NSApp.keyWindow
+            if key === self.panel || (key != nil && key === self.popover?.contentViewController?.view.window) { return }
+            if self.panel.attachedSheet != nil || self.store.holdsPanel { return }
+            self.close()
         }
     }
 
@@ -4501,6 +5999,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     func close() {
         guard isShown else { return }
+        if popover?.isShown == true { popover?.close() }
+        store.connectShown = false
+        store.shareWaiting = false  // the menu-bar icon puts a waiting code away; it is shown again
         panel.orderOut(nil)
         lastClose = Date()
         if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
@@ -4509,6 +6010,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func windowDidResignKey(_ n: Notification) {
+        // with the + the keyboard may move to its popover, and the panel may be held (§3.8 rule 3)
+        if store.machinesUI { keyMoved(); return }
         // a sheet/alert attached to the panel takes key status; don't close for that
         if panel.attachedSheet == nil { close() }
     }
@@ -4614,6 +6117,7 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
         let opened: Double = Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: "openedAgo")
         for m in store.machines.dropFirst() { m.refreshCurrent(); m.markOpened(at: opened); m.loadIncidents() }
     }
+    if mirror == nil && store.machinesUI { renderConnect(store, ai) }
     store.machine.refreshCurrent()
     store.machine.loadIncidents()
     if ai != "loading" { store.machine.reloadPoints(sync: true) }  // `--ai loading` draws the spinner
@@ -4662,12 +6166,106 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
     let view = PopoverView(store: store, showAI: ["callout", "dialog-connected", "dialog-error"].contains(ai), showTopApps: ai == "top",
                            tourStep: tour, showAllReservations: ai == "resmore")
         .background(Color(nsColor: .windowBackgroundColor))
+        .frame(minHeight: store.connectShown ? 820 : nil, alignment: .top)  // room for the popover under the +
         .environment(\.colorScheme, dark ? .dark : .light)
     let r = ImageRenderer(content: view)
     r.scale = 2
     guard let cg = r.cgImage,
           let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else { return }
     try? png.write(to: URL(fileURLWithPath: path))
+}
+
+/// The + and its popover in a render (roadmap 01 §3.13), with `-machinesUI YES`: `--ai add`, `addhover`,
+/// `addtype[:TEXT]`, `addssh[:TARGET]`, `pair[:link]`, `addconnecting`, `adderr:CODE`, `ask`, `paired[:other]`,
+/// `share[:off|update|activate]`, `sharecode`. Recents come from OOMPH_MACHINES_DIR; everything else here
+/// is invented. `--ai tour:4` is the tour's Machines step.
+@MainActor
+func renderConnect(_ store: Store, _ ai: String) {
+    let d = store.draft
+    let parts = ai.split(separator: ":", maxSplits: 1).map(String.init)
+    let what = parts.first ?? "", arg = parts.count > 1 ? parts[1] : ""
+    let now = Date().timeIntervalSince1970
+    let fp = "sha256:328861212bbe5cc89a48359f4426b50b" + String(repeating: "0", count: 32)
+    var share = ShareStatus(on: true, port: 6674, networks: [.init(iface: "en0", net: "192.168.1.0/24", router: "192.168.1.1")],
+                            any_network: false,
+                            clients: [.init(id: "c-4f2a9d10", name: "sams-macbook-pro", paired: now - 3 * 86400, last_seen: now - 40,
+                                            last_addr: "192.168.1.12"),
+                                      .init(id: "c-91be03f7", name: "air", paired: now - 30 * 86400, last_seen: now - 14 * 86400,
+                                            last_addr: "192.168.1.40")],
+                            reading: [.init(client: "c-4f2a9d10", peer: "192.168.1.12", since: now - 1800)],
+                            pairing: .init(active: false, expires: nil, left: nil), fp: fp, host: "studio.local",
+                            service: true, more: 0)
+    store.known = MachineEntry.loadAll(machinesDir)
+    switch what {
+    case "add", "addhover":
+        renderRowHover = what == "addhover"
+    case "addtype":
+        d.text = arg.isEmpty ? "stu" : arg
+    case "addssh":
+        d.step = .ssh; d.target = arg.isEmpty ? "sam@atlas" : arg
+    case "pair":
+        d.step = .code; d.target = "studio.local"; d.fp = fp; d.fpShort = "3288 6121 2BBE 5CC8"
+        if arg == "link" { d.code = "K7QF-2M9X-D4TR"; d.fp = nil; d.fpShort = "" }  // a link sends nothing before Pair
+    case "addconnecting":
+        d.step = .connecting; d.target = "studio.local"
+    case "adderr":
+        let code = arg.isEmpty ? "refused" : arg
+        d.text = "studio.local"; d.target = "studio.local"; d.errorCode = code; d.blocked = code == "local_network_denied"
+        d.error = ConnectInput.message(code, target: "studio.local")
+    case "ask":
+        d.step = .ask; d.target = "studio.local"; d.askMid = "m-7f3a9c1e5b2d4a68"; d.askLabel = "studio"
+    case "paired":
+        d.step = .paired; d.pairedName = "studio.local"; d.pairedAbout = "macOS 27.2 · 64 GB · \(brand) 1.10.2"; d.tabName = "studio"
+        if arg == "other" { d.pairedName = "atlas"; d.pairedAbout = "Ubuntu 24.04 · 251 GB · \(brand) 1.10.2"; d.pairedOther = true }
+    case "share":
+        d.step = .share
+        if arg == "off" || arg == "update" || arg == "activate" { share.on = false; share.clients = []; share.reading = [] }
+        store.share = share
+        renderShareGate = arg == "update" || arg == "activate" ? arg : ""
+    case "sharecode":
+        d.step = .share
+        share.pairing = .init(active: true, expires: now + 581, left: 5)
+        store.share = share
+        store.shareCode = ShareCode(code: "K7QF-2M9X-D4TR", link: "oomph://K7QF-2M9X-D4TR@studio.local", expires: now + 581, before: [])
+        store.shareWaiting = true
+        renderShareGate = ""
+    default:
+        return
+    }
+    store.connectShown = true
+}
+
+/// `oomph --connect-vectors FILE`: the popover's pure functions (ConnectInput) over the inputs of FILE
+/// (tools/vectors/connect.json), answered as JSON. tools/connectvectors.py compares them with the file,
+/// whose link, code and kind answers the CLI must give too (oomph_sync.parse_link, parse_target).
+func connectVectors(_ path: String) -> Int32 {
+    guard let data = FileManager.default.contents(atPath: path),
+          let v = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        FileHandle.standardError.write("oomph: --connect-vectors: can't read \(path)\n".data(using: .utf8)!)
+        return 2
+    }
+    func cases(_ k: String) -> [[String: Any]] { (v[k] as? [[String: Any]]) ?? [] }
+    func str(_ c: [String: Any], _ k: String = "s") -> String { (c[k] as? String) ?? "" }
+    var out: [String: Any] = [:]
+    out["link"] = cases("link").map { c -> Any in ConnectInput.link(str(c)).map { [$0.target, $0.code] as Any } ?? NSNull() }
+    out["code"] = cases("code").map { c -> Any in ConnectInput.normCode(str(c)) as Any? ?? NSNull() }
+    out["kind"] = cases("kind").map { ConnectInput.kind(str($0)) }
+    out["ssh_command"] = cases("ssh_command").map { ConnectInput.sshCommand(str($0)) }
+    out["host"] = cases("host").map { ConnectInput.host(str($0)) }
+    out["ago"] = cases("ago").map { c in
+        ConnectInput.ago((c["t"] as? NSNumber)?.doubleValue ?? 0, now: (c["now"] as? NSNumber)?.doubleValue ?? 0)
+    }
+    out["matches"] = cases("matches").map { c -> [[String]] in
+        let known = ((c["known"] as? [[String: Any]]) ?? []).map { k in ((k["mid"] as? String) ?? "", (k["names"] as? [String]) ?? []) }
+        return ConnectInput.matches(str(c, "text"), known).map { [$0.mid, $0.matched] }
+    }
+    out["message"] = cases("message").map { c in
+        ConnectInput.message(str(c, "code"), target: str(c, "target"), detail: str(c, "detail"), side: c["side"] as? String)
+    }
+    guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
+    FileHandle.standardOutput.write(json)
+    FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+    return 0
 }
 
 /// `oomph --chart-vectors FILE`: runs the chart's pure functions over the inputs of FILE (the shared
@@ -4774,6 +6372,9 @@ struct Main {
         let args = CommandLine.arguments
         if let i = args.firstIndex(of: "--chart-vectors"), i + 1 < args.count {
             exit(MainActor.assumeIsolated { chartVectors(args[i + 1]) })
+        }
+        if let i = args.firstIndex(of: "--connect-vectors"), i + 1 < args.count {
+            exit(connectVectors(args[i + 1]))
         }
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
             let ai = args.firstIndex(of: "--ai").map { args.count > $0 + 1 ? args[$0 + 1] : "" } ?? ""

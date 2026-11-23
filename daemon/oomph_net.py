@@ -2379,7 +2379,20 @@ def share_status(sh):
             "allow": [str(a) for a in cfg.get("allow") or []], "any_network": cfg.get("any_network") is True,
             "ai": oomph.switched_on(cfg.get("ai")), "pairing": pairing, "clients": clients, "reading": reading,
             "more": s.get("more") if isinstance(s.get("more"), int) and 0 <= s["more"] <= 256 else 0,
-            "unread": unread, "service": sh.test or sys.platform != "darwin" or os.path.exists(SHARE_PLIST)}
+            "unread": unread, "service": sh.test or sys.platform != "darwin" or os.path.exists(SHARE_PLIST),
+            "fp": _public_fp(sh), "host": local_name()}
+
+
+def _public_fp(sh):
+    """This machine's key as viewers see it (sha256:…), for comparing when pairing; None without one.
+    cert.pem is public (root's, 644); read only when it is root's (or the tester's) and bounded."""
+    try:
+        st = os.stat(sh.cert, follow_symlinks=False)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != sh.owner or st.st_size > 16 << 10:
+            return None
+        return "sha256:" + sh.fp().hex()
+    except (OSError, ValueError, AttributeError):  # AttributeError: a Python without ssl
+        return None
 
 
 def print_status(st):
@@ -2415,13 +2428,29 @@ def print_status(st):
         print("Reading now: %s from %s since %s" % (r["client"], r["peer"], _when(r["since"])[11:]))
 
 
-def print_code(code, expires, as_json):
+def local_name():
+    """The name viewers on the same network reach this machine by: its host name's first label, .local."""
+    return socket.gethostname().split(".")[0] + ".local"
+
+
+def pair_link(code, port=PORT):
+    """What Share this Mac shows and Copy link copies: address and code in one paste (roadmap 01 §3.7)."""
+    return "oomph://%s@%s%s" % (show_code(code), local_name(), "" if port == PORT else ":%d" % port)
+
+
+def print_code(code, expires, as_json, port=PORT):
     if as_json:
-        print(json.dumps({"code": show_code(code), "expires": expires}))
+        print(json.dumps({"code": show_code(code), "expires": expires, "link": pair_link(code, port),
+                          "host": local_name(), "port": port}))
         return
     print("Pairing code: %s   (valid until %s, for one viewer, 5 tries)" % (show_code(code), _when(expires)[11:]))
     print("On the viewer: oomph remote add %s   (it asks for the code; not on the command line, where "
-          "other users of that Mac could read it)" % (socket.gethostname().split(".")[0] + ".local"))
+          "other users of that Mac could read it)" % local_name())
+    print("Or as one link (address and code): %s" % pair_link(code, port))
+
+
+def _port(cfg):
+    return cfg.get("port") if isinstance(cfg.get("port"), int) and 0 < cfg["port"] < 65536 else PORT
 
 
 def cmd_share(args):
@@ -2523,7 +2552,7 @@ def _share(sh, sub, o, pos):
             r = as_service(sh, _mint)
             if norm_code(r.get("code")) != r.get("code"):
                 raise ShareError("no pairing code came back")
-            print_code(r["code"], r.get("expires"), "--json" in o)
+            print_code(r["code"], r.get("expires"), "--json" in o, cfg["port"])
         return 0
     if sub == "pair":
         if sh.config().get("on") is not True:
@@ -2531,7 +2560,7 @@ def _share(sh, sub, o, pos):
         r = as_service(sh, _mint)
         if not r.get("code") or norm_code(r.get("code")) != r.get("code"):
             raise ShareError("no pairing code came back")
-        print_code(r["code"], r.get("expires"), "--json" in o)
+        print_code(r["code"], r.get("expires"), "--json" in o, _port(sh.config()))
         return 0
     if sub == "revoke":
         r = as_service(sh, _revoke(pos[0]))
