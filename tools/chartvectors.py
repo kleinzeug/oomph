@@ -4,7 +4,9 @@
 tools/vectors/chart.json holds inputs and the expected answers of the functions both programs
 share: the mapper and its inversion (the app's TimeAxis, which every chart row is drawn on),
 thinning, gap finding, band merging, lane stacking, the strip's top, the colour index, the
-reservation merge and the hover card over a column (which `oomph top`'s inspect readout shows).
+reservation merge and the hover card over a column (which `oomph top`'s inspect readout shows);
+from 1.11.0 the four resources (02 §3.7, §3.8): the selection's gestures, the capsule's words, what
+each tile says, and an agent's palette slot.
 The expected answers are the app's: `oomph --chart-vectors FILE` runs its own functions over the
 inputs and prints what they return. A change on either side that is not made on the other fails here.
 
@@ -30,11 +32,12 @@ FILE = os.path.join(ROOT, "tools", "vectors", "chart.json")
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import oomph  # noqa: E402
 import oomph_top  # noqa: E402
 import oomph_view as V  # noqa: E402
 
 GROUPS = ("mapper", "invert", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order",
-          "hover")
+          "hover", "selection", "capsule", "tiles", "agent")
 
 
 def cases():
@@ -220,7 +223,74 @@ def cases():
     v["hover"].append({"now": now, "first": now - 600, "span": 3600.0, "du": 1.0 / 40, "u": [0.0, 0.5, 0.95, 1.0],
                        "points": [], "gaps": [], "events": [], "incidents": [], "reservations": []})
     v["hover"] += fixture_hover()
+    resource_cases(v)
     return v
+
+
+def resource_cases(v):
+    """The four resources (1.11.0): every gesture on every tile from a few selections, with and without
+    a GPU; the capsule and the tiles over samples that touch each rule; agents valid and not."""
+    full = list(V.RESOURCES)
+    for sel, focus in ((["memory"], "memory"), (["memory", "cpu"], "memory"), (["memory", "gpu", "disk"], "memory"),
+                       (["memory", "cpu", "disk"], "disk"), (full, "gpu"), (["cpu"], "cpu"), (["gpu"], "gpu"),
+                       ([], "memory"), (["disk", "gpu"], "cpu")):
+        for avail in (full, ["memory", "cpu", "disk"]):
+            for gesture in ("click", "cmd", "shift"):
+                for res in V.RESOURCES:
+                    v["selection"].append({"sel": sel, "focus": focus, "gesture": gesture, "res": res, "avail": avail})
+    base = {"t": 1795180000.0, "ram_gb": 36.0, "app_gb": 14.6, "wired_gb": 7.2, "compressed_gb": 1.9, "pressure": 1,
+            "swap_used_gb": 0.0, "swap_total_gb": 0.0, "disk_free_gb": 63.0, "jetsam_kills": 0,
+            "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+            "gpu": [{"id": "gpu0", "name": "Apple M3 Max", "unified": True, "util": 64.4, "active": 87.0,
+                     "src": "ioreport", "mem_gb": 5.31, "mem_alloc_gb": 9.0, "mem_limit_gb": 27.0}],
+            "disks": [{"id": "data", "name": "Data", "free_gb": 63.2, "total_gb": 995.0, "roles": ["home", "swap", "tmp"],
+                       "watch": True, "low_gb": 20, "crit_gb": 5, "level": "ok"}],
+            "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+            "top_cpu": [{"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5}, {"pid": 2, "name": "rustc", "g": "cargo",
+                                                                               "cpu": 2.0},
+                        {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}],
+            "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+            "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]}
+    two = [dict(base["disks"][0]), {"id": "vol:AB", "name": "Footage Archive SSD", "free_gb": 912.4, "total_gb": 1863.0,
+                                    "roles": [], "watch": True, "low_gb": 50, "crit_gb": 10, "level": "low"}]
+    variants = [{}, {"pressure": 2}, {"pressure": 4}, {"jetsam_kills": 3}, {"app_gb": 25.4},
+                {"unowned_gb": 22.0}, {"disk_free_gb": 14.0}, {"disk_free_gb": 3.5}, {"disk_free_gb": 3.5, "pressure": 4},
+                {"disk_free_gb": 14.0, "pressure": 2}, {"disk_free_gb": 3.5, "pressure": 2},
+                {"disk_free_gb": 15.0, "swap_used_gb": 5.7, "swap_total_gb": 6.0},
+                {"os": "linux", "pressure": 2, "disk_free_gb": 2.0},
+                {"cpu": dict(base["cpu"], busy=13.2, therm=2)}, {"cpu": dict(base["cpu"], busy=12.9)},
+                {"gpu": [dict(base["gpu"][0], util=93.0)]}, {"gpu": [dict(base["gpu"][0], util=93.0, src="clients")]},
+                {"gpu": [{"id": "gpu0", "util": 41.0, "src": "ioreg"}]}, {"gpu": []}, {"cpu": None, "gpu": None},
+                {"disks": two}, {"disks": [two[0], dict(two[1], level="critical")]},
+                {"disks": [dict(two[1], roles=["tmp"]), two[0]], "disk_free_gb": 912.4}, {"disks": None},
+                {"groups": [], "top_cpu": [], "top_gpu": None, "top_io": "x"},
+                # another machine's sample is untrusted: absurd core counts must not crash the app (Int(1e20) traps)
+                {"cpu": dict(base["cpu"], n=1e20, busy=1.0)}, {"cpu": dict(base["cpu"], n=1e300, busy=1e300)},
+                {"cpu": dict(base["cpu"], n=7.5)},
+                # Linux strict overcommit at 95 % of its limit is tight (oomph._verdict_parts), not past 1e15
+                {"os": "linux", "pressure": 1, "linux": {"overcommit": 2, "commit_pct": 96}},
+                {"os": "linux", "pressure": 1, "linux": {"overcommit": 2, "commit_pct": 94.9}},
+                {"os": "linux", "pressure": 1, "linux": {"overcommit": 1, "commit_pct": 99}},
+                {"os": "linux", "pressure": 1, "linux": {"overcommit": 2, "commit_pct": 1e20}},
+                {"os": "linux", "pressure": 1, "linux": {"overcommit": True, "commit_pct": 99}},
+                {"os": "linux", "pressure": 1, "linux": {"overcommit": 2, "commit_pct": "99"}},
+                {"pressure": 1, "linux": {"overcommit": 2, "commit_pct": 99}}]
+    for i, var in enumerate(variants):
+        smp = dict(base, **var)
+        smp = {k: x for k, x in smp.items() if x is not None}
+        v["capsule"].append({"sample": smp})
+        waiting = [{}, {"memory": 1}, {"memory": 2, "cpu": 1}][i % 3]
+        v["tiles"].append({"sample": smp, "waiting": waiting})
+    for a in ({"key": "3f9a0c21", "slot": 0}, {"key": "3f9a0c21", "slot": 5}, {"key": "3f9a0c21"},
+              {"key": "3f9a0c21", "slot": 6}, {"key": "3f9a0c21", "slot": -1}, {"key": "3F9A0C21", "slot": 1},
+              {"key": "3f9a0c2", "slot": 1}, {"key": 12345678, "slot": 1}, {"key": "3f9a0c21", "slot": True},
+              {"key": "3f9a0c21", "slot": 2.0}, None, "3f9a0c21", {}):
+        v["agent"].append({"agent": a})
+
+
+def tile_answer(t):
+    """What the vectors keep of a tile: its words, its flag slot as drawn, its level, queue and top."""
+    return [t["reading"], V.flag_text(t), t["level"], t["queue"], t["top"], t["meter"]]
 
 
 def fixture_hover():
@@ -316,6 +386,14 @@ def python_answers(v):
                             "more_events": i["more_events"], "reserved": [r[0] for r in i["reserved"]],
                             "more_reserved": i["more_reserved"]})
         out["hover"].append(answers)
+    for c in v["selection"]:
+        out["selection"].append(list(V.selection_apply(c["sel"], c["focus"], c["gesture"], c["res"], c["avail"])))
+    for c in v["capsule"]:
+        out["capsule"].append(oomph.capsule(c["sample"]))
+    for c in v["tiles"]:
+        t = V.tiles(c["sample"], oomph.capsule(c["sample"]), c["waiting"])
+        out["tiles"].append([tile_answer(t[r]) for r in V.RESOURCES])
+    out["agent"] = [V.agent_index(c["agent"]) for c in v["agent"]]
     return out
 
 

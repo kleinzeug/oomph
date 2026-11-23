@@ -152,6 +152,11 @@ def quietly(fn, *a, **kw):
 # --- a ledger of version 2, as a vector-aware writer (1.12) and a Linux one (1.9.4) will write it
 NOW = time.time()
 AGENT = {"key": new.agent_key(ME, START), "slot": 0}
+
+
+def agent_is(a, key):
+    """An agent as this code writes it: the key, and from 1.11.0 its palette slot (02 §3.8.4)."""
+    return isinstance(a, dict) and a.get("key") == key and isinstance(a.get("slot"), int) and set(a) == {"key", "slot"}
 OTHER_NS = 4026531836 if new._own_ns() != 4026531836 else 4026531837  # never this process's (Linux: the host's)
 V2_FIELDS = ("v", "res", "res_granted", "waiting_on", "hold", "base", "last", "watch_also", "watch_names", "user",
              "scope", "agent")
@@ -315,8 +320,8 @@ check(lease(L1, "r6") is not None and lease(L1, "r7") is None and lease(L1, "r5"
       "B a holder in another pid namespace is not looked up by its pid: a grant stays until its time (unless "
       "that is further off than any writer sets), a run ends when it stops stamping seen")
 mine = lease(L1, st.get("id"))
-check(mine and mine.get("agent") == {"key": new.agent_key(ME, START)} and "v" not in mine and "res" not in mine,
-      "B a new lease is what 1.8.1 writes plus agent {key} (%s)" % (mine or {}).get("agent"))
+check(mine and agent_is(mine.get("agent"), new.agent_key(ME, START)) and "v" not in mine and "res" not in mine,
+      "B a new lease is what 1.8.1 writes plus agent {key, slot} (%s)" % (mine or {}).get("agent"))
 end4 = [r for r in log(d) if r["id"] == "r4" and r["event"] == "end"]
 check(len(end4) == 1 and end4[0].get("res") == {"ram": 3.0, "gpu": 60, "vram": 4.0} and end4[0].get("peak") == {"gpu": 71}
       and end4[0].get("agent") == {"key": "3f9a0c21", "slot": 1} and end4[0].get("v") == 2
@@ -328,7 +333,7 @@ st2 = quietly(new.reserve, 0.5, "new client", HOLDER, ticket=st.get("id"))
 check(isinstance(st2, dict) and st2.get("status") == "granted", "B with the vector request gone, the line moves on")
 am = quietly(new.amend, st.get("id"), gb=0.75)
 ed = [r for r in log(d) if r["id"] == st.get("id") and r["event"] == "edit"]
-check(isinstance(am, dict) and ed and ed[-1].get("agent") == {"key": new.agent_key(ME, START)},
+check(isinstance(am, dict) and ed and agent_is(ed[-1].get("agent"), new.agent_key(ME, START)),
       "B an edit record carries the agent")
 co = quietly(old.coordination, ME)
 check(isinstance(co, dict) and {b["id"] for b in co["mine"]} == {"r1", st.get("id")},
@@ -387,7 +392,7 @@ check(r and new.lease_res(r) == {"ram": {"ask": 1.5, "got": 1.5}, "mem": {"got":
 c = new.reserve(0.5, "new C", HOLDER)
 L1 = raw(d)
 ob = lease(L1, b["id"])
-check("res" not in ob and "v" not in ob and ob.get("agent") == {"key": new.agent_key(ME, START)}
+check("res" not in ob and "v" not in ob and agent_is(ob.get("agent"), new.agent_key(ME, START))
       and "v" not in L1, "C this code writes no version 2 into a 1.8.1 ledger, only agent (D11)")
 old_keys = set(lease(L0, b["id"])) | {"agent", "user"}  # user: from 1.9.4 (roadmap §4.4: L1 writes it)
 nc = lease(L1, c["id"])
@@ -398,7 +403,7 @@ new.release(c["id"])
 recs = log(d)
 old_rec = set(next(x for x in recs if x["id"] == a["id"] and x["event"] == "end")) | {"agent", "user"}
 new_recs = [x for x in recs if x["id"] == c["id"]]
-check(new_recs and all(set(x) <= old_rec | {"change", "expires"} for x in new_recs),
+check(new_recs and all(set(x) <= old_rec | {"change", "expires", "segments"} for x in new_recs),  # segments: 1.8.1 too, once edited
       "C its records have 1.8.1's fields, agent and user")
 oh = old.reservation_history(3600, 500)
 nh = new.reservation_history(3600, 500)
@@ -507,7 +512,7 @@ check(new._agent_of(run, procs) == new.agent_key(SES, START - 50)
       and new._agent_of(dict(run, holder=dict(run["holder"], start=START + 1)), procs) == new.agent_key(RUN, START + 1),
       "D the agent of an old writer's `oomph run` inside a session is the session's; of anything else, the holder's")
 st = new.reserve(0.25, "run", dict(HOLDER, kind="run", agent=new.agent_key(SES, START - 50)))
-check(lease(raw(d), st["id"])["agent"] == {"key": new.agent_key(SES, START - 50)}
+check(agent_is(lease(raw(d), st["id"])["agent"], new.agent_key(SES, START - 50))
       and "agent" not in lease(raw(d), st["id"])["holder"],
       "D a reservation made by `oomph run` inside a session has the session's agent key")
 

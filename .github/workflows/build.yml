@@ -151,6 +151,19 @@ jobs:
         # nor is a render that asks whether the fixture's holders live. What the TimeAxis refactor is held to.
         run: /usr/bin/python3 -I -B tools/renderfixture.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
 
+      - name: The four resources, switched on (1.11.0)
+        # The popup of 02 §3.7 behind resourcesUI (off for users): every state of tools/renderfixture.py's
+        # RESOURCES list (each selection and focus, the callouts, hover, the compact levels, the capsule's
+        # verdicts, no GPU, an old logger), light and dark, drawn with the switch forced on; kept as an artifact.
+        run: /usr/bin/python3 -I -B tools/renderfixture.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" --resources "$RUNNER_TEMP/resources"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oomph-resources-renders
+          path: ${{ runner.temp }}/resources
+          retention-days: 14
+          if-no-files-found: error
+
       - name: The popup draws a mirror
         # Another machine's mirror, made through a pipe by the real `oomph remote sync --once`
         # (tools/mirrorfixture.py) and drawn by the app: not connected, a stretch not received.

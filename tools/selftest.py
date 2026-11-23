@@ -2931,6 +2931,89 @@ check(len(gets99) == 1 and fn99 != -1 and fn99 < gets99[0] < swift99.find("\n   
                                                                                               swift99.find("func fetchOllamaModels")],
       "the app reads the keychain only for a report (reportToken): not to know it is connected, not to fill the dialog")
 
+# --- M6–M8 (1.11.0): every reservation in its agent's colour (D11, 02 §3.8.4); the capsule follows the verdict
+slots = lambda leases, hist=(), key="new", now=1e9: oomph.agent_slot(key, leases, list(hist), now)  # noqa: E731
+live6 = [{"agent": {"key": "k%d" % i, "slot": i}, "holder": {"pid": 10 + i, "start": 500 - i}} for i in range(6)]
+check([slots(live6[:n]) for n in range(6)] == [0, 1, 2, 3, 4, 5],
+      "agent slot: the first three agents live at once wear three hues, the next three their lighter steps")
+check(slots([live6[1]]) == 0 and slots([live6[0], live6[3]]) == 1,
+      "agent slot: a free slot whose hue nobody live wears comes first")
+check(slots(live6) == 5, "agent slot: a seventh agent shares the slot whose holder started first")
+check(slots([], [{"agent": {"key": "new", "slot": 4}, "ended": 1e9 - 3600}]) == 4 and
+      slots([], [{"agent": {"key": "new", "slot": 4}, "ended": 1e9 - 15 * 86400}]) == 0,
+      "agent slot: an agent keeps its slot from its records of the last 14 days, not older")
+check(slots([], [{"agent": {"key": "old", "slot": 0}, "ended": 1e9 - 60}]) == 1,
+      "agent slot: a new agent does not take the colour of one that just finished")
+procs_now = P.collect_procs()
+sleeper = subprocess.Popen(["/bin/sleep", "120"])
+time.sleep(0.2)
+try:
+    procs_now = P.collect_procs()
+    a_me = {"pid": os.getpid(), "start": procs_now.get(os.getpid(), {}).get("start"), "kind": "session", "project": ROOT}
+    a_ot = {"pid": sleeper.pid, "start": procs_now.get(sleeper.pid, {}).get("start"), "kind": "session",
+            "project": "/tmp/other"}
+    ra, rb = oomph.reserve(0.2, "colour A", a_me), oomph.reserve(0.2, "colour B", a_ot)
+    led = {x["id"]: x for x in oomph.read_ledger()["leases"]}
+    ag = [led.get(x["id"], {}).get("agent") or {} for x in (ra, rb)]
+    check(all("slot" in x for x in ag) and ag[0]["slot"] % 3 != ag[1]["slot"] % 3,
+          "agent slot: two sessions reserving get two hues, stored in their leases (%s)" % ag)
+    with oomph.Ledger() as L:      # a lease of a writer older than 1.11.0: a key and no slot
+        for x in L["leases"]:
+            if x["id"] == rb["id"]:
+                x["agent"] = {"key": x["agent"]["key"]}
+    oomph.coordination()
+    again = next((x for x in oomph.read_ledger()["leases"] if x["id"] == rb["id"]), {}).get("agent") or {}
+    check(again.get("slot") == ag[1].get("slot"), "agent slot: a lease without one gets it from the next evaluation")
+    oomph.release(ra["id"])
+    rc_ = oomph.reserve(0.2, "colour A again", a_me)
+    led = {x["id"]: x for x in oomph.read_ledger()["leases"]}
+    check((led.get(rc_["id"], {}).get("agent") or {}).get("slot") == ag[0].get("slot"),
+          "agent slot: the same agent's next reservation keeps its colour")
+    oomph.release("all", a_me["pid"])
+    oomph.release(rb["id"])
+    hp = os.path.join(oomph.LEDGER_DIR, "reservations.jsonl")
+    recs = [x for x in map(json.loads, open(hp)) if x["id"] in (ra["id"], rb["id"])] if os.path.exists(hp) else []
+    check(recs and all((x.get("agent") or {}).get("slot") is not None for x in recs),
+          "agent slot: the history log's records carry it (%d records)" % len(recs))
+    import oomph_view  # noqa: E402
+    sleeper.kill()
+    sleeper.wait()
+    gone = dict(a_ot, project="/tmp/gone")
+    rd = oomph.reserve(0.2, "colour gone", gone)
+    with oomph.Ledger() as L:      # an older writer's lease (no slot), its holder gone before anyone evaluates
+        for x in L["leases"]:
+            if x["id"] == rd["id"]:
+                x["agent"] = {"key": x["agent"]["key"]}
+    oomph.coordination()
+    recs = [x for x in map(json.loads, open(hp)) if x["id"] == rd["id"]] if os.path.exists(hp) else []
+    check(recs and recs[-1].get("outcome") == "holder_gone" and (recs[-1].get("agent") or {}).get("slot") is not None,
+          "agent slot: a lease retired in the evaluation that would first have given it one still gets one")
+    lv = oomph.ledger_view(since=time.time() - 3600)
+    seen = {x["id"]: x for x in lv["records"]}
+    want = {x["id"]: (x.get("agent") or {}).get("slot") for x in recs}
+    merged = {x["id"]: x for x in oomph_view.merge_reservations(lv["records"], {}, time.time())}
+    check(rd["id"] in seen and (seen[rd["id"]].get("agent") or {}).get("slot") == want.get(rd["id"])
+          and merged.get(rd["id"], {}).get("agent") == want.get(rd["id"])
+          and oomph_view.res_role({"rv": True}, merged[rd["id"]]) == "g%d" % want[rd["id"]],
+          "agent slot: oomph top's records (ledger_view) keep the agent, so a finished reservation keeps its colour")
+finally:
+    sleeper.kill()
+    sleeper.wait()
+base_s = dict(ram_gb=36.0, app_gb=20.0, wired_gb=4.0, compressed_gb=2.0, pressure=1, disk_free_gb=60.0,
+              swap_used_gb=0.0, swap_total_gb=0.0)
+caps_cases = [({}, "Normal"), ({"pressure": 2}, "Memory tight"), ({"pressure": 4}, "Memory critical"),
+              ({"jetsam_kills": 2}, "Memory tight"), ({"app_gb": 29.5}, "Memory tight"),
+              ({"unowned_gb": 20.0}, "Memory tight"), ({"disk_free_gb": 12.0}, "Disk low"),
+              ({"disk_free_gb": 3.0}, "Disk critical"), ({"disk_free_gb": 3.0, "pressure": 4}, "Memory critical"),
+              ({"disk_free_gb": 12.0, "pressure": 2}, "Memory tight"), ({"disk_free_gb": 3.0, "pressure": 2}, "Disk critical"),
+              ({"disk_free_gb": 15.0, "swap_used_gb": 5.8, "swap_total_gb": 6.0}, "Memory critical")]
+got_caps = [(oomph.capsule(dict(base_s, **c)), oomph.verdict(dict(base_s, **c))) for c, _ in caps_cases]
+check([c["text"] for c, _ in got_caps] == [w for _, w in caps_cases],
+      "capsule: Normal, Memory tight or critical, Disk low or critical, memory first on a tie (%s)"
+      % [c["text"] for c, _ in got_caps])
+check(all(c["level"] == v["exit_code"] for c, v in got_caps),
+      "capsule: its level is always `oomph check`'s (the chip agrees with the verdict)")
+
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,
                    timeout=600, env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR")})

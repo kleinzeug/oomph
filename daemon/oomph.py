@@ -2276,48 +2276,81 @@ def oversize_for(s):
     return _linux().oversize_limit(free_physical_gb(s), room, s.get("ram_gb") or 0)
 
 
-def verdict(s):
-    """ok / tight / critical for a sample, with the reasons. The rules are a system's: a sample
-    without `os` is a Mac's (every sample before 1.8.8). A full disk counts only on a Mac, where
-    swap grows on the startup volume (roadmap 03 §5.4)."""
+def _verdict_parts(s):
+    """The verdict's findings for a sample: [(level 1|2, resource "memory"|"disk", reason)], in the
+    order `oomph check` lists them. The rules are a system's: a sample without `os` is a Mac's (every
+    sample before 1.8.8). A full disk counts only on a Mac, where swap grows on the startup volume
+    (roadmap 03 §5.4); a full swap on a full disk is memory's (02 §3.4.9)."""
     mac = s.get("os", "macos") == "macos"
     lin = s.get("os") == "linux"
     ram = s.get("ram_gb") or 0
     free = free_physical_gb(s)
     disk = s.get("disk_free_gb", 999)
     swap_full = s.get("swap_total_gb", 0) > 0 and s.get("swap_used_gb", 0) >= 0.9 * s["swap_total_gb"]
-    level, reasons = 0, []
-
-    def bump(lv, why):
-        nonlocal level
-        level = max(level, lv)
-        reasons.append(why)
-
+    out = []
     p = s.get("pressure", 1)
     if lin:
-        for lv, why in _linux_reasons(s, p if isinstance(p, int) else 1):
-            bump(lv, why)
+        out += [(lv, "memory", why) for lv, why in _linux_reasons(s, p if isinstance(p, int) else 1)]
     elif p >= 4:
-        bump(2, "macOS memory pressure is CRITICAL")
+        out.append((2, "memory", "macOS memory pressure is CRITICAL"))
     elif p >= 2:
-        bump(1, "macOS memory pressure is WARNING")
+        out.append((1, "memory", "macOS memory pressure is WARNING"))
     if mac and disk < 5:
-        bump(2, "only %.0f GB disk free — swap cannot grow" % disk)
+        out.append((2, "disk", "only %.0f GB disk free — swap cannot grow" % disk))
     elif mac and disk < 20:
-        bump(1, "only %.0f GB disk free — swap may not be able to grow" % disk)
+        out.append((1, "disk", "only %.0f GB disk free — swap may not be able to grow" % disk))
     if mac and swap_full and disk < 20:
-        bump(2, "swap is full (%.1f/%.1f GB) and the disk is too full to add more" % (s["swap_used_gb"], s["swap_total_gb"]))
+        out.append((2, "memory", "swap is full (%.1f/%.1f GB) and the disk is too full to add more"
+                    % (s["swap_used_gb"], s["swap_total_gb"])))
     if ram and free < 0.05 * ram and not lin:  # on Linux the headroom bounds say it (03 §5.4)
-        bump(1, "only %.1f GB physical memory free" % free)
+        out.append((1, "memory", "only %.1f GB physical memory free" % free))
     lx = s.get("linux") if lin and isinstance(s.get("linux"), dict) else {}
     if lx.get("overcommit") == 2 and _num(lx.get("commit_pct")) and lx["commit_pct"] >= 95:
-        bump(1, "strict overcommit is at %d%% of its limit: allocations are about to fail" % lx["commit_pct"])
+        out.append((1, "memory", "strict overcommit is at %d%% of its limit: allocations are about to fail"
+                    % lx["commit_pct"]))
     if s.get("jetsam_kills"):
-        bump(1, "macOS just killed %d processes for memory" % s["jetsam_kills"])
+        out.append((1, "memory", "macOS just killed %d processes for memory" % s["jetsam_kills"]))
     u = s.get("unowned_gb")
     if u is not None and ram and u >= unowned_limit_gb(ram):
-        bump(1, "%.0f GB of memory is held outside any process (likely a GPU or driver leak) "
-                "and won't come back until the Mac restarts" % u)
+        out.append((1, "memory", "%.0f GB of memory is held outside any process (likely a GPU or driver leak) "
+                                 "and won't come back until the Mac restarts" % u))
+    return out
+
+
+CAPSULE_WORDS = ("Normal", "tight", "critical")  # "Memory tight", "Disk critical" (02 §3.4.9, §15.13)
+DISK_WORDS = ("", "low", "critical")
+
+
+def capsule(s):
+    """What the app's capsule and `oomph top`'s say about a sample, and the colour of the menu-bar
+    chip and its mark (02 §3.4.9, §3.5; decided 2026-11-23: they follow oomph's verdict). One
+    function of `verdict`'s findings, so the capsule agrees with `oomph check`: the worst finding
+    names it ("Memory tight", "Memory critical", "Disk low", "Disk critical"; memory first on a
+    tie), "Normal" without one. {"text", "level" 0–2, "memory" 0–2 (the chip's body), "disk" 0–2
+    (its mark)}. CPU and GPU never change it. The machine-wide verdict only: never the raise one
+    caller's coordination applies, and no pins (the app and the dashboard are nobody's caller)."""
+    lv = {"memory": 0, "disk": 0}
+    for level, res, _why in _verdict_parts(s):
+        lv[res] = max(lv[res], level)
+    worst = max(lv.values())
+    if not worst:
+        text = CAPSULE_WORDS[0]
+    elif lv["memory"] >= lv["disk"]:
+        text = "Memory " + CAPSULE_WORDS[lv["memory"]]
+    else:
+        text = "Disk " + DISK_WORDS[lv["disk"]]
+    return {"text": text, "level": worst, "memory": lv["memory"], "disk": lv["disk"]}
+
+
+def verdict(s):
+    """ok / tight / critical for a sample, with the reasons (_verdict_parts)."""
+    lin = s.get("os") == "linux"
+    ram = s.get("ram_gb") or 0
+    free = free_physical_gb(s)
+    disk = s.get("disk_free_gb", 999)
+    parts = _verdict_parts(s)
+    level, reasons = max([lv for lv, _r, _w in parts] or [0]), [w for _lv, _r, w in parts]
+    p = s.get("pressure", 1)
     lv = LEVELS[level]
     v = {
         "level": lv, "exit_code": level, "reasons": reasons, "advice": (ADVICE_LINUX if lin else ADVICE)[lv],
@@ -3512,6 +3545,54 @@ def _agent_of(r, procs):
     return agent_key(h["pid"], h.get("start"))
 
 
+AGENT_HUES = 3                            # slots 0–2 are three hues, 3–5 the same hues a step lighter
+
+
+def agent_slot(key, leases, history, now):
+    """The palette slot of an agent with `key` (02 §3.8.4), chosen once by the writer that first
+    sees it without one, under the ledger lock. An agent keeps its slot: a live lease or a record of
+    the ledger's own history (its last HISTORY_KEEP, at most 14 days old) with this key and a slot
+    wins. Otherwise a slot no live agent holds, preferring one whose hue no live agent wears (so the
+    first three agents live at once wear three hues), then the one whose last block ended longest
+    ago, then the lowest. With every slot held (a seventh agent): the slot the fewest live agents
+    hold, then the one whose holder started first. Every front end draws the stored slot."""
+    held, first = {}, {}
+    for r in leases:
+        a = r.get("agent") if isinstance(r.get("agent"), dict) else {}
+        if "slot" not in a:
+            continue
+        if a.get("key") == key:
+            return a["slot"]
+        held.setdefault(a["slot"], set()).add(a.get("key"))
+        st = (r.get("holder") or {}).get("start")
+        if _num(st):
+            first[a["slot"]] = min(first.get(a["slot"], st), st)
+    last = {}
+    for h in history:
+        a = h.get("agent") if isinstance(h.get("agent"), dict) else {}
+        end = h.get("ended") if _num(h.get("ended")) else 0
+        if "slot" not in a or now - end > HISTORY_DAYS * 86400:
+            continue
+        if a.get("key") == key:
+            return a["slot"]
+        last[a["slot"]] = max(last.get(a["slot"], end), end)
+    worn = {s % AGENT_HUES for s in held}
+    free = [s for s in range(AGENT_SLOTS) if s not in held]
+    if free:
+        return min(free, key=lambda s: (s % AGENT_HUES in worn, last.get(s, float("-inf")), s))
+    return min(range(AGENT_SLOTS), key=lambda s: (len(held[s]), first.get(s, float("inf")), s))
+
+
+def _give_slots(L, now):
+    """Every live lease that has an agent key and no slot gets its slot, in ledger order (so each
+    choice sees the ones before it): whichever writer evaluates first, a CLI, an MCP server or the
+    logger's child, also for leases an older writer made."""
+    for r in L["leases"]:
+        a = r.get("agent")
+        if isinstance(a, dict) and a.get("key") and "slot" not in a:
+            a["slot"] = agent_slot(a["key"], L["leases"], L.get("history") or [], now)
+
+
 def lease_res(r):
     """A lease's resources as vector-aware code reads them (02 §9.2): a v2 lease's own `res`, its
     `ram` following `gb` where an old writer's amend changed only the mirror; for a 1.8 lease, a
@@ -3825,7 +3906,7 @@ def read_ledger():
 #   {"event": "edit" | "end", "t": when written, "key": "r12@1795172655", "id": "r12", "purpose", "project",
 #    "holder": "session" | "process" | "run", "gb": current GB, "segments": [{"t", "gb"}, …] (only once edited),
 #    "requested", "granted", "peak_gb", and for "end": "ended", "outcome"; for "edit": "change", "expires";
-#    from 1.9.2 "agent" {key} when the holder's start time is known (D11)}
+#    from 1.9.2 "agent" {key} when the holder's start time is known (D11), from 1.11.0 with its palette "slot"}
 # Readers merge the records of a key (merge_history): from 1.9.2 on, newer writers add a "grant" record
 # and fields that a 1.8 writer ending the same reservation leaves out. `key` stays unique across ledger
 # resets: it carries the request time.
@@ -4028,7 +4109,12 @@ def _tree_gb(procs, children, root):
 def _retire(L, r, outcome, now, at=None):
     """Move a lease into the history, ending it when it really ended: an expired grant at its
     expiry, a lapsed request when its owner stopped polling, one of an earlier boot at the boot
-    (`at`), anything else now. A refused request keeps its arithmetic (`note`)."""
+    (`at`), anything else now. A refused request keeps its arithmetic (`note`). An agent without a
+    slot yet (a lease an older writer made, retired in the evaluation that would first have given
+    it one) gets it here, so its records keep a colour (02 §3.8.4)."""
+    a = r.get("agent")
+    if isinstance(a, dict) and a.get("key") and "slot" not in a:
+        a["slot"] = agent_slot(a["key"], L["leases"], L.get("history") or [], now)
     end = now
     if at is not None:
         end = min(now, at)
@@ -4093,6 +4179,7 @@ def _evaluate(L, s, procs, now):
         else:
             keep.append(r)
     L["leases"] = keep
+    _give_slots(L, now)  # the agent's colour (D11), before any grant record is written
 
     # Memory a grant's processes have added since it was granted counts against the grant, so
     # it isn't counted twice (once as used, once as reserved). Grants watching the same process
@@ -4647,7 +4734,7 @@ def reservation_history(since_s=24 * 3600, limit=50):
 
 
 VIEW_FIELDS = ("event", "key", "id", "purpose", "project", "holder", "gb", "requested", "granted", "ended",
-               "outcome", "peak_gb", "used_gb", "expires", "segments")
+               "outcome", "peak_gb", "used_gb", "expires", "segments", "agent")
 
 
 def _view_records(recs, since):

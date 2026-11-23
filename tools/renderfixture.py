@@ -9,6 +9,11 @@ table whether a lease's holder lives; `--now T` and `--no-liveness` take both fr
                                         drawn twice and must come out byte for byte the same; a render an hour
                                         later must differ (the clock is honoured), and so must one without
                                         --no-liveness (the fixture's holders are not alive)
+    tools/renderfixture.py --app EXE --resources DIR
+                                        the four-resource popup (1.11.0, behind resourcesUI) forced on, in every
+                                        state of RESOURCES below, light and dark, into DIR as NAME-light.png and
+                                        NAME-dark.png, and the menu-bar chip (--render-chip) as chip-light.png and
+                                        chip-dark.png: what the owner looks at before switching it on
     tools/renderfixture.py --app EXE --against OLD [--same-version] [--keep DIR]
                                         a change with no visual change (the TimeAxis refactor, 1.10.7): every
                                         render state of the popup (ALL below: the --ai states, the switched-off
@@ -73,20 +78,67 @@ ALL = ([("fx", ai, []) for ai in (
         "m-1b2c3d4e5f607182", "m-90a1b2c3d4e5f607", "m-2c3d4e5f60718293", AIR)]
     + [("remote", "", SEEN + ["-selectedMachine", AIR, "-openedAgo", "2"])]
     + [("mirror", ai, []) for ai in ("", "log", "1h", "6h", "hover:300", "hoverlog:200", "rhover:420:30")]
-    + [(fx, ai, []) for fx in ("fx8", "fx16") for ai in ("", "log")])
+    + [(fx, ai, []) for fx in ("fx8", "fx16") for ai in ("", "log")]
+    # the four resources' fixture with their switch off (1.11.0): the samples' cpu, gpu and disks blocks and the
+    # agents of the reservations change nothing in the popup until the switch is on
+    + [("fxr", ai, []) for ai in ("", "log", "hover:300", "rhover:420:30", "top", "tour:1", "tour:2")])
+# The four resources forced on (--resources, and two in the check): (name, fixture, --ai state, extra arguments).
+RON = ["-resourcesUI", "YES"]
 
 
-def write(d, ram=None):
-    """The fixture: topfixture's default machine; its live leases' holder is DEAD_PID. With `ram`, the
-    machine has that many GB (current.json's ram_gb) instead of 36."""
-    log, led = topfixture.write_fixture(d, "default")
+def sel(focus, *shown):
+    return RON + ["-selectedResources", "(%s)" % ",".join(shown or (focus,)), "-focusResource", focus]
+
+
+ALL4 = ("memory", "cpu", "gpu", "disk")
+RESOURCES = ([("memory-alone", "fxr", "", sel("memory")), ("memory-cpu", "fxr", "", sel("memory", "memory", "cpu")),
+              ("memory-gpu-disk", "fxr", "", sel("memory", "memory", "gpu", "disk")),
+              ("all-memory", "fxr", "", sel("memory", *ALL4)), ("all-gpu", "fxr", "", sel("gpu", *ALL4)),
+              ("all-cpu-6h", "fxr", "6h", sel("cpu", *ALL4)), ("cpu-alone", "fxr", "", sel("cpu")),
+              ("gpu-alone", "fxr", "", sel("gpu")), ("disk-alone", "fxr", "", sel("disk")),
+              ("disk-cpu-1h", "fxr", "1h", sel("disk", "cpu", "disk")),
+              ("all-memory-inf", "fxr", "log", sel("memory", *ALL4)),
+              ("all-memory-hover", "fxr", "hover:300", sel("memory", *ALL4)),
+              ("all-cpu-hover", "fxr", "hover:300", sel("cpu", *ALL4)),
+              ("memory-strip-card", "fxr", "rhover:420:30", sel("memory")),
+              ("memory-callout", "fxr", "top", sel("memory")), ("cpu-callout", "fxr", "top", sel("cpu")),
+              ("gpu-callout", "fxr", "top", sel("gpu")), ("disk-callout", "fxr", "top", sel("disk")),
+              ("cpu-only-list", "fxr", "", sel("cpu", "cpu", "gpu")),
+              ("tour-1", "fxr", "tour:1", sel("memory", "memory", "cpu")), ("tour-2", "fxr", "tour:2", sel("memory", "memory", "cpu"))]
+             + [("all-memory-level-%d" % n, "fxr", "lvl:%d" % n, sel("memory", *ALL4)) for n in range(1, 6)]
+             + [("memory-tight", "fxr-tight", "", sel("cpu")), ("memory-critical", "fxr-crit", "", sel("cpu", "cpu", "gpu")),
+                ("disk-low", "fxr-disklow", "", sel("memory")), ("disk-critical", "fxr-diskcrit", "", sel("memory", *ALL4)),
+                ("cpu-busy-throttled", "fxr-hot", "", sel("cpu", *ALL4)), ("no-gpu", "fxr-nogpu", "", sel("memory", *ALL4)),
+                ("old-logger", "fx", "", sel("memory", *ALL4)), ("machines-and-resources", "fxr", "", sel("memory", "memory", "cpu")
+                                                                + ["-machinesUI", "YES"])])
+# what each variant of the resources fixture changes in its current.json (the samples stay the week's)
+VARIANTS = {"fxr-tight": {"pressure": 2}, "fxr-crit": {"pressure": 4, "jetsam_kills": 3},
+            "fxr-disklow": {"disk_free_gb": 12.0, "disks!": [12.0, "low"]},
+            "fxr-diskcrit": {"disk_free_gb": 3.5, "disks!": [3.5, "critical"]},
+            "fxr-hot": {"cpu!": {"busy": 13.4, "user": 11.0, "sys": 2.4, "therm": 2}}, "fxr-nogpu": {"gpu": []}}
+
+
+def write(d, ram=None, scenario="default", change=None):
+    """The fixture: topfixture's default machine (or another scenario, "resources" for 1.11.0's four
+    resources); its live leases' holder is DEAD_PID. With `ram`, the machine has that many GB (current.json's
+    ram_gb) instead of 36; `change` (VARIANTS) sets other fields of current.json ("disks!": the first pool's
+    free GB and level, "cpu!": fields of the cpu block)."""
+    log, led = topfixture.write_fixture(d, scenario)
     os.makedirs(os.path.join(d, "machines"))
     dead_holders(os.path.join(led, "ledger.json"))
-    if ram is not None:
+    if ram is not None or change:
         p = os.path.join(log, "current.json")
         with open(p, encoding="utf-8") as f:
             cur = json.load(f)
-        cur["ram_gb"] = float(ram)
+        if ram is not None:
+            cur["ram_gb"] = float(ram)
+        for k, v in (change or {}).items():
+            if k == "disks!":
+                cur["disks"][0].update(free_gb=v[0], level=v[1])
+            elif k == "cpu!":
+                cur["cpu"].update(v)
+            else:
+                cur[k] = v
         with open(p, "w", encoding="utf-8") as f:
             json.dump(cur, f)
     return d
@@ -173,7 +225,8 @@ def against(exe, old, keep=None, same_version=False):
         rfx, mirror, rnow = write_remote(os.path.join(base, "remote"))
         where = {"fx": (fx, NOW, []), "remote": (rfx, rnow, []), "mirror": (rfx, rnow, ["--mirror", mirror]),
                  "fx8": (write(os.path.join(base, "fx8"), 8), NOW, []),
-                 "fx16": (write(os.path.join(base, "fx16"), 16), NOW, [])}
+                 "fx16": (write(os.path.join(base, "fx16"), 16), NOW, []),
+                 "fxr": (write(os.path.join(base, "fxr"), scenario="resources"), NOW, [])}
         for i, (kind, ai, extra) in enumerate(ALL):
             if i and i % 20 == 0:
                 print("  %d of %d states drawn, %d pairs byte-identical" % (i, len(ALL), same), flush=True)
@@ -218,6 +271,40 @@ def render(exe, fx, out, ai="", extra=(), now=NOW, live=False):
     return r.returncode, data, r.stderr.strip()
 
 
+def resources(exe, out):
+    """Every state of RESOURCES, light and dark, into `out` (the owner's renders of the four resources)."""
+    base = tempfile.mkdtemp(prefix="oomph-renderfixture-")
+    os.makedirs(out, exist_ok=True)
+    bad = 0
+    try:
+        where = {"fx": write(os.path.join(base, "fx")), "fxr": write(os.path.join(base, "fxr"), scenario="resources")}
+        for k, ch in VARIANTS.items():
+            where[k] = write(os.path.join(base, k), scenario="resources", change=ch)
+        for name, fx, ai, extra in RESOURCES:
+            for dark in (False, True):
+                path = os.path.join(out, "%s-%s.png" % (name, "dark" if dark else "light"))
+                rc, data, err = render(exe, where[fx], path, ai, list(extra) + (["--dark"] if dark else []))
+                bad += data is None
+                print("%s  %s%s" % ("ok   " if data else "FAIL ", os.path.basename(path), "" if data else ": " + err),
+                      flush=True)
+        for dark in (False, True):          # the menu-bar chip: each body, with and without the disk's disc
+            path = os.path.join(out, "chip-%s.png" % ("dark" if dark else "light"))
+            try:
+                r = subprocess.run([exe, "--render-chip", path] + (["--dark"] if dark else []), capture_output=True,
+                                   text=True, timeout=60)
+                err = r.stderr.strip()
+            except subprocess.TimeoutExpired:
+                err = "timed out"
+            data = os.path.exists(path) and os.path.getsize(path) > 0
+            bad += not data
+            print("%s  %s%s" % ("ok   " if data else "FAIL ", os.path.basename(path), "" if data else ": " + err), flush=True)
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    print("renderfixture: %d renders of the four resources in %s%s" % (2 * len(RESOURCES) + 2, out,
+                                                                       "; %d failed" % bad if bad else ""))
+    return 1 if bad else 0
+
+
 def check(exe):
     bad = []
 
@@ -240,6 +327,17 @@ def check(exe):
                    name, "%d bytes" % len(a[1]) if a[1] and a[1] == b[1] else a[2] or b[2] or "they differ"))
         ok(first[0] is not None and first[len(STATES) - 1] not in (None, first[0]),
            "render with the machines switch on: a different picture from the plain one (the switch took)")
+        # the four resources (1.11.0): drawn twice the same, the switch takes, and off it changes nothing
+        fxr = write(os.path.join(base, "fxr"), scenario="resources")
+        pics = {}
+        for i, (ai, extra) in enumerate([("", []), ("", sel("memory")), ("", sel("gpu", *ALL4)), ("lvl:4", sel("cpu", *ALL4))]):
+            a = render(exe, fxr, os.path.join(base, "r%d-a.png" % i), ai, extra)
+            b = render(exe, fxr, os.path.join(base, "r%d-b.png" % i), ai, extra)
+            pics[i] = a[1]
+            ok(a[0] == 0 and a[1] is not None and a[1] == b[1], "render of the four resources %s: drawn twice, byte-identical (%s)"
+               % (" ".join(extra[1:]) or "switched off", "%d bytes" % len(a[1]) if a[1] and a[1] == b[1] else a[2] or b[2] or "differ"))
+        ok(len({pics[i] for i in pics if pics[i]}) == 4,
+           "the four resources: the switch takes, and Memory alone, all four on the GPU and a compact level differ")
         later = render(exe, fx, os.path.join(base, "later.png"), now=NOW + 3600)
         ok(later[1] is not None and first[0] is not None and later[1] != first[0],
            "render an hour later by --now: a different picture (the clock comes from --now)")
@@ -261,6 +359,8 @@ def main(argv):
         return argv[argv.index(k) + 1] if k in argv and argv.index(k) + 1 < len(argv) else None
     if arg("--app") and arg("--against"):
         return against(arg("--app"), arg("--against"), arg("--keep"), "--same-version" in argv)
+    if arg("--app") and arg("--resources"):
+        return resources(arg("--app"), arg("--resources"))
     if arg("--app"):
         return check(arg("--app"))
     if len(argv) == 1 and not argv[0].startswith("-"):

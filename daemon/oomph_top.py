@@ -139,17 +139,67 @@ def _lines(path):
         return
 
 
-def _point(s):
-    """The seven keys the chart needs, from one sample."""
+def _point(s, res=False):
+    """The seven keys the chart needs, from one sample; with `res` (the resources on) also the other
+    resources (view.RES_POINT: None where the sample has no reading)."""
     t = _num(s.get("t"), None)
     if t is None:
         return None
-    return dict(t=float(t), wired=_num(s.get("wired_gb")), app=_num(s.get("app_gb")), comp=_num(s.get("compressed_gb")),
-                swap=_num(s.get("swap_used_gb")), away=oomph.is_away(s) if isinstance(s.get("away"), dict) else False,
-                kills=int(_num(s.get("jetsam_kills"), 0)))
+    p = dict(t=float(t), wired=_num(s.get("wired_gb")), app=_num(s.get("app_gb")), comp=_num(s.get("compressed_gb")),
+             swap=_num(s.get("swap_used_gb")), away=oomph.is_away(s) if isinstance(s.get("away"), dict) else False,
+             kills=int(_num(s.get("jetsam_kills"), 0)))
+    if res:
+        p.update(res_point(s))
+    return p
 
 
-def load_points(log_dir, now, since):
+def res_point(s):
+    """A sample's cores busy (and of them the system's), the GPU (and whether at full speed), its memory,
+    and the free space of the Disk tile's pool (02 §5.1; Point.take in the app)."""
+    c = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
+    gl = s.get("gpu") if isinstance(s.get("gpu"), list) else []
+    g = gl[0] if gl and isinstance(gl[0], dict) else {}
+    d, _ = view.tile_pool(s)
+    return {"cpu": _num(c.get("busy"), None), "sys": _num(c.get("sys"), None), "gpu": _num(g.get("util"), None),
+            "gfull": g.get("src") == "ioreport", "gmem": _num(g.get("mem_gb"), None),
+            "disk": _num(d.get("free_gb"), None) if d else _num(s.get("disk_free_gb"), None)}
+
+
+RES_SETTING = "resourcesUI"     # top.json: the four resources (1.11.0), off until the owner has seen the renders
+
+
+def res_view(settings):
+    """model["rv"] from top.json (02 §3.7.12): {"sel", "focus"} while `"resourcesUI": true`, else None.
+    The selection is `oomph top`'s own (`"selection": ["memory"]`, `"focus"`), apart from the app's."""
+    if settings.get(RES_SETTING) is not True:
+        return None
+    want = settings.get("selection") if isinstance(settings.get("selection"), list) else []
+    sel = [r for r in view.RESOURCES if r in want] or ["memory"]
+    return {"sel": sel, "focus": settings.get("focus") if settings.get("focus") in sel else sel[0]}
+
+
+def resource_facts(model, s):
+    """The capsule (oomph's verdict in two words) and the tiles of a sample, into the model. A request
+    waits for memory until 1.12 (nothing else can be asked for)."""
+    try:
+        cap = oomph.capsule(s)
+    except (KeyError, TypeError, ValueError):
+        return
+    waiting = sum(1 for r in model.get("res") or () if r.get("granted") is None and r.get("ended") is None)
+    c = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
+    gl = s.get("gpu") if isinstance(s.get("gpu"), list) else []
+    g = gl[0] if gl and isinstance(gl[0], dict) else {}
+    d, _ = view.tile_pool(s)
+    busy, sys_ = _num(c.get("busy"), None), _num(c.get("sys"), None)
+    rf = {"n": _num(c.get("n"), None), "sys": sys_, "user": busy - (sys_ or 0.0) if busy is not None else None,
+          "util": _num(g.get("util"), None), "full": g.get("src") == "ioreport", "gmem": _num(g.get("mem_gb"), None),
+          "free": _num(d.get("free_gb"), None) if d else _num(s.get("disk_free_gb"), None),
+          "pool": str(d.get("name") or d.get("id") or "") if d else None}
+    model.update(capsule=cap, tiles=view.tiles(s, cap, {"memory": waiting} if waiting else {}), avail=view.available(s),
+                 rfacts=rf)
+
+
+def load_points(log_dir, now, since, res=False):
     """Samples from `since` to now, as chart points, oldest first; and whether older ones exist."""
     files = _day_files(log_dir)
     first_day = time.strftime("%Y-%m-%d", time.localtime(since - 86400))   # the day before: the gap into the window
@@ -163,7 +213,7 @@ def load_points(log_dir, now, since):
                 s = _loads(line)
             except ValueError:
                 continue
-            p = _point(s) if isinstance(s, dict) else None
+            p = _point(s, res) if isinstance(s, dict) else None
             if p and p["t"] <= now + 60:
                 pts.append(p)
     pts.sort(key=lambda p: p["t"])
@@ -438,8 +488,9 @@ def os_name():
     return "macOS %s" % v if v else platform.system()
 
 
-def load_model(span="24h", now=None, log_dir=None, live=True):
-    """Everything one frame shows of this machine. `now` fixed: a reproducible frame (tests)."""
+def load_model(span="24h", now=None, log_dir=None, live=True, rv=None):
+    """Everything one frame shows of this machine. `now` fixed: a reproducible frame (tests). `rv`: the
+    resources' selection (res_view) while their switch is on."""
     log_dir = log_dir or oomph.LOG_DIR
     fixed = now is not None
     now = float(now if fixed else time.time())
@@ -458,7 +509,7 @@ def load_model(span="24h", now=None, log_dir=None, live=True):
         if now - s["t"] > 3 * interval + 15:
             logger, logger_t = "silent", s["t"]
     sp = view.SPANS.get(span)
-    pts, older = load_points(log_dir, now, now - (sp or 400 * 86400))
+    pts, older = load_points(log_dir, now, now - (sp or 400 * 86400), res=rv is not None)
     gaps = view.find_gaps(pts, now)
     first = pts[0]["t"] if pts else None
     if older and pts:           # history began before what was read: never "before history" in view
@@ -473,6 +524,10 @@ def load_model(span="24h", now=None, log_dir=None, live=True):
                  logger=logger, logger_t=logger_t, interval=interval, ledger_state=lstate)
     if note:
         model.update(status=note, status_role="warntx")
+    if rv is not None:
+        model["rv"] = rv
+        if s:
+            resource_facts(model, s)
     return model
 
 
@@ -481,13 +536,15 @@ class Day:
     """One day of samples as the chart needs them: seven typed arrays (14 days are about 2 MB this
     way, against 20 MB as a dict per sample). A plain file (today's) is read on from where the last
     read stopped; a .gz once."""
-    __slots__ = ("sig", "path", "ino", "off", "t", "w", "a", "c", "s", "away", "kills", "ordered", "tmax")
+    __slots__ = ("sig", "path", "ino", "off", "t", "w", "a", "c", "s", "away", "kills", "ordered", "tmax", "res")
 
-    def __init__(self, path, ino):
+    def __init__(self, path, ino, res=False):
         self.path, self.ino, self.off, self.sig = path, ino, 0, None
         self.ordered, self.tmax = True, float("-inf")      # so that series() need not look at every sample
         self.t, self.w, self.a, self.c, self.s = (array.array("d") for _ in range(5))
         self.away, self.kills = bytearray(), array.array("l")
+        # with the resources on: cpu, sys, gpu, gmem, disk (NaN where none) and the GPU's kind (1 at full speed)
+        self.res = ([array.array("d") for _ in range(5)] + [bytearray()]) if res else None
 
     def add(self, line):
         try:
@@ -496,11 +553,16 @@ class Day:
             return
         if not isinstance(s, dict):
             return
-        p = _point(s)
+        p = _point(s, self.res is not None)
         if p is None:
             return
         if p["t"] < self.tmax:
             self.ordered = False
+        if self.res is not None:
+            nan = float("nan")
+            for a, k in zip(self.res, view.RES_POINT):
+                a.append(nan if p[k] is None else p[k])
+            self.res[5].append(1 if p["gfull"] else 0)
         self.tmax = max(self.tmax, p["t"])
         self.t.append(p["t"])
         self.w.append(p["wired"])
@@ -511,7 +573,7 @@ class Day:
         self.kills.append(max(-(1 << 31), min(p["kills"], (1 << 31) - 1)))
 
 
-def _read_day(path, old):
+def _read_day(path, old, res=False):
     """A day's file into a Day: on from `old`'s offset when it is the same plain file grown, else
     whole. A .gz that ends early is not kept (the logger may be writing it: tried again later)."""
     try:
@@ -522,7 +584,7 @@ def _read_day(path, old):
     if old is not None and old.sig == sig:
         return old
     if path.endswith(".gz"):
-        d = Day(path, st.st_ino)
+        d = Day(path, st.st_ino, res)
         n = 0
         try:
             with gzip.open(path, "rb") as f:
@@ -537,7 +599,7 @@ def _read_day(path, old):
         return d
     d = old if old is not None and old.path == path and old.ino == st.st_ino and st.st_size >= old.off else None
     if d is None:
-        d = Day(path, st.st_ino)
+        d = Day(path, st.st_ino, res)
     try:
         with open(path, "rb") as f:
             if d.off == 0 and st.st_size > DAY_CAP:
@@ -558,8 +620,8 @@ def _read_day(path, old):
 class History:
     """Every day of samples on file, kept current by refresh() (only what changed is read)."""
 
-    def __init__(self, log_dir):
-        self.log_dir, self.days = log_dir, {}
+    def __init__(self, log_dir, res=False):
+        self.log_dir, self.days, self.res = log_dir, {}, res
 
     def refresh(self, newest=None):
         """Re-read what changed; with `newest` only that many of the newest days (the first frame
@@ -574,7 +636,7 @@ class History:
                 break
             old = self.days.get(day)
             old_sig = old.sig if old is not None else None
-            d = _read_day(files[day], old)
+            d = _read_day(files[day], old, self.res)
             if d is None:
                 if old is not None:
                     del self.days[day]
@@ -590,6 +652,8 @@ class History:
         whether older days exist (the same window load_points reads)."""
         first_day = time.strftime("%Y-%m-%d", time.localtime(since - 86400))
         cols = [array.array("d") for _ in range(5)] + [bytearray(), array.array("l")]
+        if self.res:
+            cols += [array.array("d") for _ in range(5)] + [bytearray()]
         older, ordered, future, prev = False, True, False, float("-inf")
         for day in sorted(self.days):
             if day < first_day:
@@ -599,7 +663,7 @@ class History:
             if len(d.t):
                 ordered = ordered and d.ordered and d.t[0] >= prev
                 prev, future = d.tmax, future or d.tmax > now + 60
-            for dst, src in zip(cols, (d.t, d.w, d.a, d.c, d.s, d.away, d.kills)):
+            for dst, src in zip(cols, (d.t, d.w, d.a, d.c, d.s, d.away, d.kills) + tuple(d.res or ())):
                 dst.extend(src)
         T = cols[0]
         if ordered and not future:          # the usual case: each day in order, the days in order
@@ -618,8 +682,10 @@ class History:
 
 def multires_cols(cols, now):
     """view.multires over the typed arrays, point for point the same (the self-test compares them),
-    without a dict per sample: only the thinned points become dicts."""
-    T, W, A, C, S, AW, K = cols
+    without a dict per sample: only the thinned points become dicts. Thirteen arrays: also the other
+    resources (Day.res), aggregated as view.res_agg does."""
+    T, W, A, C, S, AW, K = cols[:7]
+    R = cols[7:]
     out, j, gap = [], len(T) - 1, view.GAP_S
     while j >= 0:
         tj = T[j]
@@ -633,12 +699,22 @@ def multires_cols(cols, now):
             if v > bv:
                 best, bv = k, v
         p = dict(t=T[best], wired=W[best], app=A[best], comp=C[best], swap=S[best], away=bool(AW[best]), kills=K[best])
+        if R:
+            rows = [res_row(R, k) for k in range(i, j + 1)]
+            p.update(rows[best - i] if j == i else view.res_agg(rows))
         if j > i:
             p["away"] = any(AW[i:j + 1])
             p["kills"] = sum(K[i:j + 1])
         out.append(p)
         j = i - 1
     out.reverse()
+    return out
+
+
+def res_row(R, k):
+    """The other resources of sample k of the typed arrays, as a point carries them (None for NaN)."""
+    out = {key: (None if R[n][k] != R[n][k] else R[n][k]) for n, key in enumerate(view.RES_POINT)}
+    out["gfull"] = bool(R[5][k])
     return out
 
 
@@ -670,10 +746,10 @@ class Feed:
     only what changed. A mirror is never measured here and its reservations are never ended by
     looking at pids: they are another machine's (04 §4.7)."""
 
-    def __init__(self, log_dir, ledger_dir=None, root=False):
+    def __init__(self, log_dir, ledger_dir=None, root=False, res=False):
         self.log_dir, self.ledger_dir, self.root = log_dir, ledger_dir, root
-        self.remote = ledger_dir is not None
-        self.history = History(log_dir)
+        self.remote, self.res_on = ledger_dir is not None, res
+        self.history = History(log_dir, res)
         self.incident_cache = {}
         self.sigs = {}
         self.cur = None
@@ -731,7 +807,7 @@ class Feed:
                 s = None
             if isinstance(s, dict):
                 s.setdefault("t", now)
-                p = _point(s)
+                p = _point(s, self.res_on)
                 self.live = s                                   # the newest whole sample: the readings
                 self.live_pts = (self.live_pts + [p])[-LIVE_KEEP:] if p else self.live_pts
                 changed = True
@@ -788,6 +864,8 @@ class Feed:
                  off_text=install_hint() if logger == "off" else None, pts_v=pv)
         if self.res_note:
             m.update(status=self.res_note, status_role="warntx")
+        if self.res_on and s:
+            resource_facts(m, s)
         return m
 
 
@@ -1205,12 +1283,12 @@ class Source(threading.Thread):
     facts; another tab's feed keeps what it read for a minute after that tab was left, then goes
     with its history (04 §4.6)."""
 
-    def __init__(self, log_dir, post, clock=time.time, root=False, machines=None):
+    def __init__(self, log_dir, post, clock=time.time, root=False, machines=None, res=False):
         threading.Thread.__init__(self, daemon=True)
-        self.log_dir, self.post, self.clock, self.root = log_dir, post, clock, root
+        self.log_dir, self.post, self.clock, self.root, self.res = log_dir, post, clock, root, res
         self.span = "24h"
         self.wake, self.stop = threading.Event(), threading.Event()
-        self.feeds = {"local": Feed(log_dir, root=root)}
+        self.feeds = {"local": Feed(log_dir, root=root, res=res)}
         self.machines = machines
         self.mid = "local"
         self.engine = "on"
@@ -1267,7 +1345,7 @@ class Source(threading.Thread):
         feed = self.feeds.get(mid)
         if feed is None:
             d = os.path.join(M.base, mid)
-            feed = self.feeds[mid] = Feed(os.path.join(d, "log"), os.path.join(d, "ledger"))
+            feed = self.feeds[mid] = Feed(os.path.join(d, "log"), os.path.join(d, "ledger"), res=self.res)
         now = wall + (M.tab(entry, wall)["sync"]["offset_s"] if entry is not None else 0.0)
         changed = feed.step(now, self.span)
         if changed or tabs_changed or self.posted != mid:
@@ -1782,9 +1860,10 @@ class App:
     nothing."""
 
     def __init__(self, term, caps, auto, span, log_dir, readonly=None, bell=False, fixed_now=None, probe=True,
-                 note=None, mouse=False, machines=None, no_connect=False, start_mid="local"):
+                 note=None, mouse=False, machines=None, no_connect=False, start_mid="local", rv=None):
         self.term, self.caps, self.auto = term, caps, auto
         self.mouse = mouse
+        self.rv = rv                         # the four resources' selection (res_view), None while switched off
         self.ui = {"span": span}
         if readonly:
             self.ui["readonly"] = readonly
@@ -1794,7 +1873,7 @@ class App:
         for fd in (self.wake_r, self.wake_w):
             fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
         self.me = [sys.executable or "/usr/bin/python3", "-I", "-B", os.path.realpath(oomph.__file__)]
-        self.src = Source(log_dir, self.post, clock=self.now, root=os.geteuid() == 0, machines=machines)
+        self.src = Source(log_dir, self.post, clock=self.now, root=os.geteuid() == 0, machines=machines, res=rv is not None)
         self.src.span = span
         self.M = machines                    # None: no machine tabs (oomph_sync missing, root, read-only)
         self.S = machines.S if machines is not None else None
@@ -2065,7 +2144,7 @@ class App:
         """Selections stay inside lists that may have shrunk."""
         if not self.model:
             return
-        seq = view.res_seq(at(self.model, self.now()))[0]
+        seq = view.res_seq(self.at(self.now()))[0]
         for key, n in (("res_sel", len(seq)), ("inc_sel", len(self.model["incidents"]))):
             if key in self.ui:
                 self.ui[key] = max(0, min(self.ui[key], n - 1))
@@ -2109,7 +2188,7 @@ class App:
             fr = view.Frame(W, H, self.caps.glyphs == "ascii")
             fr.put(1, 0, "%s top: reading…" % oomph.CMD, "dim")
         else:
-            m = at(self.model, now)
+            m = self.at(now)
             try:
                 fr = view.render(m, W, H, self.caps, self.ui)
             except (Leave, Gone):
@@ -2211,8 +2290,46 @@ class App:
         if changed:
             self.full = self.dirty = True
 
+    def at(self, now):
+        """The model as of now (at()), with the resources' selection while they are on."""
+        m = at(self.model, now)
+        if self.rv:
+            m["rv"] = self.rv
+        return m
+
     def model_now(self):
-        return at(self.model, self.now()) if self.model else None
+        return self.at(self.now()) if self.model else None
+
+    def res_key(self, k, m):
+        """m c g d: that resource alone, with the plot (on the one already alone: its biggest apps); M C G D:
+        add or remove it, the last one refused (02 §3.7.3, §3.7.12)."""
+        res = view.RES_KEYS[k.lower()]
+        sel, focus, out = view.selection_apply(self.rv["sel"], self.rv["focus"], "click" if k.islower() else "cmd", res,
+                                               m.get("avail") or list(view.RESOURCES))
+        if out == "refused":
+            self.note("the last resource shown can't be removed", "dim", 3.0)
+        elif out == "callout":                    # as the `a` key: a fresh apps panel, or closing it
+            self.panel_key("a", m)
+        elif out == "changed":
+            keep = [r for r in self.rv["sel"] if r not in (m.get("avail") or view.RESOURCES)] if k.isupper() else []
+            self.rv = {"sel": [r for r in view.RESOURCES if r in sel or r in keep], "focus": focus}
+            self.full = True
+        elif res not in (m.get("avail") or view.RESOURCES):
+            self.note("no %s reading on this machine" % view.RES_WORDS[res], "dim", 3.0)
+
+    def panel_key(self, k, m, P=None):
+        """a s e (and a click on the focus shown alone, for `a`): that panel in the readout's place, fresh
+        (no selection, offset or focus left from another), or closing it when it is the one open."""
+        ui = self.ui
+        if ui.get("panel") == k:
+            view.press(ui, "esc", m, P if P is not None else view.layout(m, *self.size))
+            return
+        ui.pop("inspect", None)
+        for x in ("panel_sel", "panel_off"):
+            ui.pop(x, None)
+        if ui.get("focus") in ("res", "inc", "panel"):
+            ui.pop("focus")
+        ui["panel"] = k
 
     def keep_note(self):
         """A note the view left in `ui` ("nothing to select there") stays its few seconds."""
@@ -2282,6 +2399,9 @@ class App:
             return
         if self.M is not None and not ui.get("inspect") and self.key_machines(k, m):
             return
+        if self.rv and k in ("m", "c", "g", "d", "M", "C", "G", "D"):
+            self.res_key(k, m)
+            return
         if ui.get("inspect") and W >= 40 and H >= 10:
             if k in ("t", "T"):                      # the span changes; the cursor keeps its time
                 i = (view.SPAN_ORDER.index(ui["span"]) + (1 if k == "t" else -1)) % len(view.SPAN_ORDER)
@@ -2312,14 +2432,7 @@ class App:
                 i = (i + (1 if k == "t" else -1)) % len(view.SPAN_ORDER)
             self.set_span(view.SPAN_ORDER[i])
         elif k in ("a", "s", "e"):
-            if ui.get("panel") == k:
-                view.press(ui, "esc", m, P)
-            else:
-                for x in ("panel_sel", "panel_off"):
-                    ui.pop(x, None)
-                if ui.get("focus") in ("res", "inc", "panel"):
-                    ui.pop("focus")
-                ui["panel"] = k
+            self.panel_key(k, m, P)
         elif k == "enter":
             self.open_card(m)
         elif k in ("o", "y") and m.get("tab_mid", "local") != self.mid:
@@ -3260,9 +3373,12 @@ def cmd_top(args, out=None, env=None):
         note = "--machine: no other machines in this run (%s)" % (why or "oomph remote is not installed")
     app = App(Term(sys.stdin.fileno(), out.fileno()), caps, auto, span, oomph.LOG_DIR, readonly, bell, now, probe,
               note=note, mouse=mouse, machines=machines, start_mid=start,
-              no_connect="--no-connect" in opts or "--from-ssh" in opts)   # over --ssh: that account's mirrors, no dialling
+              no_connect="--no-connect" in opts or "--from-ssh" in opts,   # over --ssh: that account's mirrors, no dialling
+              rv=res_view(settings))
     rc = app.run()
     more = {} if "--from-ssh" in opts else {"mouse": app.mouse}
+    if app.rv:                                  # the selection, the terminal's own (02 §3.7.12)
+        more.update(selection=app.rv["sel"], focus=app.rv["focus"])
     if machines is not None and "--machine" not in opts and not (kept and app.mid == "local"):
         more["machine"] = app.mid               # (a start on this machine for what it had to say keeps the tab)
     remember(span=app.ui["span"], **more)

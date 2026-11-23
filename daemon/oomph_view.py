@@ -50,7 +50,8 @@ THEMES = {
         "away": "#303031", "hatch": "#6C6C6C", "sel": "#5F5F5F", "selfg": "#FFFFFF", "trough": "#2B2B2B",
         "accent": "#0091FF", "onblock": "#111111", "rowsel": "#3A3A3A",
         "r0": "#06AEB9", "r1": "#BF5AF2", "r2": "#E8507A", "r3": "#7A78F5", "r4": "#D69E00", "r5": "#AC8E68",
-        "r6": "#4CB85C",
+        "r6": "#4CB85C", "g0": "#7E9A2E", "g1": "#9C4B36", "g2": "#9580C4", "g3": "#B5CF70", "g4": "#D99A82",
+        "g5": "#CBB0F5", "gx": "#6E6E73",
     },
     "light": {
         "fg": "#262626", "bg": "#FFFFFF", "ink": "#262626", "dim": "#767676", "faint": "#9E9E9E", "line": "#C4C4C4",
@@ -59,7 +60,8 @@ THEMES = {
         "away": "#EEEEEF", "hatch": "#A8A8A8", "sel": "#FFFFFF", "selfg": "#000000", "trough": "#E4E4E4",
         "accent": "#0088FF", "onblock": "#FFFFFF", "rowsel": "#DCDCDC",
         "r0": "#12A5B0", "r1": "#A550E0", "r2": "#F04F78", "r3": "#5E5CE6", "r4": "#C89400", "r5": "#A2845E",
-        "r6": "#34A853",
+        "r6": "#34A853", "g0": "#0E9021", "g1": "#8A3D24", "g2": "#986AC5", "g3": "#7BC98A", "g4": "#D08A5E",
+        "g5": "#CDA0EE", "gx": "#A3A3A8",
     },
 }
 ON_PAINT = ("ink", "selfg", "onblock")      # text colours that only make sense on a painted background
@@ -67,21 +69,29 @@ ON_PAINT = ("ink", "selfg", "onblock")      # text colours that only make sense 
 ROLE_CODE = {None: ".", "fg": ".", "ink": "I", "dim": "d", "faint": "f", "line": "l", "grid": "g", "bar": "B",
              "trough": "T", "sel": "S", "selfg": "s", "wired": "w", "app": "a", "comp": "c", "swap": "p",
              "incident": "i", "ok": "o", "warn": "W", "warntx": "x", "crit": "C", "away": "y", "hatch": "h",
-             "accent": "A", "onblock": "k", "rowsel": "R", "r0": "0", "r1": "1", "r2": "2", "r3": "3", "r4": "4", "r5": "5", "r6": "6"}
+             "accent": "A", "onblock": "k", "rowsel": "R", "r0": "0", "r1": "1", "r2": "2", "r3": "3", "r4": "4", "r5": "5", "r6": "6",
+             "g0": "u", "g1": "v", "g2": "z", "g3": "q", "g4": "j", "g5": "e", "gx": "n"}
 MOD_CODE = {"": ".", "off": "o"}
 # 16 colours: the index (0-7 normal, 8-15 bright) or None for the terminal's default. Whatever is a
 # block or a background is one of the eight base colours, so it works as SGR 40-47 too.
 ROLE16 = {"fg": None, "ink": None, "selfg": None, "dim": 8, "faint": 8, "line": 8, "grid": 8, "hatch": 8,
           "wired": 7, "app": 4, "comp": 3, "swap": 1, "incident": 9, "crit": 1, "ok": 2, "warn": 3, "warntx": 3,
-          "accent": 12, "onblock": 0, "r0": 6, "r1": 5, "r2": 1, "r3": 4, "r4": 3, "r5": 7, "r6": 2}
+          "accent": 12, "onblock": 0, "r0": 6, "r1": 5, "r2": 1, "r3": 4, "r4": 3, "r5": 7, "r6": 2,
+          "g0": None, "g1": None, "g2": None, "g3": None, "g4": None, "g5": None, "gx": 8}
+# With 16 colours an agent is the text colour, neighbouring slots alternating full and medium (dim) shade:
+# every free index is a state's or a resource's hue (02 §3.8.3, §16 "04 Terminal dashboard").
+AGENT16_DIM = ("g1", "g3", "g5")
 # The reference theme: hand-picked xterm-256 indexes where the nearest one loses the hue.
 # "name@off" is the muted palette of what is no longer live.
+AGENT256 = {"g0": 28, "g1": 94, "g2": 140, "g3": 114, "g4": 173, "g5": 183, "gx": 248}   # 02 §3.8.3, both themes
 PICK256 = {"dark": {"comp": 208, "ok": 41, "warn": 220, "warntx": 172, "swap": 203, "incident": 203, "r4": 178,
                     "ink": 253, "dim": 246, "faint": 242, "hatch": 242, "bar": 235, "trough": 236, "sel": 59,
                     "rowsel": 237, "wired@off": 243, "app@off": 67, "comp@off": 137, "swap@off": 131},
            "light": {"comp": 208, "ok": 28, "warn": 94, "warntx": 94, "swap": 203, "incident": 203, "away": 254,
                      "bar": 255, "trough": 253, "sel": 231, "ink": 235, "dim": 243, "faint": 247, "hatch": 248, "rowsel": 253,
                      "wired@off": 247, "app@off": 110, "comp@off": 180, "swap@off": 174}}
+for _t in PICK256.values():
+    _t.update(AGENT256)
 _CUBE = (0, 95, 135, 175, 215, 255)
 
 
@@ -159,13 +169,13 @@ GLYPHS = {
                     hatch="╱", grid="┊", inc="┃", awaydot="·", sw="■", swq="□", dot="●", odot="○",
                     sel="›", ell="…", inf="∞", mid="·", shades="█▓▒░", queued="▒", ram=("_", "╌", "‾"),
                     meter="█", meterbg="░", arrows="←→", updown="↑↓", legend_sw="■", legend_away="░",
-                    more_l="‹", more_r="›", up="▴", down="▾", dash="–", arrow="→", miss=":", close="×",
+                    more_l="‹", more_r="›", up="▴", down="▾", dash="–", arrow="→", miss=":", close="×", queue="◻",
                     marks=dict(ok="●", warn="◐", crit="◆", silent="◦", busy="↻", off="⊘", att="▲")),
     "ascii": dict(h="-", v="|", tl="+", tr="+", bl="+", br="+", lt="+", rt="+", eighths=" ...::###",
                   hatch="/", grid=" ", inc="!", awaydot=".", sw="#", swq="o", dot="*", odot="o",
                   sel=">", ell="~", inf="all", mid="-", shades="#=:*", queued="?", ram=("_", "-", "-"),
                   meter="#", meterbg=".", arrows="<>", updown="^v", legend_sw="#", legend_away=".",
-                  more_l="<", more_r=">", up="^", down="v", dash="-", arrow="->", miss=":", close="x",
+                  more_l="<", more_r=">", up="^", down="v", dash="-", arrow="->", miss=":", close="x", queue="#",
                   marks=dict(ok="*", warn="w", crit="C", silent="-", busy="~", off="o", att="^")),
 }
 GLYPHS["cells"] = dict(GLYPHS["unicode"])      # --glyphs cells: the rasteriser differs, the characters do not
@@ -190,7 +200,7 @@ def resolve(cell, caps):
             fl, bname = fl | REV, ""
         elif bname in ("bar", "trough", "away"):             # surfaces are not painted
             bname = ""
-        if fmod or bmod:
+        if fmod or bmod or fname in AGENT16_DIM or bname in AGENT16_DIM:
             fl |= DIM
         fi = ROLE16.get(fname)
         bi = ROLE16.get(bname) if bname else None
@@ -485,11 +495,31 @@ def find_gaps(pts, now):
 
 
 def worst(bucket):
-    """Store.worst: the point with the most app + compressed + swap, away if any was, kills summed."""
+    """Store.worst: the point with the most app + compressed + swap, away if any was, kills summed;
+    the other resources, where the points carry them, aggregated (res_agg)."""
     w = max(bucket, key=lambda p: p["app"] + p["comp"] + p["swap"])
     if len(bucket) == 1:
         return w
-    return dict(w, away=any(p["away"] for p in bucket), kills=sum(p["kills"] for p in bucket))
+    out = dict(w, away=any(p["away"] for p in bucket), kills=sum(p["kills"] for p in bucket))
+    if "cpu" in w:
+        out.update(res_agg(bucket))
+    return out
+
+
+RES_POINT = ("cpu", "sys", "gpu", "gmem", "disk")      # a point's other resources (oomph_top.res_point)
+
+
+def res_agg(rows):
+    """Point.aggregate: the mean of the rates, the GPU's of the newest kind only (a bucket never averages
+    busy time with the figure at full speed, 02 §3.4.11), the most GPU memory, the least free disk."""
+    def mean(xs):
+        return sum(xs) / len(xs) if xs else None
+    full = next((r["gfull"] for r in reversed(rows) if r.get("gpu") is not None), False)
+    gm, dk = [r["gmem"] for r in rows if r.get("gmem") is not None], [r["disk"] for r in rows if r.get("disk") is not None]
+    return {"cpu": mean([r["cpu"] for r in rows if r.get("cpu") is not None]),
+            "sys": mean([r["sys"] for r in rows if r.get("sys") is not None]),
+            "gpu": mean([r["gpu"] for r in rows if r.get("gpu") is not None and r["gfull"] == full]), "gfull": full,
+            "gmem": max(gm) if gm else None, "disk": min(dk) if dk else None}
 
 
 def multires(pts, now):
@@ -538,6 +568,14 @@ def res_color_index(purpose):
 
 def res_color(purpose):
     return RES_ROLES[res_color_index(purpose)]
+
+
+def res_role(model, r):
+    """A reservation's colour: its purpose's, or with the resources on its agent's (D11, 02 §3.8)."""
+    if model.get("rv"):
+        i = r.get("agent", -1)
+        return AGENT_ROLES[i] if isinstance(i, int) and 0 <= i < len(AGENT_ROLES) else "gx"
+    return res_color(r["purpose"])
 
 
 def gb_at(r, t):
@@ -607,7 +645,7 @@ def _norm(o):
                 pid=h.get("pid") if isinstance(h, dict) and isinstance(h.get("pid"), int) else None,
                 requested=o["requested"], granted=o.get("granted"), ended=o.get("ended"), outcome=_s(o.get("outcome")),
                 peak=o.get("peak_gb") or 0, used=o.get("used_gb"), expires=o.get("expires"),
-                segments=segs or [(o["requested"], o["gb"])])
+                segments=segs or [(o["requested"], o["gb"])], agent=agent_index(o.get("agent")))
 
 
 def merge_reservations(records, ledger, now, holder_alive=None, own_ns=None):
@@ -819,11 +857,13 @@ def stack_cells_whole(segs, H):
 
 
 # ------------------------------------------------------------------ the row plan
-def plan(W, H, has_res=True, has_inc=True, mline=False):
+def plan(W, H, has_res=True, has_inc=True, mline=False, spark=0):
     """Where everything goes: a function of the terminal's size and of two slow facts (a reservation
     in the last 14 days; an incident on record), never of how many there are right now, so the plot
     keeps its rectangle when an agent is granted memory or an incident opens. With several machines
-    (`mline`) row 1 is the machine line (04 §3.7)."""
+    (`mline`) row 1 is the machine line (04 §3.7). With the resources on, `spark` other shown resources
+    get a row each under the plot, taken from it, from 30 rows of height (04 §3.14); never below."""
+    sp = spark if H >= 30 else 0
     y0 = 2 if mline else 1
     wide = W >= 120                                   # two columns from 120 columns, whatever the height
     lw = W - RIGHT_W if wide else W
@@ -837,7 +877,7 @@ def plan(W, H, has_res=True, has_inc=True, mline=False):
         Inc = tier[2]
 
     def plot_h():
-        return (H - 1 - y0 - stats) - 3 - ((1 + S + R) if (S or R) else 0) - ((1 + Inc) if Inc else 0)
+        return (H - 1 - y0 - stats) - 3 - ((1 + S + R) if (S or R) else 0) - ((1 + Inc) if Inc else 0) - sp
     while plot_h() < 5 and Inc:
         Inc -= 1
     while plot_h() < 5 and R:
@@ -855,6 +895,8 @@ def plan(W, H, has_res=True, has_inc=True, mline=False):
     p["box_y"] = y
     p["plot_x"], p["plot_y"], p["plot_w"], p["plot_h"] = 1, y + 1, lw - 7, plot_h()
     y += 1 + plot_h()
+    p["spark_y"], p["spark_n"] = y, sp
+    y += sp
     p["axis_y"] = y
     y += 1
     p["cap_y"] = p["strip_y"] = p["list_y"] = p["inc_cap_y"] = p["inc_y"] = None
@@ -903,12 +945,222 @@ def _gb(x):
 
 # ------------------------------------------------------------------ row 0 and the readings
 def capsule(model):
-    """(text, role): the pressure, or "No readings" while the logger says nothing."""
+    """(text, role): the pressure, or "No readings" while the logger says nothing; with the resources
+    on, the verdict's words (capsule_rv)."""
+    if model.get("rv"):
+        return capsule_rv(model)
     cur = model.get("cur")
     if not cur or model.get("logger") == "silent":
         return "No readings", "faint"
     p = cur.get("pressure") or "Normal"
     return p, {"Normal": "ok", "Warning": "warn", "Critical": "crit"}.get(p, "ok")
+
+
+# ------------------------------------------------------------------ four resources (M6–M8 and T4a: 02 §3.7, §3.8)
+# Behind the resources switch (`"resourcesUI": true` in top.json; the app's resourcesUI): model["rv"] is then
+# {"sel": [...], "focus": ...}, the resources shown and the one with the plot. The selection, the tiles' words and
+# the agent's colour are the app's too, held together by tools/vectors/chart.json.
+RESOURCES = ("memory", "cpu", "gpu", "disk")            # tile order
+RES_WORDS = {"memory": "Memory", "cpu": "CPU", "gpu": "GPU", "disk": "Disk"}
+RES_KEYS = {"m": "memory", "c": "cpu", "g": "gpu", "d": "disk"}
+RES_HUE = {"memory": "app", "cpu": "r0", "gpu": "r1", "disk": "r2"}   # blue, teal, violet, magenta (02 §3.4)
+AGENT_ROLES = ("g0", "g1", "g2", "g3", "g4", "g5")
+AGENT_SLOTS = len(AGENT_ROLES)
+
+
+def agent_index(agent):
+    """Reservation.agentIndex: the palette slot a lease or record carries (02 §3.8.2), or -1 for "agent
+    not known" (gray): a key of 8 hex digits and a slot 0–5, or nothing."""
+    if not isinstance(agent, dict) or not isinstance(agent.get("key"), str) or len(agent["key"]) != 8 \
+            or any(c not in "0123456789abcdef" for c in agent["key"]):
+        return -1
+    sl = agent.get("slot")
+    return sl if isinstance(sl, int) and not isinstance(sl, bool) and 0 <= sl < AGENT_SLOTS else -1
+
+
+def agent_role(agent):
+    i = agent_index(agent)
+    return AGENT_ROLES[i] if i >= 0 else "gx"
+
+
+def available(s):
+    """The resources a sample's machine shows tiles for: every one, except a GPU the logger looked for
+    and found none of (`gpu: []`, a VM). A logger older than 1.9.1 has no `cpu` or `gpu`: those tiles
+    stay and say "–" (02 §3.7.10)."""
+    return [r for r in RESOURCES if not (r == "gpu" and isinstance(s, dict) and s.get("gpu") == [])]
+
+
+def selection_shown(sel, focus, avail):
+    """(the resources drawn, in tile order; the focus) for a remembered selection: one that is not
+    available is skipped, not forgotten; an unavailable focus gives way to the first shown, and an
+    empty selection is Memory alone (02 §3.7.9)."""
+    shown = [r for r in RESOURCES if r in sel and r in avail]
+    if not shown:
+        shown = ["memory"]
+    return shown, focus if focus in shown else shown[0]
+
+
+def selection_apply(sel, focus, gesture, res, avail):
+    """Selection.apply (02 §3.7.2): a gesture on a tile. gesture: "click" (m c g d), "cmd" (M C G D, a
+    ⌘-click), "shift" (a ⇧-click). Returns (selection, focus, outcome): "changed", "callout" (a click
+    on the focus shown alone), "refused" (the last resource shown can't be removed) or "none". The
+    focus moves only by a plain click, or to the next shown resource (wrapping) when it is removed."""
+    shown, focus = selection_shown(sel, focus, avail)
+    if res not in avail:
+        return shown, focus, "none"
+    if gesture == "click":
+        if res != focus:
+            return [res], res, "changed"
+        return ([focus], focus, "changed") if len(shown) > 1 else (shown, focus, "callout")
+    if gesture == "cmd":
+        if res not in shown:
+            return [r for r in RESOURCES if r in shown or r == res], focus, "changed"
+        if res != focus:
+            return [r for r in shown if r != res], focus, "changed"
+        if len(shown) == 1:
+            return shown, focus, "refused"
+        i = shown.index(res)
+        return [r for r in shown if r != res], shown[(i + 1) % len(shown)], "changed"
+    if gesture == "shift":
+        if res == focus:
+            return shown, focus, "none"
+        order = [r for r in RESOURCES if r in avail]
+        a, b = sorted((order.index(focus), order.index(res)))
+        out = [r for r in RESOURCES if r in shown or r in order[a:b + 1]]
+        return out, focus, "changed" if out != shown else "none"
+    return shown, focus, "none"
+
+
+def _n(x):
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
+
+
+def mid_fit(text, n):
+    """A name shortened in its middle to n characters, keeping its start and its end (02 §3.4.2)."""
+    text = str(text)
+    if len(text) <= n:
+        return text
+    a = (n - 1 + 1) // 2
+    return text[:a] + "…" + text[len(text) - (n - 1 - a):]
+
+
+def tile_pool(s):
+    """The pool the Disk tile shows: the one that holds the home folder or the temp directory, else the
+    first watched one, else the first; None for a sample without `disks` (the tile reads disk_free_gb)."""
+    pools = [d for d in (s.get("disks") if isinstance(s.get("disks"), list) else []) if isinstance(d, dict)
+             and _n(d.get("free_gb")) is not None]
+    for want in (lambda d: any(r in ("home", "tmp") for r in (d.get("roles") if isinstance(d.get("roles"), list) else [])),
+                 lambda d: d.get("watch") is True, lambda d: True):
+        for d in pools:
+            if want(d):
+                return d, pools
+    return None, pools
+
+
+def _busiest(rows, key):
+    """The biggest consumer by name: rows grouped by app (`g`, else the name), summed."""
+    tot, order = {}, []
+    for x in rows if isinstance(rows, list) else []:
+        if isinstance(x, dict) and _n(x.get(key)) is not None:
+            name = str(x.get("g") or x.get("name") or "")
+            if name and name not in tot:
+                order.append(name)
+            tot[name] = tot.get(name, 0.0) + x[key]
+    best = max(order, key=lambda k: tot[k], default=None)
+    return best
+
+
+def waiting_on(leases):
+    """{resource: how many queued requests wait for it}, from the ledger's leases: a request without
+    `waiting_on` (every writer before 1.12) waits for memory; pool ids name the others (02 §6.4)."""
+    out = {}
+    for r in leases if isinstance(leases, list) else []:
+        if not isinstance(r, dict) or r.get("state") != "queued":
+            continue
+        ids = r.get("waiting_on") if isinstance(r.get("waiting_on"), list) and r.get("waiting_on") else ["ram"]
+        got = set()
+        for i in ids:
+            i = str(i)
+            got.add("memory" if i in ("ram", "mem") else "cpu" if i == "cpu" else
+                    "gpu" if i.startswith(("gpu", "vram")) else "disk")
+        for k in got:
+            out[k] = out.get(k, 0) + 1
+    return out
+
+
+def tiles(s, cap, waiting=None):
+    """Tile.facts (02 §3.4.1): what each tile says for a sample. `cap`: oomph.capsule of it (the
+    memory and disk levels); `waiting`: waiting_on of the ledger. {resource: {"reading", "flag" (the one
+    flag slot: "critical", "tight", "low", "+1 critical", "+1 low", "throttled", "busy" or None),
+    "level" (2 red, 1 amber, 0 quiet), "queue" (requests waiting for it), "top" (the biggest consumer),
+    "meter" (0…1, a tank for Disk), "full" (the GPU figure is at full speed)}}. The word "waiting" is
+    the renderer's: a queue shows as "n waiting" alone, or after a flag of rank 1 to 6."""
+    waiting = waiting or {}
+    out = {}
+    ram = _n(s.get("ram_gb")) or 0.0
+    used = sum(_n(s.get(k)) or 0.0 for k in ("app_gb", "wired_gb", "compressed_gb"))
+    lv = cap.get("memory", 0)
+    groups = s.get("groups") if isinstance(s.get("groups"), list) else []
+    out["memory"] = {"reading": "%.1f / %.0f GB" % (used, ram), "meter": used / ram if ram else 0.0,
+                     "flag": "critical" if lv == 2 else "tight" if lv == 1 else None, "level": lv,
+                     "top": next((str(x.get("name")) for x in groups if isinstance(x, dict) and x.get("name")), None)}
+    c = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
+    n, busy = _n(c.get("n")), _n(c.get("busy"))
+    flag = "throttled" if (_n(c.get("therm")) or 0) >= 2 else "busy" if n and busy is not None and busy >= 0.9 * n \
+        else None
+    out["cpu"] = {"reading": "%.1f / %d cores" % (busy, n) if n and busy is not None else "–",
+                  "meter": busy / n if n and busy is not None else 0.0, "flag": flag, "level": 0,
+                  "top": _busiest(s.get("top_cpu"), "cpu")}
+    gl = s.get("gpu") if isinstance(s.get("gpu"), list) else []
+    g = gl[0] if gl and isinstance(gl[0], dict) else {}
+    util, mem, full = _n(g.get("util")), _n(g.get("mem_gb")), g.get("src") == "ioreport"
+    reading = "–"
+    if util is not None:
+        reading = "%.0f %%%s" % (util, "" if full else " busy") + (" · %.1f GB" % mem if mem is not None else "")
+    out["gpu"] = {"reading": reading, "meter": util / 100.0 if util is not None else 0.0, "full": full,
+                  "flag": "busy" if full and util is not None and util >= 90 else None, "level": 0,
+                  "top": _busiest(s.get("top_gpu"), "gpu")}
+    d, pools = tile_pool(s)
+    free = _n(d.get("free_gb")) if d else _n(s.get("disk_free_gb"))
+    dl = cap.get("disk", 0)
+    flag = "critical" if dl == 2 else "low" if dl == 1 else None
+    if flag is None:
+        others = [p.get("level") for p in pools if p is not d and p.get("watch") is True]
+        k = sum(1 for x in others if x == "critical")
+        if k:
+            flag, dl = "+%d critical" % k, 2
+        elif any(x == "low" for x in others):
+            flag, dl = "+%d low" % sum(1 for x in others if x == "low"), 1
+    reading = "–" if free is None else "%.0f GB free" % free
+    if d is not None and len(pools) > 1:
+        reading += " · " + mid_fit(d.get("name") or d.get("id") or "?", 12)
+    total = _n(d.get("total_gb")) if d else None
+    out["disk"] = {"reading": reading, "meter": min(1.0, free / total) if free is not None and total else 0.0,
+                   "flag": flag, "level": dl, "top": _busiest(s.get("top_io"), "w")}
+    for r in RESOURCES:
+        out[r]["queue"] = int(waiting.get(r, 0))
+    return out
+
+
+def flag_text(t, g=None, short=False):
+    """The flag slot's words (02 §3.4.1): a flag of rank 1 to 6 keeps the queue after it ("critical ◻2");
+    a queue alone is "n waiting" (it outranks busy), or `short` "◻n" where a tile is narrow."""
+    box = (g or GLYPHS["unicode"]).get("queue", "◻")
+    f, q = t.get("flag"), t.get("queue") or 0
+    if q and (f is None or f == "busy"):
+        return "%s%d" % (box, q) if short else "%d waiting" % q
+    if f and q:
+        return "%s %s%d" % (f, box, q)
+    return f or ""
+
+
+def capsule_rv(model):
+    """(text, role) of the capsule with the resources on: oomph's verdict in two words (02 §3.4.9,
+    §15.13: "Memory tight", "Disk critical"), "No readings" while the logger says nothing."""
+    cap = model.get("capsule")
+    if not model.get("cur") or model.get("logger") == "silent" or not cap:
+        return "No readings", "faint"
+    return cap["text"], ("ok", "warn", "crit")[max(0, min(2, cap.get("level", 0)))]
 
 
 def tab_bar(fr, model, caps, g):
@@ -1473,10 +1725,11 @@ def legend_items(g, caps, short, initials=False):
     return names, extra
 
 
-def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False):
+def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False, values=None):
     """The top edge of the chart box: the span selector on the left (it never gives way; below room
     for all four only the selected one stays), the legend on the right (it shortens, then goes).
-    `miss`: a stretch not received is in view, and the legend explains its dots (04 §3.3)."""
+    `miss`: a stretch not received is in view, and the legend explains its dots (04 §3.3). `values`
+    (the resources on): the focus's series with their live values instead (04 §3.14)."""
     mono = caps.color == "none"
     fr.hline(x, y, w, g, "line", g["tl"], g["tr"])
     cx = x + 2
@@ -1491,6 +1744,9 @@ def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False):
         else:
             cx = fr.put(cx, y, lab, "dim", None if mono else "trough")
     room = x + w - 2 - cx
+    if values is not None:
+        draw_values(fr, x + w - 2, y, room, values, caps, g)
+        return
     chosen = None
     for short, drop, initials in ((False, 0, False), (True, 0, False), (True, 1, False), (True, 2, False),
                                   (True, 3, False), (True, 3, True)) + (((True, 4, True),) if miss else ()):
@@ -1510,6 +1766,191 @@ def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False):
         lx = fr.put(lx, y, sw, role if not mono else "fg", None)
         lx = fr.put(lx, y, name, "dim", None)
     fr.put(lx, y, " ", None, None)
+
+
+def legend_values(model, focus):
+    """The focus's series and their live values (02 §3.4.2, 04 §3.14): [(name, value, role)] and a unit."""
+    cur, tiles = model.get("cur") or {}, model.get("tiles") or {}
+    if focus == "memory":
+        sw = "%.1f/%.0f" % (cur.get("swap", 0), cur.get("swap_total", 0)) if cur.get("swap") else "%.1f" % cur.get("swap", 0)
+        return [("Wired", "%.1f" % cur.get("wired", 0), "wired"), ("App", "%.1f" % cur.get("app", 0), "app"),
+                ("Compressed", "%.1f" % cur.get("comp", 0), "comp"), ("Swap", sw, "swap"), ("GB", None, None)]
+    rf = model.get("rfacts") or {}
+    if focus == "cpu":
+        return [("System", _g1(rf.get("sys")), "wired"), ("User", _g1(rf.get("user")), "r0"), ("cores", None, None)]
+    if focus == "gpu":
+        util = "%.0f" % rf["util"] if isinstance(rf.get("util"), (int, float)) else "–"
+        return [("Full speed" if rf.get("full") else "Busy", util + " %", "r1"), ("Memory", _g1(rf.get("gmem")) + " GB", "wired")]
+    free = "%.0f" % rf["free"] if isinstance(rf.get("free"), (int, float)) else "–"
+    return [("Free on " + mid_fit(rf.get("pool") or "disk", 12), free, "r2"), ("GB", None, None)]
+
+
+def _g1(x):
+    return "%.1f" % x if isinstance(x, (int, float)) else "–"
+
+
+def draw_values(fr, xr, y, room, values, caps, g):
+    """The legend with values, right-aligned at xr: "Compressed" gives way to "Compr.", then the names
+    go; the values stay (02 §3.4.2's overflow rule)."""
+    mono = caps.color == "none"
+    for short in (0, 1, 2):
+        items = []
+        for name, val, role in values:
+            if role is None:
+                items.append((" " + name, None, None))
+                continue
+            nm = "Compr." if short >= 1 and name == "Compressed" else name
+            items.append((g["legend_sw"], role, (" " if short < 2 else "") + (nm if short < 2 else "") + " " + val))
+        need = sum(tw(a) + (tw(c) if c else 0) for a, _, c in items) + len(items) + 1
+        if need <= room:
+            break
+    else:
+        return
+    x = xr - need + 1
+    for sw, role, text in items:
+        x = fr.put(x, y, " ", None, None)
+        if role is None:
+            x = fr.put(x, y, sw.strip(), "dim", None)
+            continue
+        x = fr.put(x, y, sw, role if not mono else "fg", None)
+        x = fr.put(x, y, text, "dim", None)
+    fr.put(x, y, " ", None, None)
+
+
+def draw_tiles(fr, x, y, w, model, g, caps, rows=2):
+    """The resource tiles in the place of the readings (T4a, 04 §3.14, 02 §3.7.12): name and flag over the
+    reading. The focus is in reverse video, the other shown resources bold; a flag is a word (red for
+    critical, amber for tight or low), so nothing depends on colour alone. One row: names and readings."""
+    tiles = model.get("tiles")
+    if not tiles:
+        fr.put(x, y, "No readings yet", "dim")
+        return
+    shown, focus = rv_shown(model)
+    avail = model.get("avail") or list(RESOURCES)
+    mono = caps.color == "none"
+    n = len(avail)
+    cw = (w - (n - 1)) // n
+    for i, r in enumerate(avail):
+        t, tx = tiles[r], x + i * (cw + 1)
+        name, flag = RES_WORDS[r], flag_text(t, g)
+        role = "crit" if t["level"] >= 2 else "warntx" if t["level"] == 1 else "dim"
+        if r == focus:
+            nx = fr.put(tx, y, " %s " % name, "selfg", "sel", BOLD | (REV if mono else 0))
+        else:
+            nx = fr.put(tx, y, name, "fg" if r in shown else "dim", None, BOLD if r in shown else 0)
+        reading = asc(t["reading"], fr)
+        if rows == 1:
+            fr.put(nx + 1, y, fit(reading, max(cw - (nx - tx) - 1, 0), g), "fg")
+            continue
+        room = cw - (nx - tx) - 1
+        if flag and tw(flag) > room:
+            flag = flag_text(t, g, short=True)
+        if flag and room >= 2:
+            fr.rput(tx + cw - 1, y, fit(flag, room, g), role, None, BOLD if t["level"] else 0)
+        fr.put(tx, y + 1, fit(reading, cw, g), "fg", None, BOLD)
+
+
+def _rvalue(p, r):
+    """A point's value of resource r, or None (the small rows and the resource plot)."""
+    if r == "memory":
+        return p["wired"] + p["app"] + p["comp"]
+    return p.get({"cpu": "cpu", "gpu": "gpu", "disk": "disk"}[r])
+
+
+def r_scale(model, r, pts=None):
+    """A resource's scale (02 §3.4.3): RAM, the cores, 100 %, free disk on 1, 2, 4, 8 × 10ⁿ steps."""
+    if r == "memory":
+        return max(model.get("ram") or 0, 1.0)
+    if r == "cpu":
+        return float((model.get("rfacts") or {}).get("n") or 1)
+    if r == "gpu":
+        return 100.0
+    vals = [v for v in (_rvalue(p, r) for p in (pts or model["pts"])) if v is not None]
+    top = max(vals + [1.0])
+    e = 10 ** math.floor(math.log10(top))
+    return next(m * e for m in (1, 2, 4, 8, 10) if m * e >= top - 1e-9)
+
+
+def draw_rplot(fr, x0, y0, W, H, model, ui, caps, g, r):
+    """The plot of the focus when it is not memory (T4a): the cores busy (the system's part grey under the
+    apps' teal), the GPU (violet) or the free space of the Disk tile's pool (magenta), each column the mean
+    of what it holds (the least free for disk), with the grid, no-data hatching, incident rules and the
+    time axis of the memory plot. Returns the grid columns (the strip continues them)."""
+    mono = caps.color == "none"
+    whole = mono or caps.glyphs in ("cells", "ascii")
+    now = model["now"]
+    first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
+    f, finv = mapper(now, first, SPANS[ui["span"]])
+    cols = columns(model["pts"], model["gaps"], f, finv, W, now, first, model.get("missing") or ())
+    top = r_scale(model, r, [p for st, p in cols if st == "data"])
+    labels = axis_labels(f, W, now, log=SPANS[ui["span"]] is None)
+    gridcols = set(min(W - 1, int(round(x * W))) for x, text in labels if text != "now")
+    inc = set(min(W - 1, int(f(i["start"]) * W)) for i in model["incidents"] if 0 <= f(i["start"]) <= 1)
+    L = 8 * H
+    hue = RES_HUE[r]
+    for c in range(W):
+        st, p = cols[c]
+        cells = [(" ", None, None)] * H
+        if st == "data":
+            v = _rvalue(p, r)
+            if v is not None:
+                parts = [(min(p.get("sys") or 0.0, v), "wired"), (max(v - (p.get("sys") or 0.0), 0.0), hue)] if r == "cpu" \
+                    else [(v, hue)]
+                segs, lo, cum = [], 0, 0.0
+                for amount, role in parts:
+                    cum += amount
+                    hi = min(L, int(round(cum / top * L)))
+                    if hi > lo:
+                        segs.append((lo, hi, role))
+                        lo = hi
+                if whole:
+                    shaded = mono or caps.glyphs == "ascii"        # a shade per part, as the memory plot has
+                    cells = [((g["shades"][0 if own == hue else 2] if shaded else FULL), None if mono else own, None)
+                             if own else (" ", None, None) for _, own in stack_cells_whole(segs, H)]
+                else:
+                    cells = stack_cells(segs, H, g["eighths"])
+        for row in range(H):
+            ch, fg, bg = cells[row]
+            if ch == " ":
+                if st == "gap":
+                    ch, fg = g["hatch"], "hatch"
+                elif st == "miss":
+                    ch, fg = g["miss"], "faint"
+                elif c in gridcols:
+                    ch, fg = g["grid"], "grid"
+            if c in inc:
+                ch, fg, bg = g["inc"], "incident", None
+            fr.put(x0 + c, y0 + H - 1 - row, ch, fg, bg)
+    unit = {"cpu": "", "gpu": "%", "disk": "G"}[r]
+    for v in (top, top / 2.0):
+        row = max(0, min(H - 1, int(v / top * H - 1e-9)))
+        fr.rput(x0 + W + 4, y0 + H - 1 - row, ("%d" % v if v == int(v) else "%.1f" % v) + unit, "dim")
+    for x, text in labels:
+        cx = min(max(int(round(x * W)) - len(text) // 2, 0), W - len(text))
+        fr.put(x0 + cx, y0 + H, text, "dim")
+    return gridcols
+
+
+def draw_spark(fr, x0, y, W, model, ui, caps, g, r):
+    """One row of eighth blocks for another shown resource, on the plot's time axis, its name in the
+    gutter (02 §3.7.12: from 30 rows of height)."""
+    now = model["now"]
+    first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
+    f, finv = mapper(now, first, SPANS[ui["span"]])
+    cols = columns(model["pts"], model["gaps"], f, finv, W, now, first, model.get("missing") or ())
+    top = r_scale(model, r)
+    eighths = g["eighths"]
+    for c in range(W):
+        st, p = cols[c]
+        v = _rvalue(p, r) if st == "data" else None
+        if st == "gap":
+            fr.put(x0 + c, y, g["hatch"], "hatch")
+        elif v is None:
+            fr.put(x0 + c, y, " ", None)
+        else:
+            n = max(1 if v > 0 else 0, min(8, int(round(v / top * 8))))
+            fr.put(x0 + c, y, eighths[n] if caps.glyphs != "ascii" else eighths[n], None if caps.color == "none" else RES_HUE[r])
+    fr.rput(x0 + W + 4, y, {"memory": "Mem", "cpu": "CPU", "gpu": "GPU", "disk": "Disk"}[r], "dim")
 
 
 def _runs(flags):
@@ -1703,7 +2144,7 @@ def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=()):
             queued = r.get("granted") is None or f(r["granted"]) * W >= c + 1
             hi = min(L, max(lo + 1, int(round(b_ / float(top) * L))))
             if hi > lo:
-                segs.append((lo, hi, (res_color(r["purpose"]), queued, k)))
+                segs.append((lo, hi, (res_role(model, r), queued, k)))
             lo = hi
         cells = []
         if mono or caps.glyphs in ("ascii", "cells"):
@@ -1957,7 +2398,7 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
         r, idx = row[1], row[2]
         live = r.get("ended") is None
         granted = r.get("granted") is not None
-        fr.put(x + 2, yy, g["sw"] if granted else g["swq"], None if mono else res_color(r["purpose"]), KEEP)
+        fr.put(x + 2, yy, g["sw"] if granted else g["swq"], None if mono else res_role(model, r), KEEP)
         fr.put(x + 4, yy, "%4.1fG" % r["segments"][-1][1], "fg" if live else "dim", KEEP, BOLD if live else 0)
         if not live:
             tail = "peak %.1fG %s %s %s" % (_gb(r.get("peak")), g["mid"], (r.get("outcome") or "ended").replace("_", " "),
@@ -2101,7 +2542,7 @@ def draw_panel(fr, model, ui, P, caps, g):
                 text = fit(text, max(8, min(30, w - (xr - x) - 12)), g)
                 fr.rput(tail, ry, text, "dim", KEEP)
                 tail -= tw(text) + 1
-                fr.put(tail - 1, ry, g["sw"], None if caps.color == "none" else res_color(held[0]["purpose"]), KEEP)
+                fr.put(tail - 1, ry, g["sw"], None if caps.color == "none" else res_role(model, held[0]), KEEP)
                 tail -= 3
             if big and tail - xr >= 6:
                 fr.put(xr, ry, fit(big, tail - xr, g), "dim", KEEP)
@@ -2686,6 +3127,9 @@ def help_pages(g, model):
              ("pgup pgdn", "a page"), ("home end", "first %s last row" % g["mid"]), ("enter", "details"),
              ("o", "open the report"), ("y", "copy its path"),
              ("Terminal", None), ("ctrl-o", "mouse on %s off" % g["mid"]), ("ctrl-l", "redraw"), ("ctrl-z", "suspend")]
+    if model.get("rv"):         # the four resources (02 §3.7.12): the tiles' keys open the left column
+        left = [("Resources", None), ("m c g d", "one alone, with the plot"), ("M C G D", "add %s remove" % g["mid"]),
+                ("", "")] + left
     away = model.get("os", "").startswith("macOS") or "os" not in model
     see = [("Chart", None),
            ([(g["sw"], role) for _, role in SERIES_WORDS], "%s, stacked; %s is the RAM" % (
@@ -2813,7 +3257,7 @@ def card_res(fr, caps, g, model, r):
     gb = r["segments"][-1][1]
 
     def head(fr, x, y, w, bg):
-        fr.put(x, y, g["sw"] if r.get("granted") is not None else g["swq"], None if mono else res_color(r["purpose"]), bg)
+        fr.put(x, y, g["sw"] if r.get("granted") is not None else g["swq"], None if mono else res_role(model, r), bg)
         fr.put(x + 2, y, fit("%.1f GB  %s" % (gb, r["purpose"]), w - 2, g), "fg", bg, BOLD)
     project = r.get("project") if isinstance(r.get("project"), str) else None
     lines = [(9, None), (0, head), (8, None)]
@@ -3468,8 +3912,24 @@ def too_small(W, H, caps):
 
 
 def layout(model, W, H):
-    """The row plan for this model at this size (its slow facts: reservations and incidents on record)."""
-    return plan(W, H, has_res=bool(model["res"]), has_inc=bool(model["incidents"]), mline=several(model))
+    """The row plan for this model at this size (its slow facts: reservations and incidents on record;
+    with the resources on, how many small rows the selection asks for)."""
+    return plan(W, H, has_res=bool(model["res"]), has_inc=bool(model["incidents"]), mline=several(model),
+                spark=len(rv_others(model)))
+
+
+def rv_shown(model):
+    """(the resources shown, the focus) with the resources on, over the tiles this machine has."""
+    rv = model.get("rv") or {}
+    return selection_shown(rv.get("sel") or ["memory"], rv.get("focus"), model.get("avail") or list(RESOURCES))
+
+
+def rv_others(model):
+    """The shown resources other than the focus, in tile order: the small rows under the plot."""
+    if not model.get("rv"):
+        return []
+    shown, focus = rv_shown(model)
+    return [r for r in shown if r != focus]
 
 
 def render(model, W, H, caps, ui):
@@ -3488,7 +3948,10 @@ def render(model, W, H, caps, ui):
     else:
         tab_bar(fr, model, caps, g)
     if P["stats"]:
-        draw_stats(fr, 1, P["stats_y"], W - 2, model, g, P["stats"])
+        if model.get("rv"):
+            draw_tiles(fr, 1, P["stats_y"], W - 2, model, g, caps, P["stats"])
+        else:
+            draw_stats(fr, 1, P["stats_y"], W - 2, model, g, P["stats"])
         if model.get("logger") == "silent" or model.get("stale"):   # readings that are not live: greyed
             fr.restyle(0, P["stats_y"], W, P["stats"], "off")
     draw_body(fr, P, model, ui, caps, g)
@@ -3551,8 +4014,24 @@ def draw_body(fr, P, model, ui, caps, g):
     if model.get("missing"):
         f, _ = mapper(model["now"], model.get("first") or model["now"], SPANS[ui["span"]])
         miss = any(f(b) > 0 for a, b, k in model["missing"])
-    draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory", miss)
-    gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
+    if model.get("rv"):
+        focus = rv_shown(model)[1]
+        draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, RES_WORDS[focus], miss, values=legend_values(model, focus))
+        if focus == "memory":
+            gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
+        else:
+            gridcols = draw_rplot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g, focus)
+        for i, r in enumerate(rv_others(model)[:P["spark_n"]]):
+            draw_spark(fr, x0, P["spark_y"] + i, pw, model, ui, caps, g, r)
+        if P["spark_n"]:            # the time axis goes under the small rows, which took the plot's label row
+            now_, first = model["now"], model.get("first") or (model["pts"][0]["t"] if model["pts"] else model["now"])
+            f_, _ = mapper(now_, first, SPANS[ui["span"]])
+            for x, text in axis_labels(f_, pw, now_, log=SPANS[ui["span"]] is None):
+                cx = min(max(int(round(x * pw)) - len(text) // 2, 0), pw - len(text))
+                fr.put(x0 + cx, P["axis_y"], text, "dim")
+    else:
+        draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory", miss)
+        gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
     now = model["now"]
     rows, n_live, n_wait = list_rows(model, P["R"], ui)
     if P["cap_y"] is not None:

@@ -42,9 +42,12 @@ def _within(t, spans):
     return any(a <= t < b for a, b in spans)
 
 
-def synth(seed=1120, until=NOW, start=None, crisis=False):
+def synth(seed=1120, until=NOW, start=None, crisis=False, res=False):
     """A week of samples every 30 s: working hours, nights asleep, a leak on Monday, a build that
-    swaps and gets processes killed on Thursday, pressure critical for a moment on Friday."""
+    swaps and gets processes killed on Thursday, pressure critical for a moment on Friday. With
+    `res`, also the other resources (1.9.1's blocks, from their own random numbers, so the memory
+    series stay those of the frames without them): busy cores, the GPU at full speed and its memory
+    (a model loaded on Friday morning), and free space on Data, which a dataset fills from 12:00."""
     rng = random.Random(seed)
     asleep, away = [], []
     for d in range(13, 21):
@@ -56,6 +59,7 @@ def synth(seed=1120, until=NOW, start=None, crisis=False):
     away += [(T(14, 11, 0), T(14, 16, 5)), (T(14, 17, 50), T(15, 20, 20)), (T(17, 12, 15), T(17, 13, 5)),
              (T(20, 12, 5), T(20, 12, 40))]
     pts, t = [], start or T(13, 8, 20)
+    rres = random.Random(seed + 7)
     app, comp, burst_until, burst, slept = 8.0, 6.5, 0, 0.0, False
     while t <= until:
         if _within(t, asleep):
@@ -101,8 +105,30 @@ def synth(seed=1120, until=NOW, start=None, crisis=False):
         pts.append({"t": t, "app_gb": round(app, 2), "wired_gb": round(wired, 2), "compressed_gb": round(comp, 2),
                     "swap_used_gb": round(swap, 2), "jetsam_kills": kills,
                     "away": {"idle_s": idle, "display_on": idle == 0, "locked": False}})
+        if res:
+            pts[-1].update(resource_blocks(t, work, extra, rres))
         t += 30
     return pts
+
+
+def resource_blocks(t, work, extra, rng):
+    """One sample's cpu, gpu and disks blocks for the resources fixture (02 §5.1's shapes)."""
+    busy = min(14.0, max(0.3, 1.2 + 6.5 * work + 1.1 * extra + rng.gauss(0, 0.5)))
+    if T(20, 10, 0) <= t < T(20, 10, 50):
+        busy = min(14.0, 12.4 + rng.gauss(0, 0.4))         # the build at 10:20: every core
+    model = T(20, 9, 40) <= t                              # a 16 GB model on the GPU from Friday 09:40
+    util = max(0.0, min(100.0, 4 + 22 * work + (38 if model and T(20, 11, 0) <= t < T(20, 12, 30) else 0) + rng.gauss(0, 3)))
+    free = 78.0 - 1.5 * ((t - T(13, 8)) / 86400.0)
+    if t >= T(20, 12, 0):
+        free -= min(24.0, (t - T(20, 12, 0)) / 60.0 * 0.25)  # a dataset spooled onto Data from 12:00
+    return {"cpu": {"n": 14, "p": 10, "e": 4, "busy": round(busy, 2), "user": round(busy * 0.82, 2), "sys": round(busy * 0.18, 2),
+                    "therm": 0},
+            "gpu": [{"id": "gpu0", "name": "Apple M3 Max", "unified": True, "util": round(util, 1),
+                     "active": round(min(100.0, util * 1.6 + 6), 1), "src": "ioreport",
+                     "mem_gb": round((16.4 if model else 2.1) + rng.uniform(0, 0.6), 2), "mem_alloc_gb": 20.0,
+                     "mem_limit_gb": 27.0}],
+            "disks": [{"id": "data", "name": "Data", "free_gb": round(free, 1), "total_gb": 995.0,
+                       "roles": ["home", "swap", "tmp"], "watch": True, "low_gb": 20, "crit_gb": 5, "level": "ok"}]}
 
 
 PURPOSES = [("gradle assembleDebug", 6.0, "atlas", 6), ("pnpm check", 2.0, "webshop", 9), ("pytest -n 8", 4.0, "ml-eval", 5),
@@ -121,9 +147,15 @@ HOSTILE = [("\x1b]52;c;aGk=\x07clipboard \x1b[2J", 3.0, "\x1b[31mred", 300, 1.0,
            ("構築テスト 構築テスト 構築テスト", 4.0, "ｗｉｄｅ", 60, 0.0, 1800, True)]
 
 
-def reservations(live, seed=82, now=NOW):
+AGENTS = {"atlas": ("3f9a0c21", 0), "ml-eval": ("b71e44d0", 1), "webshop": ("5c02a9e7", 2), "indexer": ("e4d10b3a", 3),
+          "atlas-ios": ("91ff20c6", 4)}
+
+
+def reservations(live, seed=82, now=NOW, agents=False):
     """Finished reservations of the working days, as reservations.jsonl holds them, and the live
-    ones as ledger.json leases (held by pid 1, which is always alive)."""
+    ones as ledger.json leases (held by pid 1, which is always alive). With `agents` (the resources
+    fixture), each project's session is an agent with its palette slot (02 §3.8), and records before
+    Tuesday have none, as a writer older than 1.9.2 left them (drawn gray)."""
     rng = random.Random(seed)
     recs, leases, seq = [], [], 100
     bag = [p for p in PURPOSES for _ in range(p[3])]
@@ -149,6 +181,8 @@ def reservations(live, seed=82, now=NOW):
             if rng.random() < 0.12:
                 rec["gb"] = round(gb * 0.6, 1)
                 rec["segments"] = [{"t": req, "gb": gb}, {"t": round(req + wait + dur * 0.4, 1), "gb": rec["gb"]}]
+            if agents and req >= T(17, 0) and project in AGENTS:
+                rec["agent"] = {"key": AGENTS[project][0], "slot": AGENTS[project][1]}
             recs.append(rec)
     for purpose, gb, project, ago_s, used, ttl, queued in live:
         seq += 1
@@ -159,6 +193,8 @@ def reservations(live, seed=82, now=NOW):
                  "used_gb": used, "peak_gb": used}
         if not queued:
             lease.update(granted=req, ttl=ttl, expires=req + ttl)
+        if agents and project in AGENTS:
+            lease["agent"] = {"key": AGENTS[project][0], "slot": AGENTS[project][1]}
         leases.append(lease)
     return recs, {"seq": seq, "leases": leases, "history": [],
                   "state": {"t": now - 1, "level": "ok", "free_gb": 3.3, "margin_gb": 1.8}}
@@ -191,13 +227,15 @@ EVENTS = [(T(20, 12, 40), "sleep_gap", {"seconds": 2100}), (T(20, 10, 29), "pres
 def write_fixture(d, scenario):
     """One machine's log and ledger directories for a scenario: default, critical, silent (the
     logger stopped at 13:02), fresh (a first run: 14 minutes of history, nothing on record), hostile
-    (text that must not reach the terminal as it is)."""
+    (text that must not reach the terminal as it is), resources (the default week with the other
+    resources in every sample and agents on the reservations: 1.11.0's four resources)."""
     log, led = os.path.join(d, "log"), os.path.join(d, "ledger")
     os.makedirs(log)
     os.makedirs(led)
     crisis = scenario == "critical"
+    res = scenario == "resources"
     until = T(20, 13, 2) if scenario == "silent" else NOW
-    pts = synth(until=until, start=NOW - 14 * 60 if scenario == "fresh" else None, crisis=crisis)
+    pts = synth(until=until, start=NOW - 14 * 60 if scenario == "fresh" else None, crisis=crisis, res=res)
     by_day = {}
     for p in pts:
         by_day.setdefault(time.strftime("%Y-%m-%d", time.localtime(p["t"])), []).append(p)
@@ -221,6 +259,19 @@ def write_fixture(d, scenario):
                daemon={"pid": 99, "version": "1.8.7", "interval": 30, "incident": None, "root": True},
                procs=742, top=[{"pid": pid, "ppid": 1, "name": n, "uid": 501, "mb": mb, "g": g, "s": ses}
                                for pid, n, mb, g, ses in PROCS])
+    if res:                    # the other resources now, the biggest consumers of each, a second disk
+        cur["disks"] = cur["disks"] + [{"id": "vol:4F632FD2", "name": "Scratch", "mount": "/Volumes/Scratch", "fs": "apfs",
+                                         "free_gb": 912.4, "total_gb": 1863.0, "roles": [], "kind": "external",
+                                         "watch": False}]
+        cur.update(io={"r_mb_s": 41.0, "w_mb_s": 86.5},
+                   top_cpu=[{"pid": 651, "name": "java", "g": "Code", "cpu": 3.1}, {"pid": 7001, "name": "rustc", "g": "cargo", "cpu": 2.2},
+                            {"pid": 7002, "name": "rustc", "g": "cargo", "cpu": 1.9}, {"pid": 4410, "name": "Google Chrome Helper (Renderer)",
+                                                                                    "g": "Google Chrome", "cpu": 0.8},
+                            {"pid": 413, "name": "WindowServer", "g": "WindowServer", "cpu": 0.5}],
+                   top_gpu=[{"pid": 2215, "name": "python", "g": "python", "gpu": 31.5},
+                            {"pid": 413, "name": "WindowServer", "g": "WindowServer", "gpu": 6.2}],
+                   top_io=[{"pid": 2215, "name": "python", "g": "python", "w": 71.0}, {"pid": 1201, "name": "OrbStack Helper",
+                                                                                     "g": "OrbStack", "w": 12.4}])
     if scenario == "hostile":
         cur["groups"][0]["name"] = "\x1b[2J\x1b[Hevil\x07 app"
         cur["groups"][1]["name"] = "\u202eppA dooG"
@@ -245,7 +296,7 @@ def write_fixture(d, scenario):
                        "summary": dict(INCIDENT_SUMMARY, jetsam_kills=kills) if kills == 14 else
                        {"jetsam_kills": kills}}, f)
     if scenario != "fresh":
-        recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else LIVE)
+        recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else LIVE, agents=res)
         with open(os.path.join(led, "reservations.jsonl"), "w") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
@@ -437,6 +488,10 @@ FRAMES = [
     ("80x24-inspect", "default", 80, 24, "6h", "256", "unicode", "dark", "golden",
      "i shift-left shift-left shift-left left left left left left left"),
     ("60x16-inspect", "default", 60, 16, "24h", "256", "unicode", "dark", "golden", "i shift-left shift-left shift-left"),
+    # T4a (1.11.0, behind the resources switch): the tiles on m c g d, Memory with the CPU added; then all four
+    # with the CPU's plot and the others as sparklines, from 30 rows (04 §3.14, 02 §3.7.12)
+    ("80x24-resources", "resources", 80, 24, "24h", "256", "unicode", "dark", "golden", "C"),
+    ("80x32-resources-cpu", "resources", 80, 32, "6h", "256", "unicode", "dark", "golden", "c M G D"),
 ]
 
 
@@ -449,7 +504,11 @@ def press_keys(model, w, h, span, keys):
         ui["detected"] = oomph_top.detected_text(view.Caps("256", "unicode", "dark"), {"theme": True}, (w, h))
     for k in (keys or "").split():
         P = view.layout(model, w, h)
-        if k == "i":
+        if model.get("rv") and k in ("m", "c", "g", "d", "M", "C", "G", "D"):
+            sel, focus, _ = view.selection_apply(model["rv"]["sel"], model["rv"]["focus"], "click" if k.islower() else "cmd",
+                                                 view.RES_KEYS[k.lower()], model.get("avail") or list(view.RESOURCES))
+            model["rv"] = {"sel": sel, "focus": focus}
+        elif k == "i":
             view.inspect_at(ui, model, P, P["plot_w"] - 1)
         elif ui.get("inspect"):
             view.inspect_key(ui, k, model, P)
@@ -477,7 +536,8 @@ def frames(base):
             dirs[scen] = write_fixture(os.path.join(base, scen), scen)
         log, led = dirs[scen]
         oomph.LEDGER_DIR = led
-        model = oomph_top.load_model(span, NOW, log_dir=log, live=False)
+        model = oomph_top.load_model(span, NOW, log_dir=log, live=False,
+                                     rv={"sel": ["memory"], "focus": "memory"} if scen == "resources" else None)
         model.update(host=HOST if scen != "hostile" else "st\x1b[2Judio\u202e", os=OS)
         caps = view.Caps(color, glyphs, theme)
         fr = view.render(model, w, h, caps, press_keys(model, w, h, span, keys[0] if keys else None))
@@ -498,7 +558,7 @@ def frames(base):
 def main(argv):
     if "--dir" in argv:
         base = argv[argv.index("--dir") + 1]
-        for scen in ("default", "critical", "silent", "fresh", "hostile"):
+        for scen in ("default", "critical", "silent", "fresh", "hostile", "resources"):
             write_fixture(os.path.join(base, scen), scen)
         print("topfixture: fixtures in %s (now = %d)" % (base, NOW))
         return 0

@@ -37,7 +37,13 @@ let ledgerDir = fixtureDir.map { $0 + "/ledger" } ?? ProcessInfo.processInfo.env
 let machinesDir = fixtureDir.map { $0 + "/machines" } ?? ProcessInfo.processInfo.environment["OOMPH_MACHINES_DIR"]
     ?? (NSHomeDirectory() + "/Library/Application Support/oomph/machines")
 let brand = "oomph"  // the product's name in prose and titles (oomph.py's BRAND; tools/brandlint.py)
+/// The popup of four resources (roadmap 02 §3.7, §3.8; 1.11.0): tiles that work as tabs, small charts, agent
+/// colours, the capsule and chip on oomph's verdict. Behind a default until the owner has looked at the renders:
+/// `defaults write local.oomph.menubar resourcesUI -bool YES`, then quit and reopen the app. Read once.
+let resourcesUIOn = UserDefaults.standard.bool(forKey: "resourcesUI")
 let descriptor = ": memory monitor"  // what the header says after the name
+/// … and with the four resources (decided 2026-11-23: the brand stays, the header reads "oomph: resource monitor").
+let resourceDescriptor = ": resource monitor"
 let agentLabel = "local.oomph.menubar"
 let popupWidth: CGFloat = 480
 let statColumn: CGFloat = 96
@@ -209,6 +215,23 @@ func readShared(_ path: String, cap: Int, tail: Bool = false) -> Data? {
 }
 
 struct Away: Decodable { var idle_s: Int?; var display_on: Bool?; var locked: Bool?; var sleep_preventers: [String]? }
+
+/// A field that may be missing or of another shape (another machine's file, an older or newer logger): nil
+/// then, instead of failing the whole sample.
+struct Soft<T: Decodable>: Decodable {
+    let v: T?
+    init(from d: Decoder) throws { v = try? T(from: d) }
+}
+/// The sample's resource blocks (roadmap 02 §5.1, logged since 1.9.1).
+struct CPUBlock: Decodable { var n: Double?; var busy: Double?; var user: Double?; var sys: Double?; var therm: Double?
+                             var p: Double?; var e: Double? }
+struct GPUBlock: Decodable { var id: String?; var name: String?; var util: Double?; var active: Double?; var src: String?
+                             var mem_gb: Double?; var mem_alloc_gb: Double?; var mem_limit_gb: Double? }
+struct DiskPool: Decodable { var id: String?; var name: String?; var free_gb: Double?; var total_gb: Double?
+                             var roles: [String]?; var watch: Bool?; var low_gb: Double?; var crit_gb: Double?; var level: String? }
+/// What the verdict reads of a Linux sample's own block (oomph._verdict_parts: strict overcommit).
+struct LinuxBlock: Decodable { var overcommit: Soft<Double>?; var commit_pct: Soft<Double>? }
+struct RateProc: Decodable { var name: String?; var g: String?; var cpu: Double?; var gpu: Double?; var w: Double? }
 struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
 struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool? }
@@ -230,6 +253,16 @@ struct Sample: Decodable {
     var groups: [Group]?
     var claude: [Session]?
     var daemon: DaemonInfo?
+    // the other resources (1.9.1) and what the verdict reads besides memory; never a reason to drop the sample
+    var cpu: Soft<CPUBlock>?
+    var gpu: Soft<[GPUBlock]>?
+    var disks: Soft<[DiskPool]>?
+    var top_cpu: Soft<[RateProc]>?
+    var top_gpu: Soft<[RateProc]>?
+    var top_io: Soft<[RateProc]>?
+    var unowned_gb: Soft<Double>?
+    var os: Soft<String>?
+    var linux: Soft<LinuxBlock>?
 
     var isAway: Bool {
         guard let a = away else { return false }
@@ -322,6 +355,54 @@ struct Point: Identifiable {
     let wired, app, comp, swap: Double
     let away: Bool
     let kills: Int
+    // the other resources, with the resources on (roadmap 02 §8); NaN where a sample has none. A bucket keeps
+    // the mean and the peak of the rates, the most GPU memory and the least free disk (02 §3.4.3)
+    var cpu: Float = .nan, cpuPeak: Float = .nan, cpuSys: Float = .nan, cpuN: Float = .nan
+    var gpu: Float = .nan, gpuPeak: Float = .nan, gpuBusy: Float = .nan, gpuMem: Float = .nan
+    /// 0 no GPU figure, 1 busy time only, 2 at full speed (IOReport): a bucket never averages the two (02 §3.4.11)
+    var gpuKind: UInt8 = 0
+    var disk: Float = .nan
+
+    var used: Double { wired + app + comp }
+
+    /// One sample's resource blocks into this point (ChartSampleR).
+    mutating func take(_ r: ChartSampleR) {
+        if let c = r.cpu?.v {
+            if let b = c.busy { cpu = Float(b); cpuPeak = Float(b) }
+            if let x = c.sys { cpuSys = Float(x) }
+            if let n = c.n { cpuN = Float(n) }
+        }
+        if let g = r.gpu?.v?.first {
+            if let u = g.util { gpu = Float(u); gpuPeak = Float(u); gpuKind = g.src == "ioreport" ? 2 : 1 }
+            if let a = g.active { gpuBusy = Float(a) }
+            if let m = g.mem_gb { gpuMem = Float(m) }
+        }
+        if let d = Tile.pool(r.disks?.v).pool?.free_gb { disk = Float(d) } else if let d = r.disk_free_gb { disk = Float(d) }
+    }
+
+    /// The resource fields of a bucket (Store.worst keeps memory's worst point and its time).
+    mutating func aggregate(_ slice: ArraySlice<Point>) {
+        func mean(_ xs: [Float]) -> Float { xs.isEmpty ? .nan : xs.reduce(0, +) / Float(xs.count) }
+        let c = slice.filter { !$0.cpu.isNaN }
+        cpu = mean(c.map(\.cpu)); cpuSys = mean(c.compactMap { $0.cpuSys.isNaN ? nil : $0.cpuSys })
+        cpuPeak = c.map { max($0.cpu, $0.cpuPeak.isNaN ? $0.cpu : $0.cpuPeak) }.max() ?? .nan
+        cpuN = c.map(\.cpuN).filter { !$0.isNaN }.max() ?? .nan
+        let kind = slice.last { $0.gpuKind > 0 }?.gpuKind ?? 0
+        let g = slice.filter { $0.gpuKind == kind && kind > 0 }
+        gpuKind = kind
+        gpu = mean(g.map(\.gpu)); gpuBusy = mean(g.compactMap { $0.gpuBusy.isNaN ? nil : $0.gpuBusy })
+        gpuPeak = g.map { max($0.gpu, $0.gpuPeak.isNaN ? $0.gpu : $0.gpuPeak) }.max() ?? .nan
+        gpuMem = slice.map(\.gpuMem).filter { !$0.isNaN }.max() ?? .nan
+        disk = slice.map(\.disk).filter { !$0.isNaN }.min() ?? .nan
+    }
+}
+
+/// What a history line carries besides memory, decoded only with the resources on.
+struct ChartSampleR: Decodable {
+    var cpu: Soft<CPUBlock>?
+    var gpu: Soft<[GPUBlock]>?
+    var disks: Soft<[DiskPool]>?
+    var disk_free_gb: Double?
 }
 
 /// One reservation of the agents' memory ledger: live (ledger.json) or finished (reservations.jsonl).
@@ -340,6 +421,8 @@ struct Reservation: Identifiable {
     var used: Double?
     var expires: Double?
     var queue: Int?                      // its place in ledger.json's list of leases: the queue's order
+    var agentSlot = -1                   // its agent's place in the palette (D11), -1 "agent not known"
+    var agentKey: String?                // its agent's key, whose first four digits the card names
 
     var live: Bool { ended == nil }
     var gb: Double { segments.last?.gb ?? 0 }
@@ -350,6 +433,29 @@ struct Reservation: Identifiable {
     /// same colour (a stable hash, not Swift's per-launch one), in the blocks and in the list.
     static let palette: [Color] = [.teal, .purple, .pink, .indigo, Color(red: 0.84, green: 0.62, blue: 0.0), .brown, .green]
     var color: Color { Reservation.palette[Reservation.colorIndex(purpose)] }
+    /// With the resources on, every reservation wears its agent's colour (D11, 02 §3.8.3): three hues kept away
+    /// from the resource and state hues, then the same three a step lighter; gray for an agent not known (a
+    /// record written before the key existed). Light and dark tones differ, so the scheme is passed in.
+    static let agentLight: [Color] = [0x0E9021, 0x8A3D24, 0x986AC5, 0x7BC98A, 0xD08A5E, 0xCDA0EE].map(Reservation.rgb)
+    static let agentDark: [Color] = [0x7E9A2E, 0x9C4B36, 0x9580C4, 0xB5CF70, 0xD99A82, 0xCBB0F5].map(Reservation.rgb)
+    static func rgb(_ h: Int) -> Color {
+        Color(red: Double((h >> 16) & 0xFF) / 255, green: Double((h >> 8) & 0xFF) / 255, blue: Double(h & 0xFF) / 255)
+    }
+    func agentColor(dark: Bool) -> Color {
+        guard agentSlot >= 0 else { return dark ? Reservation.rgb(0x6E6E73) : Reservation.rgb(0xA3A3A8) }
+        return (dark ? Reservation.agentDark : Reservation.agentLight)[agentSlot]
+    }
+    /// The colour a block, a row's swatch and the card wear: the purpose's, or with the resources on the agent's.
+    func tint(dark: Bool) -> Color { resourcesUIOn ? agentColor(dark: dark) : color }
+    /// An `agent` {key, slot} as the ledger and the history log hold it: its palette slot, or -1 for "agent not
+    /// known" (oomph_view.agent_index; tools/vectors/chart.json): a key of 8 hex digits and an integer slot 0–5.
+    static func agentIndex(_ a: Any?) -> Int {
+        guard let d = a as? [String: Any], let k = d["key"] as? String, k.count == 8,
+              k.allSatisfy({ "0123456789abcdef".contains($0) }), let n = d["slot"] as? NSNumber,
+              CFGetTypeID(n) != CFBooleanGetTypeID(), !CFNumberIsFloatType(n), (0..<6).contains(n.intValue) else { return -1 }
+        return n.intValue
+    }
+
     /// The palette index of a purpose. Shared with `oomph top` (tools/vectors/chart.json).
     static func colorIndex(_ purpose: String) -> Int {
         var h: UInt32 = 5381
@@ -397,6 +503,8 @@ struct Reservation: Identifiable {
             return (t, g)
         }
         segments = segs.isEmpty ? [(req, gb)] : segs
+        agentSlot = Reservation.agentIndex(o["agent"])
+        agentKey = ((o["agent"] as? [String: Any])?["key"] as? String).flatMap { $0.count == 8 ? $0 : nil }
     }
 }
 
@@ -470,6 +578,218 @@ struct Incident: Decodable, Identifiable {
 enum Pressure: Int { case unknown = 0, normal = 1, warn = 2, critical = 4
     var label: String { switch self { case .normal: "Normal"; case .warn: "Warning"; case .critical: "Critical"; default: "–" } }
     var color: Color { switch self { case .warn: .yellow; case .critical: .red; default: .green } }
+}
+
+// MARK: - Four resources (roadmap 02 §3.7, §3.8; 1.11.0, behind resourcesUI)
+
+/// The resources a tile shows, in tile order. `oomph top` has the same (oomph_view.RESOURCES).
+enum Resource: String, CaseIterable {
+    case memory, cpu, gpu, disk
+    var name: String { ["memory": "Memory", "cpu": "CPU", "gpu": "GPU", "disk": "Disk"][rawValue]! }
+    var letter: String { String(rawValue.prefix(1)) }
+    /// The resource hues (02 §3.4): blue, teal, violet, magenta. Agents never wear them (§3.8.3).
+    var color: Color {
+        switch self {
+        case .memory: Color(red: 0.0, green: 0.53, blue: 1.0)
+        case .cpu: Color(red: 0.0, green: 0.66, blue: 0.70)
+        case .gpu: Color(red: 0.62, green: 0.36, blue: 0.95)
+        case .disk: Color(red: 0.90, green: 0.25, blue: 0.62)
+        }
+    }
+    var unit: String { ["memory": "GB", "cpu": "cores", "gpu": "%", "disk": "GB"][rawValue]! }
+
+    /// The tiles a machine shows: every resource, except a GPU the logger looked for and found none of
+    /// (`gpu: []`, a VM). Without the blocks (a logger older than 1.9.1, or none) the tiles stay and say "–".
+    static func available(_ s: Sample?) -> [Resource] {
+        Resource.allCases.filter { !($0 == .gpu && s?.gpu?.v?.isEmpty == true) }
+    }
+}
+
+/// The selection of 02 §3.7.1: the resources shown (a set, in tile order, never empty) and the focus, which has
+/// the big chart. Held to `oomph top`'s by tools/vectors/chart.json (oomph_view.selection_apply).
+struct Selection: Equatable {
+    var shown: [Resource]
+    var focus: Resource
+    enum Gesture: String { case click, cmd, shift }
+    enum Outcome: String { case changed, callout, refused, none }
+
+    /// A remembered selection as drawn: what is not available is skipped (and comes back with it), an
+    /// unavailable focus gives way to the first shown, nothing at all is Memory alone (§3.7.9).
+    static func shown(_ sel: [Resource], focus: Resource, available: [Resource]) -> Selection {
+        var shown = Resource.allCases.filter { sel.contains($0) && available.contains($0) }
+        if shown.isEmpty { shown = [.memory] }
+        return Selection(shown: shown, focus: shown.contains(focus) ? focus : shown[0])
+    }
+
+    /// A gesture on a tile (§3.7.2): a click shows a resource alone (on the focus alone: the callout), a ⌘-click
+    /// adds or removes one (the last one is refused), a ⇧-click adds the run from the focus. Only a click
+    /// moves the focus, or removing it, which hands it to the next shown resource, wrapping round.
+    func apply(_ g: Gesture, _ r: Resource, available: [Resource]) -> (Selection, Outcome) {
+        let order = Resource.allCases
+        guard available.contains(r) else { return (self, .none) }
+        switch g {
+        case .click:
+            if r != focus { return (Selection(shown: [r], focus: r), .changed) }
+            return shown.count > 1 ? (Selection(shown: [focus], focus: focus), .changed) : (self, .callout)
+        case .cmd:
+            if !shown.contains(r) { return (Selection(shown: order.filter { shown.contains($0) || $0 == r }, focus: focus), .changed) }
+            if r != focus { return (Selection(shown: shown.filter { $0 != r }, focus: focus), .changed) }
+            if shown.count == 1 { return (self, .refused) }
+            let i = shown.firstIndex(of: r)!
+            return (Selection(shown: shown.filter { $0 != r }, focus: shown[(i + 1) % shown.count]), .changed)
+        case .shift:
+            if r == focus { return (self, .none) }
+            let avail = order.filter { available.contains($0) }
+            let a = avail.firstIndex(of: focus) ?? 0, b = avail.firstIndex(of: r) ?? 0
+            let run = avail[min(a, b)...max(a, b)]
+            let out = order.filter { shown.contains($0) || run.contains($0) }
+            return out == shown ? (self, .none) : (Selection(shown: out, focus: focus), .changed)
+        }
+    }
+}
+
+/// oomph's verdict, as the capsule and the menu-bar chip show it (02 §3.4.9, §3.5, §15.13): oomph.py's
+/// `capsule` over `_verdict_parts`, held together by tools/vectors/chart.json, so the chip agrees with
+/// `oomph check`. The machine-wide verdict: no one caller's coordination, no pins.
+enum Verdict {
+    struct Capsule: Equatable { var text: String; var level: Int; var memory: Int; var disk: Int }
+
+    static func capsule(_ s: Sample) -> Capsule {
+        let os = s.os?.v ?? "macos"
+        let mac = os == "macos", lin = os == "linux"
+        let ram = s.ram_gb
+        let free = (max(0, s.ram_gb - s.app_gb - s.wired_gb - s.compressed_gb) * 10).rounded() / 10
+        let disk = s.disk_free_gb
+        let swapFull = s.swap_total_gb > 0 && s.swap_used_gb >= 0.9 * s.swap_total_gb
+        var mem = 0, dsk = 0
+        if s.pressure >= 4 { mem = 2 } else if s.pressure >= 2 { mem = 1 }
+        if mac && disk < 5 { dsk = 2 } else if mac && disk < 20 { dsk = 1 }
+        if mac && swapFull && disk < 20 { mem = 2 }
+        if ram > 0 && free < 0.05 * ram && !lin { mem = max(mem, 1) }
+        // strict overcommit near its limit: allocations are about to fail (a finite, sane figure, as oomph._num)
+        if lin, s.linux?.v?.overcommit?.v == 2, let c = s.linux?.v?.commit_pct?.v, c.isFinite, c >= 95, c <= 1e15 {
+            mem = max(mem, 1)
+        }
+        if (s.jetsam_kills ?? 0) > 0 { mem = max(mem, 1) }
+        if let u = s.unowned_gb?.v, ram > 0, u >= max(16.0, 0.4 * ram) { mem = max(mem, 1) }
+        let worst = max(mem, dsk)
+        let text = worst == 0 ? "Normal" : mem >= dsk ? "Memory " + (mem == 2 ? "critical" : "tight")
+                                                       : "Disk " + (dsk == 2 ? "critical" : "low")
+        return Capsule(text: text, level: worst, memory: mem, disk: dsk)
+    }
+
+    static func color(_ level: Int) -> Color { level >= 2 ? .red : level == 1 ? .yellow : .green }
+
+    /// The resource the popup opens on when something is critical (§3.4.9, §3.7.9), memory first. Only
+    /// Critical steers the opening (D9): a standing tight or low stays on the capsule and the tile.
+    static func trouble(_ c: Capsule) -> Resource? { c.memory == 2 ? .memory : c.disk == 2 ? .disk : nil }
+}
+
+/// What a tile says (02 §3.4.1; oomph_view.tiles, held together by tools/vectors/chart.json).
+struct Tile {
+    var reading = "–"
+    var flag: String?           // the one flag slot
+    var level = 0               // 2 red, 1 amber: the border and the glyph; 0 quiet
+    var queue = 0               // requests waiting for this resource
+    var top: String?            // the biggest consumer
+    var meter = 0.0             // 0…1; a tank for Disk
+    var full = false            // the GPU figure is at full speed
+
+    /// The flag slot as drawn: a flag of rank 1 to 6 keeps the queue after it; a queue alone outranks busy.
+    var flagText: String {
+        if queue > 0 && (flag == nil || flag == "busy") { return "\(queue) waiting" }
+        if let f = flag, queue > 0 { return "\(f) ◻\(queue)" }
+        return flag ?? ""
+    }
+
+    /// The pool the Disk tile shows: the home folder's or the temp directory's, else the first watched one,
+    /// else the first.
+    static func pool(_ disks: [DiskPool]?) -> (pool: DiskPool?, at: Int?, pools: [DiskPool]) {
+        let pools = (disks ?? []).filter { $0.free_gb != nil }
+        let rules: [(DiskPool) -> Bool] = [{ ($0.roles ?? []).contains { $0 == "home" || $0 == "tmp" } },
+                                           { $0.watch == true }, { _ in true }]
+        for want in rules { if let i = pools.firstIndex(where: want) { return (pools[i], i, pools) } }
+        return (nil, nil, pools)
+    }
+
+    static func busiest(_ rows: [RateProc]?, _ key: KeyPath<RateProc, Double?>) -> String? {
+        var tot: [String: Double] = [:], order: [String] = []
+        for x in rows ?? [] {
+            guard let v = x[keyPath: key] else { continue }
+            let name = (x.g?.isEmpty == false ? x.g : x.name) ?? ""
+            if name.isEmpty { continue }
+            if tot[name] == nil { order.append(name) }
+            tot[name, default: 0] += v
+        }
+        var best: String?
+        for k in order where best == nil || tot[k]! > tot[best!]! { best = k }
+        return best
+    }
+
+    /// A name shortened in its middle to n characters (02 §3.4.2).
+    static func midFit(_ t: String, _ n: Int) -> String {
+        let c = Array(t)
+        guard c.count > n else { return t }
+        let a = n / 2
+        return String(c[..<a]) + "…" + String(c[(c.count - (n - 1 - a))...])
+    }
+
+    static func facts(_ s: Sample, _ cap: Verdict.Capsule, waiting: [Resource: Int] = [:]) -> [Resource: Tile] {
+        var out: [Resource: Tile] = [:]
+        let used = s.app_gb + s.wired_gb + s.compressed_gb
+        out[.memory] = Tile(reading: String(format: "%.1f / %.0f GB", used, s.ram_gb),
+                            flag: cap.memory == 2 ? "critical" : cap.memory == 1 ? "tight" : nil, level: cap.memory,
+                            top: s.groups?.first(where: { !$0.name.isEmpty })?.name, meter: s.ram_gb > 0 ? used / s.ram_gb : 0)
+        let c = s.cpu?.v
+        var t = Tile(top: busiest(s.top_cpu?.v, \.cpu))
+        if let n = c?.n, n > 0, let b = c?.busy {
+            // never Int(n): another machine's sample may say 1e300 cores (as Python's "%d", truncated)
+            t.reading = String(format: "%.1f / %.0f cores", b, n.rounded(.towardZero)); t.meter = b / n
+            if b >= 0.9 * n { t.flag = "busy" }
+        }
+        if (c?.therm ?? 0) >= 2 { t.flag = "throttled" }
+        out[.cpu] = t
+        let g = s.gpu?.v?.first
+        t = Tile(top: busiest(s.top_gpu?.v, \.gpu))
+        t.full = g?.src == "ioreport"
+        if let u = g?.util {
+            t.reading = String(format: "%.0f %%", u) + (t.full ? "" : " busy") + (g?.mem_gb.map { String(format: " · %.1f GB", $0) } ?? "")
+            t.meter = u / 100
+            if t.full && u >= 90 { t.flag = "busy" }
+        }
+        out[.gpu] = t
+        let (d, at, pools) = pool(s.disks?.v)
+        let free = d?.free_gb ?? s.disk_free_gb
+        t = Tile(level: cap.disk, top: busiest(s.top_io?.v, \.w))
+        t.flag = cap.disk == 2 ? "critical" : cap.disk == 1 ? "low" : nil
+        if t.flag == nil {
+            let others = pools.enumerated().filter { $0.offset != at && $0.element.watch == true }.map { $0.element.level }
+            let k = others.filter { $0 == "critical" }.count, l = others.filter { $0 == "low" }.count
+            if k > 0 { t.flag = "+\(k) critical"; t.level = 2 } else if l > 0 { t.flag = "+\(l) low"; t.level = 1 }
+        }
+        t.reading = String(format: "%.0f GB free", free)
+        if let d, pools.count > 1 { t.reading += " · " + midFit((d.name?.isEmpty == false ? d.name : nil) ?? d.id ?? "?", 12) }
+        if let tot = d?.total_gb, tot > 0 { t.meter = min(1, free / tot) }
+        out[.disk] = t
+        for r in Resource.allCases { out[r]!.queue = waiting[r] ?? 0 }
+        return out
+    }
+
+    /// How many queued requests wait for each resource, from ledger.json's leases (oomph_view.waiting_on): a
+    /// request without `waiting_on` (every writer before 1.12) waits for memory.
+    static func waiting(_ leases: [[String: Any]]) -> [Resource: Int] {
+        var out: [Resource: Int] = [:]
+        for l in leases where (l["state"] as? String) == "queued" {
+            let ids = ((l["waiting_on"] as? [Any]) ?? []).map { "\($0)" }
+            var got = Set<Resource>()
+            for i in ids.isEmpty ? ["ram"] : ids {
+                got.insert(i == "ram" || i == "mem" ? .memory : i == "cpu" ? .cpu
+                           : i.hasPrefix("gpu") || i.hasPrefix("vram") ? .gpu : .disk)
+            }
+            for r in got { out[r, default: 0] += 1 }
+        }
+        return out
+    }
 }
 
 // MARK: - One machine
@@ -804,7 +1124,7 @@ final class MachineStore: ObservableObject {
     }
 
     private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]?
-                            let reservations: [ResBlock] }
+                            let reservations: [ResBlock]; var waiting: [Resource: Int] = [:] }
 
     private func apply(_ r: Loaded) {
         history = r.history
@@ -812,7 +1132,12 @@ final class MachineStore: ObservableObject {
         historyNow = r.now
         if let e = r.events { events = e }
         reservations = r.reservations
+        if resourcesUIOn { waiting = r.waiting }
     }
+
+    /// Queued requests by the resource they wait for (the tiles' "n waiting"), as of the last load.
+    @Published var waiting: [Resource: Int] = [:]
+    private var waitingLoaded: [Resource: Int] = [:]
 
     /// Finished reservations from the history log and the ledger's own short history, plus the live
     /// ones, stacked for the strip. On loadQueue only. A mirror's pids are another machine's: its
@@ -825,6 +1150,7 @@ final class MachineStore: ObservableObject {
         let local = isLocal
         let rs = Store.mergeReservations(records: records, ledger: ledger, now: now,
                                          holderGone: { pid in local && !noLiveness && kill(pid, 0) != 0 && errno == ESRCH })
+        if resourcesUIOn { waitingLoaded = Tile.waiting((ledger["leases"] as? [[String: Any]]) ?? []) }
         return ResBlock.stack(rs, now: now)
     }
 
@@ -853,8 +1179,9 @@ final class MachineStore: ObservableObject {
         // drop cached files that are gone (a day's plain file once it is gzipped)
         let present = Set(files.map { "\(logDir)/\($0)" })
         for k in cache.keys where !present.contains(k) { cache[k] = nil }
+        let res = loadReservations(now: known)
         return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents(),
-                      reservations: loadReservations(now: known))
+                      reservations: res, waiting: waitingLoaded)
     }
 
     /// A mirror's gaps (roadmap 01 §3.5, §5.7): inside the coverage map, the stretches without
@@ -959,10 +1286,13 @@ final class MachineStore: ObservableObject {
     private func parse(_ data: Data.SubSequence) -> [Point] {
         var out: [Point] = []
         for line in data.split(separator: 0x0A) {
-            guard let s = try? loadDecoder.decode(ChartSample.self, from: Data(line)) else { continue }
+            let d = Data(line)
+            guard let s = try? loadDecoder.decode(ChartSample.self, from: d) else { continue }
             let away = s.away.map { ($0.idle_s ?? 0) >= 300 || ($0.locked ?? false) || $0.display_on == false } ?? false
-            out.append(Point(id: s.t, date: Date(timeIntervalSince1970: s.t), wired: s.wired_gb, app: s.app_gb,
-                             comp: s.compressed_gb, swap: s.swap_used_gb, away: away, kills: s.jetsam_kills ?? 0))
+            var p = Point(id: s.t, date: Date(timeIntervalSince1970: s.t), wired: s.wired_gb, app: s.app_gb,
+                          comp: s.compressed_gb, swap: s.swap_used_gb, away: away, kills: s.jetsam_kills ?? 0)
+            if resourcesUIOn, let r = try? loadDecoder.decode(ChartSampleR.self, from: d) { p.take(r) }
+            out.append(p)
         }
         return out
     }
@@ -1000,6 +1330,79 @@ final class Store: ObservableObject {
     /// A change in a machine is a change of the popup.
     private func watchMachines() {
         watching = machines.map { m in m.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() } }
+    }
+
+    // MARK: resources (roadmap 02 §3.7, 1.11.0; behind resourcesUI)
+
+    /// The remembered selection (§3.7.9): `selectedResources` (in tile order) and `focusResource` in
+    /// UserDefaults, written on every change the user makes. Default: Memory alone.
+    @Published var resSelection: [Resource] = Store.storedSelection()
+    @Published var resFocus: Resource = Resource(rawValue: UserDefaults.standard.string(forKey: "focusResource") ?? "") ?? .memory
+    /// The resource the verdict named when the popup opened: focused and added for this opening, never written
+    /// back (§3.4.9, §3.7.9).
+    @Published var trouble: Resource?
+    /// The compact level (§3.7.5): chosen when the popup opens and again when the selection changes, never
+    /// otherwise while it is open. `--ai lvl:N` draws one.
+    @Published var compactLevel = 0
+    /// A click on the focus shown alone: the biggest consumers open (PopoverView toggles its callout).
+    @Published var calloutAsked = 0
+    /// The last refused ⌘-click (the tile shakes): which tile, and a count that changes each time.
+    @Published var refused: (Resource, Int)?
+    var onSelectionChanged: (() -> Void)?
+
+    static func storedSelection() -> [Resource] {
+        let a = (UserDefaults.standard.array(forKey: "selectedResources") as? [String]) ?? ["memory"]
+        let r = Resource.allCases.filter { a.contains($0.rawValue) }
+        return r.isEmpty ? [.memory] : r
+    }
+
+    /// What the popup draws for machine `m`: the remembered selection with the resource in trouble added and
+    /// focused, over the tiles that machine has.
+    func selection(for m: MachineStore) -> Selection {
+        var sel = resSelection, focus = resFocus
+        if let t = trouble { if !sel.contains(t) { sel.append(t) }; focus = t }
+        return Selection.shown(sel, focus: focus, available: Resource.available(m.current))
+    }
+
+    /// A click, ⌘-click or ⇧-click on a tile, or its key (m c g d, ⇧ for the toggle). A change is written
+    /// back, keeping a remembered resource this machine does not have unless the click showed one alone.
+    @discardableResult
+    func resourceGesture(_ g: Selection.Gesture, _ r: Resource) -> Selection.Outcome {
+        let avail = Resource.available(machine.current)
+        let (next, out) = selection(for: machine).apply(g, r, available: avail)
+        switch out {
+        case .callout: calloutAsked += 1
+        case .refused: refused = (r, (refused?.1 ?? 0) + 1)
+        case .changed:
+            let keep = g == .click ? [] : resSelection.filter { !avail.contains($0) }
+            trouble = nil
+            resSelection = Resource.allCases.filter { next.shown.contains($0) || keep.contains($0) }
+            resFocus = next.focus
+            if !renderMode {
+                UserDefaults.standard.set(resSelection.map(\.rawValue), forKey: "selectedResources")
+                UserDefaults.standard.set(resFocus.rawValue, forKey: "focusResource")
+            }
+            onSelectionChanged?()
+        case .none: break
+        }
+        return out
+    }
+
+    /// Opening the popup on trouble (§3.4.9): this Mac's verdict, while its logger reports.
+    func resourcesOpened() {
+        guard resourcesUIOn else { return }
+        let m = machine
+        trouble = (m.daemonRunning || !m.isLocal) ? m.current.flatMap { Verdict.trouble(Verdict.capsule($0)) } : nil
+    }
+
+    /// m c g d and M C G D while the popup is key and no text field has the keyboard (§3.7.3).
+    func resourceKey(_ e: NSEvent) -> Bool {
+        guard resourcesUIOn, e.type == .keyDown, !(e.window?.firstResponder is NSText) else { return false }
+        let mods = e.modifierFlags.intersection([.command, .control, .option])
+        guard mods.isEmpty, let c = e.characters, c.count == 1,
+              let r = Resource.allCases.first(where: { $0.letter == c.lowercased() }) else { return false }
+        resourceGesture(c == c.lowercased() ? .click : .cmd, r)
+        return true
     }
 
     // MARK: machines (roadmap 01 R1a): tabs for the machines added with `oomph remote add`
@@ -1480,8 +1883,10 @@ final class Store: ObservableObject {
     static func worst(_ slice: ArraySlice<Point>) -> Point {
         guard slice.count > 1 else { return slice.first! }
         let w = slice.max { ($0.app + $0.comp + $0.swap) < ($1.app + $1.comp + $1.swap) }!
-        return Point(id: w.id, date: w.date, wired: w.wired, app: w.app, comp: w.comp,
-                     swap: w.swap, away: slice.contains { $0.away }, kills: slice.reduce(0) { $0 + $1.kills })
+        var p = Point(id: w.id, date: w.date, wired: w.wired, app: w.app, comp: w.comp,
+                      swap: w.swap, away: slice.contains { $0.away }, kills: slice.reduce(0) { $0 + $1.kills })
+        if resourcesUIOn { p.aggregate(slice) }
+        return p
     }
 
 
@@ -1973,6 +2378,116 @@ final class Store: ObservableObject {
 
 // MARK: - Views
 
+/// One resource tile (roadmap 02 §3.4.1, §3.7.8): name and its one flag, the reading, a meter (a tank for
+/// Disk, which fills as things get better), the biggest consumer. The focus has the strong highlight, every
+/// other shown resource a light one; a flag of rank 1 to 5 colours the border, never the fill.
+struct ResourceTile: View {
+    enum Role { case focus, shown, plain }
+    let resource: Resource
+    let tile: Tile
+    let role: Role
+    let chevron: Bool          // the focus shown alone: a click opens its biggest consumers
+    let open: Bool             // and they are open
+    let compact: Bool          // level 3 and up: no line 4, the chevron moves to line 1
+    var shake = 0
+    var help = ""
+
+    var body: some View {
+        let c = resource.color
+        let border: Color = tile.level >= 2 ? .red : tile.level == 1 ? .orange
+            : role == .focus ? c.opacity(0.6) : role == .shown ? c.opacity(0.3) : Color.primary.opacity(0.08)
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 3) {
+                Text(resource.name).font(.system(size: 10.5, weight: .semibold)).lineLimit(1).fixedSize()
+                    .foregroundStyle(role == .focus ? Color.primary : Color.secondary)
+                Spacer(minLength: 2)
+                ViewThatFits(in: .horizontal) { flag(true); flag(false) }
+                if chevron && compact { arrow }
+            }
+            Text(tile.reading).font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                .lineLimit(1).minimumScaleFactor(0.75)
+            meter.padding(.vertical, 1)
+            if !compact {
+                HStack(spacing: 2) {
+                    Text(tile.top.map(ResourceTile.friendly) ?? " ").lineLimit(1).truncationMode(.middle)
+                    Spacer(minLength: 0)
+                    if chevron { arrow }
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 7).padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
+            .fill(role == .focus ? c.opacity(0.10) : role == .shown ? c.opacity(0.045) : Color.primary.opacity(0.025)))
+        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(border, lineWidth: tile.level > 0 ? 1.5 : 1))
+        .modifier(ShakeEffect(animatableData: CGFloat(shake)))
+        .help(help)
+    }
+
+    var arrow: some View {
+        Image(systemName: open ? "chevron.up" : "chevron.down").font(.system(size: 7, weight: .bold)).foregroundStyle(.secondary)
+    }
+
+    /// The flag slot (§3.4.1): a shape and a word, never colour alone; the queue after a flag of rank 1 to 6,
+    /// or "n waiting" on its own (outranking busy). A two-digit queue drops the word.
+    @ViewBuilder func flag(_ words: Bool) -> some View {
+        let f = tile.flag, q = tile.queue
+        HStack(spacing: 2) {
+            if let f, f != "busy" {
+                let glyph = f.hasSuffix("critical") ? "●" : f == "throttled" ? "△" : "▲"
+                Text(glyph).foregroundStyle(f.hasSuffix("critical") ? Color.red : f == "throttled" ? Color.primary : Color.orange)
+                Text(f).foregroundStyle(Color.primary)
+                if q > 0 { Text("◻\(q)").foregroundStyle(resource.color) }
+            } else if q > 0 {
+                Text("◻").foregroundStyle(resource.color)
+                Text(q > 9 || !words ? "\(q)" : "\(q) waiting").foregroundStyle(Color.primary)
+            } else if f == "busy" {
+                Text("busy").foregroundStyle(.secondary)
+            }
+        }
+        .font(.system(size: 9.5)).lineLimit(1).fixedSize()
+    }
+
+    @ViewBuilder var meter: some View {
+        let frac = CGFloat(min(max(tile.meter, 0), 1))
+        if resource == .disk {
+            GeometryReader { g in
+                let w: CGFloat = g.size.width
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2).fill(resource.color.opacity(0.55)).frame(width: max(w * frac, frac > 0 ? 1.5 : 0))
+                    RoundedRectangle(cornerRadius: 2).strokeBorder(resource.color.opacity(0.7), lineWidth: 0.75)
+                }
+            }
+            .frame(height: 6)
+        } else {
+            GeometryReader { g in
+                let w: CGFloat = g.size.width
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.primary.opacity(0.1))
+                    Capsule().fill(resource.color.opacity(0.85)).frame(width: max(w * frac, frac > 0 ? 2 : 0))
+                }
+            }
+            .frame(height: 3).padding(.vertical, 1.5)
+        }
+    }
+
+    /// "com.apple.WebKit.WebContent" → "WebKit.WebContent".
+    static func friendly(_ n: String) -> String {
+        let parts = n.split(separator: ".")
+        guard parts.count >= 3, ["com", "org", "net", "io", "de", "app"].contains(parts[0].lowercased()) else { return n }
+        return parts.dropFirst(2).joined(separator: ".")
+    }
+}
+
+/// The standard 0.2 s "no" of a refused ⌘-click: 2 pt left and right, twice.
+struct ShakeEffect: GeometryEffect {
+    var animatableData: CGFloat
+    func effectValue(size: CGSize) -> ProjectionTransform {
+        ProjectionTransform(CGAffineTransform(translationX: 2 * sin(animatableData * .pi * 4), y: 0))
+    }
+}
+
 struct Stat: View {
     let label: String, value: String
     var warn = false
@@ -2302,6 +2817,14 @@ struct MemoryChart: View, Animatable {
     /// The agents' reservations, drawn as a strip of blocks under the chart on the same time axis.
     var reservations: [ResBlock] = []
     var stripHeight: CGFloat = 0 // 0 = no strip
+    // With the resources on (roadmap 02 §3.7): the resource with the big chart, the small charts under it (in
+    // tile order) and their height, and the scales the charts need from the current sample.
+    var focus: Resource = .memory
+    var rows: [Resource] = []
+    var rowHeight: CGFloat = 22
+    var cores: Double?
+    var floors: (low: Double, crit: Double)?
+    @Environment(\.colorScheme) private var scheme
     /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
     @State private var hoverX: CGFloat? = renderHoverX
     /// The pointer over the reservation strip (strip coordinates).
@@ -2328,6 +2851,9 @@ struct MemoryChart: View, Animatable {
             let grid = axis.gridLines(f, plotW: plotW)
             let labels = axis.axisLabels(f, plotW: plotW)
             VStack(spacing: MemoryChart.stripGap) {
+                if resourcesUIOn {
+                    resourceChart(f, entries: entries, away: away, gaps: gaps, missing: missing, grid: grid, labels: labels)
+                } else {
                 Chart {
                     TimeAxis.gridMarks(grid, color: .primary, scale: 1)
                     areaMarks(entries)
@@ -2354,6 +2880,10 @@ struct MemoryChart: View, Animatable {
                         hoverTracker(proxy)
                     }
                 }
+                }
+                if !rows.isEmpty {
+                    Color.clear.frame(height: rowsHeight).tourAnchor("rows")
+                }
                 if stripHeight > 0 {
                     Color.clear.frame(height: stripHeight).tourAnchor("strip")
                 }
@@ -2363,8 +2893,12 @@ struct MemoryChart: View, Animatable {
             .overlayPreferenceValue(PlotRectKey.self) { plot in
                 ZStack(alignment: .topLeading) {
                     if let plot {
+                        if !rows.isEmpty {
+                            rowsLayer(plot: plot, top: rowsTop(geo.size.height), mapper: f, grid: grid, labels: labels)
+                        }
                         if stripHeight > 0 { stripLayer(plot: plot, top: geo.size.height - stripHeight, mapper: f, grid: grid, missing: missing) }
-                        hoverLayer(plot: plot, mapper: f, stripTop: geo.size.height - stripHeight)
+                        hoverLayer(plot: plot, mapper: f, stripTop: geo.size.height - stripHeight,
+                                   rowsTop: rows.isEmpty ? nil : rowsTop(geo.size.height))
                         if stripHeight > 0 { stripCard(plot: plot, top: geo.size.height - stripHeight, width: geo.size.width, mapper: f) }
                     }
                 }
@@ -2375,6 +2909,239 @@ struct MemoryChart: View, Animatable {
 
     static let seriesColors: [Color] = [.gray, .blue, .orange, .red]
     static let stripGap: CGFloat = 4
+
+    // MARK: four resources (roadmap 02 §3.4.3, §3.7; with resourcesUI)
+
+    /// The small charts' room: each with the gap above it.
+    var rowsHeight: CGFloat { CGFloat(rows.count) * (rowHeight + 3) }
+    /// Where the small charts begin, in a chart of height h: under the big chart, above the strip.
+    func rowsTop(_ h: CGFloat) -> CGFloat { h - (stripHeight > 0 ? stripHeight + MemoryChart.stripGap : 0) - rowsHeight }
+
+    /// The focus's series, as the big chart and its legend name and colour them.
+    var seriesStyle: (names: [String], colors: [Color]) {
+        switch focus {
+        case .memory: return (MemoryChart.series, MemoryChart.seriesColors)
+        case .cpu: return (["System", "User"], [.gray, Resource.cpu.color])
+        case .gpu: return (["Full speed", "Busy time", "Busy"],
+                           [Resource.gpu.color, Resource.gpu.color.opacity(0.3), Resource.gpu.color.opacity(0.95)])
+        case .disk: return (["Free", "Free line"], [Resource.disk.color.opacity(0.16), Resource.disk.color])
+        }
+    }
+
+    /// The first of 1, 2, 4, 8 × 10ⁿ at or above v: the Disk row's scale (02 §3.4.3).
+    static func niceStep(_ v: Double) -> Double {
+        guard v > 0 else { return 1 }
+        let e = pow(10, (log10(v)).rounded(.down))
+        for m in [1.0, 2, 4, 8, 10] where m * e >= v - 1e-9 { return m * e }
+        return 10 * e
+    }
+
+    /// The big chart's y scale: memory to the next 10 GB above RAM or the highest stack (02 §8), the cores with
+    /// room for their dashed line, the GPU to 100 %, free disk on the Disk row's steps over the range in view.
+    func yTop(_ entries: [Entry]) -> Double {
+        var stack: [Double: Double] = [:]
+        for e in entries where e.kind != "Busy" && e.kind != "Free line" { stack[e.x, default: 0] += e.gb }
+        let peak = stack.values.max() ?? 0
+        switch focus {
+        case .memory: return max(10, (max(ram ?? 0, peak) / 10).rounded(.up) * 10)
+        case .cpu: return max(cores ?? 0, peak, 1) * 1.08
+        case .gpu: return 100
+        case .disk: return MemoryChart.niceStep(max(peak, 2 * (floors?.low ?? 0), 1))
+        }
+    }
+
+    /// The focus's series by screen column (02 §3.4.3): for the rates each column's mean, the System part of
+    /// the cores under the User part; the GPU at full speed solid, busy time faint with the busy line over
+    /// it; free disk as a faint area under its line. Zero at both edges of every gap, as memory's.
+    func resourceEntries(_ f: (Double) -> Double) -> [Entry] {
+        let cols = axis.columns(points, time: { $0.id }, gaps: gaps, f, reduce: Store.worst)
+        let kinds = seriesStyle.names
+        var out: [Entry] = []
+        var id = 0
+        func v(_ x: Float?) -> Double { x.map { $0.isNaN ? 0 : Double($0) } ?? 0 }
+        func add(_ x: Double, _ p: Point?) {
+            var vals: [Double] = []
+            switch focus {
+            case .cpu:
+                let busy = v(p?.cpu), sys = min(v(p?.cpuSys), busy)
+                vals = [sys, busy - sys]
+            case .gpu:
+                let k = p?.gpuKind ?? 0, u = v(p?.gpu)
+                vals = [k == 2 ? u : 0, k == 1 ? u : 0, k == 2 ? v(p?.gpuBusy) : 0]
+            case .disk: vals = [v(p?.disk), v(p?.disk)]
+            case .memory: return
+            }
+            for (k, name) in kinds.enumerated() { out.append(Entry(id: id, x: x, kind: name, gb: vals[k])); id += 1 }
+        }
+        for c in cols {
+            if c.gapBefore { add(c.x - 1e-6, nil) }
+            add(c.x, c.p)
+            if c.gapAfter { add(c.x + 1e-6, nil) }
+        }
+        return out
+    }
+
+    @ChartContentBuilder func resourceMarks(_ entries: [Entry]) -> some ChartContent {
+        ForEach(entries) { (e: Entry) in
+            if e.kind == "Busy" || e.kind == "Free line" {
+                LineMark(x: .value("time", e.x), y: .value("value", e.gb), series: .value("kind", e.kind))
+                    .foregroundStyle(by: .value("kind", e.kind))
+                    .lineStyle(StrokeStyle(lineWidth: 1))
+            } else {
+                AreaMark(x: .value("time", e.x), y: .value("value", e.gb))
+                    .foregroundStyle(by: .value("kind", e.kind))
+            }
+        }
+    }
+
+    /// What the focus is measured against: RAM, the cores, a watched pool's "low" and "critical" floors.
+    @ChartContentBuilder var capacityMarks: some ChartContent {
+        if focus == .memory {
+            ramMark
+        } else if focus == .cpu, let n = cores {
+            RuleMark(y: .value("cores", n))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(Color.primary.opacity(0.6))
+        } else if focus == .disk, let fl = floors {
+            RuleMark(y: .value("low", fl.low))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(Color.orange.opacity(0.8))
+            RuleMark(y: .value("critical", fl.crit))
+                .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(Color.red.opacity(0.8))
+        }
+    }
+
+    /// The big chart with the resources on: memory's four series, or the focus's, on an explicit y scale.
+    func resourceChart(_ f: @escaping (Double) -> Double, entries: [Entry], away: [TimeAxis.Band], gaps: [TimeAxis.Band],
+                       missing: [TimeAxis.Band], grid: [TimeAxis.GridLine], labels: [TimeAxis.Label]) -> some View {
+        let rentries = focus == .memory ? entries : resourceEntries(f)
+        let style = seriesStyle
+        let top = yTop(rentries)
+        return Chart {
+            TimeAxis.gridMarks(grid, color: .primary, scale: 1)
+            if focus == .memory { areaMarks(rentries) } else { resourceMarks(rentries) }
+            TimeAxis.gridMarks(grid, color: .white, scale: 0.45)
+            capacityMarks
+            TimeAxis.incidentMarks(TimeAxis.incidentXs(incidents, f))
+        }
+        .chartXScale(domain: 0...1)
+        .chartYScale(domain: 0...top)
+        .chartXAxis {
+            AxisMarks(values: labels.map(\.x)) { _ in
+                AxisTick(length: 3)
+                AxisValueLabel { Text(" ").font(.system(size: 10)) }
+            }
+        }
+        .chartForegroundStyleScale(domain: style.names, range: style.colors)
+        .chartLegend(.hidden)
+        .transaction { $0.animation = nil }
+        .chartBackground { proxy in TimeAxis.bandLayer(proxy, away: away, gaps: gaps, missing: missing) }
+        .chartOverlay { proxy in
+            ZStack(alignment: .topLeading) {
+                axisLabelLayer(proxy, labels: labels)
+                hoverTracker(proxy)
+            }
+        }
+    }
+
+    /// A small chart's value of a point, and its scale (02 §3.4.3: memory used, cores busy, the GPU, free disk
+    /// of the tile's pool; disk on its steps over all history, so it does not move with the range).
+    func rowValue(_ r: Resource, _ p: Point) -> Float {
+        switch r {
+        case .memory: return Float(p.used)
+        case .cpu: return p.cpu
+        case .gpu: return p.gpu
+        case .disk: return p.disk
+        }
+    }
+
+    func rowScale(_ r: Resource) -> Double {
+        switch r {
+        case .memory: return max(ram ?? 0, points.map(\.used).max() ?? 0, 1)
+        case .cpu: return max(cores ?? Double(points.map(\.cpuN).filter { !$0.isNaN }.max() ?? 1), 1)
+        case .gpu: return 100
+        case .disk:
+            return MemoryChart.niceStep(max(Double(points.map(\.disk).filter { !$0.isNaN }.max() ?? 1), 2 * (floors?.low ?? 0)))
+        }
+    }
+
+    /// The reading a small chart shows in the gutter: its newest value.
+    func rowReading(_ r: Resource) -> String {
+        guard let p = points.last(where: { !rowValue(r, $0).isNaN }) else { return "–" }
+        let v = Double(rowValue(r, p))
+        switch r {
+        case .memory, .disk: return v < 9.95 ? String(format: "%.1fG", v) : String(format: "%.0fG", v)
+        case .cpu: return String(format: "%.1f", v)
+        case .gpu: return String(format: "%.0f%%", v)
+        }
+    }
+
+    /// The small charts under the big one, on its time axis: the grid, no-data hatching, incident rules, one
+    /// curve in the resource's colour (disk the calmest: a line over a faint fill), the name at the left over a
+    /// halo, the newest reading in the gutter. Not a click target (§3.7.2).
+    func rowsLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [TimeAxis.GridLine],
+                   labels: [TimeAxis.Label]) -> some View {
+        let W = plot.width, H = rowHeight
+        let cols = axis.columns(points, time: { $0.id }, gaps: gaps, f, reduce: Store.worst)
+        let hatch = TimeAxis.gapBands(gaps, f)
+        let incs = TimeAxis.incidentXs(incidents, f)
+        let bg = Color(nsColor: .windowBackgroundColor)
+        return ZStack(alignment: .topLeading) {
+            ForEach(Array(rows.enumerated()), id: \.offset) { i, r in
+                let scale = rowScale(r), reading = rowReading(r)
+                Canvas { ctx, _ in
+                    let w = Double(W), h = Double(H)
+                    for l in grid {
+                        ctx.fill(Path(CGRect(x: l.x * w - 0.25, y: 0, width: 0.5, height: h)), with: .color(.primary.opacity(l.alpha)))
+                    }
+                    ctx.fill(Path(CGRect(x: 0, y: h - 0.5, width: w, height: 0.5)), with: .color(.primary.opacity(0.2)))
+                    var hp = Path()
+                    for b in hatch { hp.addRect(CGRect(x: b.from * w, y: 0, width: max((b.to - b.from) * w, 1), height: h)) }
+                    if !hp.isEmpty {
+                        ctx.fill(hp, with: .color(.gray.opacity(0.06)))
+                        var c = ctx
+                        c.clip(to: hp)
+                        c.stroke(TimeAxis.hatchLines(in: CGRect(x: 0, y: 0, width: w, height: h)), with: .color(.gray.opacity(0.4)), lineWidth: 1)
+                    }
+                    var line = Path(), area = Path()
+                    var open = false, startX = 0.0, lastX = 0.0
+                    func close() {
+                        if open {
+                            area.addLine(to: CGPoint(x: lastX, y: h)); area.addLine(to: CGPoint(x: startX, y: h)); area.closeSubpath()
+                        }
+                        open = false
+                    }
+                    for c in cols {
+                        let v = rowValue(r, c.p)
+                        if v.isNaN || c.gapBefore { close() }
+                        if v.isNaN { continue }
+                        let x = c.x * w, y = h - min(Double(v) / scale, 1) * (h - 2)
+                        if open { line.addLine(to: CGPoint(x: x, y: y)); area.addLine(to: CGPoint(x: x, y: y)) } else {
+                            line.move(to: CGPoint(x: x, y: y)); area.move(to: CGPoint(x: x, y: h)); area.addLine(to: CGPoint(x: x, y: y))
+                            open = true; startX = x
+                        }
+                        lastX = x
+                        if c.gapAfter { close() }
+                    }
+                    close()
+                    let color = r.color
+                    ctx.fill(area, with: .color(color.opacity(r == .disk ? 0.10 : 0.35)))
+                    ctx.stroke(line, with: .color(color.opacity(0.9)), lineWidth: 1)
+                    for x in incs { ctx.fill(Path(CGRect(x: x * w - 0.5, y: 0, width: 1, height: h)), with: .color(.red)) }
+                    let name = ctx.resolve(Text(r.name).font(.system(size: 8.5, weight: .medium)).foregroundColor(.secondary))
+                    let sz = name.measure(in: CGSize(width: 200, height: 20))
+                    ctx.fill(Path(roundedRect: CGRect(x: 1, y: 1, width: sz.width + 6, height: sz.height), cornerRadius: 3),
+                             with: .color(bg.opacity(0.75)))
+                    ctx.draw(name, at: CGPoint(x: 4, y: 1), anchor: .topLeading)
+                    ctx.draw(Text(reading).font(.system(size: 8.5)).foregroundColor(.secondary), at: CGPoint(x: w + 4, y: h / 2), anchor: .leading)
+                }
+                .frame(width: W + 40, height: H)
+                .offset(x: plot.minX, y: top + CGFloat(i) * (H + 3))
+            }
+        }
+        .allowsHitTesting(false)
+    }
 
     // MARK: reservation strip
 
@@ -2415,7 +3182,7 @@ struct MemoryChart: View, Animatable {
                     missing: [TimeAxis.Band] = []) -> some View {
         let W = plot.width, H = stripHeight
         let (rects, scaleTop) = stripRects(f, W: W, H: H)
-        let blocks = reservations, now = now
+        let blocks = reservations, now = now, dark = scheme == .dark
         return ZStack(alignment: .topLeading) {
             Canvas { ctx, size in
                 let usable = H - 4
@@ -2437,9 +3204,9 @@ struct MemoryChart: View, Animatable {
                     if x.queued { waiting[x.i, default: Path()].addRect(x.r) } else { solid[x.i, default: Path()].addRect(x.r) }
                 }
                 // in the blocks' order: a Dictionary's changes with every launch, and so would the edges
-                for (i, p) in solid.sorted(by: { $0.key < $1.key }) { plotCtx.fill(p, with: .color(blocks[i].res.color.opacity(0.8))) }
+                for (i, p) in solid.sorted(by: { $0.key < $1.key }) { plotCtx.fill(p, with: .color(blocks[i].res.tint(dark: dark).opacity(0.8))) }
                 for (i, p) in waiting.sorted(by: { $0.key < $1.key }) {
-                    let c = blocks[i].res.color
+                    let c = blocks[i].res.tint(dark: dark)
                     plotCtx.fill(p, with: .color(c.opacity(0.12)))
                     var h = plotCtx
                     h.clip(to: p)
@@ -2555,7 +3322,8 @@ struct MemoryChart: View, Animatable {
     }
 
     /// A vertical line following the pointer and a live tooltip for the time under it.
-    @ViewBuilder func hoverLayer(plot: CGRect, mapper f: @escaping (Double) -> Double, stripTop: CGFloat) -> some View {
+    @ViewBuilder func hoverLayer(plot: CGRect, mapper f: @escaping (Double) -> Double, stripTop: CGFloat,
+                                 rowsTop: CGFloat? = nil) -> some View {
         if let x = hoverX, x >= plot.minX, x <= plot.maxX {
             let info = hoverInfo(u: Double((x - plot.minX) / plot.width), du: 1 / Double(plot.width), mapper: f)
             Rectangle().fill(Color.primary.opacity(0.55))
@@ -2566,6 +3334,12 @@ struct MemoryChart: View, Animatable {
                 Rectangle().fill(Color.primary.opacity(0.4))
                     .frame(width: 1, height: stripHeight)
                     .offset(x: x - 0.5, y: stripTop)
+                    .allowsHitTesting(false)
+            }
+            if let rt = rowsTop {  // and through every small chart (02 §3.4.4)
+                Rectangle().fill(Color.primary.opacity(0.4))
+                    .frame(width: 1, height: max(rowsHeight - 3, 1))
+                    .offset(x: x - 0.5, y: rt)
                     .allowsHitTesting(false)
             }
             HoverCard(info: info)
@@ -2592,6 +3366,7 @@ struct MemoryChart: View, Animatable {
         var moreEvents = 0
         var reserved: [(String, Color)] = []  // reservations active under the pointer
         var moreReserved = 0
+        var others: [(String, String, Color)] = []  // with the resources on: CPU, GPU and disk in this pixel
     }
 
     /// Everything under one horizontal pixel, aggregated: on the log axis one pixel can hold hours.
@@ -2622,6 +3397,7 @@ struct MemoryChart: View, Animatable {
             }
             info.away = pts.contains { $0.away }
             info.peak = pts.map { $0.wired + $0.app + $0.comp + $0.swap }.max() ?? 0
+            if resourcesUIOn { info.others = MemoryChart.otherReadings(pts, cores: cores) }
         }
         let overlapping = gaps.filter { $0.from < t1 && $0.to > t0 }
         let kinds = Set(overlapping.map(\.kind))
@@ -2676,10 +3452,32 @@ struct MemoryChart: View, Animatable {
         info.reserved = res.prefix(4).map { b in
             let queued = (b.res.granted ?? .infinity) > tc
             return (String(format: "%.1f GB ", b.res.gb(at: min(max(tc, b.res.requested), b.end))) + b.res.purpose
-                    + (queued ? " (queued)" : ""), b.res.color)
+                    + (queued ? " (queued)" : ""), resourcesUIOn ? b.res.agentColor(dark: scheme == .dark) : b.res.color)
         }
         info.moreReserved = max(res.count - 4, 0)
         return info
+    }
+
+    /// The hover card's line per resource besides memory (02 §3.4.4), over the samples in the pixel.
+    static func otherReadings(_ pts: [Point], cores: Double?) -> [(String, String, Color)] {
+        func mean(_ xs: [Float]) -> Double? {
+            let v = xs.filter { !$0.isNaN }
+            return v.isEmpty ? nil : Double(v.reduce(0, +)) / Double(v.count)
+        }
+        var out: [(String, String, Color)] = []
+        if let c = mean(pts.map(\.cpu)) {
+            let n = cores ?? mean(pts.map(\.cpuN))
+            out.append(("CPU", String(format: "%.1f", c) + (n.map { String(format: " of %.0f cores", $0) } ?? " cores"), Resource.cpu.color))
+        }
+        let kind = pts.last { $0.gpuKind > 0 }?.gpuKind ?? 0
+        if let g = mean(pts.filter { $0.gpuKind == kind }.map(\.gpu)) {
+            let mem = mean(pts.map(\.gpuMem)).map { String(format: " · %.1f GB", $0) } ?? ""
+            out.append((kind == 2 ? "GPU" : "GPU busy", String(format: "%.0f %%", g) + mem, Resource.gpu.color))
+        }
+        if let d = pts.map(\.disk).filter({ !$0.isNaN }).min() {
+            out.append(("Disk", String(format: "%.0f GB free", Double(d)), Resource.disk.color))
+        }
+        return out
     }
 
     /// The elements of a sorted array with key in from...to.
@@ -2745,6 +3543,14 @@ struct MemoryChart: View, Animatable {
                             .font(.system(size: 10)).foregroundStyle(.secondary)
                         Spacer()
                         Text(String(format: "%.1f GB", info.peak)).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary)
+                    }
+                }
+                ForEach(Array(info.others.enumerated()), id: \.offset) { _, o in
+                    HStack(spacing: 5) {
+                        RoundedRectangle(cornerRadius: 1.5).fill(o.2).frame(width: 6, height: 6)
+                        Text(o.0).font(.system(size: 10))
+                        Spacer(minLength: 4)
+                        Text(o.1).font(.system(size: 10, design: .monospaced))
                     }
                 }
                 if let n = info.noData {
@@ -2838,6 +3644,7 @@ struct PlotRectKey: PreferenceKey {
 struct ReservationCard: View {
     let res: Reservation
     let now: Double
+    @Environment(\.colorScheme) private var scheme
 
     static let clock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
     static let dayClock: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d HH:mm"; return f }()
@@ -2861,14 +3668,16 @@ struct ReservationCard: View {
         let edits = res.segments.count > 1 ? " (changed " + res.segments.dropFirst().map { at($0.t) }.joined(separator: ", ") + ")" : ""
         VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline, spacing: 5) {
-                RoundedRectangle(cornerRadius: 2).fill(res.color.opacity(0.85)).frame(width: 8, height: 8)
+                RoundedRectangle(cornerRadius: 2).fill(res.tint(dark: scheme == .dark).opacity(0.85)).frame(width: 8, height: 8)
                 Text(res.purpose).font(.system(size: 11, weight: .semibold)).lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 4)
                 Text(res.rid).font(.system(size: 9, design: .monospaced)).foregroundStyle(.tertiary)
             }
             if res.projectName != nil || res.holder != nil {
-                Text([res.projectName, res.holder.map { $0 == "run" ? "oomph run" : $0 }].compactMap { $0 }.joined(separator: " · "))
+                // with the resources on the colour is the agent's, so the card says whose in words (02 §3.8.5)
+                let agent = resourcesUIOn ? res.agentKey.map { "agent " + String($0.prefix(4)) } : nil
+                Text([res.projectName, res.holder.map { $0 == "run" ? "oomph run" : $0 }, agent].compactMap { $0 }.joined(separator: " · "))
                     .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             }
             Divider().padding(.vertical, 1)
@@ -2959,6 +3768,112 @@ struct ChartLegend: View {
     }
 }
 
+/// The legend with the resources on (roadmap 02 §3.4.2): the focus's series with their live values in row 1,
+/// the away, no-data and incident entries in row 2 as before. Values come from the current sample.
+struct ResourceLegend: View {
+    let focus: Resource
+    let sample: Sample?
+    var missing = false
+
+    struct Entry { let name: String; let value: String?; let color: Color; let line: Bool; let help: String }
+
+    static func unitHelp(_ r: Resource) -> String {
+        switch r {
+        case .memory: return "Memory in GB; the dashed line is the Mac's RAM. "
+        case .cpu: return "Cores busy, of the logical cores; the dashed line is all of them. "
+        case .gpu: return "The GPU in % of what it can do at full speed, or of the time it was busy where the speed is not reported. "
+        case .disk: return "Free space in GB on the disk the tile shows; dashed: its low and critical floors. "
+        }
+    }
+
+    var entries: [Entry] {
+        let s = sample
+        func f1(_ x: Double?) -> String? { x.map { String(format: "%.1f", $0) } }
+        switch focus {
+        case .memory:
+            let swap = s.map { $0.swap_used_gb > 0 ? String(format: "%.1f / %.0f", $0.swap_used_gb, $0.swap_total_gb)
+                                                   : String(format: "%.1f", $0.swap_used_gb) }
+            return [Entry(name: "Wired", value: f1(s?.wired_gb), color: .gray, line: false, help: ChartLegend.rows[0][0].help),
+                    Entry(name: "App", value: f1(s?.app_gb), color: .blue, line: false, help: ChartLegend.rows[0][1].help),
+                    Entry(name: "Compressed", value: f1(s?.compressed_gb), color: .orange, line: false, help: ChartLegend.rows[0][2].help),
+                    Entry(name: "Swap", value: swap, color: .red, line: false, help: ChartLegend.rows[0][3].help)]
+        case .cpu:
+            let c = s?.cpu?.v
+            let user = c?.busy.map { $0 - (c?.sys ?? 0) }
+            return [Entry(name: "System", value: f1(c?.sys), color: .gray, line: false, help: "Cores busy in the kernel."),
+                    Entry(name: "User", value: f1(user), color: Resource.cpu.color, line: false, help: "Cores busy in apps and processes."),
+                    Entry(name: c?.p != nil && c?.e != nil ? String(format: "%.0f P + %.0f E cores", c!.p!, c!.e!) : c?.n.map { String(format: "%.0f cores", $0) } ?? "cores",
+                          value: nil, color: .clear, line: false, help: "The logical cores of this Mac.")]
+        case .gpu:
+            let g = s?.gpu?.v?.first
+            let mem = g?.mem_gb.map { String(format: "%.1f GB", $0) }
+            if g?.src == "ioreport" {
+                return [Entry(name: "Full speed", value: g?.util.map { String(format: "%.0f", $0) }, color: Resource.gpu.color, line: false,
+                              help: "The share of what the GPU can do at full speed."),
+                        Entry(name: "Busy", value: g?.active.map { String(format: "%.0f", $0) }, color: Resource.gpu.color, line: true,
+                              help: "The share of time the GPU was working, at any speed."),
+                        Entry(name: "Memory", value: mem, color: .gray, line: false, help: "GPU memory in use.")]
+            }
+            return [Entry(name: "Busy", value: g?.util.map { String(format: "%.0f", $0) }, color: Resource.gpu.color.opacity(0.4), line: false,
+                          help: "the share of time the GPU was working, at any speed. This Mac does not report how fast the GPU ran, so light work reads higher here than it weighs: an idle desktop shows 30 to 50 %"),
+                    Entry(name: "Memory", value: mem, color: .gray, line: false, help: "GPU memory in use."),
+                    Entry(name: "speed not reported", value: nil, color: .clear, line: false,
+                          help: "Busy time only: the full-speed figure needs the IOReport helper (`oomph doctor`).")]
+        case .disk:
+            let d = Tile.pool(s?.disks?.v).pool
+            let free = d?.free_gb ?? s?.disk_free_gb
+            let name = "Free on " + Tile.midFit((d?.name?.isEmpty == false ? d?.name : nil) ?? "disk", 12)
+            let of = d?.total_gb.map { String(format: " of %.0f GB", $0) } ?? " GB"
+            return [Entry(name: name, value: free.map { String(format: "%.0f", $0) + of }, color: Resource.disk.color, line: false,
+                          help: "Free space on the disk that holds your home folder and the temporary files.")]
+        }
+    }
+
+    /// Row 1 at a level of shortening (§3.4.2's overflow rule: values are never dropped; "Compressed" becomes
+    /// "Compr.", then the names go, the swatch and the value stay).
+    func valuesRow(_ short: Int) -> some View {
+        HStack(spacing: 4) {
+            ForEach(Array(entries.enumerated()), id: \.offset) { _, e in
+                HStack(spacing: 2.5) {
+                    if e.line {
+                        Rectangle().fill(e.color).frame(width: 8, height: 1.5)
+                    } else if e.color != .clear {
+                        RoundedRectangle(cornerRadius: 1.5).fill(e.color).frame(width: 7, height: 7)
+                    } else {
+                        Text("·")
+                    }
+                    if short < 2 || e.value == nil { Text(short >= 1 && e.name == "Compressed" ? "Compr." : e.name) }
+                    if let v = e.value { Text(v).fontWeight(.semibold).foregroundStyle(.primary).monospacedDigit() }
+                }
+                .contentShape(Rectangle())
+                .help(e.help)
+            }
+        }
+        .fixedSize()
+    }
+
+    var body: some View {
+        let legend = ChartLegend(missing: missing)
+        VStack(alignment: .trailing, spacing: 2) {
+            ViewThatFits(in: .horizontal) { valuesRow(0); valuesRow(1); valuesRow(2) }
+            HStack(spacing: 7) {
+                ForEach(Array((missing ? ChartLegend.rows[1] + [ChartLegend.notReceived] : ChartLegend.rows[1]).enumerated()), id: \.offset) { _, it in
+                    HStack(spacing: 3) {
+                        legend.swatch(it, .clear)
+                        Text(it.name)
+                    }
+                    .contentShape(Rectangle())
+                    .help(it.help)
+                }
+            }
+        }
+        .font(.system(size: 9))
+        .foregroundStyle(.secondary)
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(maxWidth: 246, alignment: .trailing)
+    }
+}
+
 struct PopoverView: View {
     @ObservedObject var store: Store
     @State private var error: String?
@@ -2973,6 +3888,8 @@ struct PopoverView: View {
     @State private var draftURL = ""
     @State private var ollamaModels: [String] = []
     @State var showAllReservations = false  // the callout behind "+N more"
+    @State private var shakes: [Resource: Int] = [:]  // a refused ⌘-click shakes its tile (§3.7.2)
+    @Environment(\.colorScheme) private var scheme
     private let series = ["Wired", "App", "Compressed", "Swap"]
     /// The machine on screen.
     var m: MachineStore { store.machine }
@@ -2996,7 +3913,9 @@ struct PopoverView: View {
                 Divider()
             }
             VStack(alignment: .leading, spacing: 10) {
-                if let c = m.current, m.showsStats {
+                if resourcesUIOn {
+                    if m.stale { tilesRow.grayscale(1).opacity(0.5).tourAnchor("stats") } else { tilesRow.opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
+                } else if let c = m.current, m.showsStats {
                     if m.stale { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") } else { stats(c).opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
                 }
                 chart.tourAnchor("chart").zIndex(1)
@@ -3064,7 +3983,7 @@ struct PopoverView: View {
                         // a click anywhere outside the bubble closes it
                         Color.black.opacity(0.001)
                             .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false } }
-                        topAppsCallout(arrowX: r.midX - left)
+                        focusCallout(arrowX: r.midX - left)
                             .frame(width: w)
                             .padding(.leading, left)
                             .padding(.top, r.maxY + 2)
@@ -3107,6 +4026,13 @@ struct PopoverView: View {
         .animation(.easeOut(duration: 0.2), value: store.showChangelog)
         .animation(.easeOut(duration: 0.25), value: store.building)
         .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false; showAllReservations = false; tourStep = nil } }
+        .onChange(of: store.calloutAsked) { _, _ in
+            withAnimation(.easeOut(duration: 0.15)) { showTopApps.toggle(); showAI = false }
+        }
+        .onChange(of: store.refused?.1) { _, _ in
+            guard let r = store.refused?.0 else { return }
+            withAnimation(.linear(duration: 0.2)) { shakes[r, default: 0] += 1 }
+        }
         .onChange(of: store.alertText) { _, e in
             if let e { error = e; store.alertText = nil }
         }
@@ -3121,7 +4047,9 @@ struct PopoverView: View {
     var header: some View {
         let live = m.current != nil && m.daemonRunning
         let p = live ? (Pressure(rawValue: m.current!.pressure) ?? .unknown) : .unknown
-        let tint: Color = live ? p.color : .secondary
+        // with the resources on, the capsule and the chip's tile are oomph's verdict (02 §3.4.9, §15.13)
+        let cap = resourcesUIOn && live ? Verdict.capsule(m.current!) : nil
+        let tint: Color = live ? (cap.map { Verdict.color($0.level) } ?? p.color) : .secondary
         return HStack(alignment: .center, spacing: 10) {
             // hover: the chip turns into a ?, a click starts the guided tour
             Button { startTour() } label: {
@@ -3139,7 +4067,7 @@ struct PopoverView: View {
             .tourAnchor("chip")
             VStack(alignment: .leading, spacing: 2) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    (Text(brand).fontWeight(.bold) + Text(descriptor).fontWeight(.medium))
+                    (Text(brand).fontWeight(.bold) + Text(resourcesUIOn ? resourceDescriptor : descriptor).fontWeight(.medium))
                         .font(.system(size: 14))
                     if let v = store.bundledVersion {
                         Text("v" + v).font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
@@ -3151,13 +4079,34 @@ struct PopoverView: View {
                     .onTapGesture { if store.machinesUI && store.share?.shared == true { store.openConnect(share: true) } }
             }
             Spacer(minLength: 8)
-            if live {
+            if let cap {
+                Text(cap.text).font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Verdict.color(cap.level).opacity(0.2), in: Capsule())
+                    .foregroundStyle(cap.level == 0 ? Color.primary : Verdict.color(cap.level))
+                    .help(m.current.map { capsuleHelp($0) } ?? "")
+            } else if resourcesUIOn && !live {  // logging is off, or the logger says nothing (02 §3.4.9)
+                Text("Off").font(.system(size: 11, weight: .semibold))
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .background(Color.gray.opacity(0.2), in: Capsule())
+            } else if live {
                 Text(p.label).font(.system(size: 11, weight: .semibold))
                     .padding(.horizontal, 10).padding(.vertical, 4)
                     .background(p.color.opacity(0.2), in: Capsule())
                     .foregroundStyle(p == .normal ? .primary : p.color)
             }
         }
+    }
+
+    /// The capsule's tooltip: what the verdict found, memory and disk, in words.
+    func capsuleHelp(_ c: Sample) -> String {
+        let v = Verdict.capsule(c)
+        var parts = [brand + "'s verdict, the same as `oomph check`: memory " + ["ok", "tight", "critical"][v.memory]
+                     + ", disk " + ["ok", "low", "critical"][v.disk]]
+        parts.append(String(format: "pressure %@ · %.1f GB free · swap %.1f / %.0f GB · %.0f GB disk free",
+                            (Pressure(rawValue: c.pressure) ?? .unknown).label.lowercased(),
+                            max(0, c.ram_gb - c.app_gb - c.wired_gb - c.compressed_gb), c.swap_used_gb, c.swap_total_gb, c.disk_free_gb))
+        return parts.joined(separator: "\n")
     }
 
     /// The header of another machine (roadmap 01 §3.3, §3.5): its name, its kind's tile tinted by
@@ -3325,21 +4274,102 @@ struct PopoverView: View {
         }
     }
 
+    // MARK: four resources (roadmap 02 §3.4.1, §3.7; with resourcesUI)
+
+    /// The tiles, in the place of the two stats rows: the summary of every resource and the selector of what
+    /// the charts show. A click shows one alone, ⌘-click adds or removes one, ⇧-click adds a run; a click on
+    /// the focus shown alone opens its biggest consumers.
+    var tilesRow: some View {
+        let sel = store.selection(for: m)
+        let live = m.current != nil && (m.isLocal ? m.daemonRunning : true)
+        let facts: [Resource: Tile] = live ? Tile.facts(m.current!, Verdict.capsule(m.current!), waiting: m.waiting) : [:]
+        let avail = Resource.available(m.current)
+        // equal tiles (02 §3.4.1: four of 108 pt, three of 146): the panel's content width shared out
+        let n = CGFloat(avail.count)
+        let width: CGFloat = (popupWidth - 28 - 6 * (n - 1)) / n
+        return HStack(spacing: 6) {
+            ForEach(avail, id: \.self) { r in
+                let role: ResourceTile.Role = sel.focus == r ? .focus : sel.shown.contains(r) ? .shown : .plain
+                ResourceTile(resource: r, tile: facts[r] ?? Tile(), role: role, chevron: role == .focus && sel.shown.count == 1,
+                             open: showTopApps && role == .focus, compact: store.compactLevel >= 3, shake: shakes[r] ?? 0,
+                             help: tileHelp(r, role: role, alone: sel.shown.count == 1, tile: facts[r]))
+                    .contentShape(Rectangle())
+                    .onTapGesture { tapTile(r) }
+                    .contextMenu {
+                        Button("Show \(r.name) alone") { gesture(.click, r, alone: true) }
+                        if role == .plain { Button("Add to view") { gesture(.cmd, r) } } else if !(role == .focus && sel.shown.count == 1) {
+                            Button("Remove from view") { gesture(.cmd, r) }
+                        }
+                        Button("Biggest apps…") { gesture(.click, r, alone: true); openCallout() }
+                    }
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(r.name + ", " + (facts[r]?.reading ?? "no reading") + (facts[r]?.flagText.isEmpty == false ? ", " + facts[r]!.flagText : ""))
+                    .accessibilityValue(role == .focus ? "shown with the big chart" : role == .shown ? "shown" : "not shown")
+                    .accessibilityAddTraits(role == .plain ? [.isButton] : [.isButton, .isSelected])
+                    .accessibilityHint("Shows \(r.name) alone. Command-click \(role == .plain ? "adds" : "removes") it.")
+                    .accessibilityAction(named: "Show alone") { gesture(.click, r, alone: true) }
+                    .accessibilityAction(named: role == .plain ? "Add to view" : "Remove from view") { gesture(.cmd, r) }
+                    .accessibilityAction(named: "Biggest apps") { gesture(.click, r, alone: true); openCallout() }
+                    .frame(width: width)
+                    .anchorPreference(key: TopAppAnchorKey.self, value: .bounds) { role == .focus ? $0 : nil }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Resources")
+    }
+
+    /// A tile's tooltip (§3.7.2): its reading in words, then what the clicks do.
+    func tileHelp(_ r: Resource, role: ResourceTile.Role, alone: Bool, tile: Tile?) -> String {
+        let what = tile.map { r.name + ": " + $0.reading + ($0.flagText.isEmpty ? "" : " · " + $0.flagText)
+                              + ($0.top.map { " · biggest: " + $0 } ?? "") } ?? r.name
+        let click = role == .focus && alone ? "Click: biggest apps · ⌘-click another tile to add it"
+            : "Click: \(r == .gpu ? "the GPU" : r.name) alone · ⌘-click to \(role == .plain ? "add" : "remove")"
+        return what + "\n" + click
+    }
+
+    /// A click on a tile, with the modifiers held: ⌘ toggles, ⇧ adds a run.
+    func tapTile(_ r: Resource) {
+        let f = NSEvent.modifierFlags
+        gesture(f.contains(.command) ? .cmd : f.contains(.shift) ? .shift : .click, r)
+    }
+
+    func gesture(_ g: Selection.Gesture, _ r: Resource, alone: Bool = false) {
+        NSApp.keyWindow?.makeFirstResponder(nil)
+        if alone && store.selection(for: m) == Selection(shown: [r], focus: r) { return }
+        let reduce = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || renderMode
+        withAnimation(reduce ? nil : .easeInOut(duration: 0.2)) {
+            if store.resourceGesture(g, r) == .changed { showTopApps = false; showAllReservations = false }
+        }
+    }
+
+    func openCallout() {
+        withAnimation(.easeOut(duration: 0.15)) { showTopApps = true; showAI = false }
+    }
+
     // Memory Claude sessions and other agents reserved through `oomph reserve` / `oomph run` / the
     // MCP server, in the colours of their blocks on the strip above.
     /// The height contract for one machine (roadmap 01 §3.11): at most this many lines of
     /// reservations; with more, the last line is "+N more", which lists them all in a callout.
     static let reservationLines = 5
 
-    func reservedList(_ live: [Reservation]) -> some View {
+    func reservedList(_ all: [Reservation]) -> some View {
         // a machine that is not connected is shown as of the moment knowledge of it ends
         let now = m.isLocal ? wallNow() : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
         let day = m.reservations.filter { ($0.res.ended ?? now) >= now - 86400 }.count
-        let capped = live.count > PopoverView.reservationLines
-        let shown = capped ? Array(live.prefix(PopoverView.reservationLines - 1)) : live
+        // with the resources on (§3.7.7): the rows of what holds a shown resource (every reservation holds
+        // memory until 1.12), the list's cap by the compact level, and one line for the rest
+        let sel = resourcesUIOn ? store.selection(for: m) : nil
+        let live = sel.map { $0.shown.contains(.memory) ? all : [] } ?? all
+        let other = sel != nil && live.isEmpty ? all : []
+        let lines = !resourcesUIOn ? PopoverView.reservationLines : store.compactLevel >= 3 ? 3 : store.compactLevel >= 1 ? 4 : PopoverView.reservationLines
+        let capped = live.count > lines
+        let shown = capped ? Array(live.prefix(lines - 1)) : live
         let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
         var summary = live.isEmpty ? "\(day) in the last 24 h" : String(format: "%.1f GB reserved · %d in the last 24 h", reserved, day)
+        if sel != nil && !live.isEmpty { summary = String(format: "%.1f GB · %d in the last 24 h", reserved, day) }
         if m.stale && !live.isEmpty { summary = "as of " + MemoryChart.when(now) + String(format: ": %.1f GB reserved", reserved) }
+        let nothing = sel.map { s in "Nothing reserved right now on " + ListFormatter.localizedString(byJoining: s.shown.map {
+            $0 == .memory ? "memory" : $0.name }) } ?? "Nothing reserved right now"
         return VStack(alignment: .leading, spacing: 3) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Reserved by agents").font(.caption).foregroundStyle(.secondary)
@@ -3352,21 +4382,48 @@ struct PopoverView: View {
             if m.fetchingLedger {
                 Text("fetching…").font(.caption).foregroundStyle(.tertiary)
             } else if live.isEmpty {
-                Text("Nothing reserved right now").font(.caption).foregroundStyle(.tertiary)
+                Text(nothing).font(.caption).foregroundStyle(.tertiary)
             }
             ForEach(shown) { (r: Reservation) in
                 if m.stale { reservationRow(r, now: now).grayscale(1).opacity(0.6) } else { reservationRow(r, now: now) }
             }
             if capped { moreLine(Array(live.dropFirst(shown.count))) }
+            if !other.isEmpty && !m.fetchingLedger { otherLine(other) }
         }
     }
 
+    /// "On other resources: 14.0 GB reserved · 1 waiting for memory ›" (§3.7.7): the live totals of the
+    /// resources not shown and how many of the hidden requests wait; a click lists them all. Shorter from
+    /// level 1, never without the count of waiting requests.
+    func otherLine(_ rest: [Reservation]) -> some View {
+        let gb = rest.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
+        let waiting = rest.filter { $0.granted == nil }.count
+        var text = store.compactLevel >= 1 ? "Other: " + String(format: "%.1f GB", gb)
+                                           : "On other resources: " + String(format: "%.1f GB reserved", gb)
+        if waiting > 0 { text += " · \(waiting) waiting" + (store.compactLevel >= 1 ? "" : " for memory") }
+        return Button {
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            withAnimation(.easeOut(duration: 0.15)) { showAllReservations.toggle(); showTopApps = false; showAI = false }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "ellipsis").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary).frame(width: 8, height: 8)
+                Text(text + " ›").font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 4)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain).focusable(false).focusEffectDisabled()
+        .help("Every live reservation, in a list")
+        .anchorPreference(key: MoreAnchorKey.self, value: .bounds) { $0 }
+    }
+
     func reservationRow(_ r: Reservation, now: Double) -> some View {
-        HStack(spacing: 6) {
+        let c = resourcesUIOn ? r.agentColor(dark: scheme == .dark) : r.color
+        return HStack(spacing: 6) {
             ZStack {
-                RoundedRectangle(cornerRadius: 2).fill(r.color.opacity(r.granted == nil ? 0.15 : 0.8))
+                RoundedRectangle(cornerRadius: 2).fill(c.opacity(r.granted == nil ? 0.15 : 0.8))
                 if r.granted == nil {
-                    RoundedRectangle(cornerRadius: 2).strokeBorder(r.color.opacity(0.8), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 2).strokeBorder(c.opacity(0.8), lineWidth: 1)
                 }
             }
             .frame(width: 8, height: 8)
@@ -3486,6 +4543,79 @@ struct PopoverView: View {
         return parts.dropFirst(2).joined(separator: ".")
     }
 
+    /// The callout of a click on the focus shown alone: the biggest apps, or with the resources on the twelve
+    /// biggest consumers of the focus (02 §3.4.1: by cores, by share of the GPU, by MB/s written).
+    @ViewBuilder func focusCallout(arrowX: CGFloat) -> some View {
+        let focus = resourcesUIOn ? store.selection(for: m).focus : .memory
+        if focus == .memory { topAppsCallout(arrowX: arrowX) } else { consumersCallout(focus, arrowX: arrowX) }
+    }
+
+    func consumersCallout(_ r: Resource, arrowX: CGFloat) -> some View {
+        let c = m.current
+        let full = c?.gpu?.v?.first?.src == "ioreport"
+        let (rows, key): ([RateProc], KeyPath<RateProc, Double?>) = r == .cpu ? (c?.top_cpu?.v ?? [], \.cpu)
+            : r == .gpu ? (c?.top_gpu?.v ?? [], \.gpu) : (c?.top_io?.v ?? [], \.w)
+        var tot: [String: (Double, Int)] = [:], order: [String] = []
+        for x in rows {
+            guard let v = x[keyPath: key] else { continue }
+            let name = (x.g?.isEmpty == false ? x.g : x.name) ?? "?"
+            if tot[name] == nil { order.append(name) }
+            tot[name] = ((tot[name]?.0 ?? 0) + v, (tot[name]?.1 ?? 0) + 1)
+        }
+        let items = Array(order.sorted { tot[$0]!.0 > tot[$1]!.0 }.prefix(12))
+        let top = items.first.map { tot[$0]!.0 } ?? 1
+        func fmt(_ v: Double) -> String {
+            r == .cpu ? String(format: "%.1f cores", v) : r == .gpu ? String(format: "%.0f %%", v) : String(format: "%.1f MB/s", v)
+        }
+        let title = r == .cpu ? "Busiest apps now" : r == .gpu ? "Busiest on the GPU" : "Biggest writers now"
+        let note = r == .cpu ? "Cores an app keeps busy, all its processes together, over the last sample."
+            : r == .gpu ? (full ? "Each app's share of the GPU at full speed." : "Each app's share of the time the GPU was busy, at any speed.")
+            : "What each app wrote to disk, all its processes together, over the last sample."
+        return VStack(spacing: 0) {
+            CalloutArrow()
+                .fill(.regularMaterial)
+                .overlay(CalloutArrow().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: 16, height: 8)
+                .rotationEffect(.degrees(180))
+                .offset(x: arrowX - 160)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(title).font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    Text(r.name).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                ForEach(Array(items.enumerated()), id: \.offset) { i, name in
+                    HStack(spacing: 8) {
+                        Text("\(i + 1)").font(.system(size: 10)).foregroundStyle(.tertiary).monospacedDigit()
+                            .frame(width: 14, alignment: .trailing)
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                Text(name).font(.system(size: 11.5)).lineLimit(1).truncationMode(.middle)
+                                if tot[name]!.1 > 1 {
+                                    Text("\(tot[name]!.1)").font(.system(size: 9.5)).foregroundStyle(.secondary).monospacedDigit()
+                                        .padding(.horizontal, 4).background(Color.primary.opacity(0.08), in: Capsule())
+                                }
+                            }
+                            GeometryReader { geo in
+                                Capsule().fill(r.color.opacity(i == 0 ? 0.75 : 0.45))
+                                    .frame(width: max(2, geo.size.width * CGFloat(tot[name]!.0 / max(top, 1e-9))))
+                            }.frame(height: 3)
+                        }
+                        Text(fmt(tot[name]!.0)).font(.system(size: 11, weight: .medium)).monospacedDigit()
+                            .frame(width: 68, alignment: .trailing)
+                    }
+                    .help(name)
+                }
+                if items.isEmpty { Text("No data yet").font(.system(size: 11)).foregroundStyle(.secondary) }
+                Text(note).font(.system(size: 9.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+        }
+        .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
+    }
+
     func topAppsCallout(arrowX: CGFloat) -> some View {
         let gs = Array((m.current?.groups ?? []).prefix(12))
         let maxMB = Double(gs.first?.mb ?? 1)
@@ -3560,11 +4690,20 @@ struct PopoverView: View {
                     }
                 }
                 Spacer(minLength: 6)
+                if resourcesUIOn {
+                    let focus = store.selection(for: m).focus
+                    ResourceLegend(focus: focus, sample: m.current, missing: missingInView)
+                    Text(focus.unit).font(.caption).foregroundStyle(.secondary)
+                        .help(ResourceLegend.unitHelp(focus) + (store.allHistory
+                              ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
+                              : "Time runs left to right up to now."))
+                } else {
                 ChartLegend(missing: missingInView)
                 Text("GB").font(.caption).foregroundStyle(.secondary)
                     .help("Memory in GB; the dashed line is the Mac's RAM. " + (store.allHistory
                           ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
                           : "Time runs left to right up to now."))
+                }
             }
             ZStack {
                 if !m.historyLoaded {
@@ -3574,6 +4713,16 @@ struct PopoverView: View {
                     }
                 } else if m.history.isEmpty && m.isLocal {
                     Text("No samples yet").font(.caption).foregroundStyle(.secondary)
+                } else if resourcesUIOn {
+                    let sel = store.selection(for: m)
+                    let pool = Tile.pool(m.current?.disks?.v).pool
+                    MemoryChart(points: m.history, gaps: m.gaps, incidents: m.incidents, events: m.events,
+                                ram: m.current?.ram_gb, axis: axis,
+                                reservations: m.reservations, stripHeight: stripHeight,
+                                focus: sel.focus, rows: smallRows, rowHeight: smallRowHeight, cores: m.current?.cpu?.v?.n,
+                                floors: pool?.watch == true ? pool.flatMap { p in p.low_gb.map { (low: $0, crit: p.crit_gb ?? 0) } } : nil)
+                        .id(sel.focus)  // a plain click cross-fades the chart area (§3.7.4)
+                        .transition(.opacity)
                 } else {
                     MemoryChart(points: m.history, gaps: m.gaps, incidents: m.incidents, events: m.events,
                                 ram: m.current?.ram_gb, axis: axis,
@@ -3582,7 +4731,7 @@ struct PopoverView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .frame(height: 160 + (stripHeight > 0 ? MemoryChart.stripGap + stripHeight : 0))
+            .frame(height: chartHeight + smallRowsHeight + (stripHeight > 0 ? MemoryChart.stripGap + stripHeight : 0))
             .tourAnchor("plot")
             .zIndex(1)  // the hover tooltips may reach over what follows
         }
@@ -3596,10 +4745,23 @@ struct PopoverView: View {
                  lgRange: log10(store.allHistory ? 24 * 3600 : store.range), blend: renderBlend ?? (store.allHistory ? 1 : 0))
     }
 
-    /// The reservation strip under the chart: there once any agent reserved memory (14 days kept).
+    /// The reservation strip under the chart: there once any agent reserved memory (14 days kept). With the
+    /// resources on, the memory band is drawn while memory is shown (§3.7.6: no other resource has a band yet).
     var stripHeight: CGFloat {
-        m.historyLoaded && (!m.history.isEmpty || !m.isLocal) && !m.reservations.isEmpty ? 46 : 0
+        m.historyLoaded && (!m.history.isEmpty || !m.isLocal) && !m.reservations.isEmpty
+            && (!resourcesUIOn || store.selection(for: m).shown.contains(.memory)) ? 46 : 0
     }
+
+    /// The big chart with its time labels: 140 pt and its axis, 118 at the tight level (§3.7.5).
+    var chartHeight: CGFloat { resourcesUIOn && store.compactLevel >= 3 ? 138 : 160 }
+    /// The small charts: the other shown resources in tile order, the focus left out; none at the solo level.
+    var smallRows: [Resource] {
+        guard resourcesUIOn, store.compactLevel < 4 else { return [] }
+        let sel = store.selection(for: m)
+        return sel.shown.filter { $0 != sel.focus }
+    }
+    var smallRowHeight: CGFloat { store.compactLevel >= 2 ? 16 : 22 }
+    var smallRowsHeight: CGFloat { smallRows.isEmpty ? 0 : CGFloat(smallRows.count) * (smallRowHeight + 3) + MemoryChart.stripGap }
 
     var incidentsList: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -3608,6 +4770,13 @@ struct PopoverView: View {
                 Text("fetching…").font(.caption).foregroundStyle(.tertiary)
             } else if m.incidents.isEmpty {
                 Text("None recorded").font(.caption).foregroundStyle(.tertiary)
+            } else if resourcesUIOn && store.compactLevel >= 5, let inc = m.incidents.first {
+                // the last resort (§3.4.8): the list becomes one line
+                Button { if m.isLocal { store.open(inc) } } label: {
+                    Text("\(m.incidents.count) recorded · latest " + MemoryChart.when(inc.start) + (inc.open == true ? " · open" : "") + " ›")
+                        .font(.system(size: 11)).foregroundStyle(inc.open == true ? Color.red : Color.secondary).lineLimit(1)
+                }
+                .buttonStyle(.plain)
             } else {
                 ScrollView {
                     VStack(spacing: 2) {
@@ -3625,7 +4794,7 @@ struct PopoverView: View {
                                 }
                         }
                     }
-                }.frame(maxHeight: 130)
+                }.frame(maxHeight: resourcesUIOn && store.compactLevel >= 1 ? 68 : 130)
             }
         }
     }
@@ -3688,12 +4857,16 @@ struct PopoverView: View {
             let chip = r["chip"] ?? .zero, top = r["topapp"] ?? CGRect(x: W - 120, y: zone.maxY - 30, width: 100, height: 30)
             let half = (W - 2 * m - 8) / 2
             return (zone, [
-                TourNote(title: "Memory pressure",
-                         text: "The chip's colour is macOS memory pressure, and the badge on the right names it. The figure in the menu bar is free memory. Hover the chip to come back to this tour.",
+                TourNote(title: resourcesUIOn ? "Is anything short?" : "Memory pressure",
+                         text: resourcesUIOn
+                            ? "The badge at the right names it: Memory tight, Disk low … or Normal, and the chip takes its colour. In the menu bar the chip is memory (colour and free GB); a ring or a disc on it means a disk needs attention. Hover the chip here to come back to this tour."
+                            : "The chip's colour is macOS memory pressure, and the badge on the right names it. The figure in the menu bar is free memory. Hover the chip to come back to this tour.",
                          left: m, width: half, above: false,
                          xs: [chip.midX], y: chip.maxY + 3, reach: zone.maxY - chip.maxY + 10),
-                TourNote(title: "Live readings",
-                         text: "Updated every 30 seconds: the same figures as Activity Monitor. Click the biggest app for the twelve largest.",
+                TourNote(title: resourcesUIOn ? "Four resources" : "Live readings",
+                         text: resourcesUIOn
+                            ? "Memory, CPU, GPU and disk right now. Click a tile to see it alone; ⌘-click another to add it below. Click the one with the big chart again for its twelve biggest apps. One flag per tile says what needs you: critical, low, throttled, 2 waiting. Hover it for the rest."
+                            : "Updated every 30 seconds: the same figures as Activity Monitor. Click the biggest app for the twelve largest.",
                          left: m + half + 8, width: half, above: false,
                          xs: [top.midX], y: top.maxY + 3, reach: zone.maxY - top.maxY + 10),
             ])
@@ -3713,14 +4886,20 @@ struct PopoverView: View {
                              left: W * 0.36, width: W * 0.64 - m, above: false,
                              xs: [plot.midX + 70], y: zone.maxY + 7, reach: 10)])
             }
-            let chartBottom = strip.minY - 22
+            let chartBottom = strip.minY - 22 - (r["rows"]?.height ?? 0)
+            let alone = store.selection(for: store.machine).shown.count == 1
             return (zone, [timeRange,
-                TourNote(title: "Memory over time",
-                         text: "Hover to read the values and events under the cursor; try it now. The legend above the chart explains the colours: hover an entry for more.",
+                TourNote(title: resourcesUIOn ? "The big chart, then what you added" : "Memory over time",
+                         text: resourcesUIOn
+                            ? (alone ? "Hover to read the values under the cursor. ⌘-click a tile to add a thin row of it here, on the same time axis."
+                                     : "The resource you clicked keeps the big chart. Each one you ⌘-click adds a thin row on the same time axis, so you see what else happened.")
+                            : "Hover to read the values and events under the cursor; try it now. The legend above the chart explains the colours: hover an entry for more.",
                          left: m, width: half, above: false,
                          xs: [plot.minX + 90], y: chartBottom, reach: zone.maxY - chartBottom + 10),
                 TourNote(title: "Reserved by agents",
-                         text: "Claude sessions and other agents reserve memory before heavy work and take turns (the oomph skill). One block per reservation: its height the GB, hatched while it waited, stacked where they overlap. Hover a block for its peak and how it ended.",
+                         text: resourcesUIOn
+                            ? "Claude sessions and other agents reserve before heavy work and take turns (the oomph skill). One colour per agent: every reservation of one session has its colour. Height is the amount, hatched while it waits. Hover a block for its peak and how it ended."
+                            : "Claude sessions and other agents reserve memory before heavy work and take turns (the oomph skill). One block per reservation: its height the GB, hatched while it waited, stacked where they overlap. Hover a block for its peak and how it ended.",
                          left: m + half + 8, width: half, above: false,
                          xs: [strip.midX + 60], y: strip.maxY + 2, reach: zone.maxY - strip.maxY + 11),
             ])
@@ -5930,7 +7109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.delegate = self
-        panel.onKey = { [weak self] e in self?.store.machineKey(e) ?? false }
+        panel.onKey = { [weak self] e in (self?.store.machineKey(e) ?? false) || (self?.store.resourceKey(e) ?? false) }
         let fx = NSVisualEffectView()
         fx.material = .popover
         fx.blendingMode = .behindWindow
@@ -5951,6 +7130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         updateIcon()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
         store.onResize = { [weak self] in DispatchQueue.main.async { if self?.isShown == true { self?.position() } } }
+        store.onSelectionChanged = { [weak self] in
+            DispatchQueue.main.async { if let self, self.isShown { self.chooseLevel(); self.position() } }
+        }
         store.onPlusMoved = { [weak self] in
             guard let self, let p = self.popover, p.isShown else { return }
             DispatchQueue.main.async { p.positioningRect = self.plusAnchorRect }
@@ -5998,8 +7180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         if Date().timeIntervalSince(lastClose) < 0.35 { return }
         store.applyOpeningRule()
         store.machine.refreshAll()
+        store.resourcesOpened()
         store.popupOpened()
         store.machinesOpened()
+        chooseLevel()
         position()
         panel.makeKeyAndOrderFront(nil)
         // nothing focused on open: a focus ring is drawn above everything, callouts included
@@ -6078,6 +7262,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         panel.setFrame(NSRect(x: x, y: y, width: size.width, height: min(size.height, top - vis.minY - 6)), display: true)
     }
 
+    /// The compact level (roadmap 02 §3.7.5): the first whose popup fits the screen's visible height, chosen
+    /// when the popup opens and when the selection changes. Only with the resources on.
+    /// SwiftUI takes a state change into its layout on a later pass, so each level is measured a moment after
+    /// it is set; a screen too small for the full popup sees it shrink once.
+    func chooseLevel(from lv: Int = 0) {
+        guard resourcesUIOn, let button = item.button, let win = button.window else { return }
+        let screen = win.screen ?? NSScreen.main!
+        let r = win.convertToScreen(button.convert(button.bounds, to: nil))
+        let room = min(r.minY, screen.visibleFrame.maxY) - 4 - screen.visibleFrame.minY - 6
+        store.compactLevel = lv
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
+            guard let self, self.isShown, self.store.compactLevel == lv else { return }
+            self.hosting.layoutSubtreeIfNeeded()
+            if self.hosting.fittingSize.height > room && lv < 5 { self.chooseLevel(from: lv + 1) } else { self.position() }
+        }
+    }
+
     func close() {
         guard isShown else { return }
         if popover?.isShown == true { popover?.close() }
@@ -6105,6 +7306,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         // where Memory Used = App Memory + Wired + Compressed
         let availGB = c.map { max(0, $0.ram_gb - $0.app_gb - $0.wired_gb - $0.compressed_gb) }
         let label = availGB.map { $0 < 9.95 ? String(format: "%.1fG", $0) : String(format: "%.0fG", $0) }
+        if resourcesUIOn, running, let c {
+            // the chip's body is the verdict's memory level (02 §3.5, §15.13); a mark only for a critical disk:
+            // a standing low disk stays on the capsule and the tile (D9)
+            let cap = Verdict.capsule(c)
+            let body: Pressure = cap.memory == 2 ? .critical : cap.memory == 1 ? .warn : .normal
+            item.button?.image = ChipIcon.make(running: true, pressure: body, label: label, mark: cap.disk == 2 ? 2 : 0)
+            let t = Tile.facts(c, cap)
+            item.button?.toolTip = "\(brand) — \(cap.text)\n\(label ?? "?") memory free · pressure \(p.label.lowercased())"
+                + "\nCPU \(t[.cpu]!.reading) · GPU \(t[.gpu]!.reading) · Disk \(t[.disk]!.reading)"
+            return
+        }
         let img = ChipIcon.make(running: running, pressure: p, label: label)
         item.button?.image = img
         item.button?.toolTip = running
@@ -6132,8 +7344,11 @@ enum ChipIcon {
         return s
     }
 
-    static func make(running: Bool, pressure: Pressure, label: String?) -> NSImage {
-        let size = NSSize(width: 28, height: 18)
+    /// `mark` (with the resources on, 02 §3.5): 2 a red disc with a white "!" at the top right (the disk is
+    /// critical), on a halo in the bar's colour. 02's amber ring for a low disk is not drawn (D9).
+    static func make(running: Bool, pressure: Pressure, label: String?, mark: Int = 0) -> NSImage {
+        let mark = mark == 2 ? 2 : 0
+        let size = NSSize(width: mark > 0 ? 31 : 28, height: 18)
         let img = NSImage(size: size, flipped: false) { rect in
             let fg = NSColor.labelColor
             let line: CGFloat = 1.6
@@ -6175,6 +7390,21 @@ enum ChipIcon {
                 x.lineWidth = 1.6; x.lineCapStyle = .round
                 fg.setStroke(); x.stroke()
             }
+            if mark > 0 {
+                let dark = NSApp?.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                let r: CGFloat = 4.2
+                let c = NSPoint(x: size.width - r - 0.8, y: size.height - r - 0.8)
+                let halo = NSBezierPath(ovalIn: NSRect(x: c.x - r - 1.2, y: c.y - r - 1.2, width: 2 * r + 2.4, height: 2 * r + 2.4))
+                let cg = NSGraphicsContext.current!.cgContext
+                cg.saveGState(); cg.setBlendMode(.clear); halo.fill(); cg.restoreGState()
+                let dot = NSBezierPath(ovalIn: NSRect(x: c.x - r, y: c.y - r, width: 2 * r, height: 2 * r))
+                (dark ? NSColor(srgbRed: 1.0, green: 0.42, blue: 0.40, alpha: 1) : NSColor(srgbRed: 0.85, green: 0.16, blue: 0.16, alpha: 1)).setFill()
+                dot.fill()
+                let bang = NSAttributedString(string: "!", attributes: [.font: NSFont.systemFont(ofSize: 7, weight: .black),
+                                                                       .foregroundColor: NSColor.white])
+                let bs = bang.size()
+                bang.draw(at: NSPoint(x: c.x - bs.width / 2, y: c.y - bs.height / 2))
+            }
             return true
         }
         img.isTemplate = false
@@ -6202,6 +7432,10 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
     store.machine.refreshCurrent()
     store.machine.loadIncidents()
     if ai != "loading" { store.machine.reloadPoints(sync: true) }  // `--ai loading` draws the spinner
+    // with `-resourcesUI YES` (and `-selectedResources "(memory,cpu)" -focusResource cpu`): opened on trouble,
+    // as the popup opens; `--ai lvl:N` draws compact level N (02 §3.7.5)
+    store.resourcesOpened()
+    if ai.hasPrefix("lvl:") { store.compactLevel = min(max(Int(ai.dropFirst(4)) ?? 0, 0), 5) }
     // `--ai callout|on|running` draws the AI states (render only; nothing is saved)
     if ai == "on" || ai == "running" { store.aiOn = true; store.aiProvider = .ollama }
     // `--ai connected:claude|openai|ollama`, `connecting`, `dialog-connected`, `dialog-error` (render only)
@@ -6253,6 +7487,53 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
     r.scale = 2
     guard let cg = r.cgImage,
           let png = NSBitmapImageRep(cgImage: cg).representation(using: .png, properties: [:]) else { return }
+    try? png.write(to: URL(fileURLWithPath: path))
+}
+
+/// `oomph --render-chip out.png [--dark]`: the menu-bar chip as the resources draw it (02 §3.5, §15.13, D9),
+/// on a menu bar's grey at 4×. Top row: the body on the verdict's memory level (Normal, tight, critical) and
+/// logging off; bottom row: the same with the critical disk's disc (31 pt wide). Each chip is drawn into a
+/// bitmap of its own first, as the menu bar does, so its halo cuts only the chip.
+@MainActor
+func renderChip(to path: String, dark: Bool) {
+    renderMode = true
+    let look = NSAppearance(named: dark ? .darkAqua : .aqua)!
+    NSApplication.shared.appearance = look
+    let cells: [(running: Bool, body: Pressure, label: String?, mark: Int)] = [
+        (true, .normal, "18G", 0), (true, .warn, "4.2G", 0), (true, .critical, "0.6G", 0), (false, .normal, nil, 0),
+        (true, .normal, "18G", 2), (true, .warn, "4.2G", 2), (true, .critical, "0.6G", 2)]
+    let scale: CGFloat = 4, cw: CGFloat = 44, ch: CGFloat = 26, pad: CGFloat = 4
+    let w: CGFloat = 4 * cw + 2 * pad, h: CGFloat = 2 * ch + 2 * pad
+    func bitmap(_ size: NSSize) -> NSBitmapImageRep? {
+        let r = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(size.width * scale), pixelsHigh: Int(size.height * scale),
+                                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                                 colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)
+        r?.size = size
+        return r
+    }
+    func drawn(into rep: NSBitmapImageRep, _ body: () -> Void) {
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        look.performAsCurrentDrawingAppearance(body)
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    guard let out = bitmap(NSSize(width: w, height: h)) else { return }
+    var chips: [(NSBitmapImageRep, NSRect)] = []
+    for (i, c) in cells.enumerated() {
+        let img = ChipIcon.make(running: c.running, pressure: c.body, label: c.label, mark: c.mark)
+        guard let rep = bitmap(img.size) else { return }
+        drawn(into: rep) { img.draw(in: NSRect(origin: .zero, size: img.size)) }
+        let row: CGFloat = i < 4 ? 0 : 1, col: CGFloat = CGFloat(i < 4 ? i : i - 4)
+        let x: CGFloat = pad + col * cw + (cw - img.size.width) / 2
+        let y: CGFloat = h - pad - (row + 1) * ch + (ch - img.size.height) / 2
+        chips.append((rep, NSRect(x: x, y: y, width: img.size.width, height: img.size.height)))
+    }
+    drawn(into: out) {
+        (dark ? NSColor(white: 0.17, alpha: 1) : NSColor(white: 0.93, alpha: 1)).setFill()
+        NSRect(x: 0, y: 0, width: w, height: h).fill()
+        for (rep, r) in chips { rep.draw(in: r, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: false, hints: nil) }
+    }
+    guard let png = out.representation(using: .png, properties: [:]) else { return }
     try? png.write(to: URL(fileURLWithPath: path))
 }
 
@@ -6452,6 +7733,34 @@ func chartVectors(_ path: String) -> Int32 {
                     "reserved": i.reserved.map { $0.0 }, "more_reserved": i.moreReserved]
         }
     }
+    // the four resources (1.11.0): the selection's gestures, the capsule's words, what each tile says, an agent's slot
+    out["selection"] = cases("selection").map { c -> [Any] in
+        let sel = ((c["sel"] as? [String]) ?? []).compactMap { Resource(rawValue: $0) }
+        let avail = ((c["avail"] as? [String]) ?? []).compactMap { Resource(rawValue: $0) }
+        let now = Selection.shown(sel, focus: Resource(rawValue: (c["focus"] as? String) ?? "") ?? .memory, available: avail)
+        let (next, outcome) = now.apply(Selection.Gesture(rawValue: (c["gesture"] as? String) ?? "") ?? .click,
+                                        Resource(rawValue: (c["res"] as? String) ?? "") ?? .memory, available: avail)
+        return [next.shown.map(\.rawValue), next.focus.rawValue, outcome.rawValue]
+    }
+    func sample(_ x: Any?) -> Sample? {
+        (x as? [String: Any]).flatMap { try? JSONSerialization.data(withJSONObject: $0) }.flatMap { try? JSONDecoder().decode(Sample.self, from: $0) }
+    }
+    out["capsule"] = cases("capsule").map { c -> Any in
+        guard let s = sample(c["sample"]) else { return NSNull() }
+        let v = Verdict.capsule(s)
+        return ["text": v.text, "level": v.level, "memory": v.memory, "disk": v.disk] as [String: Any]
+    }
+    out["tiles"] = cases("tiles").map { c -> Any in
+        guard let s = sample(c["sample"]) else { return NSNull() }
+        var waiting: [Resource: Int] = [:]
+        for (k, n) in (c["waiting"] as? [String: Any]) ?? [:] { if let r = Resource(rawValue: k) { waiting[r] = (n as? NSNumber)?.intValue ?? 0 } }
+        let t = Tile.facts(s, Verdict.capsule(s), waiting: waiting)
+        return Resource.allCases.map { r -> [Any] in
+            let x = t[r]!
+            return [x.reading, x.flagText, x.level, x.queue, x.top.map { $0 as Any } ?? NSNull(), x.meter]
+        }
+    }
+    out["agent"] = cases("agent").map { Reservation.agentIndex($0["agent"]) }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)
     FileHandle.standardOutput.write("\n".data(using: .utf8)!)
@@ -6469,6 +7778,10 @@ struct Main {
         }
         if let i = args.firstIndex(of: "--connect-vectors"), i + 1 < args.count {
             exit(connectVectors(args[i + 1]))
+        }
+        if let i = args.firstIndex(of: "--render-chip"), i + 1 < args.count {
+            MainActor.assumeIsolated { renderChip(to: args[i + 1], dark: args.contains("--dark")) }
+            return
         }
         if let i = args.firstIndex(of: "--render-popup"), i + 1 < args.count {
             // `--now T`, `--no-liveness` and `--fixture DIR` make a render repeat itself (roadmap 02 §8):

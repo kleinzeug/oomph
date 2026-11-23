@@ -64,6 +64,24 @@ Click it for the popup:
 - **Activate / Deactivate**, **Report** (HTML report for the selected range),
   **Launch at login**, and Quit. Each button explains itself in a tooltip.
 
+**Four resources (1.11.0, switched off for now).** The popup can show memory, CPU, GPU and
+disk side by side, as the design for more resources has it: four tiles in the place of the
+readings, each with its figure, a meter, the biggest consumer and one flag (*critical*,
+*tight*, *low*, *throttled*, *2 waiting*). The tiles work like tabs: a click shows that resource
+alone in the big chart, **⌘-click** adds another as a small chart under it on the same time
+axis (or removes it), **⇧-click** adds the run from the one with the big chart, and a click on
+the one shown alone lists its twelve biggest consumers; `m` `c` `g` `d` and `M` `C` `G` `D` do
+the same from the keyboard. The capsule and the menu-bar chip then follow oomph's verdict, the
+same as `oomph check`: *Normal*, *Memory tight*, *Memory critical*, *Disk low*, *Disk
+critical*; the chip is yellow while memory is tight and red while it is critical. Only what is
+critical asks for more: a red disc on the chip when the disk is critical, and the popup opening
+on the resource that is critical. A disk that is merely low, or memory that stays tight, shows
+on the capsule and the tile and does not move the popup. Every reservation wears its agent's colour: all reservations of one Claude session have
+one colour (the ledger gives each agent a palette slot since 1.11.0). The header reads "oomph:
+resource monitor". It is off by default while its design is reviewed; to switch it on:
+`defaults write local.oomph.menubar resourcesUI -bool YES`, then quit and reopen
+oomph (`-bool NO` switches it off again).
+
 New to it? Hover the chip in the popup's top-left corner: it turns into a **?**. Click it
 for a four-step tour. It lights up one part of the dashboard at a time, with notes on what
 each control does. Move through it with the bar under the header or with ← / →, and close
@@ -308,6 +326,13 @@ a `--glyphs`, `--color` or `--theme` you give are remembered in
 `--ssh`. `--ssh` needs oomph 1.9.0 or newer on the other Mac and says so when it is missing or
 older.
 
+The four resources (1.11.0) are in `oomph top` too, switched off like the app's: add
+`"resourcesUI": true` to `top.json` to switch them on. The readings become the tiles of Memory,
+CPU, GPU and Disk; `m` `c` `g` `d` show one alone with the plot (again: its biggest apps), `M`
+`C` `G` `D` add or remove one, and from 30 rows each other one shown gets a row of its own under
+the plot. The capsule says oomph's verdict and the reservations wear their agents' colours. The
+selection is remembered in `top.json` (`"selection"`, `"focus"`), apart from the app's.
+
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
 `oomph run --reserve`, `oomph reserve` / `amend` / `release` / `reservations`,
 `oomph status --json`, `oomph hook` and `oomph mcp` — see
@@ -462,7 +487,9 @@ session B  → granted r8, tests start
   time, so they stay unique even if the ledger is reset. From 1.9.2 each reservation and
   record also carries a short agent key, the same for every reservation of one Claude
   session, so a session's reservations can later be told apart from another's after it
-  is gone. `oomph reservations --history` and MCP `reservation_history` read it.
+  is gone; from 1.11.0 also the agent's place in a palette of six colours, chosen once
+  when the agent first reserves, so every view draws one session in one colour.
+  `oomph reservations --history` and MCP `reservation_history` read it.
 - **Visible everywhere:** `oomph check` turns *tight* when other sessions' reservations
   exceed what's free, and the logger records them in each sample, so an incident report
   shows what was planned at the time. In the menu-bar popup a block chart under the

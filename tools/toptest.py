@@ -685,6 +685,89 @@ def fake_tabs(n, now, states=None):
     return tabs
 
 
+def test_resource_arrays():
+    """The other resources (1.11.0) through the typed arrays: point for point view.multires's, the GPU's kind
+    never averaged across its seam, and nothing of it while the switch is off."""
+    rnd = random.Random(11)
+    now = NOW
+    pts, t = [], now - 2 * 86400
+    while t < now:
+        t += 30 if rnd.random() > 0.01 else 600
+        full = t > now - 86400
+        p = dict(t=float(t), wired=6.0, app=8.0 + rnd.random() * 4, comp=5.0, swap=0.0, away=False, kills=0,
+                 cpu=None if rnd.random() < 0.05 else rnd.random() * 14, sys=rnd.random(), gpu=rnd.random() * 100,
+                 gfull=full, gmem=rnd.random() * 20, disk=50 + rnd.random() * 10)
+        pts.append(p)
+    import array
+    nan = float("nan")
+    cols = [array.array("d", [p[k] for p in pts]) for k in ("t", "wired", "app", "comp", "swap")] + \
+        [bytearray(0 for p in pts), array.array("l", [0 for p in pts])] + \
+        [array.array("d", [nan if p[k] is None else p[k] for p in pts]) for k in V.RES_POINT] + \
+        [bytearray(1 if p["gfull"] else 0 for p in pts)]
+    a, b = T.multires_cols(cols, now), V.multires(pts, now)
+    seam = [p for p in b if p["t"] > now - 86400 - 3000 and p["t"] < now - 86400 + 3000]
+    check(a == b and all(isinstance(p["gfull"], bool) for p in b) and len(b) < len(pts),
+          "resources: the thinning over typed arrays is point for point the view's, with cpu, gpu and disk (%d → %d)"
+          % (len(pts), len(b)))
+    agg = V.res_agg([dict(cpu=2.0, sys=0.5, gpu=90.0, gfull=False, gmem=3.0, disk=40.0),
+                     dict(cpu=None, sys=None, gpu=30.0, gfull=True, gmem=5.0, disk=35.0),
+                     dict(cpu=4.0, sys=1.5, gpu=10.0, gfull=True, gmem=None, disk=None)])
+    check(agg == dict(cpu=3.0, sys=1.0, gpu=20.0, gfull=True, gmem=5.0, disk=35.0) and seam,
+          "resources: a bucket keeps the rates' mean, the GPU's newest kind only, the most GPU memory, the least disk (%s)"
+          % agg)
+    plain = T._point({"t": 1.0, "app_gb": 1, "wired_gb": 1, "compressed_gb": 1, "swap_used_gb": 0, "cpu": {"busy": 3}})
+    check("cpu" not in plain and T.History("/nonexistent").res is False and T.res_view({}) is None and
+          T.res_view({"resourcesUI": "yes"}) is None,
+          "resources: switched off unless top.json says \"resourcesUI\": true; no extra series are read then")
+    check(T.res_view({"resourcesUI": True, "selection": ["disk", "nonsense", "cpu"], "focus": "disk"}) ==
+          {"sel": ["cpu", "disk"], "focus": "disk"} and
+          T.res_view({"resourcesUI": True, "selection": "memory", "focus": "gpu"}) == {"sel": ["memory"], "focus": "memory"},
+          "resources: top.json's selection is read in tile order; anything else is Memory alone")
+
+
+def test_pty_resources(base):
+    """With the switch on: the tiles in place of the readings, m c g d and M C G D change what is shown,
+    the last one is refused, and top.json remembers the selection apart from the app's."""
+    log, led = topfixture.write_fixture(os.path.join(base, "fx"), "resources")
+    env = {k: v for k, v in os.environ.items() if k not in ("COLORTERM", "SSH_CONNECTION", "NO_COLOR", "TERM_PROGRAM",
+                                                             "COLORFGBG", "LC_ALL", "LC_CTYPE")}
+    env.update(TERM="xterm-256color", LANG="en_US.UTF-8", OOMPH_DIR=log, OOMPH_LEDGER_DIR=led,
+               OOMPH_STATE_DIR=os.path.join(base, "state"), TZ="Europe/Berlin")
+    os.makedirs(env["OOMPH_STATE_DIR"], mode=0o700)
+    with open(os.path.join(env["OOMPH_STATE_DIR"], "top.json"), "w") as f:
+        json.dump({"v": 1, "resourcesUI": True}, f)
+
+    def screen(p):
+        vt = MiniVT(80, 32)
+        vt.feed(p.text())
+        return "\n".join("".join(c[0] for c in row) for row in vt.cells)
+    p = Pty(top(), env, size=(80, 32))
+    try:
+        p.pump(5, until=b"Logging every")
+        s0 = screen(p)
+        tiles = "8.2 / 14 cores" in s0 and "45 GB free" in s0 and "Wired 7.2" in s0
+        p.send("c", wait=0.4)
+        s1 = screen(p)
+        cpu = "System" in s1 and "Wired 7.2" not in s1
+        p.send("c", wait=0.4)
+        apps = "Top apps" in screen(p)
+        p.send("esc", "M", "G", wait=0.5)
+        s2 = screen(p)
+        sparks = " Mem" in s2 and " GPU" in s2 and "System" in s2
+        p.send("C", "G", "M", wait=0.5)
+        refused = "can't be removed" in screen(p)
+        p.send("q", wait=0.1)
+        rc = p.wait(5)
+    finally:
+        p.close()
+    saved = json.load(open(os.path.join(env["OOMPH_STATE_DIR"], "top.json")))
+    check(tiles and cpu and apps and sparks and refused and rc == 0 and saved.get("selection") == ["memory"]
+          and saved.get("focus") == "memory" and saved.get("resourcesUI") is True,
+          "pty: with resourcesUI the tiles show the four resources; c gives the CPU the plot (again: its top apps); M G add "
+          "rows under it; the last one shown can't be removed; top.json keeps the selection (%s)"
+          % [tiles, cpu, apps, sparks, refused, rc, saved.get("selection"), saved.get("focus")])
+
+
 def test_tab_ladder():
     """04 §3.7: at every width from 40 to 200 columns and with 1 to 13 machines, the first, a middle and the
     last selected: the selected tab with its label and its ×, the + and the capsule are there; a counter is a
@@ -2221,6 +2304,7 @@ def main():
     test_selection()
     test_inspect_mouse()
     test_arrays()
+    test_resource_arrays()
     test_tab_ladder()
     test_link_rows()
     test_mirror_gaps()
@@ -2231,6 +2315,7 @@ def main():
         test_pty(os.path.join(base, "pty"))
         test_bell_settings_nologger(os.path.join(base, "settings"))
         test_pty_inspect(os.path.join(base, "inspect"))
+        test_pty_resources(os.path.join(base, "resources"))
         test_budget(os.path.join(base, "budget"))
         test_readonly_ssh(os.path.join(base, "ssh"))
         test_crash(os.path.join(base, "crash"))
