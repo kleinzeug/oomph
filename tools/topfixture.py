@@ -254,6 +254,156 @@ def write_fixture(d, scenario):
     return log, led
 
 
+# ------------------------------------------------------------------ machines (T2: 04 §3.7, from 01's formats)
+# (mirror name, label, transport, state, error, live pid, synced all, have) — times relative to NOW
+MACHINES = [
+    ("m-7f3a9c1e5b2d4a68", "mac-mini", "tcp", "live", None, True, True, None),
+    ("m-1b2c3d4e5f607182", "build-box", "tcp", "offline", "timeout", False, True, "holes"),
+    ("m-90a1b2c3d4e5f607", "gpu-box", "tcp", "needs_attention", "identity_changed", False, True, None),
+    ("m-2c3d4e5f60718293", "render-01", "ssh", "catching_up", None, True, False, "recent"),
+]
+RECENT = ("m-5a6b7c8d9e0f1a2b", "air", "air.local")
+
+
+def write_machines(base, more=0, pid=None):
+    """An OOMPH_MACHINES_DIR as `oomph remote add` and the engine leave it, in 01's formats (machines.json,
+    and per mirror log/, ledger/, status.json, sync.json, machine.json), every time relative to NOW: a
+    live machine, one not connected for 40 minutes with an older stretch not received, one whose key
+    changed, one just paired over ssh (catching up), a recent one that is not a tab, and `more` pinned
+    machines that have never answered (the twelve-tab frames). `pid`: the process a live status names."""
+    pid = os.getpid() if pid is None else pid
+    mdir = os.path.join(base, "machines")
+    os.makedirs(mdir, mode=0o700)
+    src_log, src_led = write_fixture(os.path.join(base, "machines-src"), "default")
+    entries = []
+    for i, (mid, name, tr, state, err, live, synced, have) in enumerate(MACHINES):
+        d = os.path.join(mdir, mid)
+        shutil.copytree(src_log, os.path.join(d, "log"))
+        shutil.copytree(src_led, os.path.join(d, "ledger"))
+        down = NOW - 40 * 60 if state == "offline" else NOW
+        spans = [[NOW - 14 * 86400, NOW]]
+        if have == "holes":
+            spans = [[NOW - 14 * 86400, NOW - 7 * 3600], [NOW - 5 * 3600, down]]
+        elif have == "recent":
+            spans = [[NOW - 6 * 3600, NOW]]
+        if state == "needs_attention":
+            spans = [[NOW - 14 * 86400, NOW - 22 * 3600]]
+        st = {"v": 1, "state": state, "was": None, "since": NOW - 3600, "last_contact": down if state != "needs_attention"
+              else NOW - 22 * 3600, "error": err, "detail": None, "attempt": 3 if state == "offline" else 0,
+              "next_try": NOW + 40 if state == "offline" else None, "connect_ms": 120, "transport": tr,
+              "peer": None, "pid": pid if live else None, "fast": None, "updated": NOW}
+        sy = {"v": 1, "have": spans, "gone": [], "bad": [], "oldest": NOW - 14 * 86400, "samples_at": None,
+              "synced": {"ledger": synced, "reservations": synced, "incidents": synced},
+              "dropped": {"samples": 0, "records": 0}, "offset_s": 0}
+        mj = {"id": mid, "name": name, "os": "macos", "os_version": "macOS 27.1", "version": "1.10.0",
+              "oldest": NOW - 14 * 86400, "caps": []}
+        for n, v in (("status.json", st), ("sync.json", sy), ("machine.json", mj)):
+            with open(os.path.join(d, n), "w") as f:
+                json.dump(v, f)
+        entries.append({"mid": mid, "id": mid, "name": name, "label": None, "transport": tr,
+                        "host": name if tr == "ssh" else name + ".local", "port": None if tr == "ssh" else 6674,
+                        "user": "sam" if tr == "ssh" else None, "addrs": ["192.168.1.%d" % (40 + i)],
+                        "fp": None if tr == "ssh" else "sha256:" + "%064x" % (i + 1), "client": None, "os": "macos",
+                        "os_version": "macOS 27.1", "ram_gb": 64, "version": "1.10.0", "caps": [],
+                        "added": NOW - 86400 * (9 - i), "last_connected": NOW - 3600, "pinned": True, "order": i + 1})
+    for k in range(more):
+        entries.append({"mid": "m-%016x" % (0xc0ffee00 + k), "id": None, "name": "ci-%02d" % (k + 1), "label": None,
+                        "transport": "tcp", "host": "ci-%02d.local" % (k + 1), "port": 6674, "pinned": True,
+                        "order": 10 + k, "added": NOW - 3600})
+    entries.append({"mid": RECENT[0], "id": RECENT[0], "name": RECENT[1], "label": None, "transport": "tcp",
+                    "host": RECENT[2], "port": 6674, "addrs": ["192.168.1.47"], "os": "macos", "os_version": "macOS 26.4",
+                    "ram_gb": 16, "last_connected": NOW - 2 * 86400, "pinned": False, "order": 30})
+    with open(os.path.join(mdir, "machines.json"), "w") as f:
+        json.dump({"v": 1, "machines": entries}, f, indent=1)
+    return mdir
+
+
+def machine_model(mdir, mid, span, now=NOW):
+    """The model `oomph top` draws with `mid` selected, read from `mdir` as the program reads it (its
+    worker's Machines and Feed), at `now`; this machine's tab named as the frames name it."""
+    import oomph
+    import oomph_sync
+    import oomph_top
+    M = oomph_top.Machines(mdir, oomph_sync)
+    M.refresh(now - 30)                     # opened half a minute ago: no grace on any tab
+    src = oomph_top.Source(oomph.LOG_DIR, lambda m: None, clock=lambda: now, machines=M)
+    src.span, src.mid = span, mid
+    src.step()
+    m = src.model(now, now, mid)
+    t0 = m["tabs"][0]
+    t0.update(label=HOST, version="1.10.0", system=OS)
+    if mid == "local":
+        m.update(host=HOST, os=OS)
+    return oomph_top.at(m, now)
+
+
+# (name, mirror selected ("local": this machine), width, height, span, glyphs, the dialog open, pinned machines more):
+# 04 §8's four for T2. The tab bar with this machine selected, the attention card, Connect, the list and twelve
+# tabs in ASCII are row expectations in tools/toptest.py (test_machine_rows), drawn by machine_frame
+MACHINE_FRAMES = [
+    ("80x24-not-connected", "m-1b2c3d4e5f607182", 80, 24, "24h", "unicode", None, 0),
+    ("80x24-catching-up", "m-2c3d4e5f60718293", 80, 24, "24h", "unicode", None, 0),
+    ("60x16-pair", "local", 60, 16, "24h", "unicode", {"kind": "pair", "target": "studio.local", "code": "K7QF2M9XD4",
+                                                       "fp_short": "3288 6121 2BBE 5CC8"}, 0),
+    ("40x10-tabs-12", "m-00000000c0ffee03", 40, 10, "24h", "unicode", None, 8),
+]
+
+
+def machine_frame(base, dirs, mid, w, h, span, glyphs, ov, more):
+    """One frame of the machine fixture (written under `base` once, kept in `dirs`) with `mid` selected."""
+    import oomph
+    import oomph_view as view
+    key = "machines-%d" % more
+    if key not in dirs:
+        dirs[key] = write_machines(os.path.join(base, key), more)
+    if "default" not in dirs:
+        dirs["default"] = write_fixture(os.path.join(base, "default"), "default")
+    log, led = dirs["default"]
+    oomph.LEDGER_DIR, oomph.LOG_DIR = led, log
+    model = machine_model(dirs[key], mid, span)
+    ui = {"span": span}
+    if ov:
+        ui["overlay"] = dict(ov)
+    return view.render(model, w, h, view.Caps("256", glyphs, "dark"), ui)
+
+
+def format_problems(mdir):
+    """The machine fixture read by oomph remote's own readers (04 §8 wants 01's fixtures; this one is
+    written here so the frames keep a fixed clock): every machines.json entry is one oomph_sync.Book
+    keeps as written, every sync.json is taken whole by oomph_sync.Sync, and every status.json has
+    exactly write_status's fields. A drift of 01's formats fails here, not silently in a frame."""
+    import oomph_sync as S
+    out = []
+    with open(os.path.join(mdir, "machines.json")) as f:
+        raw = json.load(f)["machines"]
+    book = S.Book(mdir)
+    kept = {e["mid"]: e for e in book.machines}
+    for e in raw:
+        k = kept.get(e["mid"])
+        if k is None:
+            out.append("machines.json: %s is dropped by oomph_sync.valid_entry" % e["mid"])
+        elif any(k.get(n) != e.get(n) for n in ("name", "transport", "host", "port", "user", "fp", "pinned", "addrs")):
+            out.append("machines.json: %s is changed by oomph_sync.valid_entry" % e["mid"])
+    tmp = tempfile.mkdtemp(prefix="oomph-status-")
+    try:
+        fields = set(S.write_status(S.Mirror(tmp)))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for e in raw:
+        d = os.path.join(mdir, e["mid"])
+        if not os.path.isdir(d):
+            continue
+        m = S.Mirror(d)
+        st, sy = m.json("", "status.json"), m.json("", "sync.json")
+        if set(st or {}) != fields:
+            out.append("%s/status.json: fields %s, write_status writes %s" % (e["mid"], sorted(st or {}), sorted(fields)))
+        sync = S.Sync(None, m, {"now": NOW, "oldest": (sy or {}).get("oldest")})
+        lost = [k for k, v in (sy or {}).items() if sync.state.get(k) != v]
+        if lost or [list(x) for x in sync.have.spans] != [list(x) for x in sy["have"]]:
+            out.append("%s/sync.json: oomph_sync.Sync does not take %s" % (e["mid"], lost or "have as written"))
+    return out
+
+
 # (name, scenario, width, height, span, colour, glyphs, theme, format[, keys pressed first])
 FRAMES = [
     ("80x24-default", "default", 80, 24, "24h", "256", "unicode", "dark", "golden"),
@@ -337,6 +487,11 @@ def frames(base):
         else:
             text = fr.ansi(caps)
         out[name + "." + ("golden" if fmt == "golden" else "ans")] = (text, fr)
+    import oomph_sync  # noqa: F401  (the machine frames need oomph remote's formats)
+    for name, mid, w, h, span, glyphs, ov, more in MACHINE_FRAMES:
+        fr = machine_frame(base, dirs, mid, w, h, span, glyphs, ov, more)
+        out[name + ".golden"] = (fr.golden("oomph top golden frame v2 · %dx%d · machines · selected=%s span=%s glyphs=%s%s"
+                                           % (w, h, mid, span, glyphs, " · dialog=%s" % ov["kind"] if ov else "")), fr)
     return out
 
 
@@ -358,6 +513,14 @@ def main(argv):
         shutil.rmtree(base, ignore_errors=True)
     import oomph_view as view
     bad = 0
+    if os.geteuid() != 0:                   # (oomph remote refuses root; its readers too)
+        fx = tempfile.mkdtemp(prefix="oomph-topfixture-")
+        try:
+            fmt = format_problems(write_machines(fx))
+        finally:
+            shutil.rmtree(fx, ignore_errors=True)
+        bad += bool(fmt)
+        print("%s top machine fixture in 01's formats%s" % ("FAIL " if fmt else "ok   ", "".join("\n      " + p for p in fmt)))
     drift = sorted(n for n in got if later.get(n, (None,))[0] != got[n][0])
     if drift:
         bad += 1

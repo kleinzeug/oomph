@@ -290,7 +290,7 @@ click in the chart inspects that column, a click on a span or a row chooses it (
 opens the row), and the wheel changes the span over the chart and scrolls a list; while it is on,
 the terminal selects text with `shift` (iTerm2: `option`). It fits 80 × 24 and uses the room of a
 bigger window; it works in tmux, and `--bell` rings the terminal's bell when an incident opens,
-at most every 15 minutes.
+at most every 15 minutes. Other machines are tabs in it ([below](#other-machines-110)).
 
 ```sh
 oomph top                       # this Mac
@@ -539,6 +539,26 @@ for the administrator password, and a fresh code keeps the popup up until it is 
 the popover misbehaves inside the popup, `defaults write local.oomph.menubar connectSheet -bool YES`
 shows it as a sheet.
 
+**In the terminal** (1.10.3, on without a switch: a terminal is not subject to the app's Local
+Network question) `oomph top` has the same tabs on its first row: this machine, then every machine
+added in the app or with `oomph remote add`, each with a mark for its link and its pressure
+(`●` `◐` `◆` connected, `◦` its logger is silent, `↻` connecting or catching up, `⊘` not
+connected, `▲` needs attention, a red `!` an open incident), and `+`. The second row says how the
+selected machine is (`No answer since 10:15 · next try in 40 s`); what claims to be now is greyed
+when it is not connected, what was received keeps its colours, and stretches never received
+are dotted (`:`) in the chart. Keys: `1`–`9` and `tab` (`n` `p`) pick a tab, `0` lists every machine with its
+address, `+` connects to one (a new Mac asks for the code `sudo oomph share pair` shows there,
+with its key; `user@host` goes over ssh after showing the command it runs), `x` disconnects (`u`
+undoes it for six seconds), `X` forgets (it asks), `r` tries now, `R` renames the tab, and `enter`
+on an orange capsule explains what happened. The dashboard keeps the machines live only while it
+runs, through the same `oomph remote sync` the app runs; with the app open both share one
+connection per machine, and either can quit without the other going stale. `ctrl-z` lets go of
+the connections until `fg`. `--machine NAME` starts on that tab (otherwise it is the tab of the
+last run, unless this machine has something to say: critical pressure, an open incident or a
+silent logger), and `--no-connect` shows the mirrors without connecting (`oomph top --ssh host`
+always runs so on the far side); `oomph top --once --machine NAME` prints that tab's frame. On a Mac for now:
+a Linux machine becomes a viewer in a later release.
+
 ## Files
 
 | Path | What |
@@ -587,8 +607,10 @@ from the logs to that provider for each AI report (Ollama keeps it local); when 
 upgrades; when you **share this Mac** (off by default, needs an administrator, only on the
 networks you turn it on for) or **watch one that was shared with you**. Shared data goes
 directly between your machines, encrypted, and nowhere else, and a watching machine only
-connects while its popup is open (and a minute after), or while you run `oomph remote add` or
-`oomph remote sync` in a terminal. Another machine's data goes to an AI
+connects while its popup is open (and a minute after), or while you run `oomph remote add`,
+`oomph remote sync` or `oomph top` (with another machine as a tab) in a terminal; `oomph top
+--ssh host` shows that account's machines there as they were last received, and never makes
+that host connect to them. Another machine's data goes to an AI
 provider only if its owner allowed it there (`sudo oomph share ai on`; off by default).
 
 ## Layout

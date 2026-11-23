@@ -1748,18 +1748,60 @@ class Engine:
         self.quit = False
         self.inbuf = b""
         self.forgetting = {}     # mid → (the unpairing child, until when it may take)
+        self.pipe, self.tail = None, b""
 
     def emit(self, ev):
         if self.json:
-            try:
-                sys.stdout.write(json.dumps(ev) + "\n")
-                sys.stdout.flush()
-            except (OSError, ValueError):
-                self.quit = True
+            self.send((json.dumps(ev) + "\n").encode())
         elif ev.get("ev") == "state":
             e = self.book.get(ev.get("id")) or {}
             print("%s  %s%s" % (net.clean(str(label(e) or ev.get("id")), 32), ev.get("state"),
                                 ": " + net.clean(str(ev["detail"]), 160) if ev.get("detail") else ""), flush=True)
+
+    def send(self, line):
+        """--json: a line for the reader. Into a pipe it never waits: a reader that stopped reading
+        (a dashboard held up by its terminal, a process stopped) must not leave the engine stuck in a
+        write while it holds engine.lock, every viewer's machines going stale. While the pipe is full
+        new lines are dropped, whole: they only wake the reader, and the facts are in the files. The
+        rest of a line written in part goes first. Anywhere else (a terminal, a file) as before."""
+        try:
+            if self.pipe is None:
+                mode = os.fstat(1).st_mode
+                self.pipe = stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+                if self.pipe:
+                    sys.stdout.flush()
+                    os.set_blocking(1, False)
+            if not self.pipe:
+                sys.stdout.write(line.decode())
+                sys.stdout.flush()
+                return
+            for data in ([self.tail] if self.tail else []) + [line]:
+                if self.tail and data is line:
+                    return                          # the reader is behind: this one is dropped
+                try:
+                    n = os.write(1, data)
+                except BlockingIOError:
+                    n = 0
+                self.tail = data[n:]
+        except (OSError, ValueError):
+            self.quit = True
+
+    def unpipe(self):
+        """On the way out: the rest of a line written in part, if the pipe takes it now, and stdout
+        blocking again. O_NONBLOCK belongs to the open file description, which a shell around the
+        engine (`sh -c 'oomph remote sync --json; echo done' | reader`) shares: it must not keep it."""
+        if not self.pipe:
+            return
+        try:
+            if self.tail:
+                os.write(1, self.tail)
+        except OSError:
+            pass
+        self.tail = b""
+        try:
+            os.set_blocking(1, True)
+        except (OSError, ValueError):
+            pass
 
     def try_lead(self):
         if self.leader:
@@ -1849,7 +1891,7 @@ class Engine:
         try:
             edit(cmd, mid, new_label, unpair=False)
         except SyncError as e:
-            self.emit({"ev": "failed", "cmd": cmd, "reason": e.code, "detail": e.detail})
+            self.emit({"ev": "failed", "cmd": cmd, "id": mid, "reason": e.code, "detail": e.detail})
 
     def unpair(self, mid):
         """forget's best-effort unpairing there, in a child (`remote _link MID --unpair`), so an
@@ -2457,6 +2499,8 @@ def cmd_sync(args):
             eng.loop()
         except KeyboardInterrupt:
             eng.shutdown()
+        finally:
+            eng.unpipe()
         return 0
     if "--into" in o or cmd is not None:
         if cmd is not None and not cmd:

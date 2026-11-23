@@ -34,6 +34,8 @@ import zlib
 import oomph
 import oomph_view as view
 
+view.BRAND = oomph.BRAND
+
 DAY_CAP = 128 << 20         # bytes of one day's samples, inflated (a day at a 5 s interval is about 60 MB)
 CURRENT_CAP = 256 << 10
 INCIDENT_CAP = 256 << 10
@@ -48,7 +50,7 @@ ROOT_LEDGER_S = 30          # under sudo the reservations lag by up to this (04 
 CELLS_TERMINALS = ()        # TERM_PROGRAM values that seam at their default profile (04 §8): none so far
 USAGE = ("usage: oomph top [--span inf|24h|6h|1h] [--color auto|truecolor|256|16|never] [--theme auto|dark|light]\n"
          "                 [--glyphs auto|unicode|cells|ascii] [--bell | --no-bell] [--mouse | --no-mouse] [--no-probe]\n"
-         "                 [--ssh [USER@]HOST [--ssh-port N]]\n"
+         "                 [--machine NAME] [--no-connect] [--ssh [USER@]HOST [--ssh-port N]]\n"
          "                 [--once [--size COLSxROWS] [--format text|ansi|golden] [--now UNIXTIME]]")
 
 
@@ -662,16 +664,15 @@ def install_hint():
     return "Logging is off"
 
 
-class Source(threading.Thread):
-    """The worker: every read and parse, the thinning, the reservation merge, the live measurement
-    when no logger runs. It never touches the terminal; it hands finished models to the loop
-    (`post`). It looks once a second at a few files' identities and reads only what changed."""
+class Feed:
+    """One machine's data as the frames need it: this machine's log and ledger, or another machine's
+    mirror (roadmap 01 §5.6, in the logs' own layout). It looks at a few files' identities and reads
+    only what changed. A mirror is never measured here and its reservations are never ended by
+    looking at pids: they are another machine's (04 §4.7)."""
 
-    def __init__(self, log_dir, post, clock=time.time, root=False):
-        threading.Thread.__init__(self, daemon=True)
-        self.log_dir, self.post, self.clock, self.root = log_dir, post, clock, root
-        self.span = "24h"
-        self.wake, self.stop = threading.Event(), threading.Event()
+    def __init__(self, log_dir, ledger_dir=None, root=False):
+        self.log_dir, self.ledger_dir, self.root = log_dir, ledger_dir, root
+        self.remote = ledger_dir is not None
         self.history = History(log_dir)
         self.incident_cache = {}
         self.sigs = {}
@@ -679,15 +680,11 @@ class Source(threading.Thread):
         self.pts = self.gaps = None
         self.first, self.points_at, self.points_span = None, 0.0, None
         self.res, self.res_note, self.lstate, self.res_at = [], None, {}, -1e9
+        self.blocks = []
         self.incidents, self.n90, self.inc_at = [], 0, -1e9
         self.events, self.cevents = [], []
         self.live, self.live_pts, self.live_at = None, [], -1e9
         self.loaded_all = False
-        self.error = None
-
-    def set_span(self, span):
-        self.span = span
-        self.wake.set()
 
     def _sig(self, path):
         try:
@@ -703,20 +700,9 @@ class Source(threading.Thread):
             return True
         return False
 
-    def run(self):
-        while not self.stop.is_set():
-            try:
-                self.step()
-                self.error = None
-            except Exception:
-                self.error = traceback.format_exc()
-            self.wake.wait(1.0)
-            self.wake.clear()
-
-    def step(self):
-        now = self.clock()
+    def step(self, now, span):
+        """Read what changed; True when the model did."""
         changed = False
-        span = self.span
         if self._changed("current", os.path.join(self.log_dir, "current.json")):
             self.cur = _current(self.log_dir)
             changed = True
@@ -737,7 +723,7 @@ class Source(threading.Thread):
                 self.first = min(self.first, now - (sp or 0) - 86400)
             self.last_t = T[-1] if len(T) else None
             self.points_at, self.points_span, changed = now, span, True
-        if self.cur is None and now - self.live_at >= LIVE_S:   # no logger: measure here, keep the chart's points
+        if self.cur is None and not self.remote and now - self.live_at >= LIVE_S:   # no logger: measure here
             self.live_at = now
             try:
                 s = oomph.live_sample(with_procs=False)
@@ -749,14 +735,20 @@ class Source(threading.Thread):
                 self.live = s                                   # the newest whole sample: the readings
                 self.live_pts = (self.live_pts + [p])[-LIVE_KEEP:] if p else self.live_pts
                 changed = True
-        if self.root:       # each read starts an unprivileged child (about 0.1 s of CPU): every 30 s
+        if self.remote:
+            due = (self._changed("ledger", os.path.join(self.ledger_dir, "ledger.json")) |
+                   self._changed("history", os.path.join(self.ledger_dir, "reservations.jsonl"))) or now - self.res_at >= 60
+        elif self.root:     # each read starts an unprivileged child (about 0.1 s of CPU): every 30 s
             due = now - self.res_at >= ROOT_LEDGER_S
         else:
             led = oomph.LEDGER_DIR
             due = (self._changed("ledger", os.path.join(led, "ledger.json")) |
                    self._changed("history", os.path.join(led, "reservations.jsonl"))) or now - self.res_at >= 10
         if due:
-            self.res, self.res_note, self.lstate = load_reservations(now, with_state=True)
+            if self.remote:
+                self.res, self.res_note, self.lstate = mirror_reservations(self.ledger_dir, now)
+            else:
+                self.res, self.res_note, self.lstate = load_reservations(now, with_state=True)
             self.blocks = view.stack_reservations(self.res, now)
             self.res_at, changed = now, True
         incident_now = ((self.cur or {}).get("daemon") or {}).get("incident") if isinstance(
@@ -768,14 +760,13 @@ class Source(threading.Thread):
         if self._changed("events", os.path.join(self.log_dir, "events.jsonl")):
             self.events, self.cevents = load_events(self.log_dir, chart=True)
             changed = True
-        if changed:
-            self.post(self.model(now))
+        return changed
 
     def model(self, now):
         """The model for render(), as load_model builds it for --once."""
         s, logger, logger_t, interval = self.cur, "ok", None, 30
         pts, gaps, first, pv = self.pts or [], list(self.gaps or []), self.first, getattr(self, "pts_v", None)
-        if s is None:
+        if s is None and not self.remote:
             logger = "off"
             s = self.live
             if self.live_pts and not pts:
@@ -783,7 +774,7 @@ class Source(threading.Thread):
                 pts = view.multires(live, now)
                 gaps = view.find_gaps(live, now)
                 first, pv = (live[0]["t"] if live else None), None
-        else:
+        elif s is not None:
             d = s.get("daemon") if isinstance(s.get("daemon"), dict) else {}
             interval = _num(d.get("interval"), 30) or 30
             if now - s["t"] > 3 * interval + 15:
@@ -791,21 +782,541 @@ class Source(threading.Thread):
         cur = readings(s) if s else None
         m = dict(now=now, brand=oomph.BRAND, host=host_name(), os=os_name(), ram=cur["ram"] if cur else None, pts=pts,
                  first=first, gaps=gaps, last_t=getattr(self, "last_t", None), res=self.res,
-                 blocks=getattr(self, "blocks", []), incidents=self.incidents, incidents_90d=self.n90, cur=cur,
-                 events=self.events, cevents=self.cevents, logger=logger, logger_t=logger_t, interval=interval, ledger_state=self.lstate,
-                 log_dir=self.log_dir, off_text=install_hint() if logger == "off" else None, pts_v=pv)
+                 blocks=self.blocks, incidents=self.incidents, incidents_90d=self.n90, cur=cur,
+                 events=self.events, cevents=self.cevents, logger=logger, logger_t=logger_t, interval=interval,
+                 ledger_state=self.lstate, log_dir=self.log_dir,
+                 off_text=install_hint() if logger == "off" else None, pts_v=pv)
         if self.res_note:
             m.update(status=self.res_note, status_role="warntx")
         return m
 
 
+def mirror_reservations(ledger_dir, now):
+    """Another machine's reservations from its mirror (read as the user, never as root): the
+    ledger and the history log's records of the last 14 days, merged without asking whether a
+    holder lives (its pids are another machine's; its logger retires them, 01 §4.4)."""
+    try:
+        fd = os.open(ledger_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return [], None, {}
+    try:
+        L = oomph._valid_ledger(oomph.loads_untrusted(oomph.read_bounded("ledger.json", oomph.LIMITS["ledger"], fd,
+                                                                          shared=True)))
+        recs = oomph._view_records(oomph.read_history(dfd=fd), now - view.KEEP_DAYS * 86400)
+    except (oomph.LedgerError, OSError, ValueError):
+        return [], None, {}
+    finally:
+        os.close(fd)
+    return view.merge_reservations(recs, L or {}, now, None), None, {}
+
+
+# ------------------------------------------------------------------ machines (04 §3.7, §4.7)
+FILE_CAPS = {"status.json": 64 << 10, "sync.json": 1 << 20, "machine.json": 64 << 10, "current.json": CURRENT_CAP}
+BOOK_CAP = 4 << 20
+SYNC_BACKOFF = (1, 2, 4, 8, 15, 30, 60)
+FEED_KEEP_S = 60.0          # another machine's feed (its history) is kept this long after its tab was left
+UNDO_S = 6.0
+HIDE_S = 30.0               # a forget machines.json never shows (an event lost, the sync child gone): its tab back
+
+
+def sync_module():
+    """oomph_sync, when it is installed beside this program (1.10): machine tabs exist only then."""
+    try:
+        import oomph_sync
+        return oomph_sync
+    except Exception:
+        return None
+
+
+def _json_in(d, name, cap, own=False):
+    """A JSON file of a directory of this user's, read without following a link in the last step and
+    bounded; None for anything else (with `own`, also when the directory is someone else's)."""
+    try:
+        fd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        return None
+    try:
+        if own and os.fstat(fd).st_uid != os.geteuid():
+            return None
+        return oomph.loads_untrusted(oomph.read_bounded(name, cap, fd))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def read_book(base, S):
+    """machines.json as the dashboard reads it: only read, never written or created (04 §4.7: every
+    change goes to the sync child). The entries oomph_sync trusts, each once."""
+    v = _json_in(base, "machines.json", BOOK_CAP, own=True)
+    out, seen = [], set()
+    for e in (v.get("machines") if isinstance(v, dict) and isinstance(v.get("machines"), list) else []):
+        ok = S.valid_entry(e)
+        if ok and ok["mid"] not in seen:
+            seen.add(ok["mid"])
+            ok["forgetting"] = isinstance(e, dict) and e.get("state") == "forgetting"
+            out.append(ok)
+    return out
+
+
+def _pressure(s):
+    p = s.get("pressure")
+    return {1: "Normal", 2: "Warning", 4: "Critical"}.get(p, "Normal") if isinstance(p, int) else "Normal"
+
+
+def cur_summary(c, now):
+    """What a tab shows of a machine's current.json: pressure, when, its interval, whether its logger
+    went silent, an open incident, free memory."""
+    if not isinstance(c, dict) or not oomph._t(c.get("t")):
+        return None
+    d = c.get("daemon") if isinstance(c.get("daemon"), dict) else {}
+    interval = _num(d.get("interval"), 30) or 30
+    inc = d.get("incident")
+    return dict(pressure=_pressure(c), t=float(c["t"]), interval=interval, silent=now - c["t"] > 3 * interval + 15,
+                incident=inc if isinstance(inc, str) and inc else None)
+
+
+class Machines:
+    """The tabs' facts, for the worker: machines.json (its pinned entries are tabs, after this machine,
+    at most twelve; the rest are Recents) and each tab's status.json, sync.json, machine.json and
+    current.json, each read again only when its identity changed."""
+
+    def __init__(self, base, S):
+        self.base, self.S = base, S
+        self.entries, self.sigs, self.files = [], {}, {}
+        self.opened = {}            # mid → (when this run opened it, whether its link was live then)
+        self.hidden = {}            # mid → when forgotten here: no tab while machines.json still lists it (and no longer)
+        self.hidden_lock = threading.Lock()     # the loop hides and unhides, the worker reads and expires
+        self.alive = {}
+
+    def _sig(self, path):
+        try:
+            st = os.stat(path, follow_symlinks=False)
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+
+    def hide(self, mid, at=None):
+        """A forget sent from here: no tab for it until machines.json says so or HIDE_S passed without it."""
+        with self.hidden_lock:
+            self.hidden[mid] = time.monotonic() if at is None else at
+
+    def unhide(self, mid):
+        """The forget failed: its tab again (it is still in machines.json)."""
+        with self.hidden_lock:
+            self.hidden.pop(mid, None)
+
+    def is_hidden(self, mid):
+        with self.hidden_lock:
+            return mid in self.hidden
+
+    def tabs(self):
+        """The pinned entries in their order, without the ones being forgotten."""
+        with self.hidden_lock:
+            hidden = set(self.hidden)
+        pinned = [e for e in self.entries if e["pinned"] and not e.get("forgetting") and e["mid"] not in hidden]
+        return sorted(pinned, key=lambda e: (_num(e.get("order"), 0), _num(e.get("added"), 0)))[:view.MAX_TABS]
+
+    def refresh(self, wall):
+        changed = False
+        sig = self._sig(os.path.join(self.base, "machines.json"))
+        if sig != self.sigs.get("book", 0):
+            self.sigs["book"] = sig
+            self.entries = read_book(self.base, self.S) if sig else []
+            ids = {e["mid"] for e in self.entries}
+            with self.hidden_lock:
+                for k in [k for k in self.hidden if k not in ids]:
+                    del self.hidden[k]      # gone: added again, it is a tab again
+            changed = True
+        with self.hidden_lock:
+            late = [e["mid"] for e in self.entries if not e.get("forgetting") and
+                    time.monotonic() - self.hidden.get(e["mid"], math.inf) > HIDE_S]
+            for mid in late:            # the forget never showed in machines.json: it was not done
+                self.hidden.pop(mid, None)
+                changed = True
+        mids = {e["mid"] for e in self.tabs()}
+        for k in [k for k in self.files if k[0] not in mids]:
+            del self.files[k]
+            self.sigs.pop(k, None)
+        for mid in mids:
+            d = os.path.join(self.base, mid)
+            for name, sub in (("status.json", ""), ("sync.json", ""), ("machine.json", ""), ("current.json", "log")):
+                path = os.path.join(d, sub, name)
+                sig = self._sig(path)
+                if sig != self.sigs.get((mid, name), 0):
+                    self.sigs[(mid, name)] = sig
+                    self.files[(mid, name)] = _json_in(os.path.dirname(path), name, FILE_CAPS[name]) if sig else None
+                    changed = True
+            st = self.files.get((mid, "status.json"))
+            pid = st.get("pid") if isinstance(st, dict) else None
+            alive = isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid < 1 << 31 and _alive(pid)
+            if self.alive.get(mid) != alive:
+                self.alive[mid] = alive
+                changed = True
+            if mid not in self.opened:
+                self.opened[mid] = (wall, self.was_live(mid, wall))
+        return changed
+
+    def was_live(self, mid, wall):
+        """01 §3.6: what status.json says the link was when this opening began."""
+        st = self.files.get((mid, "status.json"))
+        if not isinstance(st, dict):
+            return False
+        if st.get("state") == "idle":
+            return st.get("was") == "live"
+        upd = _num(st.get("updated"), None)
+        return st.get("state") in ("live", "catching_up") and upd is not None and wall - upd < view.LIVE_FRESH_S
+
+    def reopen(self, wall):
+        """A new opening of every tab (the sync child started again: at start, after a resume)."""
+        self.opened = {e["mid"]: (wall, self.was_live(e["mid"], wall)) for e in self.tabs()}
+
+    def tab(self, e, wall):
+        S, mid = self.S, e["mid"]
+        f = lambda n: self.files.get((mid, n)) if isinstance(self.files.get((mid, n)), dict) else {}
+        st, sy, mj = f("status.json"), f("sync.json"), f("machine.json")
+        off = _num(sy.get("offset_s"), 0.0)
+        off = off if abs(off) < 366 * 86400 else 0.0
+        have = [s_ for s_ in (sy.get("have") or []) if S._span(s_)] if isinstance(sy.get("have"), list) else []
+        gone = [s_ for s_ in (sy.get("gone") or []) if S._span(s_)] if isinstance(sy.get("gone"), list) else []
+        system = mj.get("os_version") if isinstance(mj.get("os_version"), str) else e.get("os_version")
+        if not system and (mj.get("os") or e.get("os")) == "linux":
+            system = "Linux"
+        version = mj.get("version") if isinstance(mj.get("version"), str) else e.get("version")
+        return dict(mid=mid, local=False, label=S.label(e), addr=S.show_target(e), transport=e["transport"],
+                    status=st, pid_alive=self.alive.get(mid, False), cur=cur_summary(f("current.json"), wall + off),
+                    sync=dict(offset_s=off, synced=sy.get("synced") if isinstance(sy.get("synced"), dict) else {},
+                              have=[tuple(x) for x in have], gone=[tuple(x) for x in gone],
+                              oldest=_num(sy.get("oldest") if sy.get("oldest") is not None else mj.get("oldest"), None)),
+                    known=have[-1][1] if have else None, opened=self.opened.get(mid),
+                    version=net_clean(version, 24), system=net_clean(system, 24), os=e.get("os"))
+
+
+def net_clean(x, n):
+    return view.fit(x, n) if isinstance(x, str) and x else None
+
+
+class SyncChild:
+    """This dashboard's one child for remote machines: `oomph remote sync --json` (04 §4.7, 01 §4.3).
+    It is the engine or a follower, by 01's engine.lock; the dashboard does not need to know which.
+    Commands go down its stdin, one JSON object a line; its events come back on stdout and only
+    wake the worker (what is drawn comes from the files). Its own session: a ctrl-z here never
+    reaches it, so a suspend closes its stdin first (quit), and a resume starts a new one."""
+
+    def __init__(self, argv, wake=None):
+        self.argv, self.p, self.attempt, self.next_at = argv, None, 0, 0.0
+        self.started = None
+        self.wake = wake or (lambda failed: None)
+        self.failed = collections.deque(maxlen=8)
+
+    def running(self):
+        return self.p is not None and self.p.poll() is None
+
+    def start(self, nowm):
+        try:
+            self.p = subprocess.Popen(self.argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+        except OSError:
+            self.p = None
+            self.attempt += 1
+            self.next_at = nowm + SYNC_BACKOFF[min(self.attempt, len(SYNC_BACKOFF) - 1)]
+            return False
+        threading.Thread(target=self._read, args=(self.p.stdout,), daemon=True).start()
+        self.started = nowm
+        return True
+
+    def _read(self, f):
+        """The child's events, on a thread of their own and never on the terminal's: that loop waits
+        on a terminal that stopped reading, and a child that is the engine must not be left on a full
+        pipe while it holds engine.lock (every viewer would see its machines go stale). Every event
+        wakes the worker; a `failed` one is kept for a note (the last 8). At most 1 MB is kept
+        between lines. The thread owns the pipe: it closes it at the end of the child's output."""
+        buf = b""
+        try:
+            fd = f.fileno()
+            while True:
+                b = os.read(fd, 65536)
+                if not b:
+                    break
+                buf += b
+                if len(buf) > 1 << 20:
+                    buf = b""
+                failed = False
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    ev = oomph.loads_untrusted(line) if len(line) < 64 << 10 else None
+                    if isinstance(ev, dict) and ev.get("ev") == "failed":
+                        self.failed.append(ev)
+                        failed = True
+                self.wake(failed)
+        except (OSError, ValueError):
+            pass
+        finally:
+            try:
+                f.close()
+            except (OSError, ValueError):
+                pass
+
+    def send(self, obj):
+        if not self.running():
+            return False
+        try:
+            self.p.stdin.write((json.dumps(obj) + "\n").encode())
+            self.p.stdin.flush()
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def events(self):
+        """The `failed` events the reader kept since the last call."""
+        out = []
+        while self.failed:
+            try:
+                out.append(self.failed.popleft())
+            except IndexError:
+                break
+        return out
+
+    def reap(self, nowm):
+        """True when the child ended (then it is started again after a backoff: 1, 2, 4 … 60 s)."""
+        if self.p is None or self.p.poll() is None:
+            return False
+        lasted = self.started is not None and nowm - self.started >= 30
+        self.close()
+        self.attempt = 0 if lasted else self.attempt + 1
+        self.next_at = nowm + SYNC_BACKOFF[min(max(self.attempt - 1, 0), len(SYNC_BACKOFF) - 1)]
+        return True
+
+    def quit(self):
+        """01's quit: the end of its input. It closes its connections, writes their status as idle and
+        exits by itself; nothing waits for that here."""
+        if self.p is not None:
+            try:
+                self.p.stdin.close()
+            except (OSError, ValueError):
+                pass
+        self.close(wait=False)
+
+    def close(self, wait=True):
+        """Its input closed (its output is the reader's, which ends with it)."""
+        p, self.p = self.p, None
+        if p is None:
+            return
+        try:
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+        if wait:
+            try:
+                p.wait(0.2)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+class AddRun:
+    """One `oomph remote add TARGET --json --no-mirror --ask`, as the app runs it: it reaches the
+    machine and pairs with the code (on stdin, never in an argument other users could read) bound to
+    the key the code step showed (--fp). The identity question comes as a line and is answered on
+    stdin. Its own session, no terminal."""
+
+    def __init__(self, argv, code=None):
+        self.p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                  start_new_session=True, close_fds=True)
+        os.set_blocking(self.p.stdout.fileno(), False)
+        self.buf, self.result, self.ask, self.eof = b"", None, None, False
+        if code is not None:
+            self.answer(code)
+
+    def fileno(self):
+        return self.p.stdout.fileno() if not self.eof else None
+
+    def answer(self, line):
+        try:
+            self.p.stdin.write((line + "\n").encode())
+            self.p.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def pump(self):
+        """Read what came; True when something changed (an ask, the answer, the end)."""
+        got = False
+        try:
+            while True:
+                b = self.p.stdout.read(65536)
+                if b is None:
+                    break
+                if not b:
+                    self.eof = got = True
+                    break
+                self.buf += b
+                if len(self.buf) > 1 << 20:
+                    self.buf = b""
+        except (OSError, ValueError, TypeError):
+            self.eof = got = True
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            o = oomph.loads_untrusted(line) if len(line) < 64 << 10 else None
+            if isinstance(o, dict) and o.get("ev") == "ask":
+                self.ask, got = o, True
+            elif isinstance(o, dict):
+                self.result, got = o, True
+        return got
+
+    def done(self):
+        return self.eof and self.p.poll() is not None
+
+    def cancel(self):
+        try:
+            self.p.kill()
+        except OSError:
+            pass
+        for s in (self.p.stdin, self.p.stdout):
+            try:
+                s.close()
+            except (OSError, ValueError):
+                pass
+        try:
+            self.p.wait(1)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def local_tab(model=None, cur=None):
+    """This machine's tab: from its model while it is the one shown, else from the worker's summary of
+    its current.json."""
+    if model is not None and model.get("cur"):
+        cur = dict(pressure=model["cur"]["pressure"], t=model["now"], interval=model.get("interval") or 30,
+                   silent=model.get("logger") != "ok", incident=any(i["open"] for i in model["incidents"]) or None)
+    return dict(mid="local", local=True, label=host_name(), addr="this machine", transport=None, cur=cur,
+                version=oomph.VERSION, system=os_name(), known=None)
+
+
+def with_tabs(model, wall=None):
+    """A model of this machine as the dashboard draws it when no other machine is a tab: its own tab
+    and the + (what tests compare the program's frame with)."""
+    return dict(model, tabs=[local_tab(model)], sel=0, tab_mid="local", wall=model["now"] if wall is None else wall,
+                engine="on", book=[])
+
+
+class Source(threading.Thread):
+    """The worker: every read and parse, the thinning, the reservation merge, the live measurement
+    when no logger runs. It never touches the terminal; it hands finished models to the loop
+    (`post`). Once a second it steps the selected machine's Feed and, with machines, reads the tabs'
+    facts; another tab's feed keeps what it read for a minute after that tab was left, then goes
+    with its history (04 §4.6)."""
+
+    def __init__(self, log_dir, post, clock=time.time, root=False, machines=None):
+        threading.Thread.__init__(self, daemon=True)
+        self.log_dir, self.post, self.clock, self.root = log_dir, post, clock, root
+        self.span = "24h"
+        self.wake, self.stop = threading.Event(), threading.Event()
+        self.feeds = {"local": Feed(log_dir, root=root)}
+        self.machines = machines
+        self.mid = "local"
+        self.engine = "on"
+        self.local_sig, self.local_cur = 0, None
+        self.posted = None
+        self.error = None
+        self.left = {}              # mid → when its tab was left (its feed is dropped FEED_KEEP_S later)
+
+    def set_span(self, span):
+        self.span = span
+        self.wake.set()
+
+    def select(self, mid):
+        self.mid = mid
+        self.wake.set()
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                self.step()
+                self.error = None
+            except Exception:
+                self.error = traceback.format_exc()
+            self.wake.wait(1.0)
+            self.wake.clear()
+
+    def step(self):
+        wall = self.clock()
+        tabs_changed = False
+        M = self.machines
+        if M is not None:
+            tabs_changed = M.refresh(wall)
+            p = os.path.join(self.log_dir, "current.json")
+            try:
+                st = os.stat(p)
+                sig = (st.st_ino, st.st_size, st.st_mtime_ns)
+            except OSError:
+                sig = None
+            if sig != self.local_sig or (self.local_cur and not self.local_cur["silent"] and
+                                         wall - self.local_cur["t"] > 3 * self.local_cur["interval"] + 15):
+                self.local_sig, self.local_cur = sig, cur_summary(_current(self.log_dir), wall)
+                tabs_changed = True
+        tabs = M.tabs() if M is not None else []
+        entry = next((e for e in tabs if e["mid"] == self.mid), None)
+        mid = entry["mid"] if entry is not None else "local"
+        if M is not None:           # another tab's history goes a minute after it was left (04 §4.6)
+            nowm = time.monotonic()
+            live = {e["mid"] for e in tabs}
+            for m_ in [m_ for m_ in self.feeds if m_ != "local" and m_ != mid]:
+                if m_ not in live or nowm - self.left.setdefault(m_, nowm) > FEED_KEEP_S:
+                    del self.feeds[m_]
+                    self.left.pop(m_, None)
+            self.left.pop(mid, None)
+        feed = self.feeds.get(mid)
+        if feed is None:
+            d = os.path.join(M.base, mid)
+            feed = self.feeds[mid] = Feed(os.path.join(d, "log"), os.path.join(d, "ledger"))
+        now = wall + (M.tab(entry, wall)["sync"]["offset_s"] if entry is not None else 0.0)
+        changed = feed.step(now, self.span)
+        if changed or tabs_changed or self.posted != mid:
+            self.posted = mid
+            self.post(self.model(now, wall, mid))
+
+    def model(self, now, wall=None, mid="local"):
+        """The selected machine's model, with the tabs when there are machines."""
+        m = self.feeds[mid].model(now)
+        M = self.machines
+        if M is None:
+            return m
+        wall = now if wall is None else wall
+        local = local_tab(m if mid == "local" else None, self.local_cur)
+        tabs = [local] + [M.tab(e, wall) for e in M.tabs()]
+        sel = next((i for i, t in enumerate(tabs) if t["mid"] == mid), 0)
+        m.update(tabs=tabs, sel=sel, tab_mid=mid, wall=wall, engine=self.engine,
+                 book=[dict(e) for e in M.entries if not e.get("forgetting") and not M.is_hidden(e["mid"])])
+        if mid != "local":
+            t = tabs[sel]
+            m.update(remote=True, host=t["label"], os=t.get("system") or "", off_text=None,
+                     incidents=[dict(i, report=None) for i in m["incidents"]])
+            if m.get("logger") == "off":
+                m["logger"] = "ok"
+        return m
+
+
 def at(model, now):
     """The model as of `now` (a frame drawn between two of the worker's models): the clock, and the
-    stretch without samples from the last one to now."""
+    stretch without samples from the last one to now. For another machine its clock (01 §4.6), what
+    claims to be now greyed when the link is not live, and the stretches not received (01 §3.5)."""
     m = dict(model, now=now)
+    m.pop("views", None)
+    t = None
+    if "tabs" in model:
+        m["wall"] = now
+        if model.get("remote"):
+            t = model["tabs"][model.get("sel", 0)]
+            m["now"] = now = now + t["sync"]["offset_s"]
     last = model.get("last_t")
     if last is not None and now - last > view.GAP_S:
         m["gaps"] = list(model["gaps"]) + [(last, now)]
+    if t is not None:
+        v = view.link_view(t, m["wall"], model.get("engine", "on"))
+        sy = t["sync"]
+        m["stale"], m["known"] = v["stale"], t.get("known")
+        m["gaps"], m["missing"] = view.mirror_gaps(m["gaps"], sy["have"], sy["gone"], sy["oldest"], now, v["stale"])
+        if m["missing"]:
+            m["first"] = min(m["first"], m["missing"][0][0]) if m.get("first") is not None else m["missing"][0][0]
     return m
 
 
@@ -1235,6 +1746,8 @@ def write_crash(sdir, text):
 NAV = ("up", "down", "pgup", "pgdn", "home", "end")
 KEY_ALIASES = {"j": "down", "k": "up", "f1": "?", " ": "space"}   # the decoder gives a printable key as itself
 SPAN_WORDS = {"inf": "14 days", "24h": "24 h", "6h": "6 h", "1h": "1 h"}
+MACHINE_DIALOGS = ("connect", "pair", "ssh", "ask", "name", "rename", "forget", "attention", "list")
+TEXT_DIALOGS = ("connect", "pair", "name", "rename", "list")
 REPORT_LAST = {"inf": "14d", "24h": "24h", "6h": "6h", "1h": "1h"}
 
 
@@ -1267,7 +1780,7 @@ class App:
     nothing."""
 
     def __init__(self, term, caps, auto, span, log_dir, readonly=None, bell=False, fixed_now=None, probe=True,
-                 note=None, mouse=False):
+                 note=None, mouse=False, machines=None, no_connect=False, start_mid="local"):
         self.term, self.caps, self.auto = term, caps, auto
         self.mouse = mouse
         self.ui = {"span": span}
@@ -1278,10 +1791,21 @@ class App:
         self.wake_r, self.wake_w = os.pipe()
         for fd in (self.wake_r, self.wake_w):
             fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
-        self.src = Source(log_dir, self.post, clock=self.now, root=os.geteuid() == 0)
+        self.me = [sys.executable or "/usr/bin/python3", "-I", "-B", os.path.realpath(oomph.__file__)]
+        self.src = Source(log_dir, self.post, clock=self.now, root=os.geteuid() == 0, machines=machines)
         self.src.span = span
+        self.M = machines                    # None: no machine tabs (oomph_sync missing, root, read-only)
+        self.S = machines.S if machines is not None else None
+        self.src.engine = "off" if no_connect else "on"
+        self.sync = SyncChild(self.remote_argv() + ["sync", "--json"], self.sync_woke) \
+            if machines is not None and not no_connect else None
+        self.add, self.add_from, self.undo, self.pending_select, self.watching = None, None, None, None, None
+        self.queued = []                     # commands for the sync child while it is not running
+        self.mid = start_mid if machines is not None else "local"
+        self.src.mid = self.mid
         ssh = bool(os.environ.get("SSH_CONNECTION"))
-        self.decoder = Decoder(self.on_event, esc_wait=0.15 if ssh else 0.05, mouse=lambda: self.mouse)
+        self.decoder = Decoder(self.on_event, esc_wait=0.15 if ssh else 0.05, mouse=lambda: self.mouse,
+                               in_text=self.in_text)
         self.probe_until = (time.monotonic() + (0.5 if ssh else 0.15)) if probe else 0.0
         self.probe = probe
         self.full = self.dirty = True
@@ -1292,7 +1816,6 @@ class App:
         self.note_until = 0.0
         self.pending = ""
         self.children = []
-        self.me = [sys.executable or "/usr/bin/python3", "-I", "-B", os.path.realpath(oomph.__file__)]
         self.open_ids, self.pressure, self.bell_at, self.first_model = set(), None, -1e9, True
         self.data_at = 0.0
         self.size = (80, 24)
@@ -1303,6 +1826,16 @@ class App:
     # ---- time and the worker
     def now(self):
         return self.fixed_now if self.fixed_now is not None else time.time()
+
+    def sync_woke(self, failed):
+        """From the sync child's reader: the worker reads the files again; a failure wakes the loop
+        too, for its note."""
+        self.src.wake.set()
+        if failed:
+            try:
+                os.write(self.wake_w, b"f")
+            except OSError:
+                pass
 
     def post(self, model):
         """From the worker: a finished model. Only the newest is kept: while the loop is held up (a
@@ -1390,6 +1923,10 @@ class App:
                 signal.signal(s, self._late)
             self.src.stop.set()
             self.src.wake.set()
+            if self.sync is not None:            # quitting settles an undo, as closing the popup does
+                self.sync.quit()
+            if self.add is not None:
+                self.add.cancel()
             try:
                 self.term.restore()
             finally:
@@ -1415,8 +1952,13 @@ class App:
                    nowm + (0.1 if any(c[3] for c in self.children) else 0.5) if self.children else None,
                    self.data_at + 0.5 if not self.models.empty() else None]
             wait = max(0.0, min([d for d in due if d is not None]) - nowm)
+            kids = [self.add.fileno()] if self.add is not None and self.add.fileno() is not None else []
+            if self.sync is not None and not self.sync.running() and self.wants_sync():
+                wait = min(wait, max(0.0, self.sync.next_at - nowm))
             try:
-                r, _, _ = select.select([fd, self.wake_r], [], [], min(wait, 10.0))
+                r, _, _ = select.select([fd, self.wake_r] + kids, [], [],
+                                        min(wait, 1.0 if self.add is not None or self.sync is not None and self.wants_sync()
+                                            else 10.0))
             except InterruptedError:
                 r = []
             nowm = time.monotonic()
@@ -1440,6 +1982,8 @@ class App:
                     self.decoder.feed(data, nowm)
             self.decoder.tick(nowm)
             self.handle_flags(nowm)
+            if self.M is not None:
+                self.machines_tick(nowm)
             if not self.models.empty() and nowm >= self.data_at + 0.5:
                 self.take_models()
                 self.data_at = nowm
@@ -1466,6 +2010,8 @@ class App:
             self.suspend()
         if "cont" in f:
             f.discard("cont")
+            if self.sync is not None and self.sync.running() is False and self.M is not None:
+                self.M.reopen(self.now())
             self.term.enter(self.mouse_modes())      # a shell may have changed the modes while we were stopped
             self.size, self.full, self.dirty = self.term.size(), True, True
 
@@ -1477,6 +2023,10 @@ class App:
         if os.getpgrp() == os.getsid(0):
             self.no_stop()
             return
+        if self.sync is not None:       # suspended is not watching (04 §4.7): the lock is free for the app at once
+            self.sync.quit()
+            self.sync.next_at = 0.0
+            self.watching = None
         self.term.restore()
         signal.signal(signal.SIGTSTP, signal.SIG_DFL)
         self.flags.discard("cont")
@@ -1485,6 +2035,8 @@ class App:
         signal.signal(signal.SIGTSTP, self._flag("tstp"))
         stopped = "cont" in self.flags
         self.flags.discard("cont")
+        if self.M is not None:
+            self.M.reopen(self.now())
         self.term.enter(self.mouse_modes())
         self.size, self.full, self.dirty = self.term.size(), True, True
         if not stopped:
@@ -1534,6 +2086,8 @@ class App:
         with 45 s left)? Then the frame is drawn every second; otherwise every 10 s (minutes and the
         clock are at most that late)."""
         now = m["now"]
+        if self.undo is not None or any(not t.get("local") for t in m.get("tabs") or ()):
+            return True                 # marks, countdowns and the opening's steps change by the second
         for r in m["res"]:
             if r.get("ended") is None:
                 if r.get("granted") is None and now - r["requested"] < 90:
@@ -1593,6 +2147,17 @@ class App:
         kind = ev[0]
         if kind == "reply":
             self.on_reply(ev[1], ev[2])
+            return
+        if kind in ("text", "paste") and self.in_text():
+            self.dirty = True
+            try:
+                self.type_text(ev[1])
+            except (Leave, Gone):
+                raise
+            except Exception:
+                if not self.readonly:
+                    write_crash(state_dir(), traceback.format_exc())
+                self.note("that key failed; the details are in top-crash.log", "warntx")
             return
         if kind in ("paste", "paste-too-long"):
             self.note("pasted text ignored")
@@ -1662,6 +2227,21 @@ class App:
             if not button & 64:
                 ui.pop("overlay")
             return
+        if y == 0 and m.get("tabs") and not button & 64:      # row 0: a tab, a counter, the +
+            fr = view.Frame(self.size[0], 1, self.caps.glyphs == "ascii")
+            view.machine_tabs(fr, m, self.caps, view.GLYPHS[self.caps.glyphs])
+            for x0, x1, kind, which in fr.tab_hits:
+                if x0 <= x < x1:
+                    tabs = m["tabs"]
+                    if kind == "tab":
+                        self.select_mid(tabs[which]["mid"])
+                    elif kind == "plus":
+                        self.key_machines("+", m)
+                    else:                            # a counter: the nearest machine it hides
+                        shown = [h[3] for h in fr.tab_hits if h[2] == "tab"]
+                        i = min(shown) - 1 if which == "l" else max(shown) + 1
+                        self.select_mid(tabs[max(0, min(i, len(tabs) - 1))]["mid"])
+            return
         P = view.layout(m, *self.size)
         act = view.mouse(ui, m, P, view.GLYPHS[self.caps.glyphs], button, x, y)
         self.keep_note()
@@ -1692,8 +2272,13 @@ class App:
         W, H = self.size
         P = view.layout(m, W, H)
         ov = ui.get("overlay")
+        if ov and ov.get("kind") in MACHINE_DIALOGS:
+            self.key_machine_dialog(k, ov, m)
+            return
         if ov:
             self.key_overlay(k, ov, m, P)
+            return
+        if self.M is not None and not ui.get("inspect") and self.key_machines(k, m):
             return
         if ui.get("inspect") and W >= 40 and H >= 10:
             if k in ("t", "T"):                      # the span changes; the cursor keeps its time
@@ -1735,6 +2320,8 @@ class App:
                 ui["panel"] = k
         elif k == "enter":
             self.open_card(m)
+        elif k in ("o", "y") and m.get("tab_mid", "local") != self.mid:
+            pass                        # the frame is still the last tab's: its incidents are not this one's
         elif k == "o":
             kind, item = view.selected(m, ui)
             self.report(item if kind == "inc" else None)
@@ -1766,7 +2353,7 @@ class App:
             ui.pop("overlay")
         elif k == "?":
             if ov["kind"] == "help" and boxed_help:
-                ov["page"] = 3 - ov.get("page", 1)
+                ov["page"] = ov.get("page", 1) % view.help_count(m) + 1
             elif ov["kind"] == "help":
                 ui.pop("overlay")
             else:
@@ -1779,7 +2366,8 @@ class App:
                        "end": n}.get(k, off)
                 ov["off"] = max(0, min(off, max(n - rows, 0)))
             elif boxed_help and k in ("left", "right", "tab"):
-                ov["page"] = 3 - ov.get("page", 1)
+                n = view.help_count(m)
+                ov["page"] = (ov.get("page", 1) - 1 + (-1 if k == "left" else 1)) % n + 1
         elif k in NAV:
             same = {"res": "res", "inc": "inc", "a": "panel", "s": "panel"}.get(ov["kind"])
             if ui.get("focus") == same:              # the card follows the selection of its list
@@ -1791,10 +2379,435 @@ class App:
                     ov["id"] = item["id"]
                 elif kind in ("a", "s"):
                     ov["id"] = item[0]
-        elif ov["kind"] == "inc" and k in ("o", "y"):
+        elif ov["kind"] == "inc" and k in ("o", "y") and m.get("tab_mid", "local") == self.mid:
             inc = next((i for i in m["incidents"] if i["id"] == ov.get("id")), None)
             if inc:
                 (self.report if k == "o" else self.copy)(inc)
+
+    # ---- machines (04 §3.7, §3.8, §4.7)
+    def remote_argv(self):
+        """How `oomph remote …` is run: this program's own CLI (OOMPH_TOP_REMOTE, a JSON argument
+        vector, puts a stand-in there for the tests)."""
+        v = os.environ.get("OOMPH_TOP_REMOTE")
+        if v:
+            try:
+                a = json.loads(v)
+                if isinstance(a, list) and a and all(isinstance(x, str) for x in a):
+                    return a
+            except ValueError:
+                pass
+        return self.me + ["remote"]
+
+    def in_text(self):
+        """A text field has the keyboard: letters are letters (q too), until esc."""
+        ov = self.ui.get("overlay")
+        return bool(ov and ov.get("kind") in TEXT_DIALOGS and not ov.get("busy"))
+
+    def tabs(self):
+        return (self.model or {}).get("tabs") or []
+
+    def wants_sync(self):
+        """The child runs while another machine is a tab, or a command waits for it."""
+        return bool(self.queued) or len(self.tabs()) > 1 or (self.M is not None and bool(self.M.tabs()))
+
+    def command(self, c):
+        """A command for the sync child (01 §5.8's pipe commands); queued while it is not running."""
+        if self.sync is None:
+            return False
+        if not self.sync.send(c):
+            self.queued.append(c)
+        return True
+
+    def machines_tick(self, nowm):
+        """The sync child: its events wake the worker; it is started while wanted (again after a
+        backoff when it ended) and told which machines to keep live, the selected one first."""
+        sc = self.sync
+        if self.pending_select and any(t["mid"] == self.pending_select for t in self.tabs()):
+            self.select_mid(self.pending_select)
+            self.pending_select = None
+        elif self.model is not None and self.model.get("tabs") and self.mid != "local" and \
+                not any(t["mid"] == self.mid for t in self.tabs()):
+            self.select_mid("local")            # its tab went (disconnected or forgotten in the app)
+        if self.add is not None:
+            if self.add.pump() or self.add.done():
+                self.add_progress()
+        if sc is None:
+            return
+        for ev in sc.events():
+            self.note("%s failed: %s" % (ev.get("cmd") or "that", view.fit(str(ev.get("detail") or ev.get("reason")), 60)),
+                      "warntx", 8.0)
+            if ev.get("cmd") == "forget" and self.M is not None:
+                self.M.unhide(ev.get("id"))                 # still in machines.json: its tab again
+                self.src.wake.set()
+        if sc.p is not None and sc.reap(nowm):
+            self.watching = None
+        if not sc.running() and self.wants_sync() and nowm >= sc.next_at:
+            if sc.start(nowm):
+                self.watching = None
+                if self.M is not None and sc.attempt:
+                    self.M.reopen(self.now())
+        if sc.running():
+            mids = [t["mid"] for t in self.tabs() if not t.get("local")]
+            want = (tuple(mids), self.mid if self.mid != "local" else None)
+            if want != self.watching:
+                if sc.send({"cmd": "watch", "ids": mids, "focus": want[1]}):
+                    self.watching = want
+            q, self.queued = self.queued, []
+            for c in q:
+                self.command(c)
+        if self.undo and nowm >= self.undo[2]:
+            self.undo = None
+
+    def select_mid(self, mid):
+        """Show another tab: its lists start unselected; the span is shared by all (04 §3.7)."""
+        if mid == self.mid:
+            return
+        self.mid = mid
+        self.src.select(mid)
+        for k in ("focus", "res_sel", "inc_sel", "res_off", "inc_off", "panel", "panel_sel", "panel_off", "inspect",
+                  "yhold"):
+            self.ui.pop(k, None)
+        self.dirty = True
+
+    def sel_tab(self):
+        tabs = self.tabs()
+        i = next((i for i, t in enumerate(tabs) if t["mid"] == self.mid), 0)
+        return i, (tabs[i] if tabs else None)
+
+    def key_machines(self, k, m):
+        """The keys of the tabs; True when one was used."""
+        tabs = m.get("tabs") or []
+        if not tabs:
+            return False
+        i, t = self.sel_tab()
+        v = view.tab_views(m)[min(i, len(tabs) - 1)]
+        remote = t is not None and not t.get("local")
+        on = self.sync is not None
+        if k in "123456789" and len(k) == 1:
+            if int(k) <= len(tabs):
+                self.select_mid(tabs[int(k) - 1]["mid"])
+            return True
+        if k == "0":
+            self.ui["overlay"] = {"kind": "list", "filter": "", "sel": i}
+            return True
+        if k in ("tab", "n", "shift-tab", "p"):
+            if len(tabs) > 1:
+                self.select_mid(tabs[(i + (1 if k in ("tab", "n") else -1)) % len(tabs)]["mid"])
+            return True
+        if k == "+":
+            if not on:
+                self.note("--no-connect: nothing is added", "dim", 6.0)
+            elif len(tabs) - 1 >= view.MAX_TABS:
+                self.note("Twelve machines are connected. Disconnect one to add another.", "warntx", 8.0)
+            else:
+                self.ui["overlay"] = {"kind": "connect", "text": "", "sel": None}
+            return True
+        if not remote or k not in ("x", "X", "r", "R", "u", "enter"):
+            if k == "u" and self.undo:
+                return self.undo_unpin()
+            return False
+        if k == "u":
+            return self.undo_unpin()
+        if not on:
+            self.note("not syncing (--no-connect)", "dim", 4.0)
+            return k != "enter"
+        if k == "x":
+            self.command({"cmd": "unpin", "id": t["mid"]})
+            self.undo = (t["mid"], t["label"], time.monotonic() + UNDO_S)
+            self.note("%s disconnected %s u undo" % (view.fit(t["label"], 24), view.MIDDOT), "dim", UNDO_S)
+            self.select_mid(tabs[i - 1]["mid"] if i > 0 else "local")
+        elif k == "X":
+            self.ui["overlay"] = {"kind": "forget", "mid": t["mid"], "label": t["label"], "connected": v["live"],
+                                  "ssh": t.get("transport") == "ssh"}
+        elif k == "r":
+            if v["retry"]:
+                self.command({"cmd": "retry", "id": t["mid"]})
+                self.note("trying %s now" % view.fit(t["label"], 24), "dim")
+            elif v["attention"]:
+                self.note("r can't help: enter says why", "dim")
+        elif k == "R":
+            self.ui["overlay"] = {"kind": "rename", "mid": t["mid"], "name": t["label"], "text": t["label"], "fresh": True}
+        elif k == "enter":
+            if not v["attention"] or view.selected(m, self.ui)[0] is not None:
+                return False
+            self.ui["overlay"] = {"kind": "attention", "mid": t["mid"]}
+        return True
+
+    def undo_unpin(self):
+        u = self.undo
+        if not u or time.monotonic() >= u[2]:
+            return False
+        self.command({"cmd": "pin", "id": u[0]})
+        self.pending_select, self.undo = u[0], None
+        self.note("%s is a tab again" % view.fit(u[1], 24), "dim")
+        return True
+
+    def entry(self, mid):
+        return next((e for e in (self.model or {}).get("book") or [] if e["mid"] == mid), None)
+
+    def type_text(self, text):
+        """Typed or pasted into the dialog's field."""
+        ov = self.ui["overlay"]
+        kind = ov["kind"]
+        if kind == "pair":
+            c = ov.get("code", "")
+            for ch in text.upper().translate(str.maketrans("OIL", "011")):
+                if ch in self.S.net.CODE_ALPHABET and len(c) < 12:
+                    c += ch
+            ov["code"], ov["error"] = c, None
+            return
+        key = "filter" if kind == "list" else "text"
+        old = "" if ov.get("fresh") else ov.get(key, "")
+        ov[key] = (old + "".join(ch for ch in text if ch >= " " and ch != "\x7f"))[:300]
+        ov["fresh"], ov["error"] = False, None
+        if kind == "connect":
+            ov["sel"] = None
+        if kind == "list":
+            ov["sel"] = 0
+
+    def key_machine_dialog(self, k, ov, m):
+        """The keys of the machines' dialogs (04 §3.8). Every one leaves with esc; q quits nothing
+        here (in a field it is a letter, elsewhere it closes like esc)."""
+        kind = ov["kind"]
+        ui = self.ui
+        if ov.get("busy"):
+            if k == "esc":
+                if self.add is not None:
+                    self.add.cancel()
+                    self.add = None
+                ov.pop("busy", None)
+            return
+        if k in ("backspace", "ctrl-u") and kind in TEXT_DIALOGS:
+            if kind == "pair":
+                ov["code"] = "" if k == "ctrl-u" else ov.get("code", "")[:-1]
+            else:
+                key = "filter" if kind == "list" else "text"
+                ov[key] = "" if k == "ctrl-u" or ov.get("fresh") else ov.get(key, "")[:-1]
+                ov["fresh"] = False
+                if kind == "connect":
+                    ov["sel"] = None
+            ov["error"] = None
+            return
+        if kind == "connect":
+            rows, start = view.connect_rows(ov.get("text", ""), m.get("book") or [])
+            sel = ov.get("sel") if ov.get("sel") is not None else start
+            if sel is not None and not 0 <= sel < len(rows):     # the Recents shrank meanwhile (the app forgot one)
+                sel = ov["sel"] = None if not rows else len(rows) - 1
+            if k == "esc":
+                ui.pop("overlay")
+            elif k in ("up", "down") and rows:
+                ov["sel"] = max(0, min(len(rows) - 1, (sel if sel is not None else -1) + (1 if k == "down" else -1)))
+            elif k == "tab" and sel is not None and rows[sel][0] == "known":
+                ov["text"], ov["sel"], ov["fresh"] = rows[sel][2], None, False
+            elif k == "ctrl-d" and sel is not None and rows[sel][0] == "known":
+                e = rows[sel][1]
+                ui["overlay"] = {"kind": "forget", "mid": e["mid"], "label": view.label_of(e), "connected": False,
+                                 "ssh": e.get("transport") == "ssh", "back": dict(ov)}
+            elif k == "enter" and sel is not None:
+                row = rows[sel]
+                if row[0] == "known":
+                    self.use_known(row[1])
+                else:
+                    self.connect_typed(row[1], ov)
+            return
+        if kind == "pair":
+            if k == "esc":
+                ui["overlay"] = {"kind": "connect", "text": ov.get("target", ""), "sel": None}
+            elif k == "ctrl-y":
+                self.clip("sudo %s share pair" % oomph.CMD)
+            elif k == "enter":
+                if len(ov.get("code", "")) != 12:
+                    ov["error"] = "A code has twelve characters, as `sudo oomph share pair` shows them there."
+                else:
+                    c = ov["code"]
+                    self.run_add(ov["target"], "-".join((c[:4], c[4:8], c[8:])), ov.get("fp"))
+            return
+        if kind == "ssh":
+            if k in ("esc", "q"):
+                ui["overlay"] = {"kind": "connect", "text": ov.get("target", ""), "sel": None}
+            elif k == "enter":
+                self.run_add(ov["target"], None)
+            return
+        if kind == "ask":
+            if k in ("up", "down"):
+                ov["sel"] = 1 - ov.get("sel", 0) if k in ("up", "down") else ov.get("sel", 0)
+            elif k == "enter" and self.add is not None:
+                back = ov.get("back") or {"kind": "connect", "text": ""}
+                self.add.answer("new" if ov.get("sel", 0) == 0 else "replace:" + ov["mid"])
+                ui["overlay"] = dict(back, busy="Adding %s…" % view.fit(ov.get("label") or "it", 24), error=None)
+                self.add.ask = None
+            elif k in ("esc", "q"):
+                if self.add is not None:
+                    self.add.answer("")
+                    back = ov.get("back") or {"kind": "connect", "text": ""}
+                    ui["overlay"] = dict(back, busy="Giving the pairing back…", error=None)
+                    self.add.ask = None
+                else:
+                    ui.pop("overlay")
+            return
+        if kind in ("name", "rename"):
+            if k == "esc":
+                ui.pop("overlay")
+            elif k == "enter":
+                label = ov.get("text", "").strip()
+                if kind == "rename" or (label and label != ov.get("text0")):
+                    self.command({"cmd": "rename", "id": ov["mid"], "label": label})
+                ui.pop("overlay")
+            return
+        if kind == "forget":
+            if k in ("esc", "q", "n"):
+                if ov.get("back"):
+                    ui["overlay"] = ov["back"]
+                else:
+                    ui.pop("overlay")
+            elif k == "y":
+                if not self.command({"cmd": "forget", "id": ov["mid"]}):
+                    self.note("not syncing (--no-connect): nothing is forgotten", "dim", 6.0)
+                    ui.pop("overlay")
+                    return
+                if self.M is not None:
+                    self.M.hide(ov["mid"])
+                    self.src.wake.set()
+                if self.mid == ov["mid"]:
+                    i, _ = self.sel_tab()
+                    tabs = self.tabs()
+                    self.select_mid(tabs[i - 1]["mid"] if i > 0 else "local")
+                self.note("forgetting %s" % view.fit(ov.get("label") or "it", 24), "dim")
+                ui.pop("overlay")
+            return
+        if kind == "attention":
+            _, t = self.sel_tab()
+            if k in ("esc", "q") or t is None or t["mid"] != ov.get("mid"):
+                ui.pop("overlay")
+                return
+            keys = [x[0] for x in view.attention_keys(view.tab_views(m)[self.sel_tab()[0]]["cause"],
+                                                      t.get("transport") == "ssh")]
+            if k == "p" and "p" in keys:
+                e = self.entry(t["mid"])
+                target = self.S.show_target(e) if e else t.get("addr")
+                ui["overlay"] = {"kind": "pair", "target": target, "code": "", "fp": None, "fp_short": ""}
+                self.run_add(target, None)
+            elif k == "r" and "r" in keys:
+                self.command({"cmd": "retry", "id": t["mid"]})
+                self.note("trying %s now" % view.fit(t["label"], 24), "dim")
+                ui.pop("overlay")
+            elif k == "X":
+                ui["overlay"] = {"kind": "forget", "mid": t["mid"], "label": t["label"], "connected": False,
+                                 "ssh": t.get("transport") == "ssh"}
+            return
+        if kind == "list":
+            rows = view.list_rows_machines(m, ov.get("filter", ""))
+            if k == "esc":
+                ui.pop("overlay")
+            elif k in NAV and rows:
+                n = len(rows)
+                ov["sel"] = max(0, min(n - 1, ov.get("sel", 0) + {"up": -1, "down": 1, "pgup": -10, "pgdn": 10,
+                                                                   "home": -n, "end": n}[k]))
+            elif k == "enter" and rows:
+                self.select_mid(rows[max(0, min(ov.get("sel", 0), len(rows) - 1))][1]["mid"])
+                ui.pop("overlay")
+
+    def use_known(self, e):
+        """A remembered machine always becomes a tab, reachable or not (01 §3.7); a tab is just shown."""
+        self.ui.pop("overlay", None)
+        if e.get("pinned"):
+            self.select_mid(e["mid"])
+            return
+        if len(self.tabs()) - 1 >= view.MAX_TABS:
+            self.note("Twelve machines are connected. Disconnect one to add another.", "warntx", 8.0)
+            return
+        self.command({"cmd": "pin", "id": e["mid"]})
+        self.pending_select = e["mid"]
+
+    def connect_typed(self, text, ov):
+        """enter on "as typed": a link fills the code step (nothing is sent until enter there); an ssh
+        address asks for consent first; anything else is tried, and a new machine asks for its code."""
+        S = self.S
+        try:
+            if text.startswith("oomph://"):
+                target, code = S.parse_link(text)
+                self.ui["overlay"] = {"kind": "pair", "target": target, "code": code, "fp": None, "fp_short": ""}
+                return
+            t = S.parse_target(text)
+        except ValueError:
+            ov["error"] = view.connect_message("bad_address", text)
+            return
+        if t["transport"] == "ssh" or text.startswith("ssh://"):
+            self.ui["overlay"] = {"kind": "ssh", "target": text}
+        else:
+            self.run_add(text, None)
+
+    def run_add(self, target, code, fp=None):
+        """`oomph remote add`, the dialog showing that it works (esc lets it go)."""
+        ov = self.ui.get("overlay") or {"kind": "connect", "text": target}
+        argv = self.remote_argv() + ["add", target, "--json", "--no-mirror", "--ask"]
+        if code is not None:
+            argv += ["--code", "-"] + (["--fp", fp] if fp else [])
+        if self.add is not None:
+            self.add.cancel()
+        try:
+            self.add = AddRun(argv, code)
+        except OSError:
+            ov["error"] = "can't start the %s command" % oomph.CMD
+            return
+        self.add_from = dict(ov, busy=None, error=None)
+        ov["busy"] = "Connecting to %s…" % view.fit(target.rpartition("@")[2], 40)
+        ov["error"] = None
+        self.ui["overlay"] = ov
+
+    def add_progress(self):
+        """What `remote add` said: the identity question, then its answer (01 §3.7's errors stay in
+        the dialog; a new machine asks for the tab's name)."""
+        a = self.add
+        if a.ask is not None and (self.ui.get("overlay") or {}).get("kind") != "ask":
+            k = a.ask.get("known") if isinstance(a.ask.get("known"), dict) else {}
+            if isinstance(k.get("mid"), str) and self.S.MID.fullmatch(k["mid"]):
+                self.ui["overlay"] = {"kind": "ask", "mid": k["mid"], "label": view.fit(str(k.get("label") or k["mid"]), 32),
+                                      "sel": 0, "back": dict(self.add_from)}
+            else:
+                a.answer("")
+                a.ask = None
+            self.dirty = True
+            return
+        if not a.done():
+            return
+        self.add = None
+        o = a.result or {}
+        back = dict(self.add_from or {"kind": "connect", "text": ""})
+        self.dirty = True
+        if o.get("ok") is True and isinstance(o.get("machine"), dict) and self.S.MID.fullmatch(str(o["machine"].get("mid"))):
+            mm = o["machine"]
+            self.pending_select = mm["mid"]
+            if o.get("new") is True:
+                name = mm.get("name") if isinstance(mm.get("name"), str) else back.get("target") or "?"
+                short = view.fit(name.split(".")[0] if not self.S._is_ip(name) else name, 32)
+                about = (" %s " % view.MIDDOT).join(x for x in (
+                    mm.get("os_version") if isinstance(mm.get("os_version"), str) else None,
+                    "%.0f GB" % mm["ram_gb"] if _num(mm.get("ram_gb"), None) else None,
+                    "%s %s" % (oomph.CMD, mm["version"]) if isinstance(mm.get("version"), str) else None) if x)
+                self.ui["overlay"] = {"kind": "name", "mid": mm["mid"], "name": view.fit(name, 32), "text": short,
+                                      "text0": short, "fresh": True, "about": view.fit(about, 60)}
+            else:
+                self.ui.pop("overlay", None)
+            return
+        code, detail = str(o.get("error") or ""), str(o.get("detail") or "")
+        target = back.get("target") or back.get("text") or ""
+        if code in ("needs_code", "revoked"):
+            self.ui["overlay"] = {"kind": "pair", "target": target, "code": back.get("code", "") if back.get("kind") == "pair" else "",
+                                  "fp": o.get("fp") if isinstance(o.get("fp"), str) else None,
+                                  "fp_short": view.fit(str(o.get("fp_short") or ""), 24),
+                                  "revoked": code == "revoked" or o.get("revoked") is True}
+            return
+        if code == "identity_changed" and back.get("kind") == "pair" and isinstance(o.get("fp"), str):
+            back.update(fp=o["fp"], fp_short=view.fit(str(o.get("fp_short") or ""), 24))
+        back["error"] = view.connect_message(code, target, view.fit(detail, 200), o.get("side")) if (code or detail) \
+            else "%s remote add ended without an answer" % oomph.CMD
+        self.ui["overlay"] = back
+
+    def clip(self, text):
+        tool = _clip_tool() if not self.readonly and not os.environ.get("SSH_CONNECTION") else None
+        if not (tool and self.spawn(tool, "copy", text)):
+            self.osc52(text)
 
     # ---- o and y: the report, the clipboard
     def local_desktop(self):
@@ -1872,6 +2885,10 @@ class App:
         """o: the incident's report, or with nothing selected the report for the span on screen; where
         no browser can open (over SSH, as root) the dashboard says where it is instead."""
         me = self.me
+        if getattr(self, "mid", "local") != "local":        # another machine's reports are written there
+            self.note("a report of %s: %s incident%s --html there" % (
+                view.fit(self.model.get("host") or "?", 16), oomph.CMD, " " + inc["id"] if inc else ""), "dim", 8.0)
+            return
         local = self.local_desktop()
         if local and any(k == "report" for _, k, _, _ in self.children):
             self.note("a report is still being written…")
@@ -2074,7 +3091,7 @@ def cmd_top(args, out=None, env=None):
     out = out or sys.stdout
     env = os.environ if env is None else env
     opts, ignored = {}, []
-    takes = ("--span", "--size", "--color", "--theme", "--glyphs", "--format", "--now", "--ssh", "--ssh-port")
+    takes = ("--span", "--size", "--color", "--theme", "--glyphs", "--format", "--now", "--ssh", "--ssh-port", "--machine")
     i = 0
     while i < len(args):
         a = args[i]
@@ -2151,7 +3168,13 @@ def cmd_top(args, out=None, env=None):
         if fmt not in ("text", "ansi", "golden"):
             print("oomph top: --format takes text, ansi or golden", file=sys.stderr)
             return 2
-        model = load_model(span, now)
+        if "--machine" in opts:
+            model = once_machine(opts["--machine"], span, now)
+            if isinstance(model, str):
+                sys.stderr.write("oomph top: %s\n" % model)
+                return 2
+        else:
+            model = load_model(span, now)
         if ignored:
             model.update(status="ignored: %s" % " ".join(ignored)[:60], status_role="warntx")
         fr = view.render(model, w, h, caps, {"span": span})
@@ -2222,8 +3245,80 @@ def cmd_top(args, out=None, env=None):
     probe = "--no-probe" not in opts and term_name not in ("linux", "vt100", "vt220", "ansi")
     caps = view.Caps(detect_color(color, True, env), detect_glyphs(glyphs, env), detect_theme(theme, env))
     auto = {"color": color == "auto", "theme": theme == "auto", "glyphs": glyphs == "auto"}
+    machines, start, kept, note = None, "local", False, "ignored: %s" % " ".join(ignored)[:60] if ignored else None
+    why = no_tabs_reason(readonly)
+    S = sync_module() if why is None else None
+    if S is not None:
+        machines = Machines(S.machines_dir(), S)
+        machines.refresh(now if now is not None else time.time())
+        start, kept = start_tab(machines, settings.get("machine"), opts.get("--machine"))
+        if start is None:
+            start, note = "local", "no machine named %s: oomph remote list" % view.fit(opts["--machine"], 32)
+    elif "--machine" in opts:
+        note = "--machine: no other machines in this run (%s)" % (why or "oomph remote is not installed")
     app = App(Term(sys.stdin.fileno(), out.fileno()), caps, auto, span, oomph.LOG_DIR, readonly, bell, now, probe,
-              note="ignored: %s" % " ".join(ignored)[:60] if ignored else None, mouse=mouse)
+              note=note, mouse=mouse, machines=machines, start_mid=start,
+              no_connect="--no-connect" in opts or "--from-ssh" in opts)   # over --ssh: that account's mirrors, no dialling
     rc = app.run()
-    remember(span=app.ui["span"], **({} if "--from-ssh" in opts else {"mouse": app.mouse}))
+    more = {} if "--from-ssh" in opts else {"mouse": app.mouse}
+    if machines is not None and "--machine" not in opts and not (kept and app.mid == "local"):
+        more["machine"] = app.mid               # (a start on this machine for what it had to say keeps the tab)
+    remember(span=app.ui["span"], **more)
     return rc
+
+
+def no_tabs_reason(readonly):
+    """Why this run has no machine tabs, or None: they need the state folder writable and not root
+    (04 §4.10), and on Linux they come with T3 (roadmap §3.1, 1.13.2: the engine's files there)."""
+    if readonly:
+        return "read-only"
+    if os.geteuid() == 0:
+        return "running as root"
+    if sys.platform != "darwin" and not os.environ.get("OOMPH_TOP_TABS"):
+        return "not on Linux yet"
+    return None
+
+
+def start_tab(M, remembered, asked):
+    """Which tab a run starts on (01 §3.3 rule 4, 04 §3.7), and whether the remembered one was passed
+    over: the one named by --machine (None when no machine has that name); else the tab of the last
+    run, unless this machine has something to say (D9, as the app's localHasSay): its pressure is
+    critical, an incident is open, or its logger is installed but not reporting. Warning is not
+    enough. That does not change the remembered tab."""
+    tabs = M.tabs()
+    if asked is not None:
+        if asked in ("local", "this", host_name()):
+            return "local", False
+        e = next((e for keys in (("mid", "id"), ("label",), ("name",), ("host",)) for e in tabs
+                  if any(e.get(k) == asked for k in keys)), None)
+        return (e["mid"] if e else None), False
+    if not (isinstance(remembered, str) and any(e["mid"] == remembered for e in tabs)):
+        return "local", False
+    c = _current(oomph.LOG_DIR)
+    if c is not None:
+        cs = cur_summary(c, time.time())
+        if cs["pressure"] == "Critical" or cs["incident"] or cs["silent"]:
+            return "local", True
+    return remembered, False
+
+
+def once_machine(asked, span, now=None):
+    """--once --machine NAME: that tab's frame, read as the dashboard's worker reads it (its mirror,
+    never measured here); this machine's own frame for its own name. A string says why not."""
+    why = no_tabs_reason(None)
+    S = sync_module() if why is None else None
+    if S is None:
+        return "--machine: no other machines here (%s)" % (why or "oomph remote is not installed")
+    wall = float(now) if now is not None else time.time()
+    M = Machines(S.machines_dir(), S)
+    M.refresh(wall - 30)
+    mid, _ = start_tab(M, None, asked)
+    if mid is None:
+        return "no machine named %s: oomph remote list" % view.fit(asked, 32)
+    if mid == "local":
+        return load_model(span, now)
+    got = []
+    src = Source(oomph.LOG_DIR, got.append, clock=lambda: wall, machines=M)
+    src.span, src.mid = span, mid
+    src.step()
+    return at(got[-1], wall)

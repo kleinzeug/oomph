@@ -30,6 +30,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import unicodedata
 
@@ -657,6 +658,241 @@ def test_arrays():
 # group, waits for it, and reports the program's pid, its exit and whether the terminal's modes after it
 # are the modes before it. (The terminal is taken from a session when its leader exits: the leader must
 # outlive the program to look.)
+# ------------------------------------------------------------------ machines (T2): the pure parts
+def fake_tabs(n, now, states=None):
+    """This machine and n others, with marks of every kind."""
+    kinds = states or ["live", "offline", "attention", "live-warn", "connecting", "live-crit-inc"]
+    tabs = [dict(mid="local", local=True, label="studio", cur=dict(pressure="Normal", t=now, interval=30, silent=False,
+                                                                     incident=None), version="1.10.3", system="macOS 27.2")]
+    for i in range(n):
+        k = kinds[i % len(kinds)]
+        st = {"state": "live", "updated": now, "pid": 1}
+        cur = dict(pressure="Normal", t=now, interval=30, silent=False, incident=None)
+        if k == "offline":
+            st = {"state": "offline", "error": "timeout", "updated": now, "last_contact": now - 600, "next_try": now + 40}
+        elif k == "attention":
+            st = {"state": "needs_attention", "error": "identity_changed", "updated": now}
+        elif k == "connecting":
+            st = {"state": "connecting", "updated": now}
+        elif k == "live-warn":
+            cur["pressure"] = "Warning"
+        elif k == "live-crit-inc":
+            cur.update(pressure="Critical", incident="20261120-132412")
+        tabs.append(dict(mid="m-%016x" % i, local=False, label="machine-number-%d" % (i + 1), addr="host%d.local" % i,
+                         transport="tcp", status=st, pid_alive=True, cur=cur,
+                         sync=dict(offset_s=0, have=[], gone=[], oldest=None, synced={}), known=now - 60,
+                         opened=(now - 60, False), version="1.10.0", system="macOS 27.1"))
+    return tabs
+
+
+def test_tab_ladder():
+    """04 §3.7: at every width from 40 to 200 columns and with 1 to 13 machines, the first, a middle and the
+    last selected: the selected tab with its label and its ×, the + and the capsule are there; a counter is a
+    guillemet, a plus sign and a count; rows are as wide as the terminal."""
+    caps = V.Caps("256", "unicode", "dark")
+    g = V.GLYPHS["unicode"]
+    bad = []
+    for n in range(0, 13):
+        for sel in sorted({0, n // 2, n}):
+            for W in range(40, 201, 3):
+                tabs = fake_tabs(n, NOW)
+                m = dict(now=NOW, wall=NOW, brand="oomph", tabs=tabs, sel=sel, engine="on", cur=None, logger="ok")
+                fr = V.Frame(W, 10)
+                V.machine_tabs(fr, m, caps, g)
+                row = "".join(c[0] for c in fr.c[0])
+                lab = V.fit(tabs[sel]["label"], 2, g)[:1]
+                hits = fr.tab_hits
+                seltab = [h for h in hits if h[2] == "tab" and h[3] == sel]
+                cap = V.tab_views(m)[sel]["capsule"][0] if sel else V.capsule(m)[0]
+                why = None
+                if not seltab:
+                    why = "no selected tab"
+                elif lab not in row[seltab[0][0]:seltab[0][1]]:
+                    why = "the selected tab has no label"
+                elif sel and g["close"] not in row[seltab[0][0]:seltab[0][1]]:
+                    why = "no ×"
+                elif not any(h[2] == "plus" for h in hits) or "+" not in row:
+                    why = "no +"
+                elif cap not in row:
+                    why = "no capsule"
+                elif len(fr.c[0]) != W:
+                    why = "row width"
+                for h in hits:
+                    if h[2] == "more":
+                        txt = row[h[0]:h[1]]
+                        if not (("‹+" in txt and txt.index("‹+") == 0) if h[3] == "l" else txt.endswith("›")):
+                            why = "a counter without its guillemet: %r" % txt
+                        if not any(ch.isdigit() for ch in txt):
+                            why = "a counter without its count: %r" % txt
+                shown = {h[3] for h in hits if h[2] == "tab"}
+                hidden = sum(int("".join(c for c in row[h[0]:h[1]] if c.isdigit())) for h in hits if h[2] == "more")
+                if len(shown) + hidden != len(tabs):
+                    why = "%d tabs shown and %d counted of %d" % (len(shown), hidden, len(tabs))
+                if why:
+                    bad.append("%d machines, %d selected, %d columns: %s (%r)" % (n + 1, sel + 1, W, why, row.rstrip()))
+    check(not bad, "tab bar: 40 to 200 columns, 1 to 13 machines, first/middle/last selected: the selected tab with "
+                   "label and ×, the +, the capsule and every machine shown or counted (%s)" % (bad[:2],))
+    m = dict(now=NOW, wall=NOW, brand="oomph", tabs=fake_tabs(6, NOW), sel=2, engine="on", cur=None, logger="ok")
+    fr = V.Frame(80, 2)
+    V.machine_tabs(fr, m, caps, g)
+    row = "".join(c[0] for c in fr.c[0])
+    check(row.startswith(" oomph  1●  2●  3 machi… ⊘ ×  4▲  5◐  6↻  7◆!  +") and row.rstrip().endswith("Not connected  13:27"),
+          "tab bar at 80 columns: labels cut alike, the marks by state and pressure, a red ! for an incident (%r)" % row)
+
+
+def test_link_rows():
+    """Every row of 04 §3.7's table: its capsule and its sentence from a status.json."""
+    w = NOW
+    cur = dict(pressure="Normal", t=w - 20, interval=30, silent=False, incident=None)
+    rows = [
+        ({"state": "live", "updated": w, "pid": 1}, cur, "Normal", "Logging every 30 s"),
+        ({"state": "live", "updated": w, "pid": 1}, dict(cur, silent=True, t=w - 3600), "No readings",
+         "Connected, but its logger stopped at 12:27"),
+        ({"state": "catching_up", "updated": w, "pid": 1}, cur, "Normal", "Catching up: fetching missed history…"),
+        ({"state": "offline", "error": "timeout", "updated": w, "last_contact": w - 1800, "next_try": w + 40}, cur,
+         "Not connected", "No answer since 12:57 · next try in 40 s"),
+        ({"state": "offline", "error": "refused", "updated": w}, cur, "Sharing is off there", "Last data 13:26"),
+        ({"state": "offline", "error": "local_network_denied", "updated": w}, cur, "Blocked by macOS", "Last data 13:26"),
+        ({"state": "needs_attention", "error": "identity_changed", "updated": w}, cur, "Key changed",
+         "Its key changed · last data 13:26"),
+        ({"state": "needs_attention", "error": "revoked", "updated": w}, cur, "Access revoked", "Access revoked · last data"),
+        ({"state": "needs_attention", "error": "incompatible", "updated": w}, cur, "Too old", "talk to this one"),
+        ({"state": "needs_attention", "error": "ssh", "updated": w}, cur, "SSH can't sign in", "SSH can't sign in · last"),
+        ({"state": "pairing", "updated": w}, cur, "Pairing…", "Pairing…"),
+        ({"state": "connecting", "updated": w}, cur, "Connecting…", "Last data 13:26"),
+        ({"state": "live", "updated": w - 30, "pid": 1}, dict(cur, pressure="Warning"), "Not connected",
+         "pressure was warning"),
+    ]
+    bad = []
+    for st, c, cap, words in rows:
+        t = dict(mid="m-0000000000000001", local=False, label="mac-mini", status=st, pid_alive=True, cur=c,
+                 sync=dict(offset_s=0, have=[(w - 86400, w - 60)], gone=[], oldest=None,
+                           synced={"ledger": True, "incidents": True}), known=w - 60,
+                 opened=(w - 60, False), transport="tcp")
+        v = V.link_view(t, w)
+        s = V.machine_sentence(t, v, dict(now=w, wall=w, engine="on", tabs=[t]))
+        if v["capsule"][0] != cap or words not in s:
+            bad.append("%s/%s: %r %r" % (st["state"], st.get("error"), v["capsule"][0], s))
+    t = dict(mid="m-0000000000000001", local=False, label="mac-mini", status={"state": "idle", "was": "live", "connect_ms": 400,
+             "updated": w - 100}, pid_alive=False, cur=cur, sync={}, known=w - 100, opened=(w - 0.5, True), transport="tcp")
+    grace = V.link_view(t, w)
+    t["opened"] = (w - 2, True)
+    conn = V.link_view(t, w)
+    t["opened"] = (w - 9, True)
+    after = V.link_view(t, w)
+    ns = V.link_view(t, w, engine="off")
+    check(not bad and grace["phase"] == "grace" and grace["dim"] and not grace["stale"] and
+          conn["capsule"][0] == "Connecting…" and after["capsule"][0] == "Not connected" and
+          ns["capsule"][0] == "Not syncing",
+          "link: every row of 04 §3.7's table has its capsule and sentence; an opening is a grace (dimmed), then "
+          "Connecting…, then Not connected at 8 s; --no-connect is Not syncing (%s)" % bad)
+    crash = []
+    for junk in ([], {}, 1e308, -1e308, 10 ** 400, "x", None, True):
+        for st in ({"state": "offline", "error": junk, "last_contact": junk, "next_try": junk, "updated": junk},
+                   {"state": junk, "error": "timeout", "updated": w, "last_contact": 1e308, "next_try": 1e308}):
+            t = dict(mid="m-0000000000000001", local=False, label="mac-mini", status=st, pid_alive=True,
+                     cur=dict(cur, t=junk), sync={}, known=junk, opened=(w - 60, False), transport="tcp")
+            try:
+                V.machine_sentence(t, V.link_view(t, w), dict(now=w, wall=w, engine="on", tabs=[t]))
+            except Exception as e:
+                crash.append("%s: %s" % (repr(st)[:120], e))
+    check(not crash, "link: a status.json with lists, huge or odd values is drawn as not connected, not a crash (%s)"
+          % crash[:2])
+
+
+def test_mirror_gaps():
+    """MachineStore.mirrorGaps in Python: inside coverage no data, outside not received, gone, not connected."""
+    now = 10000.0
+    nd, miss = V.mirror_gaps([(1000, 1600), (8000, 8500)], [(0, 5000), (6000, 9000)], [], 0, now, True)
+    nd2, miss2 = V.mirror_gaps([], [(0, 5000)], [(-500, -100)], -500, now, False)
+    nd3, miss3 = V.mirror_gaps([], [], [], None, now, True)
+    nd4, miss4 = V.mirror_gaps([], [(0, now - 100)], [], 0, now, False)
+    check(nd == [(1000, 1600), (8000, 8500)] and miss == [(5000, 6000, "not_received"), (9000, now, "not_connected")] and
+          miss2 == [(-500, -100, "gone"), (-100, 0, "not_received"), (5000, now, "not_received")] and
+          miss3 == [(now - 14 * 86400, now, "not_connected")] and miss4 == [],
+          "not received: holes in the coverage map by kind; the youngest one while live only past a gap (%s %s %s %s)"
+          % (miss, miss2, miss3, miss4))
+
+
+def test_connect_rows():
+    """04 §3.8: a complete address highlights "as typed" (round 1 sent 192.168.1.4 to a remembered .42); a
+    beginning highlights the best match; nothing typed lists the Recents."""
+    book = [{"mid": "m-1", "name": "build-box", "host": "build-box.local", "addrs": ["192.168.1.42"], "pinned": True},
+            {"mid": "m-2", "name": "air", "host": "air.local", "addrs": [], "pinned": False, "last_connected": 5}]
+    r1, s1 = V.connect_rows("192.168.1.4", book)
+    r2, s2 = V.connect_rows("bui", book)
+    r3, s3 = V.connect_rows("", book)
+    r4, s4 = V.connect_rows("sam@atlas", book)
+    check(r1[s1][0] == "typed" and r1[0][1]["mid"] == "m-1" and r2[s2][1]["mid"] == "m-1" and
+          [r[1]["mid"] for r in r3] == ["m-2"] and s3 == 0 and r4[s4] == ("typed", "sam@atlas"),
+          "connect: as typed for a complete address, the match for a beginning, Recents for nothing")
+    msgs = [V.connect_message(c, "mac-mini.local") for c in ("refused", "timeout", "dns", "pair_failed", "too_many")]
+    check(all(m and "this Mac" not in m.replace("Share this Mac", "") for m in msgs) and "mac-mini" in msgs[0] and
+          "isn't oomph" in V.connect_message("not_oomph", "x.local") and
+          "not installed" in V.connect_message("not_oomph", "sam@atlas", "oomph is not installed on atlas"),
+          "connect: 01 §3.7's sentences, this Mac read as this computer")
+
+
+# 04 §8's row expectations for what was a golden frame before the list closed: (what, mirror selected, width,
+# height, span, glyphs, the dialog open, pinned machines more, {row: the row's text from its first column, or a
+# piece of it}). The chart is in the goldens; these rows are the tab bar, the machine line, the dialogs and the keys.
+MACHINE_ROWS = [
+    ("tabs, this machine selected", "local", 80, 24, "24h", "unicode", None, 0, {
+        0: " 1 studio ●  2 mac-m… ●  3 build… ⊘  4 gpu-b… ▲  5 rende… ↻  +    Normal  13:27",
+        1: " ● studio · this machine · Logging every 30 s         oomph 1.10.0 · macOS 27.2",
+        23: " q quit  ? help  a apps  ←→ span  ↑↓ select  tab machine  s sessions  e events"}),
+    ("the attention card", "m-90a1b2c3d4e5f607", 80, 24, "24h", "unicode",
+     {"kind": "attention", "mid": "m-90a1b2c3d4e5f607"}, 0, {
+         0: " 1 studio ●  2 mac-m… ●  3 build… ⊘  4 gpu-b… ▲ ×  5 rende… ↻  +   Key changed",
+         1: " ▲ gpu-box · Its key changed · last data yesterday 15:27           oomph 1.10.0",
+         4: "╭─ gpu-box needs attention ─", 6: "│  Its key changed.  ",
+         8: "│  gpu-box answers with a different key than the one pinned when   │",
+         14: "│  Last data yesterday 15:27; what was received stays here.        │",
+         18: "│  esc close  p pair again  X forget                               │", 23: " esc close"}),
+    ("Connect, an address typed", "local", 80, 24, "24h", "unicode",
+     {"kind": "connect", "text": "192.168.1.4", "sel": None}, 0, {
+         4: "╭─ Connect to a machine ─", 6: "│  Address   192.168.1.4    ",
+         8: "│    mac-mini   192.168.1.40 · macOS 27.1 · 64 GB           12:27  │",
+         12: "│    air        192.168.1.47 · macOS 26.4 · 16…  Wed 18 Nov 13:27  │",
+         13: "│  › + connect to “192.168.1.4” as typed                           │",
+         18: "│  esc cancel  enter connect  tab complete  ↑↓ choose  ^D forget   │", 23: " esc close"}),
+    ("the list of machines", "m-7f3a9c1e5b2d4a68", 80, 24, "24h", "unicode", {"kind": "list", "filter": "", "sel": 1}, 0, {
+        0: " 1 studio ●  2 mac-m… ● ×  3 build… ⊘  4 gpu-b… ▲  5 rende… ↻  +        Normal",
+        1: " ● mac-mini · Logging every 30 s                      oomph 1.10.0 · macOS 27.1",
+        9: "│      1 ●  studio         this machine                       connected  │",
+        10: "│  ›   2 ●  mac-mini       mac-mini.local                     connected  │",
+        11: "│      3 ⊘  build-box      build-box.local                not connected  │",
+        12: "│      4 ▲  gpu-box        gpu-box.loc…    needs attention: key changed  │",
+        13: "│      5 ↻  render-01      sam@render-01                    catching up  │",
+        16: "│  esc close  enter show  ↑↓ choose  type to filter                      │", 23: " esc close"}),
+    ("twelve tabs in ASCII", "m-1b2c3d4e5f607182", 80, 24, "6h", "ascii", None, 8, {
+        0: " 1*  2*  3 build~ o x  4^  5~  6o  7o  8o  9o  10o  o+3>  +      Not connected",
+        1: " o build-box - No answer since 12:47 - next try in 40 s            oomph 1.10.0",
+        4: "+- all  24h  6h  1h -------- #Wired #App #Compr. #Swap /no data :not received -+",
+        6: "|                ::::::::::::::::::::!::::::::::::::::::::::::::::::::::::     |",
+        12: "+- Reserved by agents ------------------------- as of 12:47: 12.0 GB reserved -+",
+        18: "|  #  2.0G  pnpm check              webshop                     was using 0.3G |",
+        23: " q quit  ? help  r retry now  x disconnect  X forget  tab machine  + add"}),
+]
+
+
+def test_machine_rows():
+    """04 §8: the machine frames beyond the four goldens, as rows (from the same fixture and model)."""
+    base = tempfile.mkdtemp(prefix="oomph-toptest-")
+    led, log = oomph.LEDGER_DIR, oomph.LOG_DIR
+    try:
+        dirs = {}
+        for what, mid, w, h, span, glyphs, ov, more, rows in MACHINE_ROWS:
+            got = topfixture.machine_frame(base, dirs, mid, w, h, span, glyphs, ov, more).text().rstrip("\n").split("\n")
+            bad = [(y, got[y].rstrip()) for y, want in sorted(rows.items())
+                   if y >= len(got) or (want != got[y].rstrip() if not want.endswith(" ") and len(want) >= w - 4
+                                        else want.strip() not in got[y])]
+            check(not bad, "machine rows: %s (%s)" % (what, bad[:2]))
+    finally:
+        oomph.LEDGER_DIR, oomph.LOG_DIR = led, log
+        shutil.rmtree(base, ignore_errors=True)
+
+
 LAUNCHER = r"""
 import json, os, resource, signal, subprocess, sys, termios, fcntl
 os.setsid()
@@ -820,7 +1056,8 @@ def test_pty(base):
         V.press(ui, "up", model, V.layout(model, 80, 24))
         m1 = T.load_model("1h", NOW, log_dir=log, live=False)
         m1.update(host=model["host"], os=model["os"])
-        want = V.render(m1, 80, 24, caps, ui)
+        tabs = T.no_tabs_reason(None) is None and T.sync_module() is not None
+        want = V.render(T.with_tabs(m1) if tabs else m1, 80, 24, caps, ui)   # (with machines: its own tab and the +, 04 §3.7)
         why = vt.shows(want, caps)
         p.send("q", wait=0.1)
         rc = p.wait(5)
@@ -922,6 +1159,630 @@ def test_pty(base):
             p.close()
     r = subprocess.run(top(), stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=30)
     check(r.returncode == 2 and "--once" in r.stderr, "without a terminal oomph top exits 2 and points to --once")
+
+
+# ------------------------------------------------------------------ machines (T2) in the pty
+FAKE_REMOTE = r'''
+import json, os, sys
+log = os.environ["FAKE_REMOTE_LOG"]
+def rec(o):
+    with open(log, "a") as f:
+        f.write(json.dumps(o) + "\n")
+def out(o):
+    sys.stdout.write(json.dumps(o) + "\n")
+    sys.stdout.flush()
+args = sys.argv[1:]
+rec({"argv": args, "pid": os.getpid()})
+mdir = os.environ["OOMPH_MACHINES_DIR"]
+def book(f=None):
+    b = json.load(open(os.path.join(mdir, "machines.json")))
+    if f is not None:
+        f(b)
+        json.dump(b, open(os.path.join(mdir, ".m.tmp"), "w"))
+        os.rename(os.path.join(mdir, ".m.tmp"), os.path.join(mdir, "machines.json"))
+    return b
+if args[:1] == ["sync"]:
+    out({"ev": "hello", "pid": os.getpid()})
+    for line in sys.stdin:
+        c = json.loads(line)
+        rec({"cmd": c, "pid": os.getpid()})
+        if c.get("cmd") == "forget" and c.get("id") == "m-00000000000000bb":     # the book was busy: it stays
+            out({"ev": "failed", "cmd": "forget", "id": c["id"], "reason": "busy", "detail": "the book is busy"})
+        elif c.get("cmd") == "forget":                                            # as the engine does: it goes
+            gone = [e for e in book()["machines"] if e["mid"] == c["id"]]
+            json.dump(gone, open(os.path.join(mdir, ".forgotten"), "w"))
+            book(lambda b: b.update(machines=[e for e in b["machines"] if e["mid"] != c["id"]]))
+        out({"ev": "machines"})
+    rec({"eof": os.getpid()})
+    sys.exit(0)
+target = args[1]
+if target == "gpu-box.local":           # the forgotten machine, added again: its own id again (01's Book.place)
+    again = json.load(open(os.path.join(mdir, ".forgotten")))
+    book(lambda b: b["machines"].extend(dict(e, pinned=True) for e in again))
+    out({"ok": True, "machine": {"mid": again[0]["mid"], "name": "gpu-box"}, "new": False})
+    sys.exit(0)
+code = sys.stdin.readline().strip() if "--code" in args else None
+rec({"code": code})
+if target == "new.local" and code is None:
+    out({"ok": False, "error": "needs_code", "fp": "sha256:" + "ab" * 32, "fp_short": "ABAB ABAB ABAB ABAB"})
+    sys.exit(1)
+if code == "AAAA-AAAA-AAAA":
+    out({"ok": False, "error": "pair_failed", "detail": "the code was not accepted"})
+    sys.exit(1)
+if target == "new.local":
+    out({"ev": "ask", "question": "identity", "detail": "same id", "known": {"mid": "m-1b2c3d4e5f607182", "label": "build-box"}})
+    a = sys.stdin.readline().strip()
+    rec({"answer": a})
+    if a != "new":
+        out({"ok": False, "error": "ask", "detail": "nothing added"})
+        sys.exit(1)
+mid = "m-00000000000000aa"
+b = json.load(open(os.path.join(mdir, "machines.json")))
+b["machines"].append({"mid": mid, "id": mid, "name": "new-box", "transport": "tcp", "host": "new-box.local", "port": 6674,
+                      "pinned": True, "order": 50})
+json.dump(b, open(os.path.join(mdir, ".m.tmp"), "w"))
+os.rename(os.path.join(mdir, ".m.tmp"), os.path.join(mdir, "machines.json"))
+out({"ok": True, "machine": {"mid": mid, "name": "new-box", "os_version": "macOS 27.2", "ram_gb": 64, "version": "1.10.3"},
+     "new": target == "new.local"})
+'''
+
+
+def screen(p, w=80, h=24):
+    vt = MiniVT(w, h)
+    vt.feed(p.text())
+    return "\n".join("".join(c[0] for c in row) for row in vt.cells)
+
+
+def records(path):
+    try:
+        with open(path) as f:
+            return [json.loads(x) for x in f if x.strip()]
+    except OSError:
+        return []
+
+
+def wait_until(fn, secs, p=None):
+    end = time.time() + secs
+    while time.time() < end:
+        if p is not None:
+            p.pump(0.1)
+        else:
+            time.sleep(0.1)
+        if fn():
+            return True
+    return False
+
+
+def test_pty_machines(base):
+    """04 §10.8 with a scripted sync child (01's commands recorded) and a scripted `remote add`: tabs from
+    machines.json, switching, retry, disconnect and undo, rename, forget, connect with the pairing code (a
+    wrong one, the identity question, the tab's name), ssh with its consent, a machine added by "the app",
+    the machine list, the "what happened" card; ctrl-z quits the child and a resume starts one; q ends it."""
+    os.makedirs(base)
+    env, log, led = fixture_env(base)
+    mdir = topfixture.write_machines(os.path.join(base, "m"), pid=os.getpid())
+    fake = os.path.join(base, "fake_remote.py")
+    with open(fake, "w") as f:
+        f.write(FAKE_REMOTE)
+    flog = os.path.join(base, "remote.log")
+    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_TOP_REMOTE=json.dumps([PY, "-I", fake]), FAKE_REMOTE_LOG=flog,
+               OOMPH_TOP_TABS="1")
+    r1 = subprocess.run(top("--once", "--machine", "build-box", "--size", "80x24", "--format", "text"), env=env,
+                        capture_output=True, text=True, timeout=30)
+    r2 = subprocess.run(top("--once", "--machine", "nope", "--size", "80x24"), env=env, capture_output=True, text=True,
+                        timeout=30)
+    check(r1.returncode == 0 and "build-box · No answer since 12:47" in r1.stdout and r2.returncode == 2 and
+          "no machine named nope" in r2.stderr,
+          "machines: --once --machine NAME prints that tab's frame; an unknown name is refused (exit 2) (%s %s)"
+          % (r1.returncode, r1.stderr[-200:] + r2.stderr[-200:]))
+    p = Pty(top(), env, jobs=True)
+    mini, build, gpu = "m-7f3a9c1e5b2d4a68", "m-1b2c3d4e5f607182", "m-90a1b2c3d4e5f607"
+
+    def cmds(kind=None):
+        return [r["cmd"] for r in records(flog) if "cmd" in r and (kind is None or r["cmd"].get("cmd") == kind)]
+    try:
+        p.pump(5, until=b"this machine")
+        s0 = screen(p)
+        watched = wait_until(lambda: any(c.get("cmd") == "watch" and set(c["ids"]) >= {mini, build, gpu} for c in cmds()), 5, p)
+        check("1 studio" in s0.splitlines()[0] or " 1 " in s0.splitlines()[0] and "this machine" in s0 and watched,
+              "machines: the tabs of machines.json after this one; the sync child is told to watch them all")
+        p.send("3", wait=0.6)
+        s3 = screen(p)
+        focus = wait_until(lambda: any(c.get("cmd") == "watch" and c.get("focus") == build for c in cmds()), 3, p)
+        p.send("r", wait=0.4)
+        retried = any(c == {"cmd": "retry", "id": build} for c in cmds())
+        check("build-box · No answer since 12:47" in s3 and "Not connected" in s3 and focus and retried,
+              "machines: 3 shows build-box, not connected, its sentence; the child is told it is the focus; r retries")
+        p.send("x", wait=0.5)
+        sx = screen(p)
+        p.send("u", wait=0.5)
+        check(any(c == {"cmd": "unpin", "id": build} for c in cmds()) and "build-box disconnected · u undo" in sx and
+              any(c == {"cmd": "pin", "id": build} for c in cmds()),
+              "machines: x disconnects (unpin) and says so with u undo for 6 s; u pins it again")
+        p.send("2", "R", "m", "i", "n", "i", "enter", wait=0.4)
+        check(any(c == {"cmd": "rename", "id": mini, "label": "mini"} for c in cmds()),
+              "machines: R asks for the tab's name (typing replaces the name shown) and renames it")
+        p.send("4", "r", wait=0.5)
+        no_retry = "r can't help: enter says why" in screen(p) and not any(c == {"cmd": "retry", "id": gpu} for c in cmds())
+        p.send("enter", wait=0.6)
+        card = screen(p)
+        p.send("esc", "X", wait=0.5)
+        forget_q = screen(p)
+        p.send("y", wait=0.5)
+        check("gpu-box needs attention" in card and "Its key changed." in card and "p pair again" in card and
+              "Forget gpu-box?" in forget_q and any(c == {"cmd": "forget", "id": gpu} for c in cmds()) and no_retry,
+              "machines: r where retrying can't help says so (no retry); enter on a tab that needs attention shows "
+              "what happened; X asks, y forgets (%s)" % no_retry)
+        def watched_now():
+            w = cmds("watch")
+            return w[-1] if w else {}
+        gone = wait_until(lambda: gpu not in watched_now().get("ids", []) and "gpu-box · " not in screen(p), 4, p)
+        p.send("+", wait=0.3)
+        for ch in "gpu-box.local":
+            os.write(p.master, ch.encode())
+        p.pump(0.3)
+        p.send("enter", wait=0.3)
+        back = wait_until(lambda: watched_now().get("focus") == gpu and "gpu-box · " in screen(p), 6, p)
+        check(gone and back, "machines: a machine forgotten and added again in the same run is a tab again, and "
+                             "shown (%s %s)" % (gone, back))
+        p.send("+", wait=0.4)
+        for ch in "new.local":
+            os.write(p.master, ch.encode())
+        p.pump(0.3)
+        p.send("enter", wait=0.2)
+        pair_up = wait_until(lambda: "Pair with new.local" in screen(p), 6, p)
+        sp = screen(p)
+        for ch in "aaaa-aaaa-aaaa":
+            os.write(p.master, ch.encode())
+        p.pump(0.3)
+        p.send("enter", wait=0.2)
+        wrong = wait_until(lambda: "wasn't accepted" in screen(p), 6, p)
+        p.send(b"\x15", wait=0.2)                    # ctrl-u: the field empty again
+        os.write(p.master, b"\x1b[200~k7qf-2m9x-d4tr\x1b[201~")   # a paste fills it
+        p.pump(0.3)
+        p.send("enter", wait=0.2)
+        asked = wait_until(lambda: "Same machine as build-box?" in screen(p), 6, p)
+        p.send("enter", wait=0.2)
+        named = wait_until(lambda: "Paired with new-box" in screen(p), 6, p)
+        for ch in "box":
+            os.write(p.master, ch.encode())
+        p.pump(0.3)
+        p.send("enter", wait=0.6)
+        recs = records(flog)
+        adds = [r["argv"] for r in recs if "argv" in r and r["argv"][:1] == ["add"]]
+        codes = [r["code"] for r in recs if "code" in r]
+        newtab = wait_until(lambda: "new-" in screen(p).splitlines()[0], 4, p)
+        check(pair_up and "ABAB ABAB ABAB ABAB" in sp and "sudo oomph share pair" in sp and wrong and asked and named and
+              any(r.get("answer") == "new" for r in recs) and
+              all("K7QF" not in " ".join(a) and "AAAA" not in " ".join(a) for a in adds) and
+              ["--code", "-", "--fp", "sha256:" + "ab" * 32] == adds[-1][-4:] and codes[-1] == "K7QF-2M9X-D4TR" and
+              any(c == {"cmd": "rename", "id": "m-00000000000000aa", "label": "box"} for c in cmds()) and newtab,
+              "machines: + to a new machine asks for its code with the key; a wrong code is said in the dialog; a "
+              "paste fills the code; the identity question answers new; the tab's name renames it; the code goes on "
+              "stdin, never in an argument (%s %s %s %s %s %s %s)" % (pair_up, wrong, asked, named, codes[-1:], newtab,
+                                                                      "ABAB ABAB ABAB ABAB" in sp))
+        p.send("+", wait=0.3)
+        for ch in "sam@atlas":
+            os.write(p.master, ch.encode())
+        p.pump(0.3)
+        p.send("enter", wait=0.4)
+        consent = screen(p)
+        p.send("enter", wait=0.2)
+        closed = wait_until(lambda: "Connect to" not in screen(p), 6, p)
+        adds = [r["argv"] for r in records(flog) if "argv" in r and r["argv"][:1] == ["add"]]
+        check("ssh -l sam -- atlas oomph serve --stdio" in consent and "Whoever can sign in to atlas as sam" in consent and
+              closed and adds[-1][:2] == ["add", "sam@atlas"],
+              "machines: ssh needs no code; the dialog shows the command and the consent, enter connects")
+        b = json.load(open(os.path.join(mdir, "machines.json")))
+        b["machines"].append({"mid": "m-00000000000000bb", "name": "from-the-app", "transport": "tcp",
+                              "host": "from-the-app.local", "port": 6674, "pinned": True, "order": 60})
+        json.dump(b, open(os.path.join(mdir, ".x"), "w"))
+        os.rename(os.path.join(mdir, ".x"), os.path.join(mdir, "machines.json"))
+        p.send("0", wait=0.3)
+        for ch in "from":
+            os.write(p.master, ch.encode())
+        appeared = wait_until(lambda: "from-the-app" in screen(p), 4, p)
+        p.send("enter", wait=0.5)
+        shown = "from-the-app · " in screen(p)
+        check(appeared and shown, "machines: a machine added by the app appears; 0 lists every machine, typing filters, "
+                                  "enter shows it")
+        p.send("X", wait=0.4)
+        p.send("y", wait=0.2)
+        failed = wait_until(lambda: "forget failed: the book is busy" in screen(p), 4, p)
+        p.pump(1.5)                                  # (the worker's next models: a hidden tab would be gone by now)
+        kept = wait_until(lambda: "m-00000000000000bb" in watched_now().get("ids", []), 4, p)
+        check(failed and kept, "machines: a forget the engine could not do is said, and the tab comes back (%s %s)"
+                               % (failed, kept))
+        n_sync = len([r for r in records(flog) if r.get("argv", [None])[:1] == ["sync"]])
+        p.send("ctrl-z", wait=0.6)
+        quitted = wait_until(lambda: len([r for r in records(flog) if "eof" in r]) >= 1, 3)
+        os.kill(p.pid, signal.SIGCONT)
+        again = wait_until(lambda: len([r for r in records(flog) if r.get("argv", [None])[:1] == ["sync"]]) > n_sync, 6, p)
+        check(quitted and again, "machines: ctrl-z ends the sync child (the end of its input: the lock is free for the "
+                                 "app at once); after fg a new one runs (%s %s)" % (quitted, again))
+        p.send("q", wait=0.2)
+        rc = p.wait(5)
+        ended = wait_until(lambda: len([r for r in records(flog) if "eof" in r]) >= 2, 3)
+        check(rc == 0 and ended and p.restored() and b"Traceback" not in p.out,
+              "machines: q leaves (exit 0) and the sync child gets the end of its input (rc %s)" % rc)
+    finally:
+        p.close()
+    p = Pty(top("--no-connect"), env)
+    try:
+        p.pump(5, until=b"this machine")
+        p.send("3", wait=0.5)
+        s = screen(p)
+        n0 = len(records(flog))
+        p.send("+", wait=0.4)
+        s2 = screen(p)
+        p.send("q", wait=0.1)
+        rc = p.wait(5)
+        check("Not syncing" in s and "--no-connect" in s and "--no-connect: nothing is added" in s2 and
+              not [r for r in records(flog)[n0:] if "argv" in r] and rc == 0,
+              "--no-connect: no child; the tabs say Not syncing (--no-connect); + says why it adds nothing")
+    finally:
+        p.close()
+    app = T.App.__new__(T.App)                     # a thirteenth machine: 01's sentence
+    tabs = fake_tabs(12, NOW)
+    app.model, app.ui, app.sync, app.M, app.note_until, app.dirty = dict(tabs=tabs, sel=0), {}, object(), object(), 0, False
+    app.mid, app.undo = "local", None
+    app.key_machines("+", dict(tabs=tabs, sel=0, now=NOW, wall=NOW, engine="on"))
+    check("overlay" not in app.ui and "Twelve machines are connected" in app.ui.get("note", ("",))[0],
+          "machines: + with twelve other machines says 01's sentence and opens nothing")
+    tabs = fake_tabs(3, NOW)                       # a click on row 0: a tab is shown, the + opens Connect
+    m = dict(tabs=tabs, sel=0, now=NOW, wall=NOW, engine="on", brand="oomph", cur=None, logger="ok")
+    app.model, app.ui, app.size, app.caps, app.src = m, {}, (80, 24), V.Caps("256", "unicode", "dark"), T.Source("/nonexistent", None)
+    app.model_now = lambda: m
+    fr = V.Frame(80, 1)
+    V.machine_tabs(fr, m, app.caps, V.GLYPHS["unicode"])
+    hit = {h[2] + str(h[3]): h[0] for h in fr.tab_hits}
+    app.click(0, hit["tab2"], 0)
+    picked = app.mid
+    app.click(0, hit["plusNone"], 0)
+    check(picked == tabs[2]["mid"] and app.ui.get("overlay", {}).get("kind") == "connect",
+          "machines: with the mouse on, a click on a tab shows it and a click on + opens Connect")
+
+
+def _lock_free(path):
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+    finally:
+        os.close(fd)                    # (closing drops a lock taken here at once)
+
+
+def _logger_stand_in(log, stop):
+    """A logger for the served fixture: a sample appended to today's file every second (at most ten
+    minutes), so the coverage map grows while the test runs and a hole in it would show."""
+    with open(os.path.join(log, "current.json")) as f:
+        last = {k: v for k, v in json.load(f).items() if k not in ("groups", "claude", "top", "daemon", "procs")}
+    for _ in range(600):
+        if stop.wait(1.0):
+            return
+        now = time.time()
+        with open(os.path.join(log, "samples-%s.jsonl" % time.strftime("%Y-%m-%d", time.localtime(now))), "a") as f:
+            f.write(json.dumps(dict(last, t=now), separators=(",", ":")) + "\n")
+
+
+def _ppid(pid):
+    r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+    return int(r.stdout.strip() or 0)
+
+
+def test_pty_engine(base):
+    """04 §8's T2 exit criterion with 01's real engine: a machine over a stand-in ssh (it runs `oomph serve
+    --stdio` on a fixture). While "the app's" engine holds engine.lock the dashboard's child follows; when
+    that engine is killed, the dashboard's child takes the lock and the tab is live again with no hole left
+    in the coverage map; ctrl-z frees the lock at once; after fg a new child runs; a dashboard stopped
+    with SIGSTOP leaves its engine's status.json fresh. Then engine_handover: quitting the dashboard leaves
+    the app's engine live, and X in the dashboard while the app's engine holds the lock forgets it in both."""
+    os.makedirs(base)
+    env, log, led = fixture_env(base)
+    mdir = os.path.join(base, "machines")
+    fake = os.path.join(base, "fakessh")
+    with open(fake, "w") as f:
+        f.write("#!%s -I\nimport os, sys\nos.execv(%r, [%r, '-I', '-B', %r, 'serve', '--stdio'])\n" % (PY, PY, PY, CLI))
+    os.chmod(fake, 0o755)
+    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_SSH=fake, OOMPH_TOP_TABS="1")
+    r = subprocess.run([PY, "-I", "-B", CLI, "remote", "add", "sam@atlas", "--name", "atlas", "--no-mirror", "--json"],
+                       env=env, capture_output=True, text=True, timeout=60)
+    try:
+        mid = json.loads(r.stdout)["machine"]["mid"]
+    except (ValueError, KeyError):
+        check(False, "engine: remote add over the stand-in ssh (%s %s)" % (r.stdout[-300:], r.stderr[-300:]))
+        return
+    status = os.path.join(mdir, mid, "status.json")
+
+    def st():
+        try:
+            with open(status) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {}
+    stop = threading.Event()
+    threading.Thread(target=_logger_stand_in, args=(log, stop), daemon=True).start()
+    app = subprocess.Popen([PY, "-I", "-B", CLI, "remote", "sync", "--json"], stdin=subprocess.PIPE,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+    app.stdin.write((json.dumps({"cmd": "watch", "ids": [mid]}) + "\n").encode())
+    app.stdin.flush()
+    p = None
+    try:
+        live_app = wait_until(lambda: st().get("state") in ("live", "catching_up") and _ppid(st().get("pid") or 1) == app.pid, 30)
+        p = Pty([PY, "-I", "-B", CLI, "top", "--no-probe"], env, jobs=True)
+        p.pump(5, until=b"this machine")
+        viewers = os.path.join(mdir, "viewers")
+        follows = wait_until(lambda: any(n != "%d.json" % app.pid for n in os.listdir(viewers)), 10, p)
+        p.send("2", wait=0.5)
+        shown = wait_until(lambda: "atlas · " in screen(p) and "Not connected" not in screen(p).splitlines()[0], 10, p)
+        app.kill()
+        app.wait()
+        t0 = time.time()
+        took = wait_until(lambda: st().get("state") in ("live", "catching_up") and
+                          _ppid(st().get("pid") or 1) not in (0, 1, app.pid) and time.time() - st().get("updated", 0) < 10, 20, p)
+        took_s = time.time() - t0
+        check(live_app and follows and shown and took,
+              "engine: the dashboard's child follows the app's engine (a viewer file), the tab shows the machine; "
+              "when that engine dies the dashboard's child takes over and the tab is live again (%.1f s; %s %s %s)"
+              % (took_s, live_app, follows, shown))
+        sync_json = os.path.join(mdir, mid, "sync.json")
+
+        def whole():
+            """The coverage map has no hole from before the kill up to the dashboard's child's own samples."""
+            try:
+                with open(sync_json) as f:
+                    have = json.load(f).get("have") or []
+            except (OSError, ValueError):
+                return False
+            return any(a <= t0 - 60 and b >= t0 + 5 for a, b in have)
+        check(wait_until(whole, 30, p), "engine: after the take-over no hole is left in the chart across the kill "
+                                        "(sync.json's coverage spans it)")
+        lock = os.path.join(mdir, "engine.lock")
+        p.send("ctrl-z", wait=0.3)
+        freed = wait_until(lambda: _lock_free(lock), 5)
+        os.kill(p.pid, signal.SIGCONT)
+        again = wait_until(lambda: not _lock_free(lock), 10, p)
+        fresh = wait_until(lambda: st().get("state") in ("live", "catching_up") and time.time() - st().get("updated", 0) < 5, 15, p)
+        os.kill(p.pid, signal.SIGSTOP)              # 04 §10: stopped where ctrl-z cannot be caught
+        try:
+            u0, end, kept = st().get("updated") or 0, time.time() + 15, False
+            while time.time() < end and not kept:
+                time.sleep(0.3)
+                kept = (st().get("updated") or 0) > u0 + 3 and _ppid(st().get("pid") or 1) not in (0, 1)
+        finally:
+            os.kill(p.pid, signal.SIGCONT)
+        check(fresh and kept, "engine: with the dashboard stopped (SIGSTOP) its engine keeps status.json fresh (%s %s)"
+              % (fresh, kept))
+        p.send("q", wait=0.2)
+        rc = p.wait(5)
+        check(freed and again and rc == 0, "engine: ctrl-z frees engine.lock within seconds (suspended is not watching); "
+                                           "after fg the dashboard's new child holds it again; q (%s %s %s)" % (freed, again, rc))
+    finally:
+        if p is not None:
+            p.close()
+        if app.poll() is None:
+            app.kill()
+            app.wait()
+        stop.set()
+        end = time.time() + 10           # the children leave by themselves (the end of their input): wait for that
+        while time.time() < end and not _lock_free(os.path.join(mdir, "engine.lock")):
+            time.sleep(0.2)
+    engine_full_pipe(base, env, mid, st)
+    engine_handover(base, env, mid, st)
+
+
+def engine_handover(base, env, mid, st):
+    """04 §8's T2 criteria with the app: the dashboard's child is the engine and the app's follows; q in
+    the dashboard leaves the app's engine live (it takes the lock, status.json stays fresh under it). Then,
+    the app's engine holding the lock, X and y in a dashboard forget the machine in both: machines.json
+    loses it and the dashboard's tab goes."""
+    mdir = env["OOMPH_MACHINES_DIR"]
+    book = os.path.join(mdir, "machines.json")
+
+    def listed():
+        try:
+            with open(book) as f:
+                return any(e.get("mid") == mid for e in json.load(f).get("machines") or [])
+        except (OSError, ValueError):
+            return True
+    lock = os.path.join(mdir, "engine.lock")
+    p = Pty([PY, "-I", "-B", CLI, "top", "--no-probe"], env, jobs=True)
+    app = None
+    try:
+        p.pump(5, until=b"this machine")
+        p.send("2", wait=0.5)
+        mine = wait_until(lambda: st().get("state") in ("live", "catching_up") and
+                          _ppid(st().get("pid") or 1) not in (0, 1), 30, p)
+        top_child = _ppid(st().get("pid") or 1)
+        app = subprocess.Popen([PY, "-I", "-B", CLI, "remote", "sync", "--json"], stdin=subprocess.PIPE,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        app.stdin.write((json.dumps({"cmd": "watch", "ids": [mid]}) + "\n").encode())
+        app.stdin.flush()
+        viewers = os.path.join(mdir, "viewers")
+        follows = wait_until(lambda: os.path.exists(os.path.join(viewers, "%d.json" % app.pid)), 10, p)
+        p.send("q", wait=0.2)
+        rc = p.wait(5)
+        p.close()
+        kept = wait_until(lambda: _ppid(st().get("pid") or 1) == app.pid and time.time() - st().get("updated", 0) < 5, 20)
+        check(mine and top_child != app.pid and follows and rc == 0 and kept,
+              "engine: q in the dashboard (its child the engine) leaves the app's tabs live: the app's engine takes "
+              "the lock and status.json stays fresh under it (%s %s %s %s)" % (mine, follows, rc, kept))
+        p = Pty([PY, "-I", "-B", CLI, "top", "--no-probe"], env, jobs=True)
+        p.pump(5, until=b"this machine")
+        p.send("2", wait=0.5)
+        tab = wait_until(lambda: "atlas · " in screen(p), 10, p)
+        p.send("X", wait=0.4)
+        asked = "Forget" in screen(p) or "forget" in screen(p)
+        p.send("y", wait=0.3)
+        gone = wait_until(lambda: not listed(), 20, p)
+        app_engine = not _lock_free(lock) and app.poll() is None
+        untabbed = wait_until(lambda: "atlas" not in screen(p).splitlines()[0], 10, p)
+        p.send("q", wait=0.2)
+        rc = p.wait(5)
+        check(tab and asked and gone and untabbed and app_engine and rc == 0,
+              "engine: X and y in the dashboard while the app's engine holds engine.lock forget the machine in both "
+              "(machines.json loses it, the tab goes) (%s %s %s %s %s)" % (tab, asked, gone, untabbed, app_engine))
+    finally:
+        p.close()
+        if app is not None and app.poll() is None:
+            app.stdin.close()
+            try:
+                app.wait(10)
+            except subprocess.TimeoutExpired:
+                app.kill()
+                app.wait()
+        end = time.time() + 10
+        while time.time() < end and not _lock_free(lock):
+            time.sleep(0.2)
+
+
+def engine_full_pipe(base, env, mid, st):
+    """A reader that stopped reading (a dashboard held up by its terminal, or stopped): the engine's
+    stdout pipe is full from the start. It must not wait in a write while it holds engine.lock: the
+    machine goes live under it and its status.json keeps being rewritten; whole lines only reach the
+    pipe; the end of its input still ends it."""
+    fifo = os.path.join(base, "events")
+    os.mkfifo(fifo, 0o600)
+    rfd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    wfd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    filled = 0
+    try:
+        while filled < 1 << 20:
+            filled += os.write(wfd, b"{}\n")
+    except BlockingIOError:
+        pass
+    os.close(wfd)
+    out = os.open(fifo, os.O_WRONLY)          # (a description of its own, blocking, as a pipe's would be)
+    eng = subprocess.Popen([PY, "-I", "-B", CLI, "remote", "sync", "--json"], stdin=subprocess.PIPE, stdout=out,
+                           stderr=subprocess.DEVNULL, env=env)
+    os.close(out)
+    try:
+        eng.stdin.write((json.dumps({"cmd": "watch", "ids": [mid]}) + "\n").encode())
+        eng.stdin.flush()
+        live = wait_until(lambda: st().get("state") in ("live", "catching_up") and _ppid(st().get("pid") or 1) == eng.pid, 30)
+        u0 = st().get("updated") or 0
+        on = wait_until(lambda: (st().get("updated") or 0) > u0 + 4 and _ppid(st().get("pid") or 1) == eng.pid, 15)
+        eng.stdin.close()
+        try:
+            rc = eng.wait(10)
+        except subprocess.TimeoutExpired:
+            rc = None
+        data = b""
+        try:
+            while len(data) < 4 << 20:
+                b = os.read(rfd, 65536)
+                if not b:
+                    break
+                data += b
+        except BlockingIOError:
+            pass
+        lines = data.split(b"\n")
+        whole = lines[-1] == b"" and all(isinstance(oomph.loads_untrusted(x), dict) for x in lines[:-1])
+        check(filled > 0 and live and on and rc == 0 and whole,
+              "engine: with its output pipe full (%d bytes) it still keeps the machine live and status.json fresh, "
+              "drops whole lines only, and ends at the end of its input (%s %s %s %s)" % (filled, live, on, rc, whole))
+    finally:
+        if eng.poll() is None:
+            eng.kill()
+            eng.wait()
+        os.close(rfd)
+        end = time.time() + 10
+        while time.time() < end and not _lock_free(os.path.join(env["OOMPH_MACHINES_DIR"], "engine.lock")):
+            time.sleep(0.2)
+
+
+def test_machines_units(base):
+    """The tabs' parts without a terminal: the sync child's events read on a thread of their own (a
+    child that writes 1 MB ends although nobody calls events()); a forgotten machine that comes back
+    in machines.json is a tab again; another tab's feed goes a minute after it was left; a start on
+    this machine for what it has to say keeps the remembered tab; a connect row gone meanwhile."""
+    os.makedirs(base)
+    woke = []
+    sc = T.SyncChild([PY, "-I", "-c", "import sys\nfor i in range(20000): sys.stdout.write('{\"ev\": \"changed\", "
+                                       "\"id\": \"m-%016x\", \"what\": [\"samples\"]}\\n' % i)\n"
+                                       "sys.stdout.write('{\"ev\": \"failed\", \"cmd\": \"forget\", \"id\": \"x\"}\\n')"],
+                     woke.append)
+    sc.start(0.0)
+    try:
+        ended = wait_until(lambda: sc.p.poll() is not None, 15)
+        time.sleep(0.2)
+        evs = sc.events()
+    finally:
+        sc.close()
+    check(ended and woke and [e.get("cmd") for e in evs] == ["forget"] and any(woke),
+          "machines: the sync child's output is read off the terminal's loop (a 1 MB burst ends unread by it); a "
+          "failure is kept for a note (%s %d %s)" % (ended, len(woke), evs))
+    mdir = topfixture.write_machines(os.path.join(base, "m"), pid=os.getpid())
+    S = T.sync_module()
+    M = T.Machines(mdir, S)
+    M.refresh(NOW)
+    gpu = "m-90a1b2c3d4e5f607"
+    M.hide(gpu)
+    M.refresh(NOW)
+    hidden = gpu not in [e["mid"] for e in M.tabs()]
+    M.hide(gpu, time.monotonic() - T.HIDE_S - 1)
+    M.refresh(NOW)
+    late = gpu in [e["mid"] for e in M.tabs()] and gpu not in M.hidden
+    M.hide(gpu)
+    path = os.path.join(mdir, "machines.json")
+    b = json.load(open(path))
+    keep = [e for e in b["machines"] if e["mid"] == gpu]
+    json.dump(dict(b, machines=[e for e in b["machines"] if e["mid"] != gpu]), open(path + ".t", "w"))
+    os.rename(path + ".t", path)
+    M.refresh(NOW)
+    json.dump(dict(b, machines=[e for e in b["machines"] if e["mid"] != gpu] + keep), open(path + ".t", "w"))
+    os.rename(path + ".t", path)
+    M.refresh(NOW)
+    check(hidden and late and gpu in [e["mid"] for e in M.tabs()] and not M.hidden,
+          "machines: a forgotten machine is no tab; a forget machines.json never shows in HIDE_S is undone; gone "
+          "from machines.json and back, it is a tab again (%s %s)" % (hidden, late))
+    keep_s = T.FEED_KEEP_S
+    try:
+        T.FEED_KEEP_S = 0.05
+        src = T.Source("/nonexistent", lambda m: None, clock=lambda: NOW, machines=M)
+        build = "m-1b2c3d4e5f607182"
+        src.mid = build
+        src.step()
+        had = build in src.feeds
+        src.mid = "local"
+        src.step()
+        kept = build in src.feeds
+        time.sleep(0.1)
+        src.step()
+        check(had and kept and build not in src.feeds and "local" in src.feeds,
+              "machines: another tab's feed (its history) is dropped a while after its tab was left (04 §4.6)")
+    finally:
+        T.FEED_KEEP_S = keep_s
+    cur = T._current
+    try:
+        T._current = lambda d: {"t": time.time(), "pressure": 4}
+        hot = T.start_tab(M, build, None)
+        T._current = lambda d: {"t": time.time(), "pressure": 1}
+        calm = T.start_tab(M, build, None)
+        T._current = lambda d: {"t": time.time(), "pressure": 2}
+        warn = T.start_tab(M, build, None)
+        T._current = lambda d: {"t": time.time(), "pressure": 1, "daemon": {"interval": 30, "incident": "20261120-1"}}
+        inc = T.start_tab(M, build, None)
+    finally:
+        T._current = cur
+    check(hot == ("local", True) and inc == ("local", True) and calm == (build, False) and warn == (build, False),
+          "machines: critical pressure or an open incident starts on this machine, marked so the remembered tab is "
+          "kept; warning does not (D9, as the app's localHasSay) (%s %s %s %s)" % (hot, inc, calm, warn))
+    app = T.App.__new__(T.App)
+    app.ui = {"overlay": {"kind": "connect", "text": "", "sel": 3}}
+    e = {"mid": "m-00000000000000cc", "name": "old-box", "host": "old-box.local", "transport": "tcp", "port": 6674,
+         "pinned": False}
+    app.key_machine_dialog("tab", app.ui["overlay"], {"book": [e]})
+    check(app.ui["overlay"].get("text") == "old-box" and app.ui["overlay"].get("sel") is None,
+          "machines: a Connect row that went meanwhile (the Recents shrank) is no crash; the highlight is on the last")
+    app = T.App.__new__(T.App)
+    app.ui, app.sync, app.M, app.mid, app.dirty = {"overlay": {"kind": "forget", "mid": build, "label": "build-box"}}, None, M, \
+        "local", False
+    app.key_machine_dialog("y", app.ui["overlay"], {})
+    check(not M.is_hidden(build) and "overlay" not in app.ui and "--no-connect" in app.ui.get("note", ("",))[0],
+          "machines: a forget that could not be sent (--no-connect) hides no tab and says why")
 
 
 def test_bell_settings_nologger(base):
@@ -1340,6 +2201,11 @@ def main():
     test_selection()
     test_inspect_mouse()
     test_arrays()
+    test_tab_ladder()
+    test_link_rows()
+    test_mirror_gaps()
+    test_connect_rows()
+    test_machine_rows()
     base = tempfile.mkdtemp(prefix="oomph-toptest-")
     try:
         test_pty(os.path.join(base, "pty"))
@@ -1349,6 +2215,9 @@ def main():
         test_readonly_ssh(os.path.join(base, "ssh"))
         test_crash(os.path.join(base, "crash"))
         test_children(os.path.join(base, "children"))
+        test_machines_units(os.path.join(base, "units"))
+        test_pty_machines(os.path.join(base, "machines"))
+        test_pty_engine(os.path.join(base, "engine"))
     finally:
         shutil.rmtree(base, ignore_errors=True)
     print("toptest: %s in %.0f s" % ("all passed" if not FAILS else "%d FAILED" % len(FAILS), time.time() - t0))

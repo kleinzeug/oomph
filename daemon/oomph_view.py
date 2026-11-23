@@ -159,12 +159,14 @@ GLYPHS = {
                     hatch="╱", grid="┊", inc="┃", awaydot="·", sw="■", swq="□", dot="●", odot="○",
                     sel="›", ell="…", inf="∞", mid="·", shades="█▓▒░", queued="▒", ram=("_", "╌", "‾"),
                     meter="█", meterbg="░", arrows="←→", updown="↑↓", legend_sw="■", legend_away="░",
-                    more_l="‹", more_r="›", up="▴", down="▾", dash="–", arrow="→"),
+                    more_l="‹", more_r="›", up="▴", down="▾", dash="–", arrow="→", miss=":", close="×",
+                    marks=dict(ok="●", warn="◐", crit="◆", silent="◦", busy="↻", off="⊘", att="▲")),
     "ascii": dict(h="-", v="|", tl="+", tr="+", bl="+", br="+", lt="+", rt="+", eighths=" ...::###",
                   hatch="/", grid=" ", inc="!", awaydot=".", sw="#", swq="o", dot="*", odot="o",
                   sel=">", ell="~", inf="all", mid="-", shades="#=:*", queued="?", ram=("_", "-", "-"),
                   meter="#", meterbg=".", arrows="<>", updown="^v", legend_sw="#", legend_away=".",
-                  more_l="<", more_r=">", up="^", down="v", dash="-", arrow="->"),
+                  more_l="<", more_r=">", up="^", down="v", dash="-", arrow="->", miss=":", close="x",
+                  marks=dict(ok="*", warn="w", crit="C", silent="-", busy="~", off="o", att="^")),
 }
 GLYPHS["cells"] = dict(GLYPHS["unicode"])      # --glyphs cells: the rasteriser differs, the characters do not
 
@@ -329,6 +331,7 @@ class Frame:
     def __init__(self, w, h, ascii_only=False):
         self.w, self.h, self.ascii_only = w, h, ascii_only
         self.yhold = None           # what the plot's y axis holds for the next frame (the loop keeps it)
+        self.tab_hits = []          # row 0's tabs, counters and + as drawn: (x0, x1, kind, which), for a click
         self.c = [[[" ", None, None, 0] for _ in range(w)] for _ in range(h)]
 
     def put(self, x, y, text, fg=None, bg=KEEP, fl=0):
@@ -665,9 +668,10 @@ def merge_reservations(records, ledger, now, holder_alive=None, own_ns=None):
 
 
 # ------------------------------------------------------------------ chart maths: the terminal's own
-def columns(pts, gaps, f, finv, W, now, first=None):
-    """One entry per screen column: ('data', point) | ('gap', None) | ('none', None) (before history).
-    A column between two samples less than a gap apart repeats its nearer neighbour."""
+def columns(pts, gaps, f, finv, W, now, first=None, missing=()):
+    """One entry per screen column: ('data', point) | ('gap', None) | ('miss', kind) (another
+    machine's stretch not received, 01's coverage) | ('none', None) (before history). A column
+    between two samples less than a gap apart repeats its nearer neighbour."""
     buckets = [[] for _ in range(W)]
     for p in pts:
         x = f(p["t"])
@@ -684,8 +688,11 @@ def columns(pts, gaps, f, finv, W, now, first=None):
         ta, tb = finv(c / float(W)), finv((c + 1) / float(W))
         if c == W - 1:
             tb = now
+        miss = [k for m0, m1, k in missing if m0 < tb and m1 > ta]
         if tb <= first:
             cols.append(("none", None))
+        elif miss:
+            cols.append(("miss", miss[-1]))
         elif any(g0 < tb and g1 > ta for g0, g1 in gaps):
             cols.append(("gap", None))
         else:
@@ -812,11 +819,12 @@ def stack_cells_whole(segs, H):
 
 
 # ------------------------------------------------------------------ the row plan
-def plan(W, H, has_res=True, has_inc=True):
+def plan(W, H, has_res=True, has_inc=True, mline=False):
     """Where everything goes: a function of the terminal's size and of two slow facts (a reservation
     in the last 14 days; an incident on record), never of how many there are right now, so the plot
-    keeps its rectangle when an agent is granted memory or an incident opens."""
-    y0 = 1
+    keeps its rectangle when an agent is granted memory or an incident opens. With several machines
+    (`mline`) row 1 is the machine line (04 §3.7)."""
+    y0 = 2 if mline else 1
     wide = W >= 120                                   # two columns from 120 columns, whatever the height
     lw = W - RIGHT_W if wide else W
     stats = 0 if wide else (2 if H >= 16 else 1)
@@ -840,7 +848,9 @@ def plan(W, H, has_res=True, has_inc=True):
         S = 0
     if plot_h() < 4 and stats == 2:
         stats = 1
-    p = dict(W=W, H=H, wide=wide, lw=lw, stats_y=y0, stats=stats, S=S, R=R, I=Inc)
+    if plot_h() < 4 and stats == 1 and mline:          # 40 x 10 with the machine line: the readings go
+        stats = 0
+    p = dict(W=W, H=H, wide=wide, lw=lw, stats_y=y0, stats=stats, S=S, R=R, I=Inc, mline=mline)
     y = y0 + stats
     p["box_y"] = y
     p["plot_x"], p["plot_y"], p["plot_w"], p["plot_h"] = 1, y + 1, lw - 7, plot_h()
@@ -946,6 +956,462 @@ def tab_bar(fr, model, caps, g):
         fr.rput(xr, 0, free, "dim", "bar")
 
 
+# ------------------------------------------------------------------ machines (04 §3.7: 01 revision 3, in cells)
+# A tab (model["tabs"], built by oomph_top from machines.json and each mirror's files): mid ("local" for this
+# machine), local, label, addr, transport, status (the mirror's status.json), pid_alive (its engine exists),
+# cur (pressure, t, silent, incident, free of its current.json), known (where its coverage ends, the machine's
+# clock), synced (sync.json's), opened (when this run opened it, and whether its link was live then), version,
+# system. model["wall"] is this computer's clock (status.json's times are), model["now"] the selected machine's.
+BRAND = None                # oomph.BRAND, set by oomph_top (this module reads no settings of its own)
+MAX_TABS = 12               # other machines as tabs, after this one (01's limit, the engine's MAX_MACHINES)
+MARK_ROLE = {"ok": "ok", "warn": "warn", "crit": "crit", "silent": "faint", "busy": "accent", "off": "faint",
+             "att": "warntx"}
+ATTENTION_WORDS = {"identity_changed": ("Key changed", "Its key changed"), "revoked": ("Access revoked", "Access revoked"),
+                   "incompatible": ("Too old", "Its version can't talk to this one"),
+                   "ssh": ("SSH can't sign in", "SSH can't sign in"),
+                   "refused": ("Sharing is off there", None), "turned_away": ("Sharing is off there", None)}
+MISSING_WORDS = {"not_connected": "not connected", "not_received": "not received", "gone": "no longer available",
+                 "fetching": "fetching history"}
+LIVE_FRESH_S = 10.0         # a status.json older than this is not live, whatever it says (01 §4.4)
+
+
+def _f(x):
+    """A finite number or None (an int too big for a float is none)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        return x if math.isfinite(x) else None
+    except OverflowError:
+        return None
+
+
+def _t(x):
+    """A moment from a file (status.json, a mirror) or None: oomph's range, so that localtime can tell it."""
+    x = _f(x)
+    return x if x is not None and 0 <= x <= 1e11 else None
+
+
+def when(t, now):
+    """A moment in the words of the machine line: 10:15, yesterday 18:40, Mon 9 Nov 17:02."""
+    a, b = _lt(t), _lt(now)
+    if a[:3] == b[:3]:
+        return hhmm(t)
+    if _lt(now - 86400)[:3] == a[:3]:
+        return "yesterday " + hhmm(t)
+    return "%s %d %s %s" % (DAYS[a.tm_wday], a.tm_mday, MONTHS[a.tm_mon - 1], hhmm(t))
+
+
+MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+
+
+def link_view(t, wall, engine="on"):
+    """One tab's link as 04 §3.7's tables tell it (01 §3.2–§3.6). A dict: live (what claims to be
+    now is now), stale (it is greyed), phase (the opening: grace, connecting or None), mark (a key
+    of the glyphs' marks), dim (the last mark, during a grace), badge (an incident open there, the
+    link up), capsule (text, role), cause (the table's row), retry (r can help), attention (enter
+    explains). Pure: `wall` is this computer's clock, `engine` "on", or why nobody syncs."""
+    cur = t.get("cur") or None
+    p = (cur or {}).get("pressure") or "Normal"
+    pmark = {"Warning": "warn", "Critical": "crit"}.get(p, "ok")
+    pcap = (p, {"Warning": "warn", "Critical": "crit"}.get(p, "ok"))
+    silent = cur is None or bool(cur.get("silent"))
+    v = dict(live=False, stale=True, phase=None, mark="off", dim=False, badge=False, retry=False, attention=False,
+             capsule=("Not connected", "faint"), cause="offline")
+    if t.get("local"):
+        v.update(live=True, stale=False, mark="silent" if silent else pmark, badge=bool(cur and cur.get("incident")),
+                 capsule=("No readings", "faint") if silent else pcap, cause="local")
+        return v
+    st = t.get("status") if isinstance(t.get("status"), dict) else {}
+    state, err = (x if isinstance(x, str) else None for x in (st.get("state"), st.get("error")))
+    upd = _t(st.get("updated"))
+    if state in ("live", "catching_up") and upd is not None and wall - upd < LIVE_FRESH_S and t.get("pid_alive"):
+        v.update(live=True, stale=False, badge=bool(cur and cur.get("incident")))
+        if state == "catching_up":
+            v.update(mark="busy", capsule=pcap, cause="catching_up")
+        elif silent:
+            v.update(mark="silent", capsule=("No readings", "faint"), cause="silent")
+        else:
+            v.update(mark=pmark, capsule=pcap, cause="live")
+        return v
+    if engine != "on":
+        v.update(capsule=("Not syncing", "faint"), cause="not_syncing")
+        return v
+    if state == "needs_attention" or (state == "offline" and err in ("refused", "turned_away")):
+        v.update(mark="att", capsule=(ATTENTION_WORDS.get(err, ("Needs attention",))[0], "warntx"),
+                 cause=err if err in ATTENTION_WORDS else "attention", attention=True,
+                 retry=err in ("ssh", "refused", "turned_away"))
+        return v
+    if state == "offline" and err == "local_network_denied":
+        v.update(capsule=("Blocked by macOS", "faint"), cause="blocked", attention=True, retry=True)
+        return v
+    if state == "pairing":
+        v.update(mark="busy", capsule=("Pairing…", "faint"), cause="pairing")
+        return v
+    at, was_live = t.get("opened") or (None, False)
+    if was_live and at is not None and state != "offline":
+        ssh = (st.get("transport") or t.get("transport")) == "ssh"
+        lo, hi = (1.5, 6.0) if ssh else (0.8, 3.0)
+        age = wall - at
+        if age < min(hi, max(lo, 2 * (_f(st.get("connect_ms")) or 0) / 1000.0)):
+            v.update(phase="grace", stale=False, dim=True, mark="silent" if silent else pmark,
+                     capsule=("No readings", "faint") if silent else pcap, cause="grace")
+            return v
+        if age < (20.0 if ssh else 8.0):
+            v.update(phase="connecting", mark="busy", capsule=("Connecting…", "faint"), cause="connecting")
+            return v
+    if state == "connecting":
+        v.update(mark="busy", capsule=("Connecting…", "faint"), cause="connecting")
+        return v
+    v["retry"] = True               # offline (no answer, not found, not oomph, busy), or idle: not connected
+    return v
+
+
+def machine_sentence(t, v, model):
+    """The machine line's sentence (01 §3.5's words, 04 §3.7's table)."""
+    now, wall = model["now"], model.get("wall", model["now"])
+    st = t.get("status") if isinstance(t.get("status"), dict) else {}
+    cur = t.get("cur") or {}
+    last = "last data " + (when(t["known"], now) if _t(t.get("known")) else "never")
+    c = v["cause"]
+    if c == "local":
+        lg = model.get("logger") if model.get("tab_mid", "local") == "local" else None
+        words = ("Logging every %d s" % (cur.get("interval") or 30)) if not cur.get("silent") else \
+            "Logger not reporting since %s" % hhmm(cur["t"]) if _t(cur.get("t")) else "Logging is off"
+        if lg == "off":
+            words = "Logging is off"
+        return "this machine %s %s" % (MIDDOT, words)
+    if c in ("live", "grace"):
+        s = "Logging every %d s" % (cur.get("interval") or 30)
+        off = _f((t.get("sync") or {}).get("offset_s"))
+        if off is not None and abs(off) > 30:
+            s += " %s clock %s %s" % (MIDDOT, ago(abs(off)), "ahead" if off > 0 else "behind")
+        return s
+    if c == "catching_up":
+        synced = (t.get("sync") or {}).get("synced")
+        if isinstance(synced, dict) and not all(synced.get(k) for k in ("ledger", "incidents")):
+            return "Fetching history…"
+        return "Catching up: fetching missed history…"
+    if c == "silent":
+        return "Connected, but its logger stopped at %s" % (when(cur["t"], now) if _t(cur.get("t")) else "?")
+    if c == "pairing":
+        return "Pairing…"
+    if c == "connecting":
+        s = last[0].upper() + last[1:]
+    elif c == "not_syncing":
+        s = "Not syncing (%s) %s %s" % ("running as root" if model.get("engine") == "root" else "--no-connect", MIDDOT, last)
+    elif c == "blocked":
+        s = last[0].upper() + last[1:]
+    elif v["attention"] and ATTENTION_WORDS.get(c, (None, None))[1]:
+        s = "%s %s %s" % (ATTENTION_WORDS[c][1], MIDDOT, last)
+    elif v["attention"]:
+        s = last[0].upper() + last[1:]
+    else:
+        lc = _t(st.get("last_contact")) or _t(t.get("known"))
+        s = "No answer since %s" % when(lc, wall) if lc else "No answer yet"
+        nt = _t(st.get("next_try"))
+        if st.get("state") == "offline" and nt is not None and nt - wall >= 0.5:
+            s += " %s next try in %d s" % (MIDDOT, round(nt - wall))
+    p = cur.get("pressure")
+    if p in ("Warning", "Critical"):
+        s += " %s pressure was %s" % (MIDDOT, p.lower())
+    return s
+
+
+MIDDOT = "·"
+ASCII_WORDS = {ord("·"): "-", ord("…"): "~", ord("“"): '"', ord("”"): '"', ord("›"): ">", ord("‹"): "<", ord("–"): "-",
+               ord("×"): "x"}
+
+
+def asc(text, fr):
+    """The machines' words in the ASCII glyph set: their punctuation as the glyph set has it."""
+    return text.translate(ASCII_WORDS) if fr.ascii_only and isinstance(text, str) else text
+
+
+def state_words(t, v):
+    """The machine list's last column: the state in words."""
+    c = v["cause"]
+    if c == "local" and v["mark"] == "silent":
+        return "no readings"
+    if c in ("live", "grace", "local"):
+        p = (t.get("cur") or {}).get("pressure")
+        w = "memory %s" % p.lower() if p in ("Warning", "Critical") else "connected"
+        return w + (" %s incident" % MIDDOT if v["badge"] else "")
+    return {"silent": "connected, no readings", "catching_up": "catching up", "connecting": "connecting",
+            "pairing": "pairing", "not_syncing": "not syncing", "blocked": "blocked by macOS",
+            "refused": "sharing is off there", "turned_away": "sharing is off there"}.get(c) or \
+        ("needs attention: %s" % ATTENTION_WORDS[c][0].lower() if c in ATTENTION_WORDS else
+         "needs attention" if v["attention"] else "not connected")
+
+
+def tab_views(model):
+    """link_view of every tab, once per frame."""
+    if "views" not in model:
+        model["views"] = [link_view(t, model.get("wall", model["now"]), model.get("engine", "on"))
+                          for t in model["tabs"]]
+    return model["views"]
+
+
+def several(model):
+    return len(model.get("tabs") or ()) > 1
+
+
+def _urgent(hidden, g):
+    """What a counter shows of the machines it hides, in the order of the app's » (01 §3.2)."""
+    if any(v["mark"] == "att" for v in hidden):
+        return g["marks"]["att"], "warntx"
+    if any(v["badge"] or (v["live"] and v["mark"] == "crit") for v in hidden):
+        return "!", "crit"
+    if any(v["mark"] == "off" for v in hidden):
+        return g["marks"]["off"], "faint"
+    return "", None
+
+
+def tab_plan(model, W, g):
+    """The tab bar's ladder (04 §3.7, "When columns are short"): which tabs show how, and what of the
+    name, the clock and the free memory fits. Returns (items, extras): items are ("tab", i, label
+    width or None for number and mark) and ("more", side, count, glyph, role); extras a subset of
+    {"free", "clock", "brand"}. The selected tab with its label and ×, the + and the capsule are
+    always there, down to 40 columns."""
+    tabs, sel = model["tabs"], model.get("sel", 0)
+    views = tab_views(model)
+    n = len(tabs)
+    plus_w = 3
+    cap_w = len(views[sel]["capsule"][0]) + 2 if not tabs[sel].get("local") else len(capsule(model)[0]) + 2
+    fixed = 1 + plus_w + 2 + cap_w + 1
+
+    def tab_w(i, lw):
+        t, v = tabs[i], views[i]
+        num = len(str(i + 1))
+        badge = 1 if v["badge"] and i != sel else 0
+        close = 2 if i == sel and not t.get("local") else 0
+        if lw is None:
+            return num + 1 + badge
+        return num + 1 + tw(fit(t.get("label") or "?", lw, g)) + (2 + badge if n > 1 else 0) + close
+
+    def width(items):
+        w = 0
+        for it in items:
+            if it[0] == "tab":
+                w += tab_w(it[1], it[2])
+            else:
+                w += 2 + len(str(it[2])) + len(it[3])
+        return w + 2 * (len(items) - 1)
+    chosen = None
+    for lw in (16, 6, 5, 4):
+        items = [("tab", i, lw) for i in range(n)]
+        if fixed + width(items) <= W:
+            chosen = items
+            break
+    if chosen is None:
+        for lw in (6, 5, 4):
+            items = [("tab", i, lw if i == sel else None) for i in range(n)]
+            if fixed + width(items) <= W:
+                chosen = items
+                break
+    if chosen is None:
+        for slw in (6, 5, 4, 3, 2):
+            lo = hi = sel
+            while True:
+                grew = False
+                for side in ("r", "l"):
+                    a, b = (lo, hi + 1) if side == "r" else (lo - 1, hi)
+                    if a < 0 or b >= n:
+                        continue
+                    if fixed + width(_window(views, a, b, sel, slw, n, g)) <= W:
+                        lo, hi, grew = a, b, True
+                if not grew:
+                    break
+            items = _window(views, lo, hi, sel, slw, n, g)
+            if fixed + width(items) <= W or slw == 2:
+                chosen = items
+                break
+    room = W - fixed - width(chosen)
+    extras = set()
+    cur = model.get("cur")
+    free = "%.1fG free" % cur["free"] if cur and model.get("logger") != "silent" and not model.get("stale") else None
+    for name, need in (("free", len(free) + 2 if free else None), ("clock", 6), ("brand", len(model.get("brand") or "") + 2)):
+        if need is not None and need <= room and (name != "brand" or model.get("brand")):
+            extras.add(name)
+            room -= need
+    return chosen, extras, free
+
+
+def _window(views, lo, hi, sel, slw, n, g):
+    items = []
+    if lo > 0:
+        items.append(("more", "l", lo) + _urgent(views[:lo], g))
+    items += [("tab", i, slw if i == sel else None) for i in range(lo, hi + 1)]
+    if hi < n - 1:
+        items.append(("more", "r", n - 1 - hi) + _urgent(views[hi + 1:], g))
+    return items
+
+
+def draw_capsule(fr, xr, text, role, caps, dim=False):
+    """The capsule at row 0, right-aligned at xr; returns the column left of it."""
+    if caps.color == "none":
+        fr.rput(xr, 0, "[" + text + "]", "fg", "bar", BOLD)
+    elif caps.color == "16" and role == "faint":        # no grey among the eight base colours: brackets
+        fr.rput(xr, 0, "[" + text + "]", "dim", "bar", BOLD)
+    elif role == "faint":                               # a grey fill, the words in the primary colour
+        fr.rput(xr, 0, " " + text + " ", "selfg", "sel", BOLD)
+    else:
+        fr.rput(xr, 0, " " + text + " ", "onblock", role, BOLD)
+    if dim:
+        fr.restyle(xr - tw(text) - 1, 0, tw(text) + 2, 1, "off")
+    return xr - tw(text) - 2
+
+
+def machine_tabs(fr, model, caps, g):
+    """Row 0 with machines (04 §3.7): the name, a tab per machine (number, label, mark, badge; the
+    selected one bold on the selection colour, with × on another machine's), the +, the selected
+    machine's capsule, the clock."""
+    W, mono = fr.w, caps.color == "none"
+    tabs, sel = model["tabs"], model.get("sel", 0)
+    views = tab_views(model)
+    fr.fill(0, 0, W, 1, " ", None, "bar")
+    items, extras, free = tab_plan(model, W, g)
+    x = 1
+    if "brand" in extras:
+        x = fr.put(x, 0, model["brand"], "fg", "bar", BOLD) + 2
+    hits = []
+    for k, it in enumerate(items):
+        if k:
+            x += 2
+        if it[0] == "more":
+            _, side, count, glyph, role = it
+            x0 = x
+            if side == "l":
+                x = fr.put(x, 0, "%s+%d" % (g["more_l"], count), "dim", "bar")
+                x = fr.put(x, 0, glyph, None if mono else role, "bar", BOLD)
+            else:
+                x = fr.put(x, 0, glyph, None if mono else role, "bar", BOLD)
+                x = fr.put(x, 0, "+%d%s" % (count, g["more_r"]), "dim", "bar")
+            hits.append((x0, x, "more", side))
+            continue
+        i, lw = it[1], it[2]
+        t, v = tabs[i], views[i]
+        on = i == sel
+        bg, fl = ("sel", BOLD | (REV if mono else 0)) if on else ("bar", 0)
+        quiet = not on and not v["live"] and v["phase"] != "grace"
+        red = not on and v["live"] and v["mark"] == "crit"
+        name_role = "selfg" if on else "crit" if red else "dim" if quiet else "fg"
+        x0 = x
+        x = fr.put(x, 0, str(i + 1), name_role, bg, fl | (BOLD if red else 0))
+        if lw is not None:
+            x = fr.put(x + 1, 0, fit(t.get("label") or "?", lw, g), name_role, bg, fl | (BOLD if red else 0))
+        if len(tabs) == 1:              # one machine: its name and the +; the capsule tells its pressure
+            hits.append((x0, x, "tab", i))
+            continue
+        if lw is not None:
+            if on:
+                fr.put(x, 0, " ", None, bg)
+            x += 1
+        mark = g["marks"][v["mark"]]
+        x = fr.put(x, 0, mark, None if mono else MARK_ROLE[v["mark"]], bg, (fl if on else 0) | (DIM if v["dim"] else 0))
+        if v["badge"] and not on:
+            x = fr.put(x, 0, "!", None if mono else "crit", bg, BOLD)
+        if on and not t.get("local"):
+            fr.put(x, 0, " ", None, bg)
+            x = fr.put(x + 1, 0, g["close"], "selfg", bg, fl)
+        hits.append((x0, x, "tab", i))
+    x += 2
+    hits.append((x, x + 1, "plus", None))
+    fr.put(x, 0, "+", "fg", "bar", BOLD)
+    xr = W - 2
+    if "clock" in extras:
+        clock = hhmm(model.get("wall", model["now"]))
+        fr.rput(xr, 0, clock, "dim", "bar")
+        xr -= len(clock) + 1
+    v = views[sel]
+    text, role = capsule(model) if tabs[sel].get("local") else v["capsule"]
+    xr = draw_capsule(fr, xr, asc(text, fr), role, caps, v["dim"]) - 1
+    if "free" in extras:
+        fr.rput(xr, 0, free, "dim", "bar")
+    fr.tab_hits = hits
+
+
+def machine_line(fr, y, model, caps, g):
+    """Row 1 with several machines: the selected one's mark, name and sentence; at the right its
+    oomph and system ("oomph 1.10.0 · macOS 27.2"), the system giving way first, then all of it,
+    never the sentence."""
+    W, mono = fr.w, caps.color == "none"
+    t = model["tabs"][model.get("sel", 0)]
+    v = tab_views(model)[model.get("sel", 0)]
+    sentence = asc(machine_sentence(t, v, model), fr)
+    x = fr.put(1, y, g["marks"][v["mark"]], None if mono else MARK_ROLE[v["mark"]], None, DIM if v["dim"] else 0)
+    x = fr.put(x + 1, y, fit(t.get("label") or "?", 24, g), "fg", None, BOLD)
+    left = "%s %s" % (g["mid"], sentence)
+    right_parts = [p for p in ("%s %s" % (model.get("brand") or "", t["version"]) if t.get("version") else None,
+                               t.get("system")) if p]
+    for k in (len(right_parts), 1, 0):
+        right = (" %s " % g["mid"]).join(right_parts[:k])
+        if not right or x + 1 + tw(left) + 2 + tw(right) <= W - 1:
+            break
+    else:
+        right = ""
+    fr.put(x + 1, y, fit(left, max(0, W - x - 2 - (tw(right) + 2 if right else 0)), g), "dim")
+    if right:
+        fr.rput(W - 2, y, right, "faint")
+
+
+def mirror_gaps(no_data, have, gone, oldest, now, down):
+    """MachineStore.mirrorGaps (01 §3.5, §5.7): (the no-data stretches inside the coverage map,
+    the stretches not received with their kind). Outside the map, from the remote's oldest sample
+    (or the first covered moment) to now, a stretch the remote no longer keeps is `gone`, the one
+    that reaches now while the link is down `not_connected`, every other `not_received`. While the
+    link is up the youngest stretch counts only once it is longer than a chart's gap. Every list is
+    sorted and merged first and then walked once (sync.json may hold a megabyte of spans)."""
+    no_data, have, gone = _merged(no_data), _merged(have), _merged(gone)
+    nd, i, j = [], 0, 0
+    while i < len(no_data) and j < len(have):
+        a, b = max(no_data[i][0], have[j][0]), min(no_data[i][1], have[j][1])
+        if b > a:
+            nd.append((a, b))
+        if no_data[i][1] < have[j][1]:
+            i += 1
+        else:
+            j += 1
+    if not have:
+        return nd, [(oldest if oldest is not None else now - KEEP_DAYS * 86400, now,
+                     "not_connected" if down else "not_received")]
+    first = min(have[0][0], gone[0][0] if gone else have[0][0], oldest if oldest is not None else have[0][0])
+    at, holes, out = first, [], []
+    for a, b in have:
+        if a > at:
+            holes.append((at, a))
+        at = max(at, b)
+    if now - at > (0 if down else GAP_S):
+        holes.append((at, now))
+    k = 0
+    for a, b in holes:
+        x = a
+        while k < len(gone) and gone[k][1] <= x:
+            k += 1
+        while k < len(gone) and gone[k][0] < b:
+            ga, gb = gone[k]
+            if ga > x:
+                out.append((x, ga, "not_received"))
+            out.append((max(ga, x), min(gb, b), "gone"))
+            x = min(gb, b)
+            if gb > b:              # it reaches into the next hole
+                break
+            k += 1
+        if b > x:
+            out.append((x, b, "not_connected" if down and b >= now - 1 else "not_received"))
+    return nd, out
+
+
+def _merged(spans):
+    """Spans sorted by start, overlapping and touching ones joined."""
+    out = []
+    for a, b in sorted(spans):
+        if out and a <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], b)
+        else:
+            out.append([a, b])
+    return [(a, b) for a, b in out]
+
+
 def draw_stats(fr, x, y, w, model, g, rows=2):
     """The live readings. Two rows: value over label; tiles that do not fit are dropped, least
     important first. One row: a sentence, whole items dropped, never a label cut in half."""
@@ -989,6 +1455,8 @@ def draw_stats(fr, x, y, w, model, g, rows=2):
 SERIES_WORDS = (("Wired", "wired"), ("App", "app"), ("Compressed", "comp"), ("Swap", "swap"))
 LEGEND_ORDER = ("away", "no data", "incident")       # as drawn, left to right
 LEGEND_YIELD = ("away", "incident", "no data")       # what gives way, first to last
+LEGEND_ORDER_MISS = ("away", "no data", "not received", "incident")
+LEGEND_YIELD_MISS = ("away", "incident", "no data", "not received")
 
 
 def legend_items(g, caps, short, initials=False):
@@ -1000,13 +1468,15 @@ def legend_items(g, caps, short, initials=False):
         names = [(n[0], role, s) for n, role, s in names]
     plain_band = mono or caps.color == "16"
     extra = {"no data": ("no data", "hatch", g["hatch"]), "incident": ("incident", "incident", g["inc"]),
+             "not received": ("not received", "faint", g["miss"]),
              "away": ("away", "dim" if not mono else "fg", g["awaydot"] if plain_band else g["legend_away"])}
     return names, extra
 
 
-def draw_chart_head(fr, x, y, w, ui, caps, g, title=None):
+def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False):
     """The top edge of the chart box: the span selector on the left (it never gives way; below room
-    for all four only the selected one stays), the legend on the right (it shortens, then goes)."""
+    for all four only the selected one stays), the legend on the right (it shortens, then goes).
+    `miss`: a stretch not received is in view, and the legend explains its dots (04 §3.3)."""
     mono = caps.color == "none"
     fr.hline(x, y, w, g, "line", g["tl"], g["tr"])
     cx = x + 2
@@ -1023,9 +1493,10 @@ def draw_chart_head(fr, x, y, w, ui, caps, g, title=None):
     room = x + w - 2 - cx
     chosen = None
     for short, drop, initials in ((False, 0, False), (True, 0, False), (True, 1, False), (True, 2, False),
-                                  (True, 3, False), (True, 3, True)):
+                                  (True, 3, False), (True, 3, True)) + (((True, 4, True),) if miss else ()):
         names, extra = legend_items(g, caps, short, initials)
-        items = names + [extra[k] for k in LEGEND_ORDER if k not in LEGEND_YIELD[:drop]]
+        order, yld = (LEGEND_ORDER_MISS, LEGEND_YIELD_MISS) if miss else (LEGEND_ORDER, LEGEND_YIELD)
+        items = names + [extra[k] for k in order if k not in yld[:drop]]
         need = sum(len(n) + 2 for n, _, _ in items) + 1
         if need <= room:
             chosen = (items, need)
@@ -1070,7 +1541,7 @@ def plot_geometry(model, span, W, hold=None):
     now = model["now"]
     first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
     f, finv = mapper(now, first, SPANS[span])
-    cols = columns(model["pts"], model["gaps"], f, finv, W, now, first)
+    cols = columns(model["pts"], model["gaps"], f, finv, W, now, first, model.get("missing") or ())
     top, new = y_top(model.get("ram"), cols, hold, finv(0.0), now)
     return f, finv, cols, top, new
 
@@ -1088,7 +1559,7 @@ def draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
     epoch = int(model["now"] // (sp / float(W) if sp else 60.0))
     pv = model.get("pts_v") or hash(tuple((p["t"], p["wired"], p["app"], p["comp"], p["swap"], p["away"])
                                          for p in model["pts"]))
-    key = (pv, len(model["pts"]), tuple(model["gaps"]), model.get("first"), model.get("ram"),
+    key = (pv, len(model["pts"]), tuple(model["gaps"]), tuple(model.get("missing") or ()), model.get("first"), model.get("ram"),
            tuple((i["start"], i["open"]) for i in model["incidents"]), ui["span"], W, H, x0, y0, held, epoch,
            caps.color, caps.glyphs, caps.theme, fr.ascii_only)
     hit = _PLOT.get("key") == key
@@ -1159,6 +1630,8 @@ def _draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
                 bg = bgc
                 if st == "gap":
                     ch, fg = g["hatch"], "hatch"
+                elif st == "miss":
+                    ch, fg = g["miss"], "faint"
                 elif c in gridcols:
                     ch, fg = g["grid"], "grid"
                 elif r == ram_row and c % 2 == 0:
@@ -1169,12 +1642,25 @@ def _draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
             if c in inc:
                 if mono:
                     bg, fl = None, BOLD
-                elif ch in (g["hatch"], g["grid"], ram_glyph, g["awaydot"], " "):
+                elif ch in (g["hatch"], g["grid"], ram_glyph, g["awaydot"], " ") or st == "miss":
                     bg = bgc
                 elif ch == FULL or ch in g["eighths"][4:8]:
                     bg = fg                              # the area goes on behind the rule
                 ch, fg = g["inc"], "incident"
             fr.put(x0 + c, y0 + H - 1 - r, ch, fg, bg, fl)
+    if H >= 3:                  # a stretch wide enough names itself (not connected, not received, …)
+        c = 0
+        while c < W:
+            if cols[c][0] != "miss":
+                c += 1
+                continue
+            k, e = cols[c][1], c
+            while e < W and cols[e] == ("miss", k):
+                e += 1
+            word = MISSING_WORDS.get(k, "")
+            if word and e - c >= len(word) + 2:
+                fr.put(x0 + c + (e - c - len(word)) // 2, y0 + H // 2, word, "dim")
+            c = e
     # y labels: the RAM line names itself; round values where a row is free; the top if it has a row
     ticks = {ram_row: (gfmt(ram), "fg")} if ram else {}
     for v in ([ymax / 2.0] if H < 12 else [ymax * 0.75, ymax / 2.0, ymax * 0.25]):
@@ -1477,6 +1963,8 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
             tail = "peak %.1fG %s %s %s" % (_gb(r.get("peak")), g["mid"], (r.get("outcome") or "ended").replace("_", " "),
                                             hhmm(r["ended"]))
             trole = "faint"
+        elif granted and model.get("stale"):
+            tail, trole = "was using %.1fG" % _gb(r.get("used")), "dim"
         elif granted:
             used = "using %.1fG" % _gb(r.get("used"))
             tail = used + (" %s %s left" % (g["mid"], left_of(r["expires"] - now)) if r.get("expires") is not None else "")
@@ -1492,6 +1980,8 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
         project = r.get("project")
         if isinstance(project, str) and project and end - px >= 3:
             fr.put(x + px, yy, fit(project.rstrip("/").rsplit("/", 1)[-1], end - px, g), "dim", KEEP)
+        if live and model.get("stale"):      # what claims to be now, of a machine not connected: grey
+            fr.restyle(x, yy, w, 1, "off")
         if idx == sel:
             highlight(fr, x, yy, w, caps, g, focus)
 
@@ -1733,7 +2223,7 @@ def draw_right(fr, P, model, caps, g):
     if ev:
         section(fr, x, yy, w, g, "Events")
         draw_events(fr, x + 1, yy + 1, w - 2, ev - 1, model, caps, g)
-    if model.get("logger") == "silent":     # the last sample's readings are not live: grey. Events are history.
+    if model.get("logger") == "silent" or model.get("stale"):   # not live: grey. Events are history.
         fr.restyle(x + 1, y + 1, w - 2, h - 2 - ev, "off")
 
 
@@ -1792,6 +2282,379 @@ def dialog(fr, g, caps, title, bw, bh, lines, hints):
     return boxed
 
 
+# ------------------------------------------------------------------ dialogs of the machines (04 §3.8)
+CONNECT_WORDS = {
+    "refused": "{h} answered, but sharing is off there. On {n}: sudo oomph share on (or the app's + › Share this Mac).",
+    "turned_away": "{h} closed the connection right away. Sharing there is limited to the networks it was turned on "
+                   "for: if {n} moved, run sudo oomph share on there.",
+    "local_network_denied": "This terminal may not reach the local network: allow it in System Settings › Privacy & "
+                            "Security › Local Network.",
+    "timeout": "No answer from {h}. Is it awake and on this network?",
+    "dns": "Can't find “{h}”.",
+    "pair_failed": "That code wasn't accepted. Codes work once, for 10 minutes, and five wrong tries void them. Get a "
+                   "new one there.",
+    "too_many": "Twelve machines are connected. Disconnect one to add another.",
+    "busy": "{n} has as many viewers as it serves at once. Try again in a minute.",
+    "ssh": "ssh could not sign in to {h} without asking for something, and {b} never types a password. Try it in a "
+           "terminal: ssh {t}",
+    "identity_changed": "{h} answered with another key than the one shown: nothing was sent. Try again, and compare "
+                        "the key with oomph share status there.",
+    "revoked": "{n} no longer knows this computer: its access was revoked, or sharing was reset there. Pair again with "
+               "a new code.",
+    "bad_address": "That isn't an address. Type a host name, host:port or user@host, or paste a pairing link.",
+    "ask": "Nothing was added. The pairing made just now was given back there and its code is used up: get a new one "
+           "there to try again.",
+}
+
+
+def connect_message(code, target, detail="", side=None):
+    """The connect dialog's words for what `oomph remote add --json` answered: the app's (01 §3.7's
+    table), with "this Mac" read as "this computer"."""
+    host = target.rpartition("@")[2]
+    if host.startswith("ssh://"):
+        host = host[6:]
+    h = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    n = h.split(".")[0] or h
+    b = BRAND or "?"
+    if code == "not_oomph":
+        if "@" in target or target.startswith("ssh://"):
+            return ("{b} is not installed on {h}. Install it there, then try again." if "not installed" in detail
+                    else "The {b} on {h} is too old for remote access. Update it there.").format(b=b, h=h)
+        return "Something answers there, but it isn't %s." % b
+    if code == "incompatible":
+        return {"old": "{n}'s {b} is too old for remote access. Update it there.",
+                "new": "{n}'s {b} is newer than this dashboard understands. Upgrade {b} here."}.get(
+            side, "{n}'s {b} and this one can't talk to each other. Update the older one.").format(n=n, b=b)
+    w = CONNECT_WORDS.get(code)
+    if w:
+        return w.format(h=h, n=n, t=target, b=b)
+    return detail or "Connecting to %s failed." % h
+
+
+def is_address(text):
+    """A complete address by itself (04 §3.8): then nothing is completed and "as typed" is the
+    highlighted row. An IPv4 or bracketed IPv6 literal, a name with a dot, user@host, a link."""
+    t = text.strip()
+    if t.startswith(("oomph://", "ssh://", "[")) or "@" in t:
+        return True
+    host = t.rsplit(":", 1)[0] if t.count(":") == 1 else t
+    return "." in host.strip(".") or t.count(":") >= 2
+
+
+def known_names(e):
+    return [n for n in [e.get("label"), e.get("name"), e.get("host")] + list(e.get("addrs") or []) if isinstance(n, str) and n]
+
+
+def connect_rows(text, known):
+    """The rows under the address (04 §3.8): with nothing typed the Recents, else the machines of
+    which a name, the host name or a remembered address starts with the text, then "as typed".
+    Returns (rows, the row the highlight starts on): rows are ("known", entry, what matched) and
+    ("typed", text)."""
+    t = text.strip()
+    if not t:
+        rec = sorted((e for e in known if not e.get("pinned")), key=lambda e: -(_f(e.get("last_connected")) or 0))
+        rows = [("known", e, label_of(e)) for e in rec[:5]]
+        return rows, (0 if rows else None)
+    low = t.lower()
+    rows = []
+    for e in known:
+        hit = next((n for n in known_names(e) if n.lower().startswith(low)), None)
+        if hit is not None:
+            rows.append(("known", e, hit))
+    rows = rows[:5] + [("typed", t)]
+    return rows, (0 if len(rows) > 1 and not is_address(t) else len(rows) - 1)
+
+
+def label_of(e):
+    return e.get("label") or e.get("name") or e.get("host") or e.get("mid") or "?"
+
+
+def _field(label, text, kw=10, fresh=False, cursor=True):
+    """A text field: its label, the text (its tail, when longer), the cursor; a prefilled text
+    that typing replaces is drawn selected."""
+    def fn(fr, x, y, w, bg):
+        fr.put(x, y, label, "dim", bg)
+        room = max(1, w - kw - 1)
+        g = GLYPHS["ascii" if fr.ascii_only else "unicode"]
+        cells = cells_of(text, fr.ascii_only)
+        shown = text if len(cells) <= room else g["ell"] + "".join(cells[-(room - 1):])
+        if fresh and text:
+            xx = fr.put(x + kw, y, shown, "fg", bg, REV)
+        else:
+            xx = fr.put(x + kw, y, shown, "fg", bg, BOLD)
+        if cursor:
+            fr.put(xx, y, " ", "fg", bg, REV if not (fresh and text) else 0)
+    return fn
+
+
+def _row(text, on, right=None, role="fg"):
+    def fn(fr, x, y, w, bg):
+        g = GLYPHS["ascii" if fr.ascii_only else "unicode"]
+        text_, right_ = asc(text, fr), asc(right, fr)
+        if on:
+            fr.put(x, y, g["sel"], "accent", bg, BOLD)
+        r = tw(right_) + 2 if right_ else 0
+        fr.put(x + 2, y, fit(text_, max(1, w - 2 - r), g), role, bg, BOLD if on else 0)
+        if right_ and w - 2 - r > 8:
+            fr.rput(x + w - 1, y, right_, "dim", bg)
+    return fn
+
+
+def _line(text, role="dim"):
+    return lambda fr, x, y, w, bg: fr.put(x, y, fit(asc(text, fr), w, GLYPHS["ascii" if fr.ascii_only else "unicode"]),
+                                          role, bg)
+
+
+def _mpara(text, w, pri, role="dim"):
+    """A paragraph of a machines' dialog: _para with the ASCII punctuation where it is needed."""
+    group = object()
+    return [(pri, _line(line, role), group) for line in _wrap(text, w)]
+
+
+def _cw(fr, bw, bh):
+    """The width a dialog's lines have: inside the box, or the whole pane where the box does not fit."""
+    return bw - 6 if fr.w >= bw + 2 and fr.h >= bh + 3 else fr.w - 2
+
+
+def _err(ov, cw=62):
+    """The dialog's error line (warning colour), or what it is doing (busy)."""
+    if ov.get("busy"):
+        return [(0, _line(ov["busy"], "dim"))]
+    if ov.get("error"):
+        return [(0, _line(l, "warntx")) for l in _wrap(ov["error"], cw)[:3]]
+    return []
+
+
+def overlay_connect(fr, caps, g, model, ov):
+    """+: Connect to a machine (01 §3.7, mockups 07 and 08)."""
+    cw = _cw(fr, 68, 16)
+    text = ov.get("text", "")
+    rows, start = connect_rows(text, model.get("book") or [])
+    sel = ov.get("sel") if ov.get("sel") is not None else start
+    lines = [(9, None), (0, _field("Address", text, fresh=ov.get("fresh", False), cursor=not ov.get("busy"))), (9, None)]
+    if rows:
+        head = "Recents" if not text.strip() else "Matches"
+        hint = "enter connects" if not text.strip() else \
+            "tab completes %s enter connects as typed" % g["mid"] if rows[-1][0] == "typed" and sel == len(rows) - 1 \
+            else "tab completes %s enter connects" % g["mid"]
+        lines.append((0, lambda fr, x, y, w, bg: (fr.put(x, y, head, "dim", bg),
+                                                  fr.rput(x + w - 1, y, hint, "faint", bg) if w > 40 else None)))
+        for i, r in enumerate(rows):
+            if r[0] == "typed":
+                lines.append((0, _row("+ connect to “%s” as typed" % r[1], i == sel)))
+                continue
+            e = r[1]
+            about = (" %s " % g["mid"]).join(x for x in (
+                (e.get("addrs") or [None])[0] if (e.get("addrs") or [None])[0] != label_of(e) else None,
+                e.get("os_version") or (e.get("os") == "linux" and "Linux") or None,
+                "%.0f GB" % e["ram_gb"] if _f(e.get("ram_gb")) else None) if x)
+            last = _f(e.get("last_connected"))
+            right = when(last, model.get("wall", model["now"])) if last else None
+            lines.append((0, _row("%-10s %s" % (label_of(e), about), i == sel, right)))
+    lines += _err(ov, cw)
+    if not (len(rows) > 1 and text.strip() and is_address(text)) and rows and rows[-1][0] == "typed" and not ov.get("error"):
+        lines.append((6, _line("    a new machine asks for a pairing code once", "faint")))
+    lines.append((8, None))
+    lines += _mpara("Encrypted direct connection, TCP port 6674. Nothing is sent until you press enter. For SSH "
+                   "instead, type ssh://user@host or user@host.", cw, 5)
+    return dialog(fr, g, caps, "Connect to a machine", 68, 16, lines,
+                  [("esc", "cancel"), ("enter", "connect"), ("tab", "complete"), (g["updown"], "choose"),
+                   ("^D", "forget")])
+
+
+def show_code(code):
+    groups = [code[i:i + 4] for i in range(0, len(code), 4)] or [""]
+    return "  -  ".join(groups)
+
+
+def overlay_pair(fr, caps, g, model, ov):
+    """The pairing code (01 mockup 09): the command to run there, three groups of four, the key."""
+    cw = _cw(fr, 68, 16)
+    target = ov.get("target", "")
+    h = target.rpartition("@")[2]
+    lines = [(9, None)]
+    if ov.get("revoked"):
+        lines += _mpara("%s no longer knows this computer: its access was revoked, or sharing was reset there. Ask it "
+                       "for a new one-time code:" % h, cw, 3)
+    else:
+        lines += _mpara("First connection to this machine. Sharing must be on there; then ask it for a one-time code:",
+                       cw, 3)
+    lines += [(9, None), (0, lambda fr, x, y, w, bg: (fr.put(x + 2, y, "sudo oomph share pair", "fg", bg, BOLD),
+                                                      fr.rput(x + w - 1, y, "^Y copies", "faint", bg) if w > 40 else None)),
+              (9, None), (0, _field("Code", show_code(ov.get("code", "")), kw=8, cursor=not ov.get("busy")))]
+    lines += _err(ov, cw)
+    lines += [(8, None)]
+    lines += _mpara("Works once, for 10 minutes. The code also proves that nobody sits in between: a wrong machine "
+                   "cannot answer it.", cw, 4)
+    if ov.get("fp_short"):
+        lines += [(8, None), (2, _line("Key %s  same as oomph share status there" % ov["fp_short"], "dim"))]
+    return dialog(fr, g, caps, "Pair with %s" % h, 68, 16, lines,
+                  [("esc", "back"), ("enter", "pair"), ("^Y", "copy the command")])
+
+
+def overlay_ssh(fr, caps, g, model, ov):
+    """Through SSH the dialog carries the consent (01's mockup 37): the command that will run."""
+    cw = _cw(fr, 68, 12)
+    t = ov.get("target", "")
+    user, _, host = t[6:].rpartition("@") if t.startswith("ssh://") else t.rpartition("@")
+    who = user or "you"
+    cmd = "ssh %s-- %s oomph serve --stdio" % ("-l %s " % user if user else "", host)
+    lines = [(9, None), (0, _line("    " + cmd, "fg")), (9, None)]
+    lines += _mpara("Whoever can sign in to %s as %s can read what %s logs there; no pairing code is asked."
+                   % (host, who, BRAND or "?"), cw, 2)
+    lines += [(9, None)] + _err(ov, cw)
+    return dialog(fr, g, caps, "Connect to %s over SSH" % host, 68, 12, lines,
+                  [("esc", "back"), ("enter", "connect")])
+
+
+def overlay_ask(fr, caps, g, model, ov):
+    """A known machine id with another key is a question, never a merge (01 §4.5, mockup 29)."""
+    cw = _cw(fr, 68, 12)
+    lab = ov.get("label") or "?"
+    lines = [(9, None)]
+    lines += _mpara("It reports the same machine id as %s, but has a different key or address. That is normal after "
+                   "reinstalling %s or resetting sharing there, and for cloned systems." % (lab, BRAND or "?"), cw, 3)
+    lines += [(9, None), (0, _row("Add separately", ov.get("sel", 0) == 0, "keeps both, in two tabs")),
+              (0, _row("Replace %s" % lab, ov.get("sel", 0) == 1, "keeps its history, trusts the new key")), (9, None)]
+    return dialog(fr, g, caps, "Same machine as %s?" % lab, 68, 12, lines,
+                  [("esc", "cancel"), ("enter", "confirm"), (g["updown"], "choose")])
+
+
+def overlay_name(fr, caps, g, model, ov):
+    """After a pairing: the tab's name, prefilled with the host name (selected: typing replaces)."""
+    cw = _cw(fr, 68, 10)
+    lines = [(9, None)]
+    if ov.get("about"):
+        lines.append((3, _line(ov["about"], "dim")))
+        lines.append((9, None))
+    lines += [(0, _field("Tab name", ov.get("text", ""), fresh=ov.get("fresh", False))), (9, None)]
+    if ov.get("other"):
+        lines += _mpara("It is not a Mac: the app gives it a tab once it knows that system's words; here it is a tab "
+                       "now.", cw, 4)
+    title = ("Paired with %s" if ov.get("kind") == "name" else "Rename %s") % (ov.get("name") or "?")
+    return dialog(fr, g, caps, title, 68, 10, lines,
+                  [("esc", "keep the name" if ov.get("kind") == "name" else "cancel"),
+                   ("enter", "add" if ov.get("kind") == "name" else "rename")])
+
+
+def overlay_forget(fr, caps, g, model, ov):
+    """X: forgetting deletes the token needed to tell the other side later, so it says what is true
+    for this link (04 §3.7)."""
+    cw = _cw(fr, 66, 12)
+    lab = ov.get("label") or "?"
+    me = (model.get("tabs") or [{}])[0].get("label") or "this computer"
+    lines = [(9, None), (0, _line("Forget %s?" % lab, "fg")), (9, None)]
+    lines += _mpara("Its history on this computer is deleted, and connecting again needs a new pairing code.", cw, 4)
+    if ov.get("ssh"):
+        lines += _mpara("It was reached over SSH: nothing is kept there.", cw, 3)
+    elif ov.get("connected"):
+        lines += _mpara("%s is told to forget this computer." % lab, cw, 3)
+    else:
+        lines += _mpara("%s cannot be reached now, so it is not told: this computer stays in its list of paired machines "
+                       "until `sudo oomph share revoke %s` is run there." % (lab, me), cw, 3)
+    lines.append((9, None))
+    return dialog(fr, g, caps, "Forget this machine", 66, 12, lines, [("esc", "keep"), ("n", "keep"), ("y", "forget")])
+
+
+ATTENTION_TEXT = {
+    "identity_changed": ("Its key changed.", "{n} answers with a different key than the one pinned when it was paired. "
+                         "That is normal after reinstalling {b} or resetting sharing there. It is also what another "
+                         "machine in its place would look like. Nothing is sent to it until you decide."),
+    "revoked": ("Its access was revoked.", "{n} no longer knows this computer: its access was revoked, or sharing was "
+                "reset there. Pair again with a new code from {n}."),
+    "incompatible": ("Its {b} can't talk to this one.", "{n}'s {b} and this one don't speak the same version of the "
+                     "protocol. Update the older one."),
+    "ssh": ("SSH can't sign in.", "ssh could not sign in to {h} without asking for something, and {b} never types a "
+            "password. Try it in a terminal: ssh {t}"),
+    "refused": ("Sharing is off there.", "{n} answered, but sharing is off there. On {n}: sudo oomph share on."),
+    "turned_away": ("Sharing is off there.", "{n} closed the connection right away. Sharing there is limited to the "
+                    "networks it was turned on for: if {n} moved, run sudo oomph share on there."),
+    "blocked": ("Blocked by macOS.", "If this terminal app is not allowed on the local network (System Settings › "
+                "Privacy & Security › Local Network), that is the cause."),
+}
+
+
+def attention_keys(cause, ssh=False):
+    """The ways out of a "what happened" card, each a key of its own."""
+    k = []
+    if cause in ("identity_changed", "revoked") and not ssh:
+        k.append(("p", "pair again"))
+    if cause in ("ssh", "refused", "turned_away", "blocked", "incompatible", "attention"):
+        k.append(("r", "try again"))
+    return k + [("X", "forget")]
+
+
+def overlay_attention(fr, caps, g, model, ov):
+    """enter on a tab with an orange capsule: 01's callout as a card (04 §3.7, mockup)."""
+    cw = _cw(fr, 68, 16)
+    sel = model.get("sel", 0)
+    t, v = model["tabs"][sel], tab_views(model)[sel]
+    lab = t.get("label") or "?"
+    head, body = ATTENTION_TEXT.get(v["cause"], ("It needs attention.", "{n} can't be reached the usual way."))
+    target = t.get("addr") or lab
+    body = body.format(n=lab, h=target.rpartition("@")[2], t=target, b=BRAND or "?")
+    head = head.format(b=BRAND or "?")
+    lines = [(9, None), (0, _line(head, "fg")), (9, None)] + _mpara(body, cw, 3) + [(9, None)]
+    known = _f(t.get("known"))
+    lines.append((4, _line("Last data %s; what was received stays here." % (when(known, model["now"]) if known else "never"),
+                           "dim")))
+    keys = attention_keys(v["cause"], t.get("transport") == "ssh")
+    return dialog(fr, g, caps, "%s needs attention" % lab, 68, 16, lines + [(9, None)], [("esc", "close")] + keys)
+
+
+def list_rows_machines(model, filt):
+    """The machine list's rows: (index, tab) of the tabs whose name or address contains the filter."""
+    f = filt.strip().lower()
+    return [(i, t) for i, t in enumerate(model["tabs"])
+            if not f or f in (t.get("label") or "").lower() or f in (t.get("addr") or "").lower()]
+
+
+def overlay_list(fr, caps, g, model, ov):
+    """0: every machine in one list, with its address and state in words (04 §3.7)."""
+    views = tab_views(model)
+    rows = list_rows_machines(model, ov.get("filter", ""))
+    sel = max(0, min(ov.get("sel", 0), len(rows) - 1))
+    n = max(1, (fr.h - 8) if fr.w >= 74 and fr.h >= 24 else fr.h - 6)
+    off = max(0, min(sel - n + 1, len(rows) - n)) if sel >= n else 0
+    lines = [(9, None), (0, _field("Filter", ov.get("filter", ""), kw=8)), (9, None)]
+    mono = caps.color == "none"
+    for k, (i, t) in enumerate(rows[off:off + n]):
+        v = views[i]
+
+        def fn(fr, x, y, w, bg, i=i, t=t, v=v, on=(off + k == sel)):
+            if on:
+                fr.put(x, y, g["sel"], "accent", bg, BOLD)
+            fr.rput(x + 4, y, str(i + 1), "fg", bg)
+            xx = fr.put(x + 6, y, g["marks"][v["mark"]], None if mono else MARK_ROLE[v["mark"]], bg)
+            if v["badge"]:
+                fr.put(xx, y, "!", None if mono else "crit", bg, BOLD)
+            words = asc(state_words(t, v), fr)
+            fr.put(x + 9, y, fit(t.get("label") or "?", 14, g), "fg", bg, BOLD if on else 0)
+            if w > 44:
+                fr.put(x + 24, y, fit(t.get("addr") or "", max(4, w - 26 - tw(words) - 2), g), "dim", bg)
+            fr.rput(x + w - 1, y, fit(words, max(4, w - 26), g), "dim" if v["live"] else "warntx" if v["attention"]
+                    else "dim", bg)
+        lines.append((0, fn))
+    if not rows:
+        lines.append((0, _line("  no machine matches", "faint")))
+    return dialog(fr, g, caps, "Machines", 74, min(24, max(10, len(rows) + 8)), lines,
+                  [("esc", "close"), ("enter", "show"), (g["updown"], "choose"), ("", "type to filter")])
+
+
+def machine_help(g):
+    """The help's third page: the machines' keys and marks."""
+    m = g["marks"]
+    keys = [("Machines", None), ("1%s9  0" % g["dash"], "a tab %s every machine" % g["mid"]),
+            ("tab  n p", "next %s previous tab" % g["mid"]), ("+", "connect to a machine"),
+            ("x  u", "disconnect %s undo" % g["mid"]), ("X", "forget it"), ("r", "retry now"), ("R", "rename the tab"),
+            ("enter", "what happened there")]
+    marks = [("Marks", None), ([(m["ok"], "ok"), (m["warn"], "warn"), (m["crit"], "crit")], "normal, warning, critical"),
+             ([(m["silent"], "faint")], "its logger is silent"), ([(m["busy"], "accent")], "connecting, catching up"),
+             ([(m["off"], "faint")], "not connected"), ([(m["att"], "warntx")], "needs attention"),
+             ([("!", "crit")], "an incident is open there"), ([(g["miss"] * 2, "faint")], "not received")]
+    return keys, marks
+
+
 def _text(text, role="fg", fl=0):
     return lambda fr, x, y, w, bg: fr.put(x, y, fit(text, w, GLYPHS["ascii" if fr.ascii_only else "unicode"]), role, bg, fl)
 
@@ -1841,9 +2704,18 @@ def help_pages(g, model):
 
 
 def help_entries(g, model):
-    """Both pages as one column, for the full-pane form that scrolls."""
+    """Both pages (three with machines) as one column, for the full-pane form that scrolls."""
     left, right, see = help_pages(g, model)
-    return [e for e in left + right if e != ("", "")] + [("", ""), ("What you see", None)] + see
+    more = []
+    if model.get("tabs"):
+        keys, marks = machine_help(g)
+        more = [("", "")] + keys + marks
+    return [e for e in left + right if e != ("", "")] + [("", ""), ("What you see", None)] + see + more
+
+
+def help_count(model):
+    """How many pages the boxed help has: keys, what you see, and with machines their keys and marks."""
+    return 3 if model.get("tabs") else 2
 
 
 def overlay_help(fr, caps, g, model, ui, ov):
@@ -1867,7 +2739,19 @@ def overlay_help(fr, caps, g, model, ui, ov):
         return fn
 
     if fr.w >= 76 and fr.h >= 24:
-        if ov.get("page", 1) == 1:
+        page, npages = ov.get("page", 1), help_count(model)
+        if page == 3:
+            keys, marks = machine_help(g)
+
+            def row3(i):
+                def fn(fr, x, y, w, bg):
+                    if i < len(keys):
+                        entry(keys[i][0], keys[i][1], 11)(fr, x, y, 34, bg)
+                    if i < len(marks):
+                        entry(marks[i][0], marks[i][1], 4)(fr, x + 36, y, w - 36, bg)
+                return fn
+            rows = [(1, row3(i)) for i in range(15)]
+        elif page == 1:
             def row(i):
                 def fn(fr, x, y, w, bg):
                     if i < len(left):
@@ -1879,9 +2763,10 @@ def overlay_help(fr, caps, g, model, ui, ov):
         else:
             rows = [(1, entry(k, d, 8)) for k, d in see] + [(1, None)] * (15 - len(see))
         lines = [(9, None)] + rows + [(8, None), (5, _text(ui.get("detected") or "", "faint"))]
-        return dialog(fr, g, caps, "Keys" if ov.get("page", 1) == 1 else "What you see", 74, 21, lines,
-                      [("esc", "close"), ("?", "what you see" if ov.get("page", 1) == 1 else "keys"),
-                       ("", "page %d of 2" % ov.get("page", 1))])
+        nxt = page % npages + 1
+        return dialog(fr, g, caps, ("Keys", "What you see", "Machines")[page - 1], 74, 21, lines,
+                      [("esc", "close"), ("?", ("keys", "what you see", "machines")[nxt - 1]),
+                       ("", "page %d of %d" % (page, npages))])
     entries = help_entries(g, model)
     n = fr.h - 3
     off = max(0, min(ov.get("off", 0), len(entries) - n))
@@ -2478,7 +3363,23 @@ def keys_main(g, model):
     if not hot:
         k.append(("s", "sessions"))
     k += [("e", "events"), ("i", "inspect")]
-    return k
+    if not model.get("tabs"):
+        return k
+    sel = model.get("sel", 0)
+    t, v = model["tabs"][sel], tab_views(model)[sel]
+    on = model.get("engine") == "on"
+    if several(model):
+        k.insert(k.index((g["updown"], "select")) + 1, ("tab", "machine"))
+    if t.get("local") or v["live"] or v["phase"] == "grace":
+        return k + ([("+", "add")] if on else [])
+    lead = [("q", "quit"), ("?", "help")]
+    if v["attention"]:
+        lead.append(("enter", "what happened"))
+    elif v["retry"] and on:
+        lead.append(("r", "retry now"))
+    lead += [("x", "disconnect"), ("X", "forget")] if on else []
+    rest = [x for x in k if x[0] not in ("q", "?")]
+    return lead + [x for x in rest if x[0] == "tab"] + ([("+", "add")] if on else []) + [x for x in rest if x[0] != "tab"]
 
 
 def keys_of(g, model, ui, P):
@@ -2520,6 +3421,8 @@ def status_of(model, g, ui=None):
     for i in model["incidents"]:
         if i["open"]:
             return "Incident open %s %s" % (g["mid"], ago(model["now"] - i["start"])), "crit"
+    if model.get("remote"):              # another machine: the machine line says how it is
+        return None, "faint"
     if ui.get("readonly"):
         return ui["readonly"], "warntx"
     lg = model.get("logger")
@@ -2527,6 +3430,8 @@ def status_of(model, g, ui=None):
         return model.get("off_text") or "Logging is off", "warntx"
     if lg == "silent":
         return "Logger not reporting since %s" % hhmm(model.get("logger_t") or model["now"]), "warntx"
+    if several(model):                   # the machine line says it
+        return None, "faint"
     return "Logging every %d s" % (model.get("interval") or 30), "faint"
 
 
@@ -2564,7 +3469,7 @@ def too_small(W, H, caps):
 
 def layout(model, W, H):
     """The row plan for this model at this size (its slow facts: reservations and incidents on record)."""
-    return plan(W, H, has_res=bool(model["res"]), has_inc=bool(model["incidents"]))
+    return plan(W, H, has_res=bool(model["res"]), has_inc=bool(model["incidents"]), mline=several(model))
 
 
 def render(model, W, H, caps, ui):
@@ -2576,10 +3481,15 @@ def render(model, W, H, caps, ui):
         return too_small(W, H, caps)
     fr = Frame(W, H, caps.glyphs == "ascii")
     P = layout(model, W, H)
-    tab_bar(fr, model, caps, g)
+    if model.get("tabs"):
+        machine_tabs(fr, model, caps, g)
+        if P["mline"]:
+            machine_line(fr, 1, model, caps, g)
+    else:
+        tab_bar(fr, model, caps, g)
     if P["stats"]:
         draw_stats(fr, 1, P["stats_y"], W - 2, model, g, P["stats"])
-        if model.get("logger") == "silent":     # readings that are not live any more stay, greyed
+        if model.get("logger") == "silent" or model.get("stale"):   # readings that are not live: greyed
             fr.restyle(0, P["stats_y"], W, P["stats"], "off")
     draw_body(fr, P, model, ui, caps, g)
     if ui.get("inspect"):
@@ -2595,7 +3505,8 @@ def render(model, W, H, caps, ui):
             return fr                           # its hints are on the key line
         fr.fill(0, H - 1, W, 1, " ", None, None)
         keys = [("esc", "close")]
-    draw_footer(fr, H - 1, g, status, keys, srole, must=("esc",) if keys[0][0] == "esc" else ("a",))
+    draw_footer(fr, H - 1, g, status, keys, srole,          # (a note just asked for is shown even so)
+                must=("esc",) if keys[0][0] == "esc" else () if ui.get("note") else ("a",))
     if ov:
         fr.restyle(0, H - 1, W, 1, "off")
     return fr
@@ -2605,6 +3516,11 @@ def draw_overlay(fr, model, ui, ov, caps, g):
     kind = ov.get("kind")
     if kind == "help":
         return overlay_help(fr, caps, g, model, ui, ov)
+    machine_dialogs = {"connect": overlay_connect, "pair": overlay_pair, "ssh": overlay_ssh, "ask": overlay_ask,
+                       "name": overlay_name, "rename": overlay_name, "forget": overlay_forget,
+                       "attention": overlay_attention, "list": overlay_list}
+    if kind in machine_dialogs and (model.get("tabs") or kind == "connect"):
+        return machine_dialogs[kind](fr, caps, g, model, ov)
     if kind == "inc":
         inc = next((i for i in model["incidents"] if i["id"] == ov.get("id")), None)
         if inc:
@@ -2631,7 +3547,11 @@ def draw_body(fr, P, model, ui, caps, g):
         fr.put(0, yy, g["v"], "line")
         fr.put(lw - 1, yy, g["v"], "line")
     fr.hline(0, P["bottom_y"], lw, g, "line", g["bl"], g["br"])
-    draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory")
+    miss = False
+    if model.get("missing"):
+        f, _ = mapper(model["now"], model.get("first") or model["now"], SPANS[ui["span"]])
+        miss = any(f(b) > 0 for a, b, k in model["missing"])
+    draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory", miss)
     gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
     now = model["now"]
     rows, n_live, n_wait = list_rows(model, P["R"], ui)
@@ -2640,6 +3560,8 @@ def draw_body(fr, P, model, ui, caps, g):
         reserved = sum(r["segments"][-1][1] for r in live if r.get("granted") is not None)
         n24 = sum(1 for r in model["res"] if (r["ended"] if r.get("ended") is not None else now) >= now - 86400)
         summary = "%.1f GB reserved %s %d in the last 24 h" % (reserved, g["mid"], n24)
+        if model.get("stale"):           # another machine's, not connected: said once, as of when (01 §3.5)
+            summary = "as of %s: %.1f GB reserved" % (hhmm(model.get("known") or now), reserved)
         if tw(summary) + 4 > lw - 2 - (24 if lw >= 64 else 14):      # too long beside the title: the count gives way
             summary = summary.split(" %s " % g["mid"])[0]
         hidden = n_live - sum(1 for r in rows if r[0] == "res" and r[1].get("ended") is None)

@@ -7,6 +7,7 @@
                                      the popup's dashboard, full screen (? lists its keys)
   oomph top --ssh [USER@]HOST       the same on another Mac or Linux machine, over ssh
   oomph top --once [--size 80x24]   one frame of it, as text
+  oomph top --machine NAME          starts on another machine's tab [--no-connect: no links]
   oomph incidents
   oomph incident <id|latest> [--html]
   oomph html [--last 24h | --since ISO [--until ISO]] [-o FILE] [--open]
