@@ -1286,7 +1286,9 @@ def test_pty_machines(base):
         watched = wait_until(lambda: any(c.get("cmd") == "watch" and set(c["ids"]) >= {mini, build, gpu} for c in cmds()), 5, p)
         check("1 studio" in s0.splitlines()[0] or " 1 " in s0.splitlines()[0] and "this machine" in s0 and watched,
               "machines: the tabs of machines.json after this one; the sync child is told to watch them all")
-        p.send("3", wait=0.6)
+        p.send("3", wait=0.2)                     # the worker reads build-box's history first: on a slow runner
+        wait_until(lambda: "build-box · No answer since 12:47" in screen(p) and "Not connected" in screen(p), 6, p)
+        # (that is more than half a second; wait for the whole sentence, a frame can come in two reads)
         s3 = screen(p)
         focus = wait_until(lambda: any(c.get("cmd") == "watch" and c.get("focus") == build for c in cmds()), 3, p)
         p.send("r", wait=0.4)
@@ -1410,7 +1412,8 @@ def test_pty_machines(base):
     p = Pty(top("--no-connect"), env)
     try:
         p.pump(5, until=b"this machine")
-        p.send("3", wait=0.5)
+        p.send("3", wait=0.2)
+        wait_until(lambda: "Not syncing (--no-connect)" in screen(p), 6, p)   # (build-box's history read first)
         s = screen(p)
         n0 = len(records(flog))
         p.send("+", wait=0.4)
