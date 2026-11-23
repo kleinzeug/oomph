@@ -644,6 +644,7 @@ tools/toptest.py                  `oomph top` in a pseudo-terminal: keys, signal
 tools/nettest.py                  the protocol's tests: serve, sync through a pipe, coverage, hostile input
 tools/mirrorfixture.py            another machine's mirror, for `oomph.app --render-popup … --mirror DIR`
 tools/renderfixture.py            renders that repeat themselves: `--render-popup … --fixture DIR --now T --no-liveness`
+                                  and, with `--against OLD`, every state byte for byte against an older build
 tools/spike_role_account.sh       a CI spike: a launchd job under a role account, time to first frame
 DESIGN.md                         the investigation and the design decisions
 docs/index.html                   the website (GitHub Pages, served from /docs)

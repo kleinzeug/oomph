@@ -21,12 +21,12 @@ import unicodedata
 
 BOLD, REV, UL, DIM = 1, 2, 4, 8
 KEEP = object()          # Frame.put(..., bg=KEEP): leave the cell's background as it is
-MIN_AGE = 300.0          # ages below this share the right edge of the log axis (MemoryChart.minAge)
+MIN_AGE = 300.0          # ages below this share the right edge of the log axis (TimeAxis.minAge)
 GAP_S = 300.0            # longer than this without a sample is a gap (Store.gapSeconds)
 QUEUE_STALE_S = 180.0    # a queue place not polled for this long has lapsed (oomph.QUEUE_STALE_S)
 KEEP_DAYS = 14           # reservations and samples shown (the log keeps 14 days)
 MERGE_KEEP = ("res", "peak", "v", "agent", "user")  # a later record's null does not undo these (oomph.MERGE_KEEP)
-LEVELS = (604800, 86400, 21600, 3600, 900, 300, 60)   # grid levels, coarse first (MemoryChart.levels)
+LEVELS = (604800, 86400, 21600, 3600, 900, 300, 60)   # grid levels, coarse first (TimeAxis.levels)
 SERIES = ("wired", "app", "comp", "swap")             # stacked bottom to top
 RES_ROLES = ("r0", "r1", "r2", "r3", "r4", "r5", "r6")  # teal purple pink indigo gold brown green
 STRIP_TOPS = (2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256)
@@ -465,7 +465,7 @@ class Frame:
 # ------------------------------------------------------------------ chart maths: ports of the app's
 # Keep these in step with app/oomph.swift; tools/vectors/chart.json holds both to the same numbers.
 def mapper(now, first, span_s):
-    """MemoryChart.mapper with blend 0 (linear: the last span_s seconds) or, span_s None, blend 1 (log
+    """TimeAxis.mapper with blend 0 (linear: the last span_s seconds) or, span_s None, blend 1 (log
     in age over all history, ages under MIN_AGE at the right edge). Time → x in 0…1 (1 = now), and
     its inverse."""
     if span_s is None:
@@ -507,7 +507,7 @@ def multires(pts, now):
 
 
 def calm_bands(away, gaps, tolerance):
-    """MemoryChart.calmBands: spans closer than `tolerance` merge. Grey: away spans, bridged by the
+    """TimeAxis.calmBands: spans closer than `tolerance` merge. Grey: away spans, bridged by the
     no-data stretches that touch them. Returns (grey spans, hatched spans). The app calls it with
     pixels and 2 px; the terminal with columns and 0."""
     def merge(spans):
@@ -1585,7 +1585,7 @@ def _draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
     held = ui.get("yhold")
     f, finv, cols, ymax, fr.yhold = plot_geometry(model, ui["span"], W, held[1] if held and held[0] == ui["span"] else None)
     L = 8 * H
-    # MemoryChart.calmBands with columns as the unit: a no-data stretch that touches an away band is part of it
+    # TimeAxis.calmBands with columns as the unit: a no-data stretch that touches an away band is part of it
     grey, _ = calm_bands(_runs([st == "data" and p["away"] for st, p in cols]), _runs([st == "gap" for st, p in cols]), 0)
     band = [False] * W
     for a, b in grey:
@@ -2957,7 +2957,7 @@ def duration(sec):
 
 
 def time_at(u, f, first, now):
-    """MemoryChart.time(at:): the time at x = u, by bisection over [first - 1, now] (the mapper is
+    """TimeAxis.time(at:): the time at x = u, by bisection over [first - 1, now] (the mapper is
     monotonic), clamped to that range."""
     lo, hi = first - 1, now
     if u >= f(hi):

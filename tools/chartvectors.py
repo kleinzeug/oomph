@@ -2,11 +2,11 @@
 """Holds the chart maths of `oomph top` (daemon/oomph_view.py) to the app's (app/oomph.swift).
 
 tools/vectors/chart.json holds inputs and the expected answers of the functions both programs
-share: the mapper, thinning, gap finding, band merging, lane stacking, the strip's top, the
-colour index, the reservation merge and the hover card over a column (which `oomph top`'s inspect
-readout shows). The expected answers are the app's: `oomph
---chart-vectors FILE` runs its own functions over the inputs and prints what they return. A
-change on either side that is not made on the other fails here.
+share: the mapper and its inversion (the app's TimeAxis, which every chart row is drawn on),
+thinning, gap finding, band merging, lane stacking, the strip's top, the colour index, the
+reservation merge and the hover card over a column (which `oomph top`'s inspect readout shows).
+The expected answers are the app's: `oomph --chart-vectors FILE` runs its own functions over the
+inputs and prints what they return. A change on either side that is not made on the other fails here.
 
     tools/chartvectors.py                    the Python against the file (the self-test runs this)
     tools/chartvectors.py --app BINARY       the app against the file (CI runs this after the build)
@@ -33,7 +33,8 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import oomph_top  # noqa: E402
 import oomph_view as V  # noqa: E402
 
-GROUPS = ("mapper", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order", "hover")
+GROUPS = ("mapper", "invert", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order",
+          "hover")
 
 
 def cases():
@@ -47,6 +48,16 @@ def cases():
     v["mapper"].append({"now": now, "first": now - 600, "span": None, "t": [now, now - 200, now - 400, now - 600]})
     for span in (3600.0, None):     # a sample after the frame's clock (skew, or --now in the past) sits at now
         v["mapper"].append({"now": now, "first": first, "span": span, "t": [now + 1, now + 90, now + 7200]})
+    us = [0.0, 0.001, 0.1, 0.25, 0.5, 0.75, 0.9, 0.999, 1.0]
+    for span in (86400.0, 21600.0, 3600.0, None):   # x back to time, as an age: what the hover card is about
+        v["invert"].append({"now": now, "first": first, "span": span, "u": us})
+    v["invert"].append({"now": now, "first": now - 600, "span": None, "u": us})   # short: clamped to first - 1
+    # where the axis starts (TimeAxis.start): another machine's oldest sample newer than its first point loaded,
+    # older than it, a machine that reported none, and a machine with no points
+    for oldest, fp in ((first + 7200, first), (first - 86400, first), (None, first), (now - 3 * 86400, None),
+                       (None, None)):
+        for span in (86400.0, None):
+            v["invert"].append({"now": now, "first": fp, "oldest": oldest, "span": span, "u": us})
     for purpose in ("gradle assembleDebug", "pnpm check", "pytest -n 8", "docker build api", "xcodebuild test",
                     "cargo build --release", "playwright e2e", "training eval (overnight)", "größer – 構築", "",
                     "emoji \U0001F680 and é"):
@@ -247,12 +258,25 @@ def fixture_hover():
     return out
 
 
+def axis_start(oldest, first_point, now):
+    """TimeAxis.start: the oldest of another machine's reported oldest sample and the first point loaded;
+    the first point alone for this Mac (no oldest), now without either. `oomph top` gets the same start for
+    a mirror from the not-received stretches, which begin at that oldest sample (oomph_view.mirror_gaps)."""
+    if oldest is None:
+        return now if first_point is None else first_point
+    return oldest if first_point is None else min(oldest, first_point)
+
+
 def python_answers(v):
     """What oomph_view answers for the inputs of v, in the shape `oomph --chart-vectors` prints."""
     out = {g: [] for g in GROUPS}
     for c in v["mapper"]:
         f, _ = V.mapper(c["now"], c["first"], c["span"])
         out["mapper"].append([f(t) for t in c["t"]])
+    for c in v["invert"]:
+        first = axis_start(c.get("oldest"), c["first"], c["now"])
+        f, _ = V.mapper(c["now"], first, c["span"])
+        out["invert"].append([c["now"] - V.time_at(u, f, first, c["now"]) for u in c["u"]])
     out["color_index"] = [V.res_color_index(c["purpose"]) for c in v["color_index"]]
     out["strip_top"] = [V.strip_top(c["tallest"]) for c in v["strip_top"]]
     for c in v["multires"]:

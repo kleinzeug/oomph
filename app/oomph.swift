@@ -1984,63 +1984,53 @@ struct Stat: View {
     }
 }
 
-// MARK: - Memory chart
+// MARK: - Time axis
 
-/// The popup's memory chart. One view for every range: x is a blend of a linear axis (the last
-/// 10^lgRange seconds) and a log axis over all history (blend 0 → 1), both animatable, so a range
-/// switch morphs the chart and every point visibly travels to its new place. Each frame
-/// re-buckets the preloaded history into ~360 columns; nothing is reloaded.
-struct MemoryChart: View, Animatable {
-    var points: [Point]          // oldest first, multi-resolution (Store.multires)
-    var gaps: [Gap]
+/// The time axis every chart row shares (roadmap 02 §8): where a moment lies across the plot and back
+/// (the hover's inversion), the clock-aligned grid and its labels, a row's history bucketed into screen
+/// columns with its away spans, the no-data hatch and the not-received dots behind the series, and the
+/// incident rules. x is a blend of a linear axis (the last 10^lgRange seconds) and a log axis over all
+/// history (blend 0 → 1), both animatable: a row draws only its own series on the axis it is handed, so
+/// every row morphs alike when the range changes. The numbers are `oomph top`'s too (tools/vectors/chart.json).
+struct TimeAxis {
     var now: Double
-    var incidents: [Incident]
-    var events: [ChartEvent]
-    var ram: Double?
+    var first: Double            // where the ∞ axis begins (`start`)
     var lgRange: Double          // log10 of the linear range, seconds
     var blend: Double            // 0 = linear, 1 = log
-    /// The agents' reservations, drawn as a strip of blocks under the chart on the same time axis.
-    var reservations: [ResBlock] = []
-    var stripHeight: CGFloat = 0 // 0 = no strip
-    /// Another machine's oldest sample as it reported it: the ∞ axis spans back to it, so it does
-    /// not rescale while history arrives (roadmap 01 §3.5). nil: from the oldest point loaded.
-    var oldest: Double? = nil
-    /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
-    @State private var hoverX: CGFloat? = renderHoverX
-    /// The pointer over the reservation strip (strip coordinates).
-    @State private var stripHover: CGPoint? = renderStripHover
 
     var animatableData: AnimatablePair<Double, Double> {
         get { AnimatablePair(lgRange, blend) }
         set { lgRange = newValue.first; blend = newValue.second }
     }
 
-    static let series = ["Wired", "App", "Compressed", "Swap"]
+    /// Where the ∞ axis begins: the oldest point loaded, or another machine's oldest sample as it reported
+    /// it, so the axis does not rescale while history arrives (roadmap 01 §3.5).
+    static func start(oldest: Double?, firstPoint: Double?, now: Double) -> Double {
+        guard let o = oldest else { return firstPoint ?? now }
+        return min(o, firstPoint ?? o)
+    }
+
     static let minAge: Double = 300          // ages below this share the right edge of the log axis
-    static let columns = 360
+    static let buckets = 360                 // screen columns a row's history is bucketed into
     // grid levels, coarse first: a week, a day, 6 h, 1 h, 15 min, 5 min, 1 min (local time)
     static let levels: [Double] = [604800, 86400, 21600, 3600, 900, 300, 60]
 
-    struct Entry: Identifiable { let id: Int; let x: Double; let kind: String; let gb: Double }
     struct Band: Identifiable { let id: Int; let from: Double; let to: Double }
     struct GridLine: Identifiable { let id: Double; let x: Double; let alpha: Double }
     struct Label { let x: Double; let text: String }
+    /// One screen column of a row's history: its point, and whether a gap parts it from the older
+    /// (gapBefore) or the newer (gapAfter) neighbour, where the row's area drops to zero.
+    struct Column<P> { let x: Double; let p: P; let gapBefore: Bool; let gapAfter: Bool }
 
     /// Time → x in 0…1 (1 = now) for the current blend.
     func mapper() -> (Double) -> Double {
-        MemoryChart.mapper(now: now, first: firstT, lgRange: lgRange, blend: blend)
-    }
-
-    /// Where the ∞ axis begins.
-    var firstT: Double {
-        guard let o = oldest else { return points.first?.id ?? now }
-        return min(o, points.first?.id ?? o)
+        TimeAxis.mapper(now: now, first: first, lgRange: lgRange, blend: blend)
     }
 
     /// Linear: the last 10^lgRange s. Log: all history, ages under minAge at the right edge.
     /// Shared with `oomph top` (tools/vectors/chart.json).
     static func mapper(now: Double, first: Double, lgRange: Double, blend b: Double) -> (Double) -> Double {
-        let r = pow(10, lgRange), m = MemoryChart.minAge
+        let r = pow(10, lgRange), m = TimeAxis.minAge
         let span = log10(max(now - first, 3600) / m)
         return { t in
             let a = max(now - t, 0)
@@ -2048,76 +2038,173 @@ struct MemoryChart: View, Animatable {
         }
     }
 
-    var body: some View {
-        GeometryReader { geo in
-            let f = mapper()
-            let plotW = max(geo.size.width - 30, 50)
-            let (entries, away) = columns(f)
-            let gaps = gapBands(f)
-            let missing = gapBands(f, missing: true)
-            let grid = gridLines(f, plotW: plotW)
-            let labels = axisLabels(f, plotW: plotW)
-            VStack(spacing: MemoryChart.stripGap) {
-                Chart {
-                    gridMarks(grid, color: .primary, scale: 1)
-                    areaMarks(entries)
-                    gridMarks(grid, color: .white, scale: 0.45)
-                    ramMark
-                    incidentMarks(f)
-                }
-                .chartXScale(domain: 0...1)
-                .chartXAxis {
-                    // ticks here; the labels are drawn centered on them in the overlay (Charts would
-                    // left-align them to the tick). The blank label keeps the axis's height.
-                    AxisMarks(values: labels.map(\.x)) { _ in
-                        AxisTick(length: 3)
-                        AxisValueLabel { Text(" ").font(.system(size: 10)) }
-                    }
-                }
-                .chartForegroundStyleScale(domain: MemoryChart.series, range: MemoryChart.seriesColors)
-                .chartLegend(.hidden)  // the compact legend sits in the header row (ChartLegend)
-                .transaction { $0.animation = nil }  // this view animates itself, frame by frame
-                .chartBackground { proxy in bandLayer(proxy, away: away, gaps: gaps, missing: missing) }
-                .chartOverlay { proxy in
-                    ZStack(alignment: .topLeading) {
-                        axisLabelLayer(proxy, labels: labels)
-                        hoverTracker(proxy)
-                    }
-                }
-                if stripHeight > 0 {
-                    Color.clear.frame(height: stripHeight).tourAnchor("strip")
-                }
+    /// Time for x (the mapper is monotonic, so bisection inverts it). Shared with `oomph top`.
+    func time(at u: Double, _ f: (Double) -> Double) -> Double {
+        var lo = first - 1, hi = now
+        if u >= f(hi) { return hi }
+        if u <= f(lo) { return lo }
+        for _ in 0..<50 {
+            let mid = (lo + hi) / 2
+            if f(mid) < u { lo = mid } else { hi = mid }
+        }
+        return (lo + hi) / 2
+    }
+
+    // MARK: columns and away spans
+
+    /// A row's history (oldest first) bucketed into screen columns, each reduced to one point (the
+    /// worst, so spikes survive), breaking at every gap instead of bridging it; one point past the left
+    /// edge is kept. Oldest first, x clamped into the plot.
+    func columns<P>(_ points: [P], time: (P) -> Double, gaps: [Gap], _ f: (Double) -> Double,
+                    reduce: (ArraySlice<P>) -> P) -> [Column<P>] {
+        var cols: [(x: Double, p: P)] = []
+        var gi = gaps.count - 1
+        var bucket: [P] = [], bucketCol = Int.min, bucketX = 0.0
+        var segBreaks: Set<Int> = []                  // indices in cols that start a new segment (older side)
+        func flush() {
+            if !bucket.isEmpty { cols.append((bucketX, reduce(ArraySlice(bucket)))) }
+            bucket = []
+        }
+        var prevT = Double.infinity
+        for p in points.reversed() {
+            let t = time(p)
+            let x = f(t)
+            // a gap between this point and the newer one?
+            var broke = false
+            while gi >= 0 && gaps[gi].from >= t {
+                if gaps[gi].to <= prevT { broke = true }
+                gi -= 1
             }
-            // drawn over both: the strip needs the chart's plot frame, and the tooltips reach over
-            // the other part (the chart's tooltip over the strip, the strip's over the chart)
-            .overlayPreferenceValue(PlotRectKey.self) { plot in
-                ZStack(alignment: .topLeading) {
-                    if let plot {
-                        if stripHeight > 0 { stripLayer(plot: plot, top: geo.size.height - stripHeight, mapper: f, grid: grid, missing: missing) }
-                        hoverLayer(plot: plot, mapper: f, stripTop: geo.size.height - stripHeight)
-                        if stripHeight > 0 { stripCard(plot: plot, top: geo.size.height - stripHeight, width: geo.size.width, mapper: f) }
-                    }
-                }
-                .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            let col = Int((x * Double(TimeAxis.buckets)).rounded(.down))
+            if broke || col != bucketCol {
+                flush()
+                if broke { segBreaks.insert(cols.count) }
+                bucketCol = col; bucketX = x
             }
+            bucket.append(p)
+            prevT = t
+            if x < 0 { break }                        // one point past the left edge, clamped below
+        }
+        flush()
+        let n = cols.count
+        return stride(from: n - 1, through: 0, by: -1).map { (i: Int) -> Column<P> in
+            Column(x: min(max(cols[i].x, 0), 1), p: cols[i].p,
+                   gapBefore: i != n - 1 && segBreaks.contains(i + 1), gapAfter: i != 0 && segBreaks.contains(i))
         }
     }
 
-    static let seriesColors: [Color] = [.gray, .blue, .orange, .red]
-    static let stripGap: CGFloat = 4
+    /// The away spans of a row's columns: a run of columns whose point was away, ended by one that was
+    /// not, by a gap, or by now.
+    static func awayBands<P>(_ cols: [Column<P>], away: (P) -> Bool) -> [Band] {
+        var out: [Band] = []
+        var start: Double?
+        for (k, c) in cols.enumerated() {
+            let isAway = away(c.p)
+            if isAway { if start == nil { start = c.x } }
+            if (!isAway || c.gapAfter || k == cols.count - 1), let s = start {
+                out.append(Band(id: out.count, from: s, to: c.x)); start = nil   // the last column closes any band
+            }
+        }
+        return out
+    }
+
+    /// The no-data stretches on screen, or with `missing` the ones not received from another machine.
+    static func gapBands(_ gaps: [Gap], _ f: (Double) -> Double, missing: Bool = false) -> [Band] {
+        var out: [Band] = []
+        for g in gaps where (g.kind != .noData) == missing {
+            let a = max(f(g.from), 0), b = min(f(g.to), 1)
+            if b > a { out.append(Band(id: out.count, from: a, to: b)) }
+        }
+        return out
+    }
+
+    // MARK: grid, labels and incident rules
+
+    /// Clock-aligned lines at every level, faded by their on-screen spacing: lines closer than a
+    /// few pixels vanish, so the log axis shows its decades of grids without turning solid.
+    func gridLines(_ f: (Double) -> Double, plotW: Double) -> [GridLine] {
+        let tz = Double(TimeZone.current.secondsFromGMT())
+        var alpha: [Double: (x: Double, a: Double)] = [:]
+        for unit in TimeAxis.levels {
+            let offset = unit == 604800 ? 4 * 86400.0 : 0   // weeks start on Monday (1970-01-01 was a Thursday)
+            var t = ((now + tz - offset) / unit).rounded(.down) * unit - tz + offset
+            var guardN = 0
+            while guardN < 400 {
+                guardN += 1
+                let x = f(t)
+                if x < 0 { break }
+                let spacing = (x - f(t - unit)) * plotW
+                if spacing < 3 { break }                     // only gets denser further left
+                let s = min(max((spacing - 3) / 37, 0), 1)   // 3 px → invisible, 40 px → full
+                let a = 0.2 * s * s * (3 - 2 * s)
+                if a > (alpha[t]?.a ?? 0) { alpha[t] = (x, a) }
+                t -= unit
+            }
+        }
+        return alpha.map { GridLine(id: $0.key, x: $0.value.x, alpha: $0.value.a) }.filter { $0.x <= 0.995 }
+    }
+
+    /// Labels on grid lines, coarsest first, skipping any that would crowd an earlier one.
+    func axisLabels(_ f: (Double) -> Double, plotW: Double) -> [Label] {
+        let tz = Double(TimeZone.current.secondsFromGMT())
+        let minGap = 46 / plotW
+        var out: [Label] = []
+        for unit in TimeAxis.levels {
+            let offset = unit == 604800 ? 4 * 86400.0 : 0
+            var t = ((now + tz - offset) / unit).rounded(.down) * unit - tz + offset
+            var guardN = 0
+            while guardN < 400 {
+                guardN += 1
+                let x = f(t)
+                if x < 0 { break }
+                if (x - f(t - unit)) * plotW < 20 { break }
+                if x >= 0.03 && x <= 0.95 && !out.contains(where: { abs($0.x - x) < minGap }) {
+                    out.append(Label(x: x, text: TimeAxis.label(t, unit: unit)))
+                }
+                t -= unit
+            }
+        }
+        return out.sorted { $0.x < $1.x }
+    }
+
+    static let dayFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d"; return f }()
+    static let timeFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
+    static func label(_ t: Double, unit: Double) -> String {
+        let d = Date(timeIntervalSince1970: t)
+        return unit >= 86400 ? dayFmt.string(from: d) : timeFmt.string(from: d)
+    }
+
+    /// Where incidents start, on screen.
+    static func incidentXs(_ incidents: [Incident], _ f: (Double) -> Double) -> [Double] {
+        incidents.map { f($0.start) }.filter { $0 >= 0 && $0 <= 1 }
+    }
+
+    @ChartContentBuilder static func gridMarks(_ lines: [GridLine], color: Color, scale: Double) -> some ChartContent {
+        ForEach(lines) { (l: GridLine) in
+            RuleMark(x: .value("grid", l.x))
+                .lineStyle(StrokeStyle(lineWidth: 0.5))
+                .foregroundStyle(color.opacity(l.alpha * scale))
+        }
+    }
+
+    @ChartContentBuilder static func incidentMarks(_ xs: [Double]) -> some ChartContent {
+        ForEach(xs, id: \.self) { (x: Double) in
+            RuleMark(x: .value("incident", x)).foregroundStyle(Color.red)
+        }
+    }
 
     // MARK: away bands and no-data hatching
 
     /// Away bands and no-data stretches, drawn behind the series in one Canvas: stretches closer
     /// than 2 px merge (a Mac that keeps dozing off reads as one calm band, not a grey comb), and
     /// one hatch pattern, anchored to the plot, shows through all no-data stretches.
-    func bandLayer(_ proxy: ChartProxy, away: [Band], gaps: [Band], missing: [Band]) -> some View {
+    static func bandLayer(_ proxy: ChartProxy, away: [Band], gaps: [Band], missing: [Band]) -> some View {
         GeometryReader { g in
             let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
             Canvas { ctx, size in
                 let W = Double(size.width)
-                let (grey, hatched) = MemoryChart.calmBands(away: away.map { ($0.from * W, $0.to * W) },
-                                                            gaps: gaps.map { ($0.from * W, $0.to * W) }, tolerance: 2)
+                let (grey, hatched) = TimeAxis.calmBands(away: away.map { ($0.from * W, $0.to * W) },
+                                                         gaps: gaps.map { ($0.from * W, $0.to * W) }, tolerance: 2)
                 var greyPath = Path(), hatchPath = Path()
                 for (a, b) in grey { greyPath.addRect(CGRect(x: a, y: 0, width: max(b - a, 1), height: size.height)) }
                 for (a, b) in hatched { hatchPath.addRect(CGRect(x: a, y: 0, width: max(b - a, 1), height: size.height)) }
@@ -2125,8 +2212,8 @@ struct MemoryChart: View, Animatable {
                 ctx.fill(hatchPath, with: .color(.gray.opacity(0.06)))
                 var c = ctx
                 c.clip(to: hatchPath)
-                c.stroke(MemoryChart.hatchLines(in: CGRect(origin: .zero, size: size)), with: .color(.gray.opacity(0.45)), lineWidth: 1)
-                if !missing.isEmpty { MemoryChart.drawMissing(ctx, missing.map { ($0.from * W, $0.to * W) }, height: size.height) }
+                c.stroke(TimeAxis.hatchLines(in: CGRect(origin: .zero, size: size)), with: .color(.gray.opacity(0.45)), lineWidth: 1)
+                if !missing.isEmpty { TimeAxis.drawMissing(ctx, missing.map { ($0.from * W, $0.to * W) }, height: size.height) }
             }
             .frame(width: plot.width, height: plot.height)
             .offset(x: plot.minX, y: plot.minY)
@@ -2166,7 +2253,7 @@ struct MemoryChart: View, Animatable {
         ctx.fill(field, with: .color(.gray.opacity(0.05)))
         var c = ctx
         c.clip(to: field)
-        c.fill(MemoryChart.dots(in: field.boundingRect, spacing: 4), with: .color(.gray.opacity(0.55)))
+        c.fill(TimeAxis.dots(in: field.boundingRect, spacing: 4), with: .color(.gray.opacity(0.55)))
         ctx.stroke(edges, with: .color(.gray.opacity(0.5)), style: StrokeStyle(lineWidth: 0.75, dash: [2, 2]))
     }
 
@@ -2198,6 +2285,96 @@ struct MemoryChart: View, Animatable {
         }
         return p
     }
+}
+
+// MARK: - Memory chart
+
+/// The popup's memory chart. One view for every range, on the TimeAxis it is handed: a range switch
+/// animates the axis, so the chart morphs and every point visibly travels to its new place. Each frame
+/// re-buckets the preloaded history into ~360 columns; nothing is reloaded.
+struct MemoryChart: View, Animatable {
+    var points: [Point]          // oldest first, multi-resolution (Store.multires)
+    var gaps: [Gap]
+    var incidents: [Incident]
+    var events: [ChartEvent]
+    var ram: Double?
+    var axis: TimeAxis
+    /// The agents' reservations, drawn as a strip of blocks under the chart on the same time axis.
+    var reservations: [ResBlock] = []
+    var stripHeight: CGFloat = 0 // 0 = no strip
+    /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
+    @State private var hoverX: CGFloat? = renderHoverX
+    /// The pointer over the reservation strip (strip coordinates).
+    @State private var stripHover: CGPoint? = renderStripHover
+
+    var animatableData: AnimatablePair<Double, Double> {
+        get { axis.animatableData }
+        set { axis.animatableData = newValue }
+    }
+
+    var now: Double { axis.now }
+
+    static let series = ["Wired", "App", "Compressed", "Swap"]
+
+    struct Entry: Identifiable { let id: Int; let x: Double; let kind: String; let gb: Double }
+
+    var body: some View {
+        GeometryReader { geo in
+            let f = axis.mapper()
+            let plotW = max(geo.size.width - 30, 50)
+            let (entries, away) = columns(f)
+            let gaps = TimeAxis.gapBands(self.gaps, f)
+            let missing = TimeAxis.gapBands(self.gaps, f, missing: true)
+            let grid = axis.gridLines(f, plotW: plotW)
+            let labels = axis.axisLabels(f, plotW: plotW)
+            VStack(spacing: MemoryChart.stripGap) {
+                Chart {
+                    TimeAxis.gridMarks(grid, color: .primary, scale: 1)
+                    areaMarks(entries)
+                    TimeAxis.gridMarks(grid, color: .white, scale: 0.45)
+                    ramMark
+                    TimeAxis.incidentMarks(TimeAxis.incidentXs(incidents, f))
+                }
+                .chartXScale(domain: 0...1)
+                .chartXAxis {
+                    // ticks here; the labels are drawn centered on them in the overlay (Charts would
+                    // left-align them to the tick). The blank label keeps the axis's height.
+                    AxisMarks(values: labels.map(\.x)) { _ in
+                        AxisTick(length: 3)
+                        AxisValueLabel { Text(" ").font(.system(size: 10)) }
+                    }
+                }
+                .chartForegroundStyleScale(domain: MemoryChart.series, range: MemoryChart.seriesColors)
+                .chartLegend(.hidden)  // the compact legend sits in the header row (ChartLegend)
+                .transaction { $0.animation = nil }  // this view animates itself, frame by frame
+                .chartBackground { proxy in TimeAxis.bandLayer(proxy, away: away, gaps: gaps, missing: missing) }
+                .chartOverlay { proxy in
+                    ZStack(alignment: .topLeading) {
+                        axisLabelLayer(proxy, labels: labels)
+                        hoverTracker(proxy)
+                    }
+                }
+                if stripHeight > 0 {
+                    Color.clear.frame(height: stripHeight).tourAnchor("strip")
+                }
+            }
+            // drawn over both: the strip needs the chart's plot frame, and the tooltips reach over
+            // the other part (the chart's tooltip over the strip, the strip's over the chart)
+            .overlayPreferenceValue(PlotRectKey.self) { plot in
+                ZStack(alignment: .topLeading) {
+                    if let plot {
+                        if stripHeight > 0 { stripLayer(plot: plot, top: geo.size.height - stripHeight, mapper: f, grid: grid, missing: missing) }
+                        hoverLayer(plot: plot, mapper: f, stripTop: geo.size.height - stripHeight)
+                        if stripHeight > 0 { stripCard(plot: plot, top: geo.size.height - stripHeight, width: geo.size.width, mapper: f) }
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            }
+        }
+    }
+
+    static let seriesColors: [Color] = [.gray, .blue, .orange, .red]
+    static let stripGap: CGFloat = 4
 
     // MARK: reservation strip
 
@@ -2234,8 +2411,8 @@ struct MemoryChart: View, Animatable {
         [2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256].first { $0 >= vis } ?? vis
     }
 
-    func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [GridLine],
-                    missing: [Band] = []) -> some View {
+    func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [TimeAxis.GridLine],
+                    missing: [TimeAxis.Band] = []) -> some View {
         let W = plot.width, H = stripHeight
         let (rects, scaleTop) = stripRects(f, W: W, H: H)
         let blocks = reservations, now = now
@@ -2253,7 +2430,7 @@ struct MemoryChart: View, Animatable {
                 plotCtx.clip(to: Path(CGRect(x: 0, y: 0, width: W, height: H)))
                 if !missing.isEmpty {
                     let w = Double(W)
-                    MemoryChart.drawMissing(plotCtx, missing.map { ($0.from * w, $0.to * w) }, height: H)
+                    TimeAxis.drawMissing(plotCtx, missing.map { ($0.from * w, $0.to * w) }, height: H)
                 }
                 var solid: [Int: Path] = [:], waiting: [Int: Path] = [:]
                 for x in rects {
@@ -2266,7 +2443,7 @@ struct MemoryChart: View, Animatable {
                     plotCtx.fill(p, with: .color(c.opacity(0.12)))
                     var h = plotCtx
                     h.clip(to: p)
-                    h.stroke(MemoryChart.hatchLines(in: p.boundingRect, spacing: 4), with: .color(c.opacity(0.75)), lineWidth: 1)
+                    h.stroke(TimeAxis.hatchLines(in: p.boundingRect, spacing: 4), with: .color(c.opacity(0.75)), lineWidth: 1)
                 }
                 // purpose labels on the widest granted part of each block, when it fits
                 var best: [Int: CGRect] = [:]
@@ -2346,7 +2523,7 @@ struct MemoryChart: View, Animatable {
         return m < 60 ? "\(m)m" : (m % 60 == 0 || m >= 600 ? "\(m / 60)h" : "\(m / 60)h\(String(format: "%02d", m % 60))")
     }
 
-    func axisLabelLayer(_ proxy: ChartProxy, labels: [Label]) -> some View {
+    func axisLabelLayer(_ proxy: ChartProxy, labels: [TimeAxis.Label]) -> some View {
         GeometryReader { g in
             let plot = proxy.plotFrame.map { g[$0] } ?? CGRect(origin: .zero, size: g.size)
             ForEach(Array(labels.enumerated()), id: \.offset) { _, l in
@@ -2417,25 +2594,13 @@ struct MemoryChart: View, Animatable {
         var moreReserved = 0
     }
 
-    /// Time for x (the mapper is monotonic, so bisection inverts it).
-    func time(at u: Double, _ f: (Double) -> Double) -> Double {
-        var lo = firstT - 1, hi = now
-        if u >= f(hi) { return hi }
-        if u <= f(lo) { return lo }
-        for _ in 0..<50 {
-            let mid = (lo + hi) / 2
-            if f(mid) < u { lo = mid } else { hi = mid }
-        }
-        return (lo + hi) / 2
-    }
-
     /// Everything under one horizontal pixel, aggregated: on the log axis one pixel can hold hours.
     func hoverInfo(u: Double, du: Double, mapper f: (Double) -> Double) -> HoverInfo {
         var info = HoverInfo()
-        let t0 = time(at: max(u - du / 2, 0), f), t1 = time(at: min(u + du / 2, 1), f)
+        let t0 = axis.time(at: max(u - du / 2, 0), f), t1 = axis.time(at: min(u + du / 2, 1), f)
         let tc = (t0 + t1) / 2
         // the time under the pointer
-        let day = MemoryChart.dayFmt, clock = MemoryChart.timeFmt
+        let day = TimeAxis.dayFmt, clock = TimeAxis.timeFmt
         let d0 = Date(timeIntervalSince1970: t0), d1 = Date(timeIntervalSince1970: t1)
         if t1 - t0 < 90 {
             info.when = day.string(from: Date(timeIntervalSince1970: tc)) + " " + clock.string(from: Date(timeIntervalSince1970: tc))
@@ -2475,7 +2640,7 @@ struct MemoryChart: View, Animatable {
             info.noData = "\(overlapping.count) stretches without data, \(MemoryChart.duration(overlapping.reduce(0) { $0 + $1.to - $1.from })) in all"
         }
         // incidents and events: catch the ones within a few pixels, they are thin lines
-        let e0 = time(at: max(u - 3 * du, 0), f), e1 = time(at: min(u + 3 * du, 1), f)
+        let e0 = axis.time(at: max(u - 3 * du, 0), f), e1 = axis.time(at: min(u + 3 * du, 1), f)
         info.incidents = incidents.filter { $0.start <= e1 && ($0.end ?? now) >= e0 }.map { inc in
             "incident " + clock.string(from: Date(timeIntervalSince1970: inc.start))
                 + (inc.reasons.first.map { ": " + $0.desc } ?? "")
@@ -2621,39 +2786,9 @@ struct MemoryChart: View, Animatable {
 
     /// The history bucketed into screen columns (worst point each), with the area dropping to
     /// zero at both edges of every gap instead of bridging it; plus the away spans.
-    func columns(_ f: (Double) -> Double) -> ([Entry], [Band]) {
-        var cols: [(x: Double, p: Point)] = []
-        var gi = gaps.count - 1
-        var bucket: [Point] = [], bucketCol = Int.min, bucketX = 0.0
-        var segBreaks: Set<Int> = []                  // indices in cols that start a new segment (older side)
-        func flush() {
-            if !bucket.isEmpty { cols.append((bucketX, Store.worst(ArraySlice(bucket)))) }
-            bucket = []
-        }
-        var prevT = Double.infinity
-        for p in points.reversed() {
-            let x = f(p.id)
-            // a gap between this point and the newer one?
-            var broke = false
-            while gi >= 0 && gaps[gi].from >= p.id {
-                if gaps[gi].to <= prevT { broke = true }
-                gi -= 1
-            }
-            let col = Int((x * Double(MemoryChart.columns)).rounded(.down))
-            if broke || col != bucketCol {
-                flush()
-                if broke { segBreaks.insert(cols.count) }
-                bucketCol = col; bucketX = x
-            }
-            bucket.append(p)
-            prevT = p.id
-            if x < 0 { break }                        // one point past the left edge, clamped below
-        }
-        flush()
-        // oldest first, clamped into the plot
+    func columns(_ f: (Double) -> Double) -> ([Entry], [TimeAxis.Band]) {
+        let cols = axis.columns(points, time: { $0.id }, gaps: gaps, f, reduce: Store.worst)
         var entries: [Entry] = []
-        var away: [Band] = []
-        var awayStart: Double?
         var id = 0
         func add(_ x: Double, _ p: Point?) {
             let v: [Double] = p.map { [$0.wired, $0.app, $0.comp, $0.swap] } ?? [0, 0, 0, 0]
@@ -2661,100 +2796,20 @@ struct MemoryChart: View, Animatable {
                 entries.append(Entry(id: id, x: x, kind: name, gb: v[k])); id += 1
             }
         }
-        let n = cols.count
-        for i in stride(from: n - 1, through: 0, by: -1) {
-            let x = min(max(cols[i].x, 0), 1), p = cols[i].p
-            let startsSeg = i == n - 1 || segBreaks.contains(i + 1)   // older neighbour is across a gap
-            let endsSeg = i == 0 || segBreaks.contains(i)
-            if startsSeg && i != n - 1 { add(x - 1e-6, nil) }
-            add(x, p)
-            if endsSeg && i != 0 { add(x + 1e-6, nil) }
-            if p.away { if awayStart == nil { awayStart = x } }
-            if (!p.away || endsSeg), let s = awayStart {
-                away.append(Band(id: away.count, from: s, to: x)); awayStart = nil
-            }
+        for c in cols {
+            if c.gapBefore { add(c.x - 1e-6, nil) }
+            add(c.x, c.p)
+            if c.gapAfter { add(c.x + 1e-6, nil) }
         }
-        if let s = awayStart { away.append(Band(id: away.count, from: s, to: 1)) }
-        return (entries, away)
+        return (entries, TimeAxis.awayBands(cols, away: { $0.away }))
     }
 
-    /// The no-data stretches on screen, or with `missing` the ones not received from another machine.
-    func gapBands(_ f: (Double) -> Double, missing: Bool = false) -> [Band] {
-        var out: [Band] = []
-        for g in gaps where (g.kind != .noData) == missing {
-            let a = max(f(g.from), 0), b = min(f(g.to), 1)
-            if b > a { out.append(Band(id: out.count, from: a, to: b)) }
-        }
-        return out
-    }
-
-    /// Clock-aligned lines at every level, faded by their on-screen spacing: lines closer than a
-    /// few pixels vanish, so the log axis shows its decades of grids without turning solid.
-    func gridLines(_ f: (Double) -> Double, plotW: Double) -> [GridLine] {
-        let tz = Double(TimeZone.current.secondsFromGMT())
-        var alpha: [Double: (x: Double, a: Double)] = [:]
-        for unit in MemoryChart.levels {
-            let offset = unit == 604800 ? 4 * 86400.0 : 0   // weeks start on Monday (1970-01-01 was a Thursday)
-            var t = ((now + tz - offset) / unit).rounded(.down) * unit - tz + offset
-            var guardN = 0
-            while guardN < 400 {
-                guardN += 1
-                let x = f(t)
-                if x < 0 { break }
-                let spacing = (x - f(t - unit)) * plotW
-                if spacing < 3 { break }                     // only gets denser further left
-                let s = min(max((spacing - 3) / 37, 0), 1)   // 3 px → invisible, 40 px → full
-                let a = 0.2 * s * s * (3 - 2 * s)
-                if a > (alpha[t]?.a ?? 0) { alpha[t] = (x, a) }
-                t -= unit
-            }
-        }
-        return alpha.map { GridLine(id: $0.key, x: $0.value.x, alpha: $0.value.a) }.filter { $0.x <= 0.995 }
-    }
-
-    /// Labels on grid lines, coarsest first, skipping any that would crowd an earlier one.
-    func axisLabels(_ f: (Double) -> Double, plotW: Double) -> [Label] {
-        let tz = Double(TimeZone.current.secondsFromGMT())
-        let minGap = 46 / plotW
-        var out: [Label] = []
-        for unit in MemoryChart.levels {
-            let offset = unit == 604800 ? 4 * 86400.0 : 0
-            var t = ((now + tz - offset) / unit).rounded(.down) * unit - tz + offset
-            var guardN = 0
-            while guardN < 400 {
-                guardN += 1
-                let x = f(t)
-                if x < 0 { break }
-                if (x - f(t - unit)) * plotW < 20 { break }
-                if x >= 0.03 && x <= 0.95 && !out.contains(where: { abs($0.x - x) < minGap }) {
-                    out.append(Label(x: x, text: MemoryChart.label(t, unit: unit)))
-                }
-                t -= unit
-            }
-        }
-        return out.sorted { $0.x < $1.x }
-    }
-
-    static let dayFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "EEE d"; return f }()
-    static let timeFmt: DateFormatter = { let f = DateFormatter(); f.dateFormat = "HH:mm"; return f }()
     /// "06:36" today, "Tue 4 Nov 06:36" before.
     static func when(_ t: Double) -> String {
         let d = Date(timeIntervalSince1970: t)
-        if isWallToday(d) { return timeFmt.string(from: d) }
+        if isWallToday(d) { return TimeAxis.timeFmt.string(from: d) }
         let f = DateFormatter(); f.dateFormat = "EEE d MMM HH:mm"
         return f.string(from: d)
-    }
-    static func label(_ t: Double, unit: Double) -> String {
-        let d = Date(timeIntervalSince1970: t)
-        return unit >= 86400 ? dayFmt.string(from: d) : timeFmt.string(from: d)
-    }
-
-    @ChartContentBuilder func gridMarks(_ lines: [GridLine], color: Color, scale: Double) -> some ChartContent {
-        ForEach(lines) { (l: GridLine) in
-            RuleMark(x: .value("grid", l.x))
-                .lineStyle(StrokeStyle(lineWidth: 0.5))
-                .foregroundStyle(color.opacity(l.alpha * scale))
-        }
     }
 
     @ChartContentBuilder func areaMarks(_ entries: [Entry]) -> some ChartContent {
@@ -2769,13 +2824,6 @@ struct MemoryChart: View, Animatable {
             RuleMark(y: .value("RAM", ram))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                 .foregroundStyle(Color.primary.opacity(0.6))
-        }
-    }
-
-    @ChartContentBuilder func incidentMarks(_ f: (Double) -> Double) -> some ChartContent {
-        let xs: [Double] = incidents.map { f($0.start) }.filter { $0 >= 0 && $0 <= 1 }
-        ForEach(xs, id: \.self) { (x: Double) in
-            RuleMark(x: .value("incident", x)).foregroundStyle(Color.red)
         }
     }
 }
@@ -2874,14 +2922,14 @@ struct ChartLegend: View {
                 let r = CGRect(origin: .zero, size: size)
                 ctx.fill(Path(r), with: .color(.gray.opacity(0.08)))
                 ctx.clip(to: Path(r))
-                ctx.stroke(MemoryChart.hatchLines(in: r, spacing: 3.5), with: .color(.gray.opacity(0.75)), lineWidth: 1)
+                ctx.stroke(TimeAxis.hatchLines(in: r, spacing: 3.5), with: .color(.gray.opacity(0.75)), lineWidth: 1)
             }
             .frame(width: 9, height: 7)
         case 4:
             Canvas { ctx, size in
                 let r = CGRect(origin: .zero, size: size)
                 ctx.fill(Path(r), with: .color(.gray.opacity(0.06)))
-                ctx.fill(MemoryChart.dots(in: r, spacing: 3), with: .color(.gray.opacity(0.75)))
+                ctx.fill(TimeAxis.dots(in: r, spacing: 3), with: .color(.gray.opacity(0.75)))
             }
             .frame(width: 9, height: 7)
         default: Rectangle().fill(Color.red).frame(width: 1.5, height: 8).frame(width: 5)
@@ -3527,12 +3575,9 @@ struct PopoverView: View {
                 } else if m.history.isEmpty && m.isLocal {
                     Text("No samples yet").font(.caption).foregroundStyle(.secondary)
                 } else {
-                    MemoryChart(points: m.history, gaps: m.gaps, now: m.historyNow,
-                                incidents: m.incidents, events: m.events, ram: m.current?.ram_gb,
-                                lgRange: log10(store.allHistory ? 24 * 3600 : store.range),
-                                blend: renderBlend ?? (store.allHistory ? 1 : 0),
-                                reservations: m.reservations, stripHeight: stripHeight,
-                                oldest: m.isLocal ? nil : m.info?.oldest)
+                    MemoryChart(points: m.history, gaps: m.gaps, incidents: m.incidents, events: m.events,
+                                ram: m.current?.ram_gb, axis: axis,
+                                reservations: m.reservations, stripHeight: stripHeight)
                         .transition(.opacity)  // fades in (0.33 s) once the history has loaded
                 }
             }
@@ -3541,6 +3586,14 @@ struct PopoverView: View {
             .tourAnchor("plot")
             .zIndex(1)  // the hover tooltips may reach over what follows
         }
+    }
+
+    /// The time axis of the chart and of every row drawn with it (roadmap 02 §8): the range chosen, or ∞;
+    /// another machine's spans back to the oldest sample it reported.
+    var axis: TimeAxis {
+        TimeAxis(now: m.historyNow,
+                 first: TimeAxis.start(oldest: m.isLocal ? nil : m.info?.oldest, firstPoint: m.history.first?.id, now: m.historyNow),
+                 lgRange: log10(store.allHistory ? 24 * 3600 : store.range), blend: renderBlend ?? (store.allHistory ? 1 : 0))
     }
 
     /// The reservation strip under the chart: there once any agent reserved memory (14 days kept).
@@ -6311,9 +6364,19 @@ func chartVectors(_ path: String) -> Int32 {
     var out: [String: Any] = [:]
     out["mapper"] = cases("mapper").map { c -> [Double] in
         let span = (c["span"] as? NSNumber)?.doubleValue
-        let f = MemoryChart.mapper(now: num(c["now"]), first: num(c["first"]), lgRange: log10(span ?? 86400),
+        let f = TimeAxis.mapper(now: num(c["now"]), first: num(c["first"]), lgRange: log10(span ?? 86400),
                                    blend: span == nil ? 1 : 0)
         return ((c["t"] as? [NSNumber]) ?? []).map { f($0.doubleValue) }
+    }
+    // the hover's inversion, x back to time, as an age (TimeAxis.time(at:); oomph_view.time_at), on an axis that
+    // starts where TimeAxis.start puts it: "first" the first point loaded, "oldest" another machine's oldest sample
+    out["invert"] = cases("invert").map { c -> [Double] in
+        let now = num(c["now"]), span = (c["span"] as? NSNumber)?.doubleValue
+        let first = TimeAxis.start(oldest: (c["oldest"] as? NSNumber)?.doubleValue,
+                                   firstPoint: (c["first"] as? NSNumber)?.doubleValue, now: now)
+        let axis = TimeAxis(now: now, first: first, lgRange: log10(span ?? 86400), blend: span == nil ? 1 : 0)
+        let f = axis.mapper()
+        return ((c["u"] as? [NSNumber]) ?? []).map { now - axis.time(at: $0.doubleValue, f) }
     }
     out["color_index"] = cases("color_index").map { Reservation.colorIndex(($0["purpose"] as? String) ?? "") }
     out["strip_top"] = cases("strip_top").map { MemoryChart.stripTop(num($0["tallest"])) }
@@ -6332,7 +6395,7 @@ func chartVectors(_ path: String) -> Int32 {
     }
     func spans(_ x: Any?) -> [(Double, Double)] { ((x as? [[NSNumber]]) ?? []).compactMap { $0.count >= 2 ? ($0[0].doubleValue, $0[1].doubleValue) : nil } }
     out["calm_bands"] = cases("calm_bands").map { c -> [String: Any] in
-        let r = MemoryChart.calmBands(away: spans(c["away"]), gaps: spans(c["gaps"]), tolerance: num(c["tolerance"]))
+        let r = TimeAxis.calmBands(away: spans(c["away"]), gaps: spans(c["gaps"]), tolerance: num(c["tolerance"]))
         return ["grey": r.grey.map { [$0.0, $0.1] }, "hatched": r.hatched.map { [$0.0, $0.1] }]
     }
     out["stack"] = cases("stack").map { c -> [[String: Any]] in
@@ -6365,7 +6428,7 @@ func chartVectors(_ path: String) -> Int32 {
     }
     // the hover card over a column (`oomph top`'s inspect readout must say the same): day names in English,
     // as the terminal writes them; the time zone is the environment's (TZ), as for both programs
-    MemoryChart.dayFmt.locale = Locale(identifier: "en_US_POSIX")
+    TimeAxis.dayFmt.locale = Locale(identifier: "en_US_POSIX")
     out["hover"] = cases("hover").map { c -> [[String: Any]] in
         let now = num(c["now"]), span = (c["span"] as? NSNumber)?.doubleValue
         let rs = ((c["reservations"] as? [[String: Any]]) ?? []).compactMap { Reservation($0) }
@@ -6373,11 +6436,13 @@ func chartVectors(_ path: String) -> Int32 {
             (try? JSONSerialization.data(withJSONObject: d)).flatMap { try? JSONDecoder().decode(Incident.self, from: $0) }
         }
         let evs = ((c["events"] as? [[String: Any]]) ?? []).compactMap { ChartEvent($0) }.sorted { $0.t < $1.t }
-        let chart = MemoryChart(points: points(c["points"]), gaps: spans(c["gaps"]).map { Gap(from: $0.0, to: $0.1) },
-                                now: now, incidents: incs, events: evs, ram: nil,
-                                lgRange: log10(span ?? 86400), blend: span == nil ? 1 : 0,
-                                reservations: ResBlock.stack(rs, now: now), oldest: num(c["first"]))
-        let f = chart.mapper()
+        let pts = points(c["points"])
+        let axis = TimeAxis(now: now, first: TimeAxis.start(oldest: num(c["first"]), firstPoint: pts.first?.id, now: now),
+                            lgRange: log10(span ?? 86400), blend: span == nil ? 1 : 0)
+        let chart = MemoryChart(points: pts, gaps: spans(c["gaps"]).map { Gap(from: $0.0, to: $0.1) },
+                                incidents: incs, events: evs, ram: nil, axis: axis,
+                                reservations: ResBlock.stack(rs, now: now))
+        let f = axis.mapper()
         return ((c["u"] as? [NSNumber]) ?? []).map { u -> [String: Any] in
             let i = chart.hoverInfo(u: u.doubleValue, du: num(c["du"]), mapper: f)
             return ["when": i.when, "ago": i.ago, "samples": i.samples, "peak": i.peak, "away": i.away,

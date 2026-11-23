@@ -9,16 +9,35 @@ table whether a lease's holder lives; `--now T` and `--no-liveness` take both fr
                                         drawn twice and must come out byte for byte the same; a render an hour
                                         later must differ (the clock is honoured), and so must one without
                                         --no-liveness (the fixture's holders are not alive)
+    tools/renderfixture.py --app EXE --against OLD [--same-version] [--keep DIR]
+                                        a change with no visual change (the TimeAxis refactor, 1.10.7): every
+                                        render state of the popup (ALL below: the --ai states, the switched-off
+                                        + and its popover, the tabs, a mirror, the plain and ∞ popup at 8 and
+                                        16 GB of RAM), light and dark, drawn by EXE and by OLD (the build before
+                                        the change) must be byte-identical; --keep saves the pairs that differ
+                                        into DIR. A line per pair that differs as it is found, progress every 20.
+                                        The popup shows its version, and a changed tree builds "X-dirty":
+                                        --same-version draws EXE from a copy of its bundle restamped with OLD's
+                                        version and commit (Info.plist's CFBundleShortVersionString and
+                                        CFBundleVersion, Resources/oomph.py's VERSION and COMMIT) and signed
+                                        again ad hoc (codesign --force --sign -), as build-app.sh signs
 
 The data is tools/topfixture.py's invented week ("default"), its live leases held by a process that cannot
 exist. CI runs the check after building the app; the TimeAxis refactor (M5) is held to it before and after.
+The tabs and the mirror of --against are tools/mirrorfixture.py's, with this Mac's week moved to end with them;
+they are dated by the clock when written, and both builds draw the one written fixture at the same --now.
+The fixture's machine has 36 GB of RAM (topfixture); "fx8" and "fx16" are the same week on 8 and 16 GB, whose
+y domain is another (roadmap 02 §8). Takes about ten minutes; run it under `oomph run --reserve`.
 """
+import contextlib
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -26,24 +45,165 @@ import topfixture  # noqa: E402
 
 NOW = int(topfixture.NOW)
 DEAD_PID = 99999999  # above every system's pid limit: kill(pid, 0) says ESRCH
-# (--ai state, extra arguments): the plain popup, the ∞ range, both tooltips, dark, and the machines switch on
-STATES = [("", []), ("log", []), ("hover:300", []), ("rhover:420:30", []), ("", ["--dark"]),
-          ("", ["-machinesUI", "YES"])]
+# (--ai state, extra arguments): the plain popup, the ∞ range, the morph halfway, both tooltips, dark, and the
+# machines switch on
+STATES = [("", []), ("log", []), ("blend:0.5", []), ("hover:300", []), ("hoverlog:300", ["--dark"]),
+          ("rhover:420:30", []), ("", ["--dark"]), ("", ["-machinesUI", "YES"])]
 DEFAULTS = ["-aiOn", "NO", "-machinesUI", "NO", "-openedAgo", "0"]  # never this Mac's own settings
+ON = ["-machinesUI", "YES"]
+SEEN = ON + ["-lastSeenIncident", "99999999-999999"]  # This Mac has nothing new to say: the remembered tab opens
+STUDIO, AIR = "m-7f3a9c1e5b2d4a68", "m-4e5f607182930415"
+# Every render state of the popup, for --against: (fixture, --ai state, extra arguments), each drawn light and
+# dark. "fx" is the fixture of `write`, "remote" that of `write_remote` (its tabs), "mirror" draws its offline
+# mirror. `--ai changelog` is left out: it runs this Mac's installed CLI, which is not part of the fixture.
+ALL = ([("fx", ai, []) for ai in (
+    "", "loading", "callout", "top", "resmore", "on", "running", "connected:claude", "connected:openai",
+    "connected:ollama", "connecting", "dialog-connected", "dialog-error", "upgrade", "check", "checking", "uptodate",
+    "build", "log", "6h", "1h", "blend:0.25", "blend:0.5", "blend:0.75", "hover:40", "hover:300", "hover:452",
+    "hoverlog:120", "hoverlog:300", "hoverlog:440", "rhover:420:30", "rhover:200:20:6h", "rhover:100:40:1h",
+    "tour:1", "tour:2", "tour:3", "tour:4")]
+    + [("fx", ai, ON) for ai in (
+        "", "tour:4", "add", "addhover", "addtype", "addssh", "pair", "pair:link", "addconnecting", "adderr:refused",
+        "adderr:local_network_denied", "ask", "paired", "paired:other", "share", "share:off", "share:update",
+        "share:activate", "sharecode")]
+    + [("remote", "", SEEN), ("remote", "log", SEEN), ("remote", "", ON + ["-selectedMachine", STUDIO])]
+    + [("remote", ai, SEEN + ["-selectedMachine", STUDIO]) for ai in ("", "log", "1h", "hover:300", "hoverlog:200",
+                                                                       "rhover:420:30", "blend:0.5")]
+    + [("remote", "", SEEN + ["-selectedMachine", m]) for m in (
+        "m-1b2c3d4e5f607182", "m-90a1b2c3d4e5f607", "m-2c3d4e5f60718293", AIR)]
+    + [("remote", "", SEEN + ["-selectedMachine", AIR, "-openedAgo", "2"])]
+    + [("mirror", ai, []) for ai in ("", "log", "1h", "6h", "hover:300", "hoverlog:200", "rhover:420:30")]
+    + [(fx, ai, []) for fx in ("fx8", "fx16") for ai in ("", "log")])
 
 
-def write(d):
-    """The fixture: topfixture's default machine; its live leases' holder is DEAD_PID."""
+def write(d, ram=None):
+    """The fixture: topfixture's default machine; its live leases' holder is DEAD_PID. With `ram`, the
+    machine has that many GB (current.json's ram_gb) instead of 36."""
     log, led = topfixture.write_fixture(d, "default")
     os.makedirs(os.path.join(d, "machines"))
-    p = os.path.join(led, "ledger.json")
-    with open(p) as f:
+    dead_holders(os.path.join(led, "ledger.json"))
+    if ram is not None:
+        p = os.path.join(log, "current.json")
+        with open(p, encoding="utf-8") as f:
+            cur = json.load(f)
+        cur["ram_gb"] = float(ram)
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(cur, f)
+    return d
+
+
+def dead_holders(p):
+    """The live leases of the ledger at p, held by DEAD_PID."""
+    with open(p, encoding="utf-8") as f:
         ledger = json.load(f)
     for lease in ledger["leases"]:
         lease["holder"]["pid"] = DEAD_PID
-    with open(p, "w") as f:
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(ledger, f)
-    return d
+
+
+def write_remote(d):
+    """The tabs and a mirror: tools/mirrorfixture.py's machines (studio live, mini-ci not connected, gpu-box
+    needs attention, lab-mini blocked by macOS, air reconnecting, and two Recents) and its offline mirror,
+    with this Mac's own week moved to end with them. Returns (fixture, mirror, the --now that draws them)."""
+    import mirrorfixture
+    with contextlib.redirect_stdout(io.StringIO()):
+        mirrorfixture.machines(os.path.join(d, "m"), tabs=True)
+    now = int(time.time())
+    fx = os.path.join(d, "fx")
+    mirrorfixture.moved(fx, now - 60)
+    os.rename(os.path.join(d, "m", "machines"), os.path.join(fx, "machines"))
+    dead_holders(os.path.join(fx, "ledger", "ledger.json"))
+    return fx, os.path.join(d, "m", "offline", "mirror"), now
+
+
+def stamp(exe):
+    """The version a build carries, as build-app.sh stamps it: Info.plist's CFBundleShortVersionString and
+    CFBundleVersion, and the VERSION and COMMIT lines of its CLI (Contents/Resources/oomph.py)."""
+    import plistlib
+    contents, v = os.path.dirname(os.path.dirname(os.path.abspath(exe))), {}
+    try:
+        with open(os.path.join(contents, "Info.plist"), "rb") as f:
+            info = plistlib.load(f)
+        v.update((k, info.get(k)) for k in ("CFBundleShortVersionString", "CFBundleVersion"))
+        with open(os.path.join(contents, "Resources", "oomph.py"), encoding="utf-8") as f:
+            v.update((ln.split(" ", 1)[0], ln.rstrip("\n")) for ln in f if ln.startswith(("VERSION = ", "COMMIT = ")))
+    except (OSError, ValueError):
+        pass
+    return v
+
+
+def restamp(exe, old, base):
+    """A copy of the bundle of `exe` under `base` carrying `old`'s stamp, signed again ad hoc; its executable."""
+    import plistlib
+    app = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(exe))))
+    copy = os.path.join(base, "restamped", os.path.basename(app))
+    shutil.copytree(app, copy, symlinks=True)
+    want = stamp(old)
+    p = os.path.join(copy, "Contents", "Info.plist")
+    with open(p, "rb") as f:
+        info = plistlib.load(f)
+    info.update((k, want[k]) for k in ("CFBundleShortVersionString", "CFBundleVersion") if want.get(k) is not None)
+    with open(p, "wb") as f:
+        plistlib.dump(info, f)
+    p = os.path.join(copy, "Contents", "Resources", "oomph.py")
+    with open(p, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    lines = [want.get(ln.split(" ", 1)[0], ln) if ln.startswith(("VERSION = ", "COMMIT = ")) else ln for ln in lines]
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    subprocess.run(["codesign", "--force", "--sign", "-", copy], check=True, capture_output=True, timeout=120)
+    return os.path.join(copy, "Contents", "MacOS", os.path.basename(exe))
+
+
+def against(exe, old, keep=None, same_version=False):
+    """Every state of ALL, light and dark, drawn by `exe` and by `old`: byte-identical, or reported. A pair
+    that differs is drawn by `old` once more, to tell a change from a state that does not repeat itself.
+    Prints as it goes (flushed): a run cut short still says what it found."""
+    base = tempfile.mkdtemp(prefix="oomph-renderfixture-")
+    same, differ, unsteady = 0, [], []
+    try:
+        if same_version:
+            exe = restamp(exe, old, base)
+        shown = [" / ".join(str(stamp(x).get(k)) for k in ("CFBundleShortVersionString", "VERSION")) for x in (exe, old)]
+        if shown[0] != shown[1]:
+            print("warning: the builds carry different versions (%s; %s), which the popup shows: renders with it "
+                  "differ (--same-version restamps a copy)" % tuple(shown), flush=True)
+        fx = write(os.path.join(base, "fx"))
+        rfx, mirror, rnow = write_remote(os.path.join(base, "remote"))
+        where = {"fx": (fx, NOW, []), "remote": (rfx, rnow, []), "mirror": (rfx, rnow, ["--mirror", mirror]),
+                 "fx8": (write(os.path.join(base, "fx8"), 8), NOW, []),
+                 "fx16": (write(os.path.join(base, "fx16"), 16), NOW, [])}
+        for i, (kind, ai, extra) in enumerate(ALL):
+            if i and i % 20 == 0:
+                print("  %d of %d states drawn, %d pairs byte-identical" % (i, len(ALL), same), flush=True)
+            for dark in (False, True):
+                d, now, more = where[kind]
+                args = list(more) + list(extra) + (["--dark"] if dark else [])
+                name = "%s %s%s" % (kind, ai or "plain", "".join(" " + x for x in extra + (["--dark"] if dark else [])))
+                a = render(old, d, os.path.join(base, "%d%s-old.png" % (i, "d" * dark)), ai, args, now)
+                b = render(exe, d, os.path.join(base, "%d%s-new.png" % (i, "d" * dark)), ai, args, now)
+                if a[1] is not None and a[1] == b[1]:
+                    same += 1
+                    continue
+                c = render(old, d, os.path.join(base, "%d%s-again.png" % (i, "d" * dark)), ai, args, now)
+                (unsteady if c[1] != a[1] else differ).append(name)
+                said = ["%d bytes" % len(r[1]) if r[1] else r[2] or "nothing" for r in (a, b)]
+                print("%s  %s (old %s, new %s)" % ("UNSTEADY" if c[1] != a[1] else "DIFFER  ", name, said[0], said[1]),
+                      flush=True)
+                if keep:
+                    os.makedirs(keep, exist_ok=True)
+                    stem = name.replace(" ", "_").replace(":", "-").replace("/", "-")
+                    for tag, r in (("old", a), ("new", b)):
+                        if r[1]:
+                            with open(os.path.join(keep, "%s.%s.png" % (stem, tag)), "wb") as f:
+                                f.write(r[1])
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    print("renderfixture: %d of %d renders byte-identical to the build before%s%s" % (
+        same, 2 * len(ALL), "; %d differ" % len(differ) if differ else "",
+        "; %d do not repeat themselves in the old build" % len(unsteady) if unsteady else ""), flush=True)
+    return 1 if differ or unsteady or not same else 0
 
 
 def render(exe, fx, out, ai="", extra=(), now=NOW, live=False):
@@ -62,7 +222,7 @@ def check(exe):
     bad = []
 
     def ok(cond, what):
-        print(("ok    " if cond else "FAIL  ") + what)
+        print(("ok    " if cond else "FAIL  ") + what, flush=True)
         if not cond:
             bad.append(what)
 
@@ -97,8 +257,12 @@ def check(exe):
 
 
 def main(argv):
-    if "--app" in argv and argv.index("--app") + 1 < len(argv):
-        return check(argv[argv.index("--app") + 1])
+    def arg(k):
+        return argv[argv.index(k) + 1] if k in argv and argv.index(k) + 1 < len(argv) else None
+    if arg("--app") and arg("--against"):
+        return against(arg("--app"), arg("--against"), arg("--keep"), "--same-version" in argv)
+    if arg("--app"):
+        return check(arg("--app"))
     if len(argv) == 1 and not argv[0].startswith("-"):
         d = write(argv[0])
         print("renderfixture: %s (now = %d)\n  oomph.app/Contents/MacOS/oomph --render-popup out.png --fixture %s "
