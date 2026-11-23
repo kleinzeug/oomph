@@ -1272,17 +1272,19 @@ class Source(threading.Thread):
         changed = feed.step(now, self.span)
         if changed or tabs_changed or self.posted != mid:
             self.posted = mid
-            self.post(self.model(now, wall, mid))
+            self.post(self.model(now, wall, mid, tabs))
 
-    def model(self, now, wall=None, mid="local"):
-        """The selected machine's model, with the tabs when there are machines."""
+    def model(self, now, wall=None, mid="local", entries=None):
+        """The selected machine's model, with the tabs when there are machines: those of `entries`, the
+        step's own reading of M.tabs(), so the selected one is among them although the loop hid it
+        (a forget) while this step read its history."""
         m = self.feeds[mid].model(now)
         M = self.machines
         if M is None:
             return m
         wall = now if wall is None else wall
         local = local_tab(m if mid == "local" else None, self.local_cur)
-        tabs = [local] + [M.tab(e, wall) for e in M.tabs()]
+        tabs = [local] + [M.tab(e, wall) for e in (M.tabs() if entries is None else entries)]
         sel = next((i for i, t in enumerate(tabs) if t["mid"] == mid), 0)
         m.update(tabs=tabs, sel=sel, tab_mid=mid, wall=wall, engine=self.engine,
                  book=[dict(e) for e in M.entries if not e.get("forgetting") and not M.is_hidden(e["mid"])])

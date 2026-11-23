@@ -1626,7 +1626,7 @@ def engine_handover(base, env, mid, st):
         rc = p.wait(5)
         check(tab and asked and gone and untabbed and app_engine and rc == 0,
               "engine: X and y in the dashboard while the app's engine holds engine.lock forget the machine in both "
-              "(machines.json loses it, the tab goes) (%s %s %s %s %s)" % (tab, asked, gone, untabbed, app_engine))
+              "(machines.json loses it, the tab goes) (%s %s %s %s %s %s)" % (tab, asked, gone, untabbed, app_engine, rc))
     finally:
         p.close()
         if app is not None and app.poll() is None:
@@ -1699,8 +1699,9 @@ def engine_full_pipe(base, env, mid, st):
 def test_machines_units(base):
     """The tabs' parts without a terminal: the sync child's events read on a thread of their own (a
     child that writes 1 MB ends although nobody calls events()); a forgotten machine that comes back
-    in machines.json is a tab again; another tab's feed goes a minute after it was left; a start on
-    this machine for what it has to say keeps the remembered tab; a connect row gone meanwhile."""
+    in machines.json is a tab again; another tab's feed goes a minute after it was left; a forget while
+    the worker reads that tab is no crash; a start on this machine for what it has to say keeps the
+    remembered tab; a connect row gone meanwhile."""
     os.makedirs(base)
     woke = []
     sc = T.SyncChild([PY, "-I", "-c", "import sys\nfor i in range(20000): sys.stdout.write('{\"ev\": \"changed\", "
@@ -1758,6 +1759,22 @@ def test_machines_units(base):
               "machines: another tab's feed (its history) is dropped a while after its tab was left (04 §4.6)")
     finally:
         T.FEED_KEEP_S = keep_s
+    posted, step = [], T.Feed.step
+    try:                                # the loop's y lands while the worker reads that tab's history
+        T.Feed.step = lambda self, *a: (M.hide(build), step(self, *a))[1]
+        src = T.Source("/nonexistent", posted.append, clock=lambda: NOW, machines=M)
+        src.mid = build
+        src.step()
+    finally:
+        T.Feed.step = step
+        M.unhide(build)
+    try:
+        m = T.at(posted[-1], NOW)
+        err = None
+    except Exception as e:
+        m, err = None, repr(e)
+    check(m is not None and m["tabs"][m["sel"]]["mid"] == m["tab_mid"] == build,
+          "machines: a forget sent while the worker reads that tab draws its last frame, no crash (%s)" % err)
     cur = T._current
     try:
         T._current = lambda d: {"t": time.time(), "pressure": 4}
