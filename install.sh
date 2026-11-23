@@ -174,6 +174,11 @@ if [ -n "$PFX" ]; then
 fi
 launchctl enable system/local.oomph.daemon
 launchctl bootstrap system "$PLIST"
+# Sharing (roadmap 01 §4.2) has a switch of its own that installing never flips: when it is on, its
+# LaunchDaemon is rendered again from the new code and restarted. Installing never turns it on.
+if [ -f "/Library/Application Support/oomph/share/config.json" ]; then
+  /usr/bin/python3 -I -B "$LIB/oomph.py" share reload || echo "oomph: sharing could not be reloaded (oomph share status)" >&2
+fi
 sleep 2
 if launchctl print system/local.oomph.daemon 2>/dev/null | grep -q "state = running"; then
   echo "oomph: daemon running. Logs: /Library/Logs/oomph  ·  try: oomph status"

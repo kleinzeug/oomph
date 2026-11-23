@@ -998,8 +998,9 @@ for args, want in ((["version"], oomph.VERSION + "\n"), (["version", "--json"], 
         check(buf.getvalue() == want, "oomph version prints exactly the version")
     else:
         vj = json.loads(buf.getvalue())
-        check(set(vj) == {"version", "commit", "brand", "command", "hardening"} and vj["command"] == "oomph" and
-              vj["brand"] == oomph.BRAND, "oomph version --json: version, commit, brand, command, hardening")
+        check(set(vj) == {"version", "commit", "brand", "command", "hardening", "sharing"} and vj["command"] == "oomph"
+              and vj["brand"] == oomph.BRAND and vj["sharing"] >= 1,
+              "oomph version --json: version, commit, brand, command, hardening, sharing (what `share on` asks)")
 if MAC:  # MCP serverInfo and tool names, from the child process
     init = resp.get(1, {}).get("result", {}).get("serverInfo", {})
     check(init.get("name") == "oomph" and init.get("title") == oomph.BRAND, "MCP serverInfo: name oomph, title BRAND")
@@ -2752,6 +2753,17 @@ for line in r.stdout.splitlines():
     if line.startswith(("ok    ", "FAIL  ")):
         print("      net: " + line)
 check(r.returncode == 0, "the protocol core (tools/nettest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                      + r.stderr[-400:]))
+
+# remote machines (1.10.0): the peer gate, pairing and tokens, TLS, the share commands, remote over TCP and ssh,
+# the engine (tools/sharetest.py, a file of its own)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "sharetest.py")], capture_output=True, text=True,
+                   timeout=600, env={k: v for k, v in os.environ.items()
+                                     if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_SHARE_DIR", "OOMPH_MACHINES_DIR")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("    share: " + line)
+check(r.returncode == 0, "remote machines (tools/sharetest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                       + r.stderr[-400:]))
 
 # Linux for agents (1.9.4): the Linux backend on recorded machines, here too; the exit codes of the CLI on this

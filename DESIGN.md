@@ -357,6 +357,25 @@ roadmap 03 (§5, §7.3, §7.5).
 | The hook's state | `$XDG_RUNTIME_DIR/oomph`, else `oomph-<uid>` in `$TMPDIR` or `/tmp`, a folder of the user's own, 0700; a state file of another owner, or with a time in the future, is ignored | A shared `/tmp` would let another user silence the warnings |
 | Presence | None without the logger: `idle_s` is unknown, drawn as a dash; nothing is drawn as away | |
 
+## Remote machines (1.10)
+
+Read-only, Mac to Mac over TLS, or anything with oomph over ssh (roadmap `01-remote-machines`).
+
+| Decision | Why |
+|---|---|
+| The listener is not the logger: `local.oomph.share`, a second LaunchDaemon, runs `oomph serve --inetd` once per connection as `_oomph`, a role account with a group of its own | a root daemon on the network is the main danger; the logs are world-readable, so serving them needs no privilege. A crash or a flaw dies with one connection |
+| A peer gate before TLS: loopback, ranges allowed by `share allow`, else only peers on the subnet (or link-local on a wired or Wi-Fi interface) of a network sharing was turned on for, identified by its router's address and hardware address | nothing a stranger sends reaches Apple's old TLS library (LibreSSL 2.8.3). The port still accepts and closes everywhere; laptops should be watched over ssh |
+| TLS with a self-signed key the viewer pins; a one-time code (60 bits, 10 minutes, 5 tries) proved by both sides over the certificate each sees (PBKDF2, HMAC); then a per-viewer token, of which the server keeps only a hash | no CA, no accounts; a machine in the middle fails both proofs. Every pairing failure looks the same and costs the same derivation and pause |
+| State split by owner: root's `config.json`, `cert.pem`, `key.pem` (root:_oomph 640); the service's `run/`. Root never opens a path in `run/` (the share commands fork and become `_oomph` first) and interprets nothing from it but ids matching `^c-[0-9a-f]{8}$` | a compromised service account must not steer root |
+| An administrator per pairing code and per revoke (`sudo oomph share pair`, `revoke`) | handing out access is an administrator's act (roadmap §11) |
+| The viewer's one client is the engine, `oomph remote sync`: one child per machine, mirrors in the log's own layout, a coverage map of what was received, backoff 1 to 60 s. The app starts it while its popup is open and tells it to go idle when it closes (it leaves a minute later) | no background network traffic (D8); every reader already reads a directory |
+| A machine's AI consent travels as the capability `ai`, absent unless its owner ran `sudo oomph share ai on`; a change reaches open sessions within a second (a `machine` notification), and a consent last heard more than a day ago no longer counts | another machine's process names and paths reach a model only with that machine's consent (D7), and only while it still gives it |
+| Tabs in the app behind `machinesUI` (off) | macOS's Local Network permission for an ad hoc signed, self-rebuilt app is untried (roadmap 01 §7.6) |
+| "Blocked by macOS" is established by the app, not guessed: after the engine reports a connection that failed at once, the app opens one `NWConnection` to the same host and port, sends nothing, and reads `localNetworkDenied` from the path. Its only networking | an error number can't tell a denied app from a machine that is away; the probe comes from the process the system's alert names |
+| A connection looks at its pairing and at `config.json` once a second on a timer, whatever the viewer sends: a revoke, `share off` and Deactivate end it with a `bye`. A pairings file it cannot read is no revocation | a viewer that talks without pause must still meet its revocation; a viewer deletes its token on one, so a passing read error must not look like it |
+| Every opening is a reconnect (D8), so a machine that was live at the last close goes through 01 §3.6's three steps: a grace (twice its last connect time, 0.8 to 3 s, ssh 1.5 to 6 s) with its last values at 60 %, then *Connecting…*, then the verdict at 8 s (ssh 20 s) or on a definite failure | "Not connected" is never said of a machine that is only reconnecting |
+| Only critical pressure, an open or unseen incident and a silent logger make the popup open on This Mac instead of the remembered tab | a small disk or hours of Warning must not take over every opening (D9) |
+
 ## AI analysis (1.4)
 
 | Decision | Choice | Why |

@@ -2,7 +2,7 @@
 """Mirror fixtures for the popup (roadmap 01 §3.4, §3.5, §12): another machine's mirror, made the
 way the app will get one, so `--render-popup … --mirror DIR` can draw each state of a link.
 
-    tools/mirrorfixture.py DIR [live|offline|fetching]
+    tools/mirrorfixture.py DIR [live|offline|fetching|machines]
 
 writes a made-up machine ("studio": the week of tools/topfixture.py, moved so that it ends now)
 into DIR/source, mirrors it through a pipe with the real `oomph remote sync --once` into
@@ -12,7 +12,15 @@ DIR/mirror, and then sets the scene:
     offline   the link dropped 40 minutes ago; an earlier drop left 2 hours not received
     fetching  just paired: the last 6 hours are in, the lists are still being fetched
 
-Then: <app>/Contents/MacOS/oomph --render-popup out.png --mirror DIR/mirror [--dark] [--ai log].
+    machines  five tabs (roadmap 01 R1a): DIR/machines is an OOMPH_MACHINES_DIR whose machines.json
+              pins studio (live), mini-ci (not connected), gpu-box (its key changed), lab-mini
+              (Blocked by macOS: Local Network) and air (live when the popup last closed, 40 minutes
+              ago: an opening draws its grace, then Connecting…, never Not connected; -openedAgo 2
+              renders the second step), and atlas, a Linux machine, which gets no tab
+
+Then: <app>/Contents/MacOS/oomph --render-popup out.png --mirror DIR/mirror [--dark] [--ai log], or
+for the tabs OOMPH_MACHINES_DIR=DIR/machines <app> --render-popup out.png -machinesUI YES
+[-selectedMachine m-7f3a9c1e5b2d4a68].
 Render right after writing the fixture: a live link goes stale 10 s after status.json was written
 (this tool dates it two minutes ahead). All data is invented.
 """
@@ -109,9 +117,11 @@ def main(argv):
         print(__doc__.strip())
         return 2
     out, scene = argv[0], (argv[1] if len(argv) > 1 else "offline")
-    if scene not in ("live", "offline", "fetching"):
+    if scene not in ("live", "offline", "fetching", "machines"):
         print(__doc__.strip())
         return 2
+    if scene == "machines":
+        return machines(out)
     now = time.time()
     drop = now - 40 * 60 if scene == "offline" else now
     src, mir = os.path.join(out, "source"), os.path.join(out, "mirror")
@@ -160,6 +170,44 @@ def main(argv):
     json.dump(st, open(os.path.join(mir, "sync.json"), "w"))
     json.dump(status, open(os.path.join(mir, "status.json"), "w"))
     print("%s: %s (%d samples mirrored)" % (scene, mir, r["counts"]["samples"]))
+    return 0
+
+
+def machines(out):
+    """Five pinned machines (and a Linux one) in an OOMPH_MACHINES_DIR, as `oomph remote add` leaves them."""
+    shutil.rmtree(out, ignore_errors=True)
+    main([os.path.join(out, "live"), "live"])
+    main([os.path.join(out, "offline"), "offline"])
+    base = os.path.join(out, "machines")
+    os.makedirs(base, mode=0o700)
+    now = time.time()
+    tabs = [("m-7f3a9c1e5b2d4a68", "studio", "live", None, "macos"), ("m-1b2c3d4e5f607182", "mini-ci", "offline", None, "macos"),
+            ("m-90a1b2c3d4e5f607", "gpu-box", "offline", "identity_changed", "macos"),
+            ("m-2c3d4e5f60718293", "lab-mini", "offline", "local_network_denied", "macos"),
+            ("m-4e5f607182930415", "air", "offline", "was_live", "macos"),
+            ("m-3d4e5f6071829304", "atlas", "offline", None, "linux")]
+    entries = []
+    for i, (mid, name, src, problem, osname) in enumerate(tabs):
+        shutil.copytree(os.path.join(out, src, "mirror"), os.path.join(base, mid))
+        mj = os.path.join(base, mid, "machine.json")
+        json.dump(dict(json.load(open(mj)), id=mid, name=name), open(mj, "w"))
+        p = os.path.join(base, mid, "status.json")
+        st = json.load(open(p))
+        if problem == "was_live":  # the engine left it so when the popup closed (D8)
+            st.update(state="idle", was="live", error=None, detail=None, fast=None, attempt=0, next_try=None, pid=None,
+                      connect_ms=110, transport="tcp", last_contact=now - 40 * 60)
+        elif problem == "identity_changed":
+            st.update(state="needs_attention", error=problem, detail="its key changed", attempt=0, next_try=None)
+        elif problem:
+            st.update(state="offline", error=problem, fast=True, detail="192.168.1.31: No route to host, after 2 ms")
+        json.dump(st, open(p, "w"))
+        entries.append({"mid": mid, "id": mid, "name": name, "label": None, "transport": "tcp", "host": name + ".local",
+                        "port": 6674, "user": None, "addrs": [], "fp": "sha256:" + "%064x" % (i + 1),
+                        "client": "c-0000000%d" % i, "os": osname, "version": "1.10.0", "caps": [],
+                        "added": now - 86400 * (3 - i), "pinned": True, "order": i + 1})
+    json.dump({"v": 1, "machines": entries}, open(os.path.join(base, "machines.json"), "w"), indent=1)
+    print("machines: %s (studio live, mini-ci not connected, gpu-box needs attention, lab-mini blocked by macOS, "
+          "air reconnecting, atlas Linux: no tab)" % base)
     return 0
 
 

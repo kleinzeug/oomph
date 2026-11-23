@@ -657,11 +657,11 @@ check(len([a for a in ans if "result" in a]) == 4 and not any(a.get("method") ==
       % [a.get("method") or ("result" if "result" in a else "error") for a in ans])
 
 # the CLI's edges
-r = subprocess.run([PY, "-I", "-B", OOMPH, "remote", "sync"], capture_output=True, text=True, timeout=30)
+r = subprocess.run([PY, "-I", "-B", OOMPH, "remote", "sync", "--into", TMP], capture_output=True, text=True, timeout=30)
 r2 = subprocess.run([PY, "-I", "-B", OOMPH, "remote", "sync", "--once", "--bogus"], capture_output=True, text=True, timeout=30)
 r3 = subprocess.run([PY, "-I", "-B", OOMPH, "serve"], capture_output=True, text=True, timeout=30)
-check(r.returncode == r2.returncode == r3.returncode == 2 and "only --once" in r.stderr and "--bogus" in r2.stderr,
-      "remote sync without --once, an unknown option, serve without --stdio: exit 2 with the usage")
+check(r.returncode == r2.returncode == r3.returncode == 2 and "without --once" in r.stderr and "--bogus" in r2.stderr,
+      "remote sync --into without --once, an unknown option, serve without a mode: exit 2 with the usage")
 
 shutil.rmtree(TMP, ignore_errors=True) if not os.environ.get("NETTEST_KEEP") else print("kept", TMP)
 print("\n%s" % ("FAILED (%d)" % len(failures) if failures else "all protocol checks passed"))

@@ -3,12 +3,16 @@
 import AppKit
 import Charts
 import Combine
+import Network
 import Security
 import SwiftUI
 
 let logDir = ProcessInfo.processInfo.environment["OOMPH_DIR"] ?? "/Library/Logs/oomph"
 /// The agents' coordination ledger (ledger.json) and its history log (reservations.jsonl).
 let ledgerDir = ProcessInfo.processInfo.environment["OOMPH_LEDGER_DIR"] ?? "/Users/Shared/oomph"
+/// Where `oomph remote` keeps the machines this Mac watches: machines.json and one mirror per machine.
+let machinesDir = ProcessInfo.processInfo.environment["OOMPH_MACHINES_DIR"]
+    ?? (NSHomeDirectory() + "/Library/Application Support/oomph/machines")
 let brand = "oomph"  // the product's name in prose and titles (oomph.py's BRAND; tools/brandlint.py)
 let descriptor = ": memory monitor"  // what the header says after the name
 let agentLabel = "local.oomph.menubar"
@@ -450,8 +454,16 @@ struct LinkStatus: Decodable {
     var since: Double?
     var last_contact: Double?
     var error: String?
+    var detail: String?
+    /// The connection failed at once (the engine's word for "maybe macOS's Local Network privacy").
+    var fast: Bool?
     var pid: Int32?
     var updated: Double?
+    /// How long the last connection took to its first frame: the opening grace (roadmap 01 §3.6).
+    var connect_ms: Double?
+    /// When the engine tries again after a failure (backoff, §6.2).
+    var next_try: Double?
+    var transport: String?
 }
 
 /// A mirror's sync.json: the coverage map (`have`: stretches of the remote's time received whole,
@@ -475,6 +487,44 @@ struct MachineInfo: Decodable {
     var kind: String?
     var version: String?
     var oldest: Double?
+    /// What it serves; "ai" when its owner allows AI analysis of its data (D7, off by default).
+    var caps: [String]?
+}
+
+/// A machine of machines.json (roadmap 01 §5.6), as `oomph remote` writes it. The app reads it and
+/// never writes it: every change goes through the engine.
+struct MachineEntry: Decodable {
+    var mid: String
+    var label: String?
+    var name: String?
+    var host: String?
+    var transport: String?
+    var user: String?
+    var port: Int?
+    var version: String?
+    var pinned: Bool?
+    var order: Double?
+    var caps: [String]?
+    var os: String?
+
+    /// The pinned machines (tabs), in the order they were added; entries whose mirror name is not of
+    /// the fixed pattern are skipped, since that name becomes a path. Only Macs (or a machine not yet
+    /// reached): the app does not know Linux's words until 1.13, so a Linux machine is watched from
+    /// the terminal for now (roadmap G5, the LG row; 01 §4.3: an unknown os is not drawn).
+    static func load(_ dir: String) -> [MachineEntry] {
+        struct File: Decodable { var machines: [MachineEntry]? }
+        guard let d = readShared(dir + "/machines.json", cap: 4 << 20),
+              let f = try? JSONDecoder().decode(File.self, from: d) else { return [] }
+        return (f.machines ?? []).filter { e in
+            e.pinned == true && (e.os == nil || e.os == "macos")
+                && e.mid.range(of: #"^m-[0-9a-f]{16}(-[0-9a-f]{8})?$"#, options: .regularExpression) != nil
+        }.sorted { ($0.order ?? 0) < ($1.order ?? 0) }
+    }
+    var address: String {
+        let h = host ?? "?"
+        if transport == "ssh" { return (user.map { $0 + "@" } ?? "") + h }
+        return port.map { $0 == 6674 ? h : "\(h):\($0)" } ?? h
+    }
 }
 
 /// One machine's data, as the popup draws it: this Mac from its own directories, or another
@@ -545,8 +595,52 @@ final class MachineStore: ObservableObject {
         else { return false }
         return Date().timeIntervalSince1970 - u < 10 && (kill(pid, 0) == 0 || errno == EPERM)
     }
-    /// Another machine that is not live: what claims to be now is drawn grey (roadmap 01 §3.5).
-    var stale: Bool { !isLocal && !linkLive }
+    /// Another machine that is not live: what claims to be now is drawn grey (roadmap 01 §3.5),
+    /// except during the grace of an opening.
+    var stale: Bool { !isLocal && !linkLive && !inGrace }
+
+    /// When the popup last opened, and whether this machine's link was live when it closed: the
+    /// three opening steps of roadmap 01 §3.6 (grace, Connecting…, the verdict). Every opening is a
+    /// reconnect (D8), so a machine that was fine is not called "Not connected" while it reconnects.
+    var openedAt: Double?
+    var openedLive = false
+    enum Opening { case none, grace, connecting }
+
+    func markOpened(at t: Double = Date().timeIntervalSince1970) {
+        openedAt = t
+        openedLive = !isLocal && ((link?.state == "idle" && link?.was == "live") || linkLive)
+        guard openedLive, !renderMode else { return }
+        // the steps change with time alone: draw again then (after the grace the chart shows what
+        // was not received, unless the link is live by then)
+        DispatchQueue.main.asyncAfter(deadline: .now() + grace + 0.05) { [weak self] in
+            guard let self, self.openedAt == t else { return }
+            if !self.linkLive { self.reloadPoints() }
+            self.objectWillChange.send()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + openTimeout + 0.05) { [weak self] in
+            if let self, self.openedAt == t { self.objectWillChange.send() }
+        }
+    }
+    var isSSH: Bool { (link?.transport ?? entry?.transport) == "ssh" }
+    /// Twice what the last connection took, at least 0.8 s and at most 3 s (ssh 1.5 s and 6 s).
+    var grace: Double {
+        let ms: Double = link?.connect_ms ?? 0
+        let lo: Double = isSSH ? 1.5 : 0.8, hi: Double = isSSH ? 6 : 3
+        return min(hi, max(lo, 2 * ms / 1000))
+    }
+    var openTimeout: Double { isSSH ? 20 : 8 }
+    /// The step of this opening: none once live, for a machine that was not live at the last close,
+    /// and after a definite failure or the timeout (the verdict).
+    var opening: Opening {
+        guard !isLocal, openedLive, let t = openedAt, !linkLive else { return .none }
+        if link?.state == "offline" || link?.state == "needs_attention" || link?.error == "local_network_denied" || probeDenied {
+            return .none
+        }
+        let age: Double = Date().timeIntervalSince1970 - t
+        return age < grace ? .grace : age < openTimeout ? .connecting : .none
+    }
+    var inGrace: Bool { opening == .grace }
+    var connecting: Bool { opening == .connecting }
     /// Where this dashboard's knowledge of the machine ends: the end of a mirror's coverage.
     var knownUntil: Double? { sync?.spans.last?.1 ?? history.last?.id }
     /// The stat tiles: this Mac's while its logger reports; a mirror's whenever it has a reading.
@@ -555,6 +649,20 @@ final class MachineStore: ObservableObject {
     var fetchingLedger: Bool { !isLocal && sync?.synced?.ledger != true }
     var fetchingIncidents: Bool { !isLocal && sync?.synced?.incidents != true }
 
+    /// The mirror's name (…/machines/<mid>); "local" for this Mac.
+    var mid: String { mirror.map { ($0 as NSString).lastPathComponent } ?? "local" }
+    /// Its line in machines.json (nil for this Mac).
+    var entry: MachineEntry?
+    /// The tab's name: "This Mac", or the label someone gave it, or what it calls itself.
+    var title: String { isLocal ? "This Mac" : (entry?.label ?? info?.name ?? entry?.name ?? entry?.host ?? mid) }
+    /// Whether its data may go to an AI model: this Mac's always (the person chose a provider), another's
+    /// only when its owner allows it there (`oomph share ai on`; D7).
+    var allowsAI: Bool { isLocal || (info?.caps ?? entry?.caps ?? []).contains("ai") }
+    /// Pressure as a tab shows it: critical only while live.
+    var critical: Bool { (isLocal ? daemonRunning : linkLive) && current?.pressure == 4 }
+    /// An incident open there now (the red badge).
+    var incidentOpen: Bool { current?.daemon?.incident != nil || incidents.first?.open == true }
+
     var lastSeenKey: String { isLocal ? "lastSeenIncident" : "lastSeenIncident." + (info?.id ?? (mirror! as NSString).lastPathComponent) }
     var lastSeenIncident: String {
         get { UserDefaults.standard.string(forKey: lastSeenKey) ?? "" }
@@ -562,9 +670,55 @@ final class MachineStore: ObservableObject {
     }
     var hasUnseen: Bool { (incidents.first?.id ?? "") > lastSeenIncident }
 
+    /// The app's own answer to "is macOS blocking this?" (roadmap 01 §7.6), from the probe below.
+    @Published var probeDenied = false
+    private var probe: NWConnection?
+    private var probedAt: Double = 0
+    /// Blocked by macOS: the engine said so (a fixture) or the probe found `localNetworkDenied`.
+    var blocked: Bool { !isLocal && !linkLive && (link?.error == "local_network_denied" || probeDenied) }
+
+    /// When the engine reports a connection that failed at once, the app opens one NWConnection to
+    /// the same host and port (it sends nothing; cancelled within 5 s) and reads the path: only
+    /// `localNetworkDenied` is "Blocked by macOS", anything else stays "No answer". From the app's own
+    /// long-lived process, the one the system's alert names. At most every 30 s per machine; the only
+    /// networking the Swift side does.
+    func probeLocalNetwork() {
+        guard !renderMode, probe == nil, let e = entry, e.transport != "ssh", let host = e.host, !host.isEmpty,
+              Date().timeIntervalSince1970 - probedAt > 30,
+              let port = NWEndpoint.Port(rawValue: UInt16(clamping: e.port ?? 6674)) else { return }
+        probedAt = Date().timeIntervalSince1970
+        let c = NWConnection(host: NWEndpoint.Host(host), port: port, using: .tcp)
+        probe = c
+        c.stateUpdateHandler = { [weak self] st in
+            DispatchQueue.main.async {
+                guard let self, self.probe === c else { return }
+                switch st {
+                case .waiting, .failed:
+                    self.probeDenied = c.currentPath?.unsatisfiedReason == .localNetworkDenied
+                    self.endProbe()
+                case .ready:
+                    self.probeDenied = false
+                    self.endProbe()
+                default: break
+                }
+            }
+        }
+        c.start(queue: .main)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            if let self, self.probe === c { self.endProbe() }
+        }
+    }
+
+    private func endProbe() {
+        probe?.stateUpdateHandler = nil
+        probe?.cancel()
+        probe = nil
+    }
+
     func refreshCurrent() {
         if let m = mirror {
             link = FileManager.default.contents(atPath: m + "/status.json").flatMap { try? decoder.decode(LinkStatus.self, from: $0) }
+            if linkLive { probeDenied = false } else if link?.state == "offline" && link?.fast == true { probeLocalNetwork() }
             info = FileManager.default.contents(atPath: m + "/machine.json").flatMap { try? decoder.decode(MachineInfo.self, from: $0) }
             sync = FileManager.default.contents(atPath: m + "/sync.json").flatMap { try? decoder.decode(SyncState.self, from: $0) }
         }
@@ -586,9 +740,9 @@ final class MachineStore: ObservableObject {
     /// In the background: the popup opens at once and keeps showing the previous history
     /// until the new one is ready (or a spinner, the first time). `sync` is for renders.
     func reloadPoints(sync: Bool = false) {
-        let state = self.sync, down = stale, oldest = info?.oldest
+        let state = self.sync, down = stale, grace = inGrace, oldest = info?.oldest
         if sync {
-            let r = loadQueue.sync { loadHistory(state, down: down, oldest: oldest) }
+            let r = loadQueue.sync { loadHistory(state, down: down, grace: grace, oldest: oldest) }
             apply(r); historyLoaded = true
             return
         }
@@ -596,7 +750,7 @@ final class MachineStore: ObservableObject {
         loading = true
         loadQueue.async { [weak self] in
             guard let self else { return }
-            let r = self.loadHistory(state, down: down, oldest: oldest)
+            let r = self.loadHistory(state, down: down, grace: grace, oldest: oldest)
             DispatchQueue.main.async {
                 self.apply(r)
                 if !self.historyLoaded { withAnimation(.easeIn(duration: 0.33)) { self.historyLoaded = true } }
@@ -631,8 +785,9 @@ final class MachineStore: ObservableObject {
         return ResBlock.stack(rs, now: now)
     }
 
-    /// On loadQueue only. For a mirror: its coverage, whether its link is down, its oldest sample.
-    private func loadHistory(_ state: SyncState?, down: Bool, oldest: Double?) -> Loaded {
+    /// On loadQueue only. For a mirror: its coverage, whether its link is down (or in the grace of
+    /// an opening: the stretch from its last data to now is then left blank), its oldest sample.
+    private func loadHistory(_ state: SyncState?, down: Bool, grace: Bool = false, oldest: Double?) -> Loaded {
         let now = Date().timeIntervalSince1970 + (isLocal ? 0 : state?.offset_s ?? 0)
         let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd"
         let today = fmt.string(from: Date())
@@ -649,7 +804,8 @@ final class MachineStore: ObservableObject {
         var known = now
         if !isLocal, let st = state {
             gaps = MachineStore.mirrorGaps(gaps, have: st.spans, gone: st.goneSpans, oldest: oldest, now: now, down: down)
-            if down { known = st.spans.last?.1 ?? all.last?.id ?? now }
+            if down || grace { known = st.spans.last?.1 ?? all.last?.id ?? now }
+            if grace { gaps.removeAll { $0.kind == .notReceived && $0.to >= now - 1 } }
         }
         // drop cached files that are gone (a day's plain file once it is gzipped)
         let present = Set(files.map { "\(logDir)/\($0)" })
@@ -801,6 +957,269 @@ final class Store: ObservableObject {
     /// A change in a machine is a change of the popup.
     private func watchMachines() {
         watching = machines.map { m in m.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() } }
+    }
+
+    // MARK: machines (roadmap 01 R1a): tabs for the machines added with `oomph remote add`
+
+    /// Tabs for other machines, behind a default until the Local Network question is settled on a
+    /// second Mac: `defaults write local.oomph.menubar machinesUI -bool YES`.
+    var machinesUI: Bool { UserDefaults.standard.bool(forKey: "machinesUI") }
+    /// The machine whose pane was on screen during this opening: only their incidents become seen.
+    var shownThisOpening = Set<String>()
+    /// When each machine's tab was last chosen: who goes behind » first.
+    var lastSelected: [String: Double] = [:]
+    /// A tab just closed with its ×: one click brings it back for six seconds.
+    @Published var undoUnpin: (mid: String, title: String)?
+    private var engine: Process?
+    private var engineIn: FileHandle?
+    private var engineBuf = Data()
+    private var engineTries = 0
+    var engineRunning: Bool { engine != nil }
+    var popupOpen = false
+
+    /// The tabs: This Mac, then every pinned machine of machines.json (at most twelve). Stores are
+    /// kept across reloads, so a mirror is not read from scratch again.
+    func reloadMachines() {
+        guard machinesUI else {
+            if machines.count > 1 { machines = [local]; selected = 0 }
+            return
+        }
+        let was = machine.mid
+        var next: [MachineStore] = [local]
+        for e in MachineEntry.load(machinesDir).prefix(12) {
+            let dir = machinesDir + "/" + e.mid
+            let m = machines.first { $0.mirror == dir } ?? MachineStore(mirror: dir)
+            m.entry = e
+            next.append(m)
+        }
+        if next.map(\.mid) != machines.map(\.mid) { machines = next }
+        selected = machines.firstIndex { $0.mid == was } ?? 0
+    }
+
+    /// This Mac has something to say (D9): critical pressure, an open or unseen incident, or a logger
+    /// that is installed but silent. Warning, a low disk and the like show on its tile and tab only.
+    var localHasSay: Bool {
+        guard installed else { return false }
+        let l = local
+        return !l.daemonRunning || l.current?.pressure == 4 || l.incidentOpen || l.hasUnseen
+    }
+
+    /// The opening rule (roadmap 01 §3.3 rule 4, D9): the tab the popup was closed on, unless This Mac
+    /// has something to say. Opening on This Mac then does not change which tab is remembered.
+    func applyOpeningRule() {
+        reloadMachines()
+        let remembered = UserDefaults.standard.string(forKey: "selectedMachine") ?? "local"
+        selected = localHasSay ? 0 : (machines.firstIndex { $0.mid == remembered } ?? 0)
+        shownThisOpening = [machine.mid]
+    }
+
+    /// A tab chosen by a click: remembered for the next opening, and backfilled first.
+    func select(_ i: Int) {
+        guard machines.indices.contains(i) else { return }
+        selected = i
+        let m = machines[i]
+        UserDefaults.standard.set(m.mid, forKey: "selectedMachine")
+        lastSelected[m.mid] = Date().timeIntervalSince1970
+        shownThisOpening.insert(m.mid)
+        m.refreshAll()
+        sendWatch()
+    }
+
+    /// The tab's ×: the engine unpins it (it stays in Recents), and Undo can pin it again.
+    func unpin(_ i: Int) {
+        guard machines.indices.contains(i), i > 0 else { return }
+        let m = machines[i]
+        sendEngine(["cmd": "unpin", "id": m.mid])
+        if selected == i { selected = 0 } else if selected > i { selected -= 1 }
+        machines.remove(at: i)
+        undoUnpin = (m.mid, m.title)
+        let mid = m.mid
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) { [weak self] in
+            if self?.undoUnpin?.mid == mid { self?.undoUnpin = nil }
+        }
+        sendWatch()
+    }
+
+    func undoLastUnpin() {
+        guard let u = undoUnpin else { return }
+        sendEngine(["cmd": "pin", "id": u.mid])
+        undoUnpin = nil
+    }
+
+    /// The tab's context menu: try now instead of waiting out the backoff.
+    func reconnect(_ i: Int) {
+        guard machines.indices.contains(i), i > 0 else { return }
+        sendEngine(["cmd": "retry", "id": machines[i].mid])
+    }
+
+    /// The tab's context menu: a label of its own (empty: the name the machine gives itself again).
+    func rename(_ i: Int) {
+        guard machines.indices.contains(i), i > 0 else { return }
+        let m = machines[i]
+        let a = NSAlert()
+        a.messageText = "Rename \(m.title)"
+        a.informativeText = "The tab's name on this Mac. Leave it empty for the name the machine gives itself."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 240, height: 22))
+        field.stringValue = m.entry?.label ?? ""
+        field.placeholderString = m.info?.name ?? m.entry?.name ?? m.mid
+        a.accessoryView = field
+        a.addButton(withTitle: "Rename")
+        a.addButton(withTitle: "Cancel")
+        a.window.initialFirstResponder = field
+        let done: (NSApplication.ModalResponse) -> Void = { [weak self] r in
+            guard r == .alertFirstButtonReturn else { return }
+            self?.sendEngine(["cmd": "rename", "id": m.mid, "label": String(field.stringValue.prefix(64))])
+        }
+        // a sheet on the popup: it stays open (it closes when another window takes the keyboard)
+        if let w = NSApp.keyWindow { a.beginSheetModal(for: w, completionHandler: done) } else { done(a.runModal()) }
+    }
+
+    static func openLocalNetworkSettings() {
+        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork") {
+            NSWorkspace.shared.open(u)
+        }
+    }
+
+    /// Keys while the popup is open and tabs are on (roadmap 01 §3.2): ⌘1…⌘9 choose a tab, ⌃⇥ and
+    /// ⌃⇧⇥ the next and previous one. True when the key was taken.
+    func machineKey(_ e: NSEvent) -> Bool {
+        guard machinesUI, machines.count > 1, e.type == .keyDown else { return false }
+        let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == .command, let c = e.charactersIgnoringModifiers, let n = Int(c), (1...9).contains(n) {
+            if machines.indices.contains(n - 1) { select(n - 1) }
+            return true
+        }
+        if e.keyCode == 48 && mods.contains(.control) {  // ⇥
+            let step = mods.contains(.shift) ? machines.count - 1 : 1
+            select((selected + step) % machines.count)
+            return true
+        }
+        return false
+    }
+
+    /// Opening the popup: machines connect only now, and until a minute after it closed (D8).
+    func machinesOpened() {
+        popupOpen = true
+        guard machinesUI, machines.count > 1 else { return }
+        for m in machines.dropFirst() { m.refreshCurrent(); m.markOpened(); m.reloadPoints(); m.loadIncidents() }
+        startEngine()
+    }
+
+    /// Closing it: incidents become seen only on the panes that were on screen; the engine is told
+    /// to go idle (it disconnects a minute later).
+    func machinesClosed() {
+        popupOpen = false
+        for m in machines where shownThisOpening.contains(m.mid) {
+            if let first = m.incidents.first?.id { m.lastSeenIncident = first }
+        }
+        sendEngine(["cmd": "idle"])
+    }
+
+    /// `oomph remote sync --json`, the bundled CLI: the only thing here that talks to other
+    /// machines. It writes the mirrors; the app reads them when it says what changed.
+    private func startEngine() {
+        if engine != nil { sendWatch(); return }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        p.arguments = ["-I", "-B", cliPath, "remote", "sync", "--json"]
+        let inp = Pipe(), out = Pipe()
+        p.standardInput = inp
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        let rd = out.fileHandleForReading
+        rd.readabilityHandler = { [weak self] h in
+            let d = h.availableData
+            // at the end of output the handler fires again and again with nothing: it goes now
+            if d.isEmpty { h.readabilityHandler = nil; return }
+            DispatchQueue.main.async { self?.engineData(d) }
+        }
+        p.terminationHandler = { [weak self] _ in
+            rd.readabilityHandler = nil
+            DispatchQueue.main.async { self?.engineEnded() }
+        }
+        do { try p.run() } catch { return }
+        engine = p
+        engineIn = inp.fileHandleForWriting
+        sendWatch()
+    }
+
+    private func sendEngine(_ obj: [String: Any]) {
+        guard let h = engineIn, var d = try? JSONSerialization.data(withJSONObject: obj) else { return }
+        d.append(0x0A)
+        try? h.write(contentsOf: d)
+    }
+
+    func sendWatch() {
+        sendEngine(["cmd": "watch", "ids": machines.dropFirst().map(\.mid),
+                    "focus": machine.isLocal ? NSNull() as Any : machine.mid as Any])
+    }
+
+    private func engineData(_ d: Data) {
+        guard !d.isEmpty else { return }
+        engineBuf.append(d)
+        if engineBuf.count > 1 << 20 { engineBuf.removeAll() }
+        while let i = engineBuf.firstIndex(of: 0x0A) {
+            let line = engineBuf.subdata(in: engineBuf.startIndex..<i)
+            engineBuf.removeSubrange(engineBuf.startIndex...i)
+            guard let o = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any] else { continue }
+            let id = o["id"] as? String
+            switch o["ev"] as? String {
+            case "state":
+                engineTries = 0
+                machines.first { $0.mid == id }?.refreshCurrent()
+            case "changed":
+                if let m = machines.first(where: { $0.mid == id }) {
+                    m.refreshCurrent()
+                    let what = (o["what"] as? [String]) ?? []
+                    if what.contains("samples") || what.contains("ledger") || what.contains("events") { m.reloadPoints() }
+                    if what.contains("incidents") { m.loadIncidents() }
+                }
+            case "machines":
+                reloadMachines()
+                sendWatch()
+            default: break
+            }
+        }
+    }
+
+    /// The engine ended: on its own after the idle minute, or it died. While the popup is open it is
+    /// started again, after 1, 2, 4 … at most 60 s.
+    private func engineEnded() {
+        engine = nil
+        engineIn = nil
+        engineBuf.removeAll()
+        for m in machines.dropFirst() { m.refreshCurrent() }
+        guard popupOpen, machines.count > 1 else { engineTries = 0; return }
+        engineTries += 1
+        let wait = min(60.0, pow(2.0, Double(engineTries - 1)))
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            if let self, self.popupOpen, self.engine == nil { self.startEngine() }
+        }
+    }
+
+    /// Which tabs fit the strip (roadmap 01 §3.2, simplified): This Mac and the selected tab always;
+    /// then the others, most recently chosen first, at least 92 pt each; the rest go behind ».
+    func fitTabs(width: CGFloat = 426) -> (visible: [Int], hidden: [Int]) {
+        let font = NSFont.systemFont(ofSize: 11.5)
+        func natural(_ i: Int) -> CGFloat {
+            let w: CGFloat = (machines[i].title as NSString).size(withAttributes: [.font: font]).width
+            let cap: CGFloat = i == selected ? 180 : 150
+            return min(cap, w + (i == 0 ? 33 : 38))
+        }
+        let all = Array(machines.indices)
+        let total: CGFloat = all.reduce(CGFloat(0)) { $0 + natural($1) + 2 }
+        if total <= width { return (all, []) }
+        var budget: CGFloat = width - 47 - natural(0) - 2
+        if selected != 0 { budget -= max(92, min(natural(selected), 120)) + 2 }
+        let others = all.filter { $0 != 0 && $0 != selected }
+            .sorted { (lastSelected[machines[$0].mid] ?? -Double($0)) > (lastSelected[machines[$1].mid] ?? -Double($1)) }
+        var shown: [Int] = []
+        for i in others where budget >= 94 {
+            shown.append(i)
+            budget -= 94
+        }
+        let visible = all.filter { $0 == 0 || $0 == selected || shown.contains($0) }
+        return (visible, all.filter { !visible.contains($0) })
     }
 
     // AI reports
@@ -1367,7 +1786,7 @@ final class Store: ObservableObject {
     }
 
     func runReport() {
-        if aiRunning { return }
+        if aiRunning || !machine.isLocal { return }  // another machine's reports come in R2 (1.10.3)
         if aiConnected { runAIReport() } else { runCLI(["html", "--last", "24h", "--open"]) }
     }
 
@@ -2405,10 +2824,10 @@ struct PopoverView: View {
                 .frame(maxWidth: .infinity)
                 .background(Color.primary.opacity(0.045))
                 .tourAnchor("header")
-            Divider()
+            if store.machinesUI && store.machines.count > 1 { machineTabs } else { Divider() }
             VStack(alignment: .leading, spacing: 10) {
                 if let c = m.current, m.showsStats {
-                    if m.stale { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") } else { stats(c).tourAnchor("stats") }
+                    if m.stale { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") } else { stats(c).opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
                 }
                 chart.tourAnchor("chart").zIndex(1)
                 if !m.reservations.isEmpty || m.fetchingLedger { reservedList(m.liveReservations).tourAnchor("leases") }
@@ -2554,26 +2973,81 @@ struct PopoverView: View {
                 .foregroundStyle(tint)
                 .frame(width: 32, height: 32)
                 .background(tint.opacity(0.16), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .opacity(m.inGrace ? 0.6 : 1)
                 .tourAnchor("chip")
             VStack(alignment: .leading, spacing: 2) {
-                (Text(brand).fontWeight(.bold) + Text(": " + (m.info?.name ?? m.info?.id ?? "another machine")).fontWeight(.medium))
+                (Text(brand).fontWeight(.bold) + Text(": " + m.title).fontWeight(.medium))
                     .font(.system(size: 14)).lineLimit(1).truncationMode(.tail)
-                Text(mirrorStatusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                if m.link?.next_try != nil, m.link?.state == "offline", store.engineRunning, !renderMode {
+                    TimelineView(.periodic(from: .now, by: 1)) { _ in  // the countdown of "next try in 40 s"
+                        Text(mirrorStatusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                    }
+                } else {
+                    Text(mirrorStatusLine).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+                }
             }
             Spacer(minLength: 8)
             SwiftUI.Group {
                 if live {
                     Text(p.label).background(p.color.opacity(0.2), in: Capsule()).foregroundStyle(p == .normal ? .primary : p.color)
+                } else if m.blocked {
+                    Button { Store.openLocalNetworkSettings() } label: {
+                        Text("Local Network settings…").padding(.horizontal, 10).padding(.vertical, 4)
+                            .background(Color.orange.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
+                    }
+                    .buttonStyle(.plain).padding(.horizontal, -10).padding(.vertical, -4)
+                    .help("macOS does not let \(brand) reach the local network: allow it in System Settings › Privacy & Security › Local Network")
                 } else if attention {
                     Text("Needs attention").background(Color.orange.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
+                } else if m.connecting {
+                    HStack(spacing: 5) {
+                        ProgressView().controlSize(.mini).scaleEffect(0.8).frame(width: 10, height: 10)
+                        Text("Connecting…")
+                    }
+                    .background(Color.gray.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
                 } else {
                     Text("Not connected").background(Color.gray.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
                 }
             }
+            .opacity(m.inGrace ? 0.6 : 1)
             .font(.system(size: 11, weight: .semibold))
             .padding(.horizontal, 10).padding(.vertical, 4)
             .fixedSize()
         }
+    }
+
+    /// The line under the header becomes a strip of tabs once another machine is watched (roadmap 01
+    /// §3.2): This Mac first, then each machine added with `oomph remote add`; » holds what does not
+    /// fit. The header and everything below the strip belong to the selected tab.
+    var machineTabs: some View {
+        let fit = store.fitTabs()
+        return HStack(alignment: .bottom, spacing: 2) {
+            ForEach(fit.visible, id: \.self) { i in
+                MachineTab(store: store, index: i)
+            }
+            if !fit.hidden.isEmpty {
+                Menu {
+                    ForEach(fit.hidden, id: \.self) { i in
+                        Button(store.machines[i].title) { store.select(i) }
+                    }
+                } label: {
+                    Text("» \(fit.hidden.count)").font(.system(size: 11.5)).foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
+                .frame(height: 24).padding(.horizontal, 6)
+                .help("\(fit.hidden.count) more machine\(fit.hidden.count == 1 ? "" : "s")")
+            }
+            Spacer(minLength: 0)
+            if let u = store.undoUnpin {
+                Button("Undo") { store.undoLastUnpin() }
+                    .buttonStyle(.link).font(.system(size: 11)).frame(height: 24)
+                    .help("Watch \(u.title) again")
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, minHeight: 27, maxHeight: 27, alignment: .bottomLeading)
+        .background(Color.primary.opacity(0.045))
+        .overlay(alignment: .bottom) { Divider() }
     }
 
     var mirrorStatusLine: String {
@@ -2584,12 +3058,20 @@ struct PopoverView: View {
             if let i = m.current?.daemon?.incident { s += " · incident \(i) open" }
             return s
         }
+        if m.connecting { return "Last data " + last }
         let was = m.link?.state == "idle" ? m.link?.was : m.link?.state
         if was == "catching_up" { return "Fetching history…" }
         var s: String
+        if m.blocked { return "Blocked by macOS · last data " + last }
         switch was {
-        case "offline": s = "No answer since " + MemoryChart.when(m.link?.last_contact ?? m.knownUntil ?? 0)
-        case "needs_attention": s = (m.link?.error ?? "Needs attention") + " · last data " + last
+        case "offline":
+            s = "No answer since " + MemoryChart.when(m.link?.last_contact ?? m.knownUntil ?? 0)
+            let left: Double = (m.link?.next_try ?? 0) - Date().timeIntervalSince1970
+            if m.link?.state == "offline", store.engineRunning, left >= 0.5 { s += " · next try in \(Int(left.rounded())) s" }
+        case "needs_attention":
+            let why = ["identity_changed": "Its key changed", "revoked": "Access revoked", "ssh": "SSH can't sign in",
+                       "incompatible": "Its version can't talk to this one"][m.link?.error ?? ""] ?? "Needs attention"
+            s = why + " · last data " + last
         default: s = "Last data " + last
         }
         if let c = m.current, c.pressure != 1, let p = Pressure(rawValue: c.pressure) { s += " · pressure was " + p.label.lowercased() }
@@ -2639,7 +3121,7 @@ struct PopoverView: View {
 
     func reservedList(_ live: [Reservation]) -> some View {
         // a machine that is not connected is shown as of the moment knowledge of it ends
-        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale ? (m.knownUntil ?? m.now) : m.now
+        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
         let day = m.reservations.filter { ($0.res.ended ?? now) >= now - 86400 }.count
         let capped = live.count > PopoverView.reservationLines
         let shown = capped ? Array(live.prefix(PopoverView.reservationLines - 1)) : live
@@ -2718,7 +3200,7 @@ struct PopoverView: View {
     /// Every live reservation, above the "+N more" line.
     func allReservationsCallout(arrowX: CGFloat) -> some View {
         let live = m.liveReservations
-        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale ? (m.knownUntil ?? m.now) : m.now
+        let now = m.isLocal ? Date().timeIntervalSince1970 : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
         let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
         let rows = renderMode ? Array(live.prefix(14)) : live
         return VStack(spacing: 0) {
@@ -3643,6 +4125,115 @@ struct PopoverView: View {
     }
 }
 
+/// One tab of the strip (roadmap 01 §3.2): the link's state as a glyph whose colour is the
+/// machine's pressure, its name, and a 16 pt slot at the end that holds its badge (a red ! for an
+/// open incident, an orange ring for an unseen one) or, under the pointer, the × that stops
+/// watching it. This Mac has no ×. A tab at critical pressure that is not selected is tinted red.
+struct MachineTab: View {
+    @ObservedObject var store: Store
+    let index: Int
+    @State private var hover = false
+
+    var body: some View {
+        let m = store.machines[index]
+        let sel = index == store.selected
+        let alarm = m.critical && !sel
+        return HStack(spacing: 6) {
+            glyph(m)
+            Text(m.title)
+                .font(.system(size: 11.5, weight: sel ? .semibold : .regular))
+                .italic(!m.isLocal && m.stale)
+                .lineLimit(1).truncationMode(m.entry?.label == nil ? .middle : .tail)
+                .foregroundStyle(alarm ? Color.red : sel ? Color.primary : Color.secondary)
+                .frame(width: nameWidth(m.title, sel), alignment: .leading)
+            if alarm && store.machines.count <= 4 { Text("critical").font(.system(size: 10)).foregroundStyle(.red) }
+            if !m.isLocal || (!sel && (m.incidentOpen || m.hasUnseen)) {
+                ZStack {
+                    if hover && !m.isLocal {
+                        Button { store.unpin(index) } label: {
+                            Image(systemName: "xmark").font(.system(size: 8, weight: .bold)).foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Stop watching \(m.title) · it comes back with: oomph remote add \(m.entry?.address ?? m.mid)")
+                    } else if !sel && m.incidentOpen {
+                        Text("!").font(.system(size: 11, weight: .heavy)).foregroundStyle(.red)
+                    } else if !sel && m.hasUnseen {
+                        Circle().stroke(Color.orange, lineWidth: 1.5).frame(width: 7, height: 7)
+                    }
+                }
+                .frame(width: 16, height: 16)
+            }
+        }
+        .padding(.leading, 9).padding(.trailing, m.isLocal && !(!sel && (m.incidentOpen || m.hasUnseen)) ? 11 : 3)
+        .frame(height: 24)
+        .background(alarm ? Color.red.opacity(0.12) : sel ? Color(nsColor: .windowBackgroundColor) : Color.clear,
+                    in: UnevenRoundedRectangle(topLeadingRadius: 7, topTrailingRadius: 7, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { store.select(index) }
+        .onHover { hover = $0 }
+        .help(tooltip(m))
+        .contextMenu {
+            if !m.isLocal {
+                Button("Rename…") { store.rename(index) }
+                Button("Reconnect") { store.reconnect(index) }
+                Button("Copy address") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(m.entry?.address ?? m.mid, forType: .string)
+                }
+                if m.blocked { Button("Open Local Network settings") { Store.openLocalNetworkSettings() } }
+                Divider()
+                Button("Stop watching") { store.unpin(index) }
+            }
+        }
+    }
+
+    /// A filled dot: live, coloured by pressure (grey while that machine's logger is silent); a
+    /// dotted circle while connecting; a slashed circle when not connected; an orange triangle
+    /// when waiting will not help (its key changed, access revoked, ssh can't sign in, too old).
+    @ViewBuilder func glyph(_ m: MachineStore) -> some View {
+        let state = m.link?.state == "idle" ? m.link?.was : m.link?.state
+        if !m.isLocal && (state == "needs_attention") {
+            Image(systemName: "exclamationmark.triangle.fill").font(.system(size: 9)).foregroundStyle(.orange)
+        } else if m.blocked {
+            Image(systemName: "hand.raised.fill").font(.system(size: 9)).foregroundStyle(.orange)
+        } else if !m.isLocal && (m.connecting || m.stale && (state == "connecting" || state == "catching_up") && m.link?.state != "idle") {
+            Image(systemName: "circle.dotted").font(.system(size: 9)).foregroundStyle(.secondary)
+        } else if !m.isLocal && m.stale {
+            Image(systemName: "circle.slash").font(.system(size: 10)).foregroundStyle(.secondary)
+        } else {
+            let p = Pressure(rawValue: m.current?.pressure ?? 0) ?? .unknown
+            let reporting = m.isLocal ? m.daemonRunning : m.inGrace || (m.current.map { m.now - $0.t < 3 * ($0.daemon?.interval ?? 30) + 15 } ?? false)
+            Circle().fill(reporting ? p.color : Color.gray).frame(width: 7, height: 7).opacity(m.inGrace ? 0.6 : 1)
+        }
+    }
+
+    /// The name's width: as wide as it is, at most 112 pt (142 when selected; roadmap 01 §3.2 caps a
+    /// tab at 150 and 180 pt); a longer one is cut in the middle (a host name) or at the end (a label).
+    func nameWidth(_ s: String, _ sel: Bool) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 11.5, weight: sel ? .semibold : .regular)
+        let w: CGFloat = ceil((s as NSString).size(withAttributes: [.font: font]).width) + 1
+        return min(w, sel ? 142 : 112)
+    }
+
+    func tooltip(_ m: MachineStore) -> String {
+        if m.isLocal { return "This Mac" }
+        var parts = [m.title]
+        if let e = m.entry { parts.append(e.address + (e.transport == "ssh" ? " (ssh)" : "")) }
+        if let v = m.info?.os_version { parts.append((m.info?.os == "linux" ? "Linux " : "macOS ") + v) }
+        if let v = m.info?.version { parts.append(brand + " " + v) }
+        parts.append(m.allowsAI ? "AI analysis allowed there" : "AI analysis not allowed there")
+        if m.linkLive { parts.append("connected") } else if let t = m.link?.last_contact {
+            parts.append("last contact " + MemoryChart.when(t))
+        }
+        if m.blocked {
+            parts.append("Blocked by macOS: allow \(brand) in System Settings › Privacy & Security › Local Network")
+        } else if !m.linkLive, let d = m.link?.detail, !d.isEmpty {
+            parts.append(d)
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
 /// The connected provider's mark on the ✦ button: Claude's orange burst, OpenAI's aperture,
 /// Ollama's llama. Drawn here (no bundled brand artwork).
 struct AIProviderMark: View {
@@ -3794,6 +4385,12 @@ struct CalloutArrow: Shape {
 /// Borderless panel used instead of NSPopover, positioned explicitly below the status item.
 final class PopupPanel: NSPanel {
     override var canBecomeKey: Bool { true }
+    /// The tabs' keys (Store.machineKey), seen before any view: a ⌃⇥ never reaches the key-view loop.
+    var onKey: ((NSEvent) -> Bool)?
+    override func sendEvent(_ e: NSEvent) {
+        if e.type == .keyDown, attachedSheet == nil, onKey?(e) == true { return }
+        super.sendEvent(e)
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
@@ -3808,6 +4405,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     var isShown: Bool { panel?.isVisible ?? false }
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        signal(SIGPIPE, SIG_IGN)  // a child that ended (the engine, a report) must not take the app with it
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         store.machine.reloadPoints()  // in the background: the first popup then opens with its chart ready
         item.button?.target = self
@@ -3823,6 +4421,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.delegate = self
+        panel.onKey = { [weak self] e in self?.store.machineKey(e) ?? false }
         let fx = NSVisualEffectView()
         fx.material = .popover
         fx.blendingMode = .behindWindow
@@ -3870,8 +4469,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if isShown { close(); return }
         // clicking the icon first makes the panel resign key (which closes it); don't reopen on that same click
         if Date().timeIntervalSince(lastClose) < 0.35 { return }
+        store.applyOpeningRule()
         store.machine.refreshAll()
         store.popupOpened()
+        store.machinesOpened()
         position()
         panel.makeKeyAndOrderFront(nil)
         // nothing focused on open: a focus ring is drawn above everything, callouts included
@@ -3903,7 +4504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         panel.orderOut(nil)
         lastClose = Date()
         if let m = clickMonitor { NSEvent.removeMonitor(m); clickMonitor = nil }
-        if let first = store.machine.incidents.first?.id { store.machine.lastSeenIncident = first }
+        store.machinesClosed()
         updateIcon()
     }
 
@@ -4003,6 +4604,16 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
     let store = Store()
     // `--mirror DIR` draws another machine's mirror (…/machines/<mid>/, as `oomph remote sync` writes it)
     if let dir = mirror { store.machines.append(MachineStore(mirror: dir)); store.selected = 1 }
+    // with `-machinesUI YES`: the tabs of OOMPH_MACHINES_DIR, opened by the opening rule
+    // (`-selectedMachine MID` is the remembered tab)
+    if mirror == nil && store.machinesUI {
+        store.local.refreshCurrent()
+        store.local.loadIncidents()
+        store.applyOpeningRule()
+        // a render is the popup just opened (roadmap 01 §3.6); `-openedAgo S` draws it S seconds later
+        let opened: Double = Date().timeIntervalSince1970 - UserDefaults.standard.double(forKey: "openedAgo")
+        for m in store.machines.dropFirst() { m.refreshCurrent(); m.markOpened(at: opened); m.loadIncidents() }
+    }
     store.machine.refreshCurrent()
     store.machine.loadIncidents()
     if ai != "loading" { store.machine.reloadPoints(sync: true) }  // `--ai loading` draws the spinner

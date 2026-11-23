@@ -35,7 +35,7 @@ jobs:
           bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
           sh -n linux/install.sh linux/uninstall.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/sharetest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
@@ -105,6 +105,15 @@ jobs:
           fi
           git worktree remove --force "$RUNNER_TEMP/v1.8.4"
 
+      - name: Sharing as real root (remote machines, 1.10.0)
+        # The share service for real (roadmap 01 §12): `sudo oomph share on --pair` creates the group and the
+        # role account _oomph and asserts them, key.pem root:_oomph 640, the LaunchDaemon under _oomph; a
+        # viewer (the runner's user) pairs over loopback with the printed code, cold; share status as that
+        # user shows no secret; revoke refuses the viewer; install.sh over a sharing install keeps it on;
+        # uninstall.sh then install.sh brings it back with the same key; uninstall.sh --purge removes the
+        # account, the state and the job. The runner is thrown away afterwards.
+        run: sudo CI=1 /usr/bin/python3 -I -B tools/sharetest.py root
+
       - name: Old upgraders build this commit
         # Installed copies upgrade themselves: their own `oomph upgrade build` runs main's
         # build-app.sh. The upgraders of v1.6.2 and v1.8.1 must still get an app out of it.
@@ -144,6 +153,15 @@ jobs:
           "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" --render-popup "$RUNNER_TEMP/mirror.png" \
             --mirror "$RUNNER_TEMP/mirror/mirror" -aiOn NO
           test -s "$RUNNER_TEMP/mirror.png" && sips -g pixelWidth -g pixelHeight "$RUNNER_TEMP/mirror.png"
+          # the tabs of 1.10.0, switched off for users (machinesUI), drawn with the switch forced on
+          /usr/bin/python3 -I -B tools/mirrorfixture.py "$RUNNER_TEMP/mfx" machines
+          OOMPH_MACHINES_DIR="$RUNNER_TEMP/mfx/machines" "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" \
+            --render-popup "$RUNNER_TEMP/tabs.png" -aiOn NO -machinesUI YES -selectedMachine m-7f3a9c1e5b2d4a68
+          test -s "$RUNNER_TEMP/tabs.png" && sips -g pixelWidth -g pixelHeight "$RUNNER_TEMP/tabs.png"
+          # a machine that was live when the popup closed, reconnecting: the grace, then Connecting…
+          OOMPH_MACHINES_DIR="$RUNNER_TEMP/mfx/machines" "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" \
+            --render-popup "$RUNNER_TEMP/tabs-reopen.png" -aiOn NO -machinesUI YES -selectedMachine m-4e5f607182930415 -openedAgo 2
+          test -s "$RUNNER_TEMP/tabs-reopen.png"
 
       - name: Verify app bundle
         run: |
@@ -285,9 +303,9 @@ jobs:
       - name: Python, git, tmux
         run: |
           if command -v apt-get >/dev/null; then
-            apt-get update -q && apt-get install -y -q python3 git tmux procps util-linux ca-certificates
+            apt-get update -q && apt-get install -y -q python3 git tmux procps util-linux ca-certificates openssl
           else
-            dnf install -y -q python3 git tmux procps-ng diffutils findutils util-linux shadow-utils
+            dnf install -y -q python3 git tmux procps-ng diffutils findutils util-linux shadow-utils openssl
           fi
           python3 --version
           useradd -m tester

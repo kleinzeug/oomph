@@ -25,8 +25,15 @@ if [ -n "$PFX" ]; then
 else
   [ "$(id -u)" = 0 ] || { echo "oomph: uninstall.sh must run as root (sudo ./uninstall.sh)" >&2; exit 1; }
   launchctl bootout system/local.oomph.daemon 2>/dev/null || true
+  # nothing may listen without the code it would run: the share service goes too, its key, pairings and
+  # account stay (Activate brings sharing back as it was), unless --purge removes them, as its account
+  if [ "${1:-}" = "--purge" ] && [ -f /usr/local/libexec/oomph/oomph.py ]; then
+    /usr/bin/python3 -I -B /usr/local/libexec/oomph/oomph.py share purge >/dev/null 2>&1 || true
+  fi
+  launchctl bootout system/local.oomph.share 2>/dev/null || true
 fi
-rm -f "$PFX/Library/LaunchDaemons/local.oomph.daemon.plist" "$PFX/usr/local/bin/oomph" "$PFX"/usr/local/bin/.oomph.link.*
+rm -f "$PFX/Library/LaunchDaemons/local.oomph.daemon.plist" "$PFX/Library/LaunchDaemons/local.oomph.share.plist" \
+      "$PFX/usr/local/bin/oomph" "$PFX"/usr/local/bin/.oomph.link.*
 rm -rf "$PFX/usr/local/libexec/oomph" "$PFX"/usr/local/libexec/oomph-* "$PFX"/usr/local/libexec/.oomph-new.* \
        "$PFX"/usr/local/libexec/.oomph.link.*
 if [ "${1:-}" = "--purge" ]; then

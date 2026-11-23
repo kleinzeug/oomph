@@ -44,11 +44,20 @@ coordinating memory between sessions (a shared first-come-first-served ledger):
   oomph doctor [--json]             what works on this machine and what to fix; exit 0 fine, 1 something to
                                     fix, 2 it cannot work here
 
-another machine (over a pipe for now; the network comes later):
-  oomph serve --stdio               answer for this machine on stdin/stdout, read only (what the
-                                    other end runs, e.g. through ssh)
-  oomph remote sync --once [--into DIR] [-- COMMAND…]   mirror the machine whose `serve --stdio`
-                                    COMMAND starts (default: this one) into a directory of logs
+other machines (read-only, Mac to Mac over TLS, or anything with `oomph` over ssh):
+  oomph share on [--pair]           share this Mac on the networks it is on now (sudo; off by default)
+  oomph share pair | revoke ID      a one-time pairing code for a viewer; end a viewer's access (sudo)
+  oomph share status | networks     whether this Mac is shared, where, and who is paired or reading
+  oomph share ai on|off             whether viewers may send this machine's data to an AI model (sudo)
+  oomph share off [--forget]        stop sharing (--forget: drop the key and every pairing too)
+  oomph remote add HOST [--code C]  watch a shared Mac (the first time with the code its `share pair` showed)
+  oomph remote add USER@HOST        watch a machine over ssh (it needs `oomph` there, nothing else)
+  oomph remote list [--json]        the machines this one watches, and how each link is
+  oomph remote remove|forget NAME   stop watching (forget: also its history and pairing)
+  oomph remote rename NAME LABEL    the tab's name
+  oomph remote sync [--json]        keep the watched machines' mirrors live (what the app runs)
+  oomph remote sync --once [NAME]   catch up once, then exit
+  oomph serve --stdio               answer for this machine on stdin/stdout, read only (what ssh runs)
 """
 import datetime
 import functools
@@ -75,6 +84,7 @@ COMMIT = ""      # the git commit the stamped copy was built from
 BRAND = "oomph"  # the product's name in prose and titles: one edit renames it (tools/brandlint.py)
 CMD = "oomph"    # the command, its message prefix and every identifier: never changes
 HARDENING = 1    # H0 (1.8.4): root never opens the shared ledger directory; `oomph share on` requires it
+SHARING = 1      # R1a (1.10.0): this code serves `serve --inetd` with TLS, pairing and the peer gate
 
 
 def _checkout_version():
@@ -3228,9 +3238,10 @@ CONFIG_FILE = PATHS_HERE["config"]
 CONFIG_CAP = 64 << 10
 
 
-def read_config(path=CONFIG_FILE):
+def read_config(path=CONFIG_FILE, owner=0):
     """The root-owned configuration as a dict; {} when it is missing or not to be trusted. Both
-    the file and its directory must belong to root and be writable by nobody else, the file a
+    the file and its directory must belong to root (`owner`: a test's own user) and be writable by
+    nobody else, the file a
     regular file with one link (read without following links or blocking, like read_bounded),
     at most CONFIG_CAP bytes of a JSON object within LIMITS."""
     d, name = os.path.split(path)
@@ -3245,7 +3256,7 @@ def read_config(path=CONFIG_FILE):
         return {}
     try:
         for st in (os.fstat(dfd), os.fstat(fd)):
-            if st.st_uid != 0 or st.st_mode & 0o022:
+            if st.st_uid != owner or st.st_mode & 0o022:
                 return {}
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or st.st_size > CONFIG_CAP:
@@ -5837,12 +5848,15 @@ def _main(argv):
             sys.path.insert(0, HERE)
         import oomph_ai
         return oomph_ai.cmd_ai_report(rest)
-    if c in ("serve", "remote"):
+    if c in ("serve", "remote", "share"):
         if HERE not in sys.path:
             sys.path.insert(0, HERE)
         if c == "serve":
             import oomph_net
             return oomph_net.cmd_serve(rest)
+        if c == "share":
+            import oomph_net
+            return oomph_net.cmd_share(rest)
         import oomph_sync
         return oomph_sync.cmd_remote(rest)
     if c == "hook":
@@ -5867,7 +5881,7 @@ def _main(argv):
         return cmd_html(rest)
     if c == "version":
         print(json.dumps({"version": VERSION, "commit": COMMIT, "brand": BRAND, "command": CMD,
-                          "hardening": HARDENING}) if "--json" in rest else VERSION)
+                          "hardening": HARDENING, "sharing": SHARING}) if "--json" in rest else VERSION)
         return 0
     print(usage(__doc__))
     return 2

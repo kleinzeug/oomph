@@ -481,6 +481,49 @@ session B  → granted r8, tests start
   `nobody` that the sampler never waits for, and `sudo oomph reserve` (any root caller)
   runs its ledger operation as the user who ran sudo.
 
+### Other machines (1.10)
+
+A Mac can watch other machines, read-only: Macs that are shared with it over the network, and
+any machine with oomph installed that it can reach over `ssh`. Mac to Mac first; in 1.10.0
+from the terminal, with tabs in the app behind a switch (below).
+
+```sh
+# on the Mac to be watched (an administrator; off by default)
+sudo oomph share on --pair        # share it on the networks it is on now, and print a pairing code
+sudo oomph share pair             # a new one-time code (10 minutes, five tries) for the next viewer
+oomph share status                # on which networks, who is paired, who is reading now
+sudo oomph share revoke c-4f2a9d10   # end one viewer's access (its live connection ends within seconds)
+sudo oomph share ai on            # let viewers send this Mac's data to their AI analysis (off by default)
+sudo oomph share off [--forget]   # stop sharing (--forget: a new key, every viewer pairs again)
+
+# on the Mac you sit at (no sudo)
+oomph remote add studio.local    # asks for the code `share pair` showed, pairs, then mirrors its 14 days
+oomph remote add sam@atlas        # or over ssh: nothing to set up there but oomph
+oomph remote list                 # the machines watched, and how each link is
+oomph remote sync                 # follow them live in this terminal (the app does this while its popup is open)
+oomph remote sync --once          # catch every watched machine up once (before 1.10 this mirrored this Mac
+                                  # into machines/<its id>: that folder can go; --into DIR still does it)
+oomph remote remove studio        # stop watching (forget: also its history here and its pairing there)
+```
+
+How it works, briefly. Sharing is a second, optional service (`local.oomph.share`) that
+launchd starts once per connection as a role account of its own, `_oomph`, never as root and
+never inside the logger; it only reads what every user of that Mac can read in its logs.
+Before a byte is read, a peer must be on the same network (one that sharing was turned on
+for; `share allow CIDR` adds a routed range such as a tailnet). Then TLS with the Mac's own
+key, which the viewer pins at pairing; the pairing code is never sent, both sides prove they
+know it, so a machine in between cannot pair. Each viewer keeps a token in a file only it can
+read (`~/Library/Application Support/oomph/machines/secrets.json`) and its mirror of the other
+machine next to it, in the same layout as `/Library/Logs/oomph`. A laptop is best watched over
+`ssh`: that opens no port of ours.
+
+**Tabs in the app** are switched off in 1.10.0, until macOS's Local Network permission for a
+self-built app is tried on a second Mac. To switch them on:
+`defaults write local.oomph.menubar machinesUI -bool YES`, then quit and reopen oomph. The
+popup then has a tab per machine added with `oomph remote add`: the header and everything below
+belong to the selected tab, the menu-bar chip stays this Mac's, and the popup opens on the tab
+it was closed on unless this Mac is critical, has an incident or its logger is silent.
+
 ## Files
 
 | Path | What |
@@ -493,6 +536,9 @@ session B  → granted r8, tests start
 | `/usr/local/libexec/oomph/` | a link to the installed daemon and CLI, `/usr/local/libexec/oomph-<version>/` |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job (replaced by every install) |
 | `/Library/Application Support/oomph/config.json` | settings that survive updates (optional, see below) |
+| `/Library/Application Support/oomph/share/` | sharing (1.10, only once turned on): its settings, certificate and key (root's), and `run/` (the `_oomph` account's: pairings, the active code, who is reading) |
+| `/Library/LaunchDaemons/local.oomph.share.plist` | the share service's launchd job (only while sharing is on) |
+| `~/Library/Application Support/oomph/machines/` | the machines you watch (`machines.json`, tokens in `secrets.json`) and a mirror of each |
 | `/Users/Shared/oomph/ledger.json` | the sessions' memory reservations and the last 100 finished ones (shared by all users; advisory) |
 | `/Users/Shared/oomph/reservations.jsonl` | every reservation edit and finished reservation, one JSON record per line; kept 14 days |
 
@@ -519,11 +565,16 @@ The logs contain process names and working directories — never command-line ar
 or file contents — and are readable by every user on the Mac. From 1.9.1 they also hold
 how much CPU, GPU time and disk writing each process used, and the names and mount points
 of the disks oomph records (a volume's name can say something: `oomph volumes hide` keeps it
-out of your own lists, not out of the logs). Nothing leaves your
-machine: no network access, no telemetry — except when you turn on the AI analysis with
-Claude or OpenAI, which sends figures, process names, project paths and the names and mount
-points of recorded disks from the logs to that provider for each AI report (Ollama keeps it
-local).
+out of your own lists, not out of the logs). No telemetry. oomph does not talk to the
+network unless you ask it to: when you turn on the AI analysis with Claude or OpenAI, which
+sends figures, process names, project paths and the names and mount points of recorded disks
+from the logs to that provider for each AI report (Ollama keeps it local); when you check for
+upgrades; when you **share this Mac** (off by default, needs an administrator, only on the
+networks you turn it on for) or **watch one that was shared with you**. Shared data goes
+directly between your machines, encrypted, and nowhere else, and a watching machine only
+connects while its popup is open (and a minute after), or while you run `oomph remote add` or
+`oomph remote sync` in a terminal. Another machine's data goes to an AI
+provider only if its owner allowed it there (`sudo oomph share ai on`; off by default).
 
 ## Layout
 

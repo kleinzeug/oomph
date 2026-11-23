@@ -784,11 +784,52 @@ def cmd_ai_check(args):
     return 0
 
 
+AI_CONSENT_S = 86400   # a remote machine's AI consent counts this long after it was last reached
+
+
+def remote_refusal(log_dir=None):
+    """Why the logs at `log_dir` may not go to a model, or None (D7). A mirror of another machine
+    (…/machines/<mid>/log, beside its machine.json and sync.json) goes only when that machine
+    allows it: its owner ran `sudo oomph share ai on` there, and it said so (`ai` in its caps)."""
+    d = os.path.realpath(log_dir or oomph.LOG_DIR)
+    up = os.path.dirname(d)
+    machines = os.path.realpath(os.environ.get("OOMPH_MACHINES_DIR") or os.path.join(oomph.STATE_DIR, "machines"))
+    beside = any(os.path.lexists(os.path.join(up, n)) for n in ("sync.json", "machine.json", "status.json"))
+    # Fails closed: a mirror whose first catch-up was cut off has no sync.json yet, but it lies under
+    # machines/ or has machine.json beside it, and goes only when that machine.json says `ai`.
+    if not (os.path.basename(d) == "log" and beside or d.startswith(machines + os.sep)):
+        return None
+    try:
+        dfd = os.open(up, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            m = oomph.loads_untrusted(oomph.read_bounded("machine.json", 1 << 20, dfd))
+            st = oomph.loads_untrusted(oomph.read_bounded("status.json", 1 << 16, dfd))
+        finally:
+            os.close(dfd)
+    except OSError:
+        m = st = None
+    caps = m.get("caps") if isinstance(m, dict) and isinstance(m.get("caps"), list) else []
+    if "ai" not in caps:
+        return ("these logs are another machine's, and it does not allow AI analysis of its data (its owner can "
+                "allow it there: sudo %s share ai on)" % oomph.CMD)
+    # Its consent is what it said when last reached: a day old at most, as `share ai off` there
+    # reaches a viewer only while it is connected.
+    last = st.get("last_contact") if isinstance(st, dict) else None
+    if not (oomph._num(last, 0, 1e11) and time.time() - last < AI_CONSENT_S):
+        return ("these logs are another machine's, and it was last reached more than a day ago: whether it still "
+                "allows AI analysis of its data is not known. Connect to it again (%s remote sync --once)" % oomph.CMD)
+    return None
+
+
 def cmd_ai_report(args):
     pk = (_opt(args, "--provider") or "claude").lower()
     if pk not in PROVIDERS:
         emit(error="unknown provider %s (claude, openai or ollama)" % pk)
         return 2
+    why = remote_refusal()
+    if why:
+        emit(error=why)
+        return 3
     token = os.environ.get("OOMPH_AI_TOKEN") or os.environ.get(
         {"claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "ollama": "OLLAMA_API_KEY"}[pk]) or ""
     since, until = oomph.window(args, "24h")
