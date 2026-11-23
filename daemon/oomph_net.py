@@ -1,9 +1,9 @@
 """oomph's wire protocol and its serving side (roadmap 01 §4.2, §5, §7).
 
     oomph serve --stdio [--now T]          the protocol on stdin and stdout (what ssh runs)
-    oomph serve --inetd                    one TLS connection on fd 0, as launchd hands it over
-    oomph serve --listen HOST:PORT         accept, fork one --inetd per connection (tests; loopback
-                                           unless sharing is on)
+    oomph serve --inetd [--now T]          one TLS connection on fd 0, as launchd hands it over
+    oomph serve --listen HOST:PORT [--now T]   accept, start one --inetd per connection (tests;
+                                           loopback unless sharing is on)
     oomph share on|off|pair|status|revoke|networks|allow|ai|reload|purge
 
 answers for this machine, read only, from its two directories: the log directory (LOG_DIR, written
@@ -70,6 +70,7 @@ ROLE = "_oomph"                      # the share service's account and its group
 LABEL = "local.oomph.share"
 SHARE_PLIST = "/Library/LaunchDaemons/%s.plist" % LABEL
 HANDSHAKE_S = 10                     # gate, TLS, hello and pair or auth: all within this
+WARM_S = 90                          # share on waits this long at most for the service's first start
 PAIR_S = 600                         # a pairing code lives this long ...
 PAIR_TRIES = 5                       # ... and survives this many wrong proofs
 PAUSE_S = 1.0                        # every failed pair or auth waits this long before it answers
@@ -1954,7 +1955,7 @@ def serve_connection(sock, sh=None, now=None, gate_fn=None):
             pass
 
 
-def serve_inetd():
+def serve_inetd(now=None):
     """`serve --inetd`: launchd (inetdCompatibility, no Wait) passes the connection as fd 0 and fd
     1. It moves to a private descriptor first and 0, 1 and 2 point at /dev/null, so no stray print
     or traceback can put plaintext into the TLS stream."""
@@ -1971,13 +1972,16 @@ def serve_inetd():
         sock = socket.socket(fileno=fd)
     except OSError:
         return 1
-    return serve_connection(sock)
+    return serve_connection(sock, now=now)
 
 
 def serve_listen(spec, now=None):
-    """`serve --listen HOST:PORT`: accept, and fork one connection process per connection (tests;
-    a machine without launchd). Loopback only unless sharing is on. Prints the address it listens
-    on (port 0: a free one) as its first line."""
+    """`serve --listen HOST:PORT`: accept, and start one `serve --inetd` per connection, as launchd
+    does (tests; a machine without launchd). Loopback only unless sharing is on. Prints the address
+    it listens on (port 0: a free one) as its first line. A fresh interpreter, not a bare fork: on
+    macOS a forked child that does not exec reads the time zone file again at every localtime()
+    (its notification of zone changes does not survive the fork), which made a pairing's
+    catch-up ten times slower than the launchd service it stands in for."""
     m = re.fullmatch(r"\[?([0-9A-Fa-f:.]+)\]?:(\d{1,5})", spec or "")
     if not m:
         sys.stderr.write("oomph: serve --listen takes ADDRESS:PORT, e.g. 127.0.0.1:6674\n")
@@ -2013,15 +2017,16 @@ def serve_listen(spec, now=None):
             c, _ = s.accept()
         except OSError:
             continue
+        argv = [sys.executable, "-I", "-B", os.path.abspath(oomph.__file__), "serve", "--inetd"]
         pid = os.fork()
         if pid == 0:
-            rc = 1
             try:
                 s.close()
-                limit_self()
-                rc = serve_connection(c, sh, now) or 0
+                os.dup2(c.fileno(), 0)
+                os.dup2(c.fileno(), 1)
+                os.execv(argv[0], argv + (["--now", repr(now)] if now is not None else []))
             finally:
-                os._exit(rc)
+                os._exit(1)
         c.close()
 
 
@@ -2298,6 +2303,37 @@ def install_service(port):
     r = _run(["/bin/launchctl", "bootstrap", "system", SHARE_PLIST])
     if r.returncode != 0:
         raise ShareError("launchctl bootstrap failed: %s" % clean((r.stderr or r.stdout).strip(), 200))
+    if not warm_service(port):  # best effort: say so, but the service is installed
+        sys.stderr.write("oomph: the sharing service did not answer within %d s (oomph share status)\n" % WARM_S)
+
+
+def warm_service(port, wait=WARM_S):
+    """Start the service once and wait until it ran: connect on loopback, send nothing, half-close,
+    and wait for it to close (True), at most `wait` seconds (False). The first interpreter of a new
+    role account through the /usr/bin/python3 shim took 14 to 26 s on CI runners
+    (tools/spike_role_account.sh), longer than a viewer's 10 s for the TLS handshake: the first
+    viewer met that start and timed out. Best effort; root opens no file here."""
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline:
+        try:
+            s = socket.create_connection(("127.0.0.1", port), timeout=max(0.05, min(3.0, deadline - time.monotonic())))
+        except OSError:  # not listening yet
+            time.sleep(0.5)
+            continue
+        try:
+            s.shutdown(socket.SHUT_WR)
+            while time.monotonic() < deadline:
+                s.settimeout(max(0.05, deadline - time.monotonic()))
+                if not s.recv(4096):
+                    return True
+        except socket.timeout:
+            pass
+        except OSError:  # reset: it ran and is gone
+            return True
+        finally:
+            s.close()
+        return False
+    return False
 
 
 def remove_service():
@@ -2570,7 +2606,7 @@ def _share(sh, sub, o, pos):
 
 
 SERVE_USAGE = ("usage: oomph serve --stdio [--now T]   (the protocol on stdin and stdout)\n"
-               "       oomph serve --inetd             (one TLS connection on fd 0: the share service)\n"
+               "       oomph serve --inetd [--now T]   (one TLS connection on fd 0: the share service)\n"
                "       oomph serve --listen ADDR:PORT [--now T]   (accept and serve; loopback unless shared)")
 
 
@@ -2580,7 +2616,7 @@ def cmd_serve(args):
     rest = args[1:]
     if mode == "--listen" and rest:
         spec, rest = rest[0], rest[1:]
-    if mode not in ("--stdio", "--inetd", "--listen") or mode == "--inetd" and rest or \
+    if mode not in ("--stdio", "--inetd", "--listen") or \
             rest and (len(rest) != 2 or rest[0] != "--now") or mode == "--listen" and not args[1:]:
         sys.stderr.write(SERVE_USAGE + "\n")
         return 2
@@ -2593,7 +2629,7 @@ def cmd_serve(args):
             sys.stderr.write("oomph: serve: --now takes a unix time\n")
             return 2
     if mode == "--inetd":
-        return serve_inetd()
+        return serve_inetd(now)
     if mode == "--listen":
         return serve_listen(spec, now)
     drop_root()

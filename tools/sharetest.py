@@ -9,6 +9,7 @@ it. All data is invented.
                                                           pairing over loopback, revoke, install.sh over
                                                           a sharing install, uninstall --purge (macOS)
 """
+import atexit
 import base64
 import hashlib
 import json
@@ -78,6 +79,7 @@ class Listener:
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=dict(os.environ, OOMPH_SHARE_DIR=share))
         line = self.p.stdout.readline().decode()
         self.port = int(line.rsplit(":", 1)[1]) if line.startswith("listening") else None
+        atexit.register(self.stop)  # a check that raises (a CLI timeout) must not leave it listening
 
     def stop(self):
         self.p.terminate()
@@ -105,14 +107,15 @@ def run_root():
         return subprocess.run(["/usr/bin/sudo", "-u", "#%d" % user, "env", "OOMPH_MACHINES_DIR=" + mdir + "/machines",
                                PY, "-I", "-B", OOMPH] + list(args), capture_output=True, text=True, timeout=timeout)
 
-    def root(*args, timeout=90):
+    def root(*args, timeout=net.WARM_S + 90):  # share on waits for the service's first start
         return subprocess.run([inst] + list(args), capture_output=True, text=True, timeout=timeout)
     r = subprocess.run(["./install.sh"], cwd=ROOT, capture_output=True, text=True, timeout=300)
     check(r.returncode == 0, "install.sh as root (%s)" % r.stderr.strip()[-200:])
     r = root("share", "on", "--pair", "--json")
     print(r.stdout, r.stderr)
     code = json.loads(r.stdout.strip().splitlines()[-1])["code"] if r.returncode == 0 else ""
-    check(r.returncode == 0 and code, "sudo oomph share on --pair: sharing on, a code printed")
+    check(r.returncode == 0 and code and "did not answer" not in r.stderr,
+          "sudo oomph share on --pair: sharing on, the service started once and answered, a code printed")
     ids = subprocess.run(["/usr/bin/id", net.ROLE], capture_output=True, text=True).stdout
     check(subprocess.run(["/usr/bin/id", "-gn", net.ROLE], capture_output=True, text=True).stdout.strip() == net.ROLE,
           "the role account's group is its own (%s)" % ids.strip())
@@ -130,8 +133,9 @@ def run_root():
           "nobody signs in as %s: no password, hidden, an empty one refused" % net.ROLE)
     t = time.time()
     r = as_user("remote", "add", "127.0.0.1", "--code", code, "--json")
-    check(r.returncode == 0 and json.loads(r.stdout)["ok"], "a viewer pairs over loopback with the code, cold "
-                                                            "(%.1f s; %s)" % (time.time() - t, r.stderr.strip()[-200:]))
+    check(r.returncode == 0 and json.loads(r.stdout)["ok"], "a viewer pairs over loopback with the code, the first "
+                                                            "connection after share on (%.1f s; %s %s)"
+          % (time.time() - t, r.stdout.strip()[-300:] if r.returncode else "", r.stderr.strip()[-200:]))
     mid = json.loads(r.stdout)["machine"]["mid"] if r.returncode == 0 else None
     r = as_user("share", "status", "--json")
     stj = json.loads(r.stdout) if r.returncode == 0 else {}
@@ -712,16 +716,61 @@ def main():
     check(r.returncode == 2 and bad_id not in r.stderr, "share revoke refuses anything but an id, without echoing it")
     srv = Listener(share)
     check(srv.port is not None, "serve --listen 127.0.0.1:0 listens")
+    probe = socket.create_connection(("127.0.0.1", srv.port))
+
+    def conn_procs():
+        ps = subprocess.run(["ps", "-axo", "ppid=,args="], capture_output=True, text=True).stdout.splitlines()
+        return [x for x in ps if x.split(None, 1)[0] == str(srv.p.pid) and "serve --inetd --now" in x]
+    fresh = wait_for(conn_procs, 10)
+    probe.close()
+    check(fresh, "… and serves each connection in a fresh `serve --inetd`, as launchd does (a bare fork reads the "
+                 "time zone file at every localtime() on macOS)")
+
+    def slow_service(delay):
+        """A listener whose one connection is closed `delay` s after it came (None: kept open)."""
+        ls = socket.socket()
+        ls.bind(("127.0.0.1", 0))
+        ls.listen(1)
+        held = []
+
+        def run():
+            c, _ = ls.accept()
+            held.append(c)
+            if delay is not None:
+                time.sleep(delay)
+                c.close()
+        threading.Thread(target=run, daemon=True).start()
+        return ls, held
+    ls, held = slow_service(1.0)
+    t0 = time.monotonic()
+    started = net.warm_service(ls.getsockname()[1], 10)
+    took = time.monotonic() - t0
+    ls2, held2 = slow_service(None)
+    t1 = time.monotonic()
+    stuck = net.warm_service(ls2.getsockname()[1], 1.0)
+    gave_up = time.monotonic() - t1
+    free = socket.socket()
+    free.bind(("127.0.0.1", 0))
+    t2 = time.monotonic()
+    nobody = net.warm_service(free.getsockname()[1], 1.0)
+    check(started is True and 0.9 <= took < 5 and stuck is False and gave_up < 3 and nobody is False and
+          time.monotonic() - t2 < 3, "share on waits for the service's first start: until it closes (%.1f s), at "
+                                     "most as long as it may (%.1f s); nothing listening: also only that long"
+          % (took, gave_up))
+    for x in [ls, ls2, free] + held + held2:
+        x.close()
     r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--json", env=env)
     check(r.returncode == 1 and json.loads(r.stdout)["error"] == "needs_code", "a new machine without a code: needs_code")
     t0 = time.time()
     r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--code", "ZZZZ-ZZZZ-ZZZZ", "--json", env=env)
     check(r.returncode == 1 and json.loads(r.stdout)["error"] == "pair_failed" and time.time() - t0 >= 1.0,
           "a wrong code: pair_failed, after the pause")
+    t0 = time.time()
     r = cli("remote", "add", "127.0.0.1:%d" % srv.port, "--code", code.lower(), "--name", "studio", "--json", env=env)
     res = json.loads(r.stdout) if r.stdout.strip() else {}
-    check(r.returncode == 0 and res.get("ok") and res["counts"]["samples"] > 1000,
-          "remote add with the code: paired, %s samples mirrored (%s)" % (res.get("counts", {}).get("samples"), r.stderr.strip()[-200:]))
+    check(r.returncode == 0 and res.get("ok") and res["counts"]["samples"] > 1000 and time.time() - t0 < 30,
+          "remote add with the code: paired, %s samples mirrored in %.1f s, under 30 (%s)"
+          % (res.get("counts", {}).get("samples"), time.time() - t0, r.stderr.strip()[-200:]))
     mbase = os.environ["OOMPH_MACHINES_DIR"]
     book = sync.Book()
     e = book.find("studio")
