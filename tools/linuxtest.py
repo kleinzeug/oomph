@@ -784,6 +784,17 @@ def part_logger():
     rc, out, _ = fx_cli("epyc-nvidia", "report", OOMPH_DIR=logs)
     check(rc == 0 and "OOM kills: 2 of the machine" in out and not MAC_WORDS.search(out),
           "oomph report on Linux: the kills in Linux words%s" % ("" if rc == 0 else ": " + out[-200:]))
+    rc, out, _ = fx_cli("epyc-nvidia", "report", "--last", "2h", OOMPH_DIR=logs)
+    check(rc == 0 and "biggest group" in out and "avail" in out and "stall" in out and "biggest risers (groups)" in out
+          and not MAC_WORDS.search(out), "oomph report on Linux (L3): what is available and the stall time per step, groups")
+    page = os.path.join(TMP, "linux-report.html")
+    rc, out, _ = fx_cli("epyc-nvidia", "html", "--last", "2h", "-o", page, OOMPH_DIR=logs)
+    html = open(page, encoding="utf-8").read() if rc == 0 and os.path.exists(page) else ""
+    check(html and ">kernel<" in html and "Least available" in html and "Biggest risers — groups" in html and
+          "OOM kills" in html and not re.search(r"Jetsam|jetsam|[Uu]nowned|>wired<|Activity Monitor", html),
+          "oomph html on Linux (L3): Kernel, the least available, groups, OOM kills; no jetsam, unowned or wired%s"
+          % ("" if html else ": " + out[-200:]))
+    ai_linux(logs, inc["id"])
     rc, out, _ = fx_cli("epyc-nvidia", "check", OOMPH_DIR=logs)
     check("busy 87 % of the time" in out or "busy 0 % of the time" in out, "check shows the NVIDIA cards")
     hello = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"proto": [1, 1]}}) + "\n"
@@ -1006,6 +1017,100 @@ def part_logger():
 def _gpu_line(g):
     import oomph
     return oomph._gpu_text(g)
+
+
+def ai_linux(logs, iid):
+    """L3 (1.13.4): the AI harness on a Linux machine's logs speaks Linux. The model is a stand-in that asks for the
+    overview, the timeline, the incidents and the incident's kernel log, then writes: the system prompt it got is
+    the Linux one (the OOM killer, stall time, what is available; no jetsam, no Mac), the timeline's rows carry
+    kernel, available and the stall time, the incidents and the incident their kills, the kernel log its OOM kills
+    by name."""
+    import contextlib
+    import io
+    import oomph
+    import oomph_ai
+    got = {}
+
+    class Model:
+        model = "stand-in"
+
+        @staticmethod
+        def tool(n, d, schema):
+            return {"name": n, "description": d, "input_schema": schema}
+
+        def start(self, system, user):
+            got["tools"] = json.dumps(self.tools)
+            got["system"], got["user"], got["turn"] = system, user, 0
+
+        def turn(self, final=False):
+            got["turn"] += 1
+            if got["turn"] == 1:
+                return "", [("1", "timeline", {"step_minutes": 5}), ("2", "incidents", {}), ("3", "syslog", {"id": iid}),
+                            ("4", "top_at", {}), ("5", "incident", {"id": iid})]
+            return "## Verdict\nA kill.", []
+
+        def results(self, outs, nudge=None):
+            got["outs"] = [json.loads(o) for _, o, _ in outs]
+    saved = oomph.LOG_DIR
+    oomph.LOG_DIR = logs
+    sl = os.path.join(logs, "incidents", iid, "syslog.txt")
+    before = open(sl, "rb").read() if os.path.exists(sl) else None
+    k = "2026-11-24T03:00:0%d kernel: "
+    with open(sl, "w") as f:            # each killer's lines, a victim named twice or more, a kill at a limit
+        f.write("\n".join([
+            k % 1 + "cargo invoked oom-killer: gfp_mask=0x140cca(GFP_HIGHUSER_MOVABLE|__GFP_COMP), order=0, oom_score_adj=0",
+            k % 1 + "Out of memory: Killed process 4100 (cargo) total-vm:9000kB, anon-rss:8000kB, file-rss:0kB, "
+                    "shmem-rss:0kB, UID:1000",
+            k % 1 + "Out of memory: Killed process 4100 (cargo) total-vm:9000kB, anon-rss:8000kB, file-rss:0kB, "
+                    "shmem-rss:0kB, UID:1000",
+            k % 2 + "Out of memory: Kill process 4200 (rustc) score 900 or sacrifice child",
+            k % 2 + "Killed process 4200 (rustc) total-vm:9000kB, anon-rss:8000kB, file-rss:0kB",
+            k % 3 + "Memory cgroup out of memory: Killed process 4300 (node) total-vm:9000kB, anon-rss:8000kB, "
+                    "file-rss:0kB, shmem-rss:0kB, UID:1000",
+            '2026-11-24T03:00:04 earlyoom: sending SIGTERM to process 4242 uid 1000 "python3": badness 900, VmRSS 8000 MiB',
+            '2026-11-24T03:00:05 earlyoom: sending SIGKILL to process 4242 uid 1000 "python3": badness 900, VmRSS 8000 MiB',
+            '2026-11-24T03:00:06 earlyoom: sending SIGTERM to process 4400 uid 1000 "python3": badness 800, VmRSS 6000 MiB',
+            "2026-11-24T03:00:07 systemd-oomd: Killed /user.slice/user-1000.slice/user@1000.service/app.slice/x.scope "
+            "due to memory pressure for /user.slice/user-1000.slice/user@1000.service being 80.00% > 50.00% for > 20s "
+            "with reclaim activity", ""]))
+    try:
+        lg = oomph_ai.Logs(time.time() - 7200, time.time() + 60)
+        with contextlib.redirect_stdout(io.StringIO()):
+            md, _ = oomph_ai.investigate(Model(), lg)
+        empty = oomph_ai.Logs(1e9, 1e9 + 60).system()
+    finally:
+        oomph.LOG_DIR = saved
+        if before is None:
+            os.unlink(sl)
+        else:
+            with open(sl, "wb") as f:
+                f.write(before)
+    sysp, outs = got.get("system") or "", got.get("outs") or [{}, {}, {}, {}, {}]
+    rows = outs[0].get("rows") or [{}]
+    check(lg.system() == "linux" and sysp == oomph_ai.SYSTEM_LINUX and "OOM killer" in sysp and "available" in sysp and
+          not re.search(r"jetsam|\bMac\b|macOS", sysp + got.get("user", "")),
+          "the AI harness on Linux data (L3): the Linux system prompt, no jetsam or Mac in what the model is told")
+    check("kernel" in rows[0] and "available" in rows[0] and "wired" not in rows[0] and "unowned" not in rows[0] and
+          any("kills" in i for i in outs[1].get("incidents") or [{}]) and "available_gb" in outs[3] and
+          "unowned_gb" not in outs[3],
+          "its tools on Linux data: kernel, available and stall time in the timeline, kills in the incidents (%s)"
+          % sorted(rows[0])[:12])
+    sk = outs[2]
+    check(sk.get("most_killed") == {"python3": 2, "cargo": 1, "rustc": 1,
+                                    "/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope": 1} and
+          sk.get("oom_kills") == 5 and sk.get("kills_at_a_limit") == 1 and sk.get("most_killed_at_a_limit") == {"node": 1}
+          and "jetsam_exits" not in sk,
+          "its kernel log tool counts each victim once by name (earlyoom's SIGTERM and SIGKILL one, a repeated or an "
+          "older kernel's line one), systemd-oomd's by cgroup, kills at a container's limit apart: %s"
+          % {x: sk.get(x) for x in ("oom_kills", "most_killed", "kills_at_a_limit")})
+    tl = got.get("tools") or ""
+    check(tl and "syslog" in tl and not re.search(r"jetsam|[Uu]nowned|\bMac\b", tl),
+          "the tools sent with Linux data are described in its words: no jetsam, no unowned memory, no Mac")
+    inc = json.dumps(outs[4] if len(outs) > 4 else {})
+    ok = '"kills"' in inc and not re.search(r"jetsam|[Uu]nowned", inc)
+    check(ok, "its incident tool on Linux data: the summary's kills in its words, no jetsam or unowned memory%s"
+          % ("" if ok else " (%s)" % inc[:300]))
+    check(empty == "linux", "a window without samples on a Linux machine's logs still speaks Linux (its current.json)")
 
 
 def part_system():

@@ -16,6 +16,7 @@ Standard library only, Python 3.9.
 import bisect
 import collections
 import math
+import re
 import time
 import unicodedata
 
@@ -137,7 +138,7 @@ def nearest256(h):
 
 
 class Caps:
-    """What the terminal can do. color: truecolor | 256 | 16 | none; glyphs: unicode | cells | ascii;
+    """What the terminal can do. color: truecolor | 256 | 16 | none; glyphs: unicode | cells | ascii | cp437;
     theme: dark | light (a guess about the terminal's background: everything stays readable when
     it is wrong)."""
 
@@ -179,6 +180,22 @@ GLYPHS = {
                   marks=dict(ok="*", warn="w", crit="C", silent="-", busy="~", off="o", att="^")),
 }
 GLYPHS["cells"] = dict(GLYPHS["unicode"])      # --glyphs cells: the rasteriser differs, the characters do not
+# --glyphs cp437, the Linux console (TERM=linux; 04 §3.11, T3): its font has the full and lower half block, the three
+# shades, single-line boxes and a few symbols of code page 437, but no eighths, no rounded corners and no circles. The
+# chart drops to half-row accuracy (a cell is empty, half or full); the marks are the ASCII set's.
+GLYPHS["cp437"] = dict(GLYPHS["unicode"], tl="┌", tr="┐", bl="└", br="┘", eighths="  ▄▄▄▄███", hatch="/", grid="·",
+                       inc="│", sw="■", swq="o", dot="*", odot="o", sel="►", ell="~",
+                       mid="·", queued="▒", ram=("_", "─", "─"), legend_away="░", more_l="◄", more_r="►", up="▲",
+                       down="▼", dash="-", arrow="→", miss=":", close="x", queue="■", arrows="←→", updown="↑↓",
+                       marks=dict(GLYPHS["ascii"]["marks"]))
+# The view's own words hold a few characters code page 437 does not have (an ellipsis, a dash, rounded corners, a
+# circle): on the Linux console a frame puts them as these (one cell for one cell; no-data is "/", not a shade, so
+# that without colour it differs from Swap's shade and from away).
+CP437_WORDS = {ord(k): v for k, v in {
+    "…": "~", "–": "-", "—": "-", "›": ">", "‹": "<", "×": "x", "“": '"', "”": '"', "‘": "'", "’": "'", "◻": "■",
+    "●": "*", "○": "o", "◦": "o", "◐": "w", "◆": "C", "⊘": "o", "↻": "~", "╭": "┌", "╮": "┐", "╰": "└", "╯": "┘",
+    "╱": "/", "┊": "│", "┃": "│", "╌": "─", "‾": "─", "▴": "▲", "▾": "▼", "▁": "_", "▂": "▄", "▃": "▄", "▅": "▄",
+    "▆": "█", "▇": "█"}.items()}
 
 
 def resolve(cell, caps):
@@ -338,13 +355,15 @@ class Frame:
     """The whole screen as cells [char, fg role, bg role, flags]; char is "" in the second cell of a
     two-cell character. put() is the only way text gets in, and it cleans."""
 
-    def __init__(self, w, h, ascii_only=False):
-        self.w, self.h, self.ascii_only = w, h, ascii_only
+    def __init__(self, w, h, ascii_only=False, cp437=False):
+        self.w, self.h, self.ascii_only, self.cp437 = w, h, ascii_only, cp437   # cp437: CP437_WORDS on every put
         self.yhold = None           # what the plot's y axis holds for the next frame (the loop keeps it)
         self.tab_hits = []          # row 0's tabs, counters and + as drawn: (x0, x1, kind, which), for a click
         self.c = [[[" ", None, None, 0] for _ in range(w)] for _ in range(h)]
 
     def put(self, x, y, text, fg=None, bg=KEEP, fl=0):
+        if self.cp437 and not text.isascii():
+            text = text.translate(CP437_WORDS)
         cells = cells_of(text, self.ascii_only)
         if not 0 <= y < self.h:
             return x + len(cells)
@@ -1322,7 +1341,7 @@ def tab_bar(fr, model, caps, g):
     cap_text, cap_role = capsule(model)
     cap_w = len(cap_text) + 2
     cur = model.get("cur")
-    free = "%.1fG free" % cur["free"] if cur and model.get("logger") != "silent" else None
+    free = "%.1fG %s" % (cur["free"], free_word(cur)) if cur and model.get("logger") != "silent" else None
     host = model.get("host") or "this Mac"
     room = W - 1 - 1 - cap_w - 1 - 3
     rest = (len(model.get("brand") or "") + 1) + 6 + (len(free) + 2 if free else 0)
@@ -1630,7 +1649,7 @@ def tab_plan(model, W, g):
     room = W - fixed - width(chosen)
     extras = set()
     cur = model.get("cur")
-    free = "%.1fG free" % cur["free"] if cur and model.get("logger") != "silent" and not model.get("stale") else None
+    free = "%.1fG %s" % (cur["free"], free_word(cur)) if cur and model.get("logger") != "silent" and not model.get("stale") else None
     for name, need in (("free", len(free) + 2 if free else None), ("clock", 6), ("brand", len(model.get("brand") or "") + 2)):
         if need is not None and need <= room and (name != "brand" or model.get("brand")):
             extras.add(name)
@@ -1816,41 +1835,117 @@ def _merged(spans):
 
 def draw_stats(fr, x, y, w, model, g, rows=2):
     """The live readings. Two rows: value over label; tiles that do not fit are dropped, least
-    important first. One row: a sentence, whole items dropped, never a label cut in half."""
+    important first. One row: a sentence, whole items dropped, never a label cut in half. A Linux
+    machine's in its own words (linux_tiles)."""
     c = model.get("cur")
     if not c:
         fr.put(x, y, "No readings yet", "dim")
         return
     idle = c.get("idle")
     idle_s = g["dash"] if idle is None else "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle  # None: not known
+    lin = c.get("linux")
     if rows == 1:
-        items = [("%.1fG" % c["app"], "App"), ("%.1fG" % c["comp"], "Compressed"), ("%.1fG" % c["wired"], "Wired"),
-                 ("%.0fG" % c["ram"], "RAM"), ("%.1f/%.0fG" % (c["swap"], c["swap_total"]), "swap"),
-                 ("%.0fG" % c["disk"], "disk free"), (idle_s, "idle")]
+        items = [(v, lab, "fg") for v, lab in (
+            ("%.1fG" % c["app"], "App"), ("%.1fG" % c["comp"], "Compressed"), ("%.1fG" % c["wired"], "Wired"),
+            ("%.0fG" % c["ram"], "RAM"), ("%.1f/%.0fG" % (c["swap"], c["swap_total"]), "swap"),
+            ("%.0fG" % c["disk"], "disk free"), (idle_s, "idle"))] if lin is None else \
+            [(v.replace(" GB", "G").replace(" / ", "/"), short, role) for v, _, short, _, _, role in linux_tiles(c, g)[:7]]
         sep = " %s " % g["mid"]
-        while items and sum(len(v) + 1 + len(lab) for v, lab in items) + len(sep) * (len(items) - 1) > w:
+        while items and sum(tw(v) + 1 + len(lab) for v, lab, _ in items) + len(sep) * (len(items) - 1) > w:
             items.pop()
-        for i, (v, lab) in enumerate(items):
+        for i, (v, lab, role) in enumerate(items):
             if i:
                 x = fr.put(x, y, sep, "faint")
-            x = fr.put(x, y, v, "fg", KEEP, BOLD)
+            x = fr.put(x, y, v, role, KEEP, BOLD)
             x = fr.put(x + 1, y, lab, "dim")
         return
-    # (value, label, width, priority: the highest number gives way first)
-    tiles = [("%.1f GB" % c["app"], "App memory", 12, 0), ("%.1f GB" % c["comp"], "Compressed", 12, 1),
-             ("%.1f GB" % c["wired"], "Wired", 9, 2), ("%.0f GB" % c["ram"], "RAM total", 11, 4),
-             ("%.1f / %.0f GB" % (c["swap"], c["swap_total"]), "Swap / size", 13, 3),
-             ("%.0f GB" % c["disk"], "Free disk", 11, 5), (idle_s, "Idle", 7, 6)]
-    if c.get("groups"):
-        name, gb, _ = c["groups"][0]
-        tiles.append(("%.1f GB" % gb, "#1 " + name, 18, 7))
+    # (value, label, width, priority: the highest number gives way first, role of the value)
+    if lin is not None:
+        tiles = [(v, lab, wd, pr, role) for v, lab, _, wd, pr, role in linux_tiles(c, g)]
+    else:
+        tiles = [(v, lab, wd, pr, "fg") for v, lab, wd, pr in (
+            ("%.1f GB" % c["app"], "App memory", 12, 0), ("%.1f GB" % c["comp"], "Compressed", 12, 1),
+            ("%.1f GB" % c["wired"], "Wired", 9, 2), ("%.0f GB" % c["ram"], "RAM total", 11, 4),
+            ("%.1f / %.0f GB" % (c["swap"], c["swap_total"]), "Swap / size", 13, 3),
+            ("%.0f GB" % c["disk"], "Free disk", 11, 5), (idle_s, "Idle", 7, 6))]
+        if c.get("groups"):
+            name, gb, _ = c["groups"][0]
+            tiles.append(("%.1f GB" % gb, "#1 " + name, 18, 7, "fg"))
     while sum(t[2] for t in tiles) > w:
         tiles.remove(max(tiles, key=lambda t: t[3]))
     pad = min(6, max(0, (w - sum(t[2] for t in tiles)) // max(len(tiles) - 1, 1)))
-    for val, lab, twid, _ in tiles:
-        fr.put(x, y, val, "fg", KEEP, BOLD)
+    for val, lab, twid, _, role in tiles:
+        fr.put(x, y, fit(val, twid + pad - 1, g) if lin is not None else val, role, KEEP, BOLD)
         fr.put(x, y + 1, fit(lab, twid + pad - 1, g), "dim")
         x += twid + pad
+
+
+def free_word(cur):
+    """What the header calls the memory left: "free" on a Mac, "avail" on Linux (03 §5.2: MemAvailable)."""
+    return "avail" if (cur or {}).get("linux") is not None else "free"
+
+
+def stall_pct(x):
+    """A stall figure as the app's LinuxTab.pct writes it: one decimal under 10 %, whole numbers above."""
+    return "%.1f %%" % x if x < 9.95 else "%.0f %%" % x
+
+
+def linux_group(name):
+    """A Linux group's name as a tile shows it (03 §3.9 state 7, LinuxTab.groupName): a container's program
+    first and its runtime after it ("nginx · docker"), cut in the middle beyond 22 characters."""
+    m = re.match(r"^(docker|podman|pod):[^ ]+ \((.+)\)$", name)
+    return mid_fit("%s · %s" % (m.group(2), m.group(1)) if m else name, 22)
+
+
+def linux_tiles(c, g):
+    """A Linux machine's eight tiles (03 §3.9's matrix, as LinuxTab.tiles in the app): App, Available (or
+    Compressed where memory is compressed), Kernel, the RAM with its decimal (or the container's limit),
+    swap (or zram where it is the only swap), free disk, stall time on a server (Idle on a desktop, what
+    is available where PSI is off), the biggest group. Each (value, label, one-row label, width, priority,
+    role of the value)."""
+    f = c["linux"]
+    avail = c["free"]
+    out = [("%.1f GB" % c["app"], "App memory", "App", 12, 0, "fg")]
+    out.append(("%.1f GB" % c["comp"], "Compressed", "Compressed", 12, 1, "fg") if f["comp"] else
+               ("%.1f GB" % avail, "Available", "avail", 12, 1, "fg"))
+    out.append(("%.1f GB" % c["wired"], "Kernel", "Kernel", 9, 2, "fg"))
+    out.append(("%.1f GB" % c["ram"], "Memory limit" if f["cgroup"] else "RAM total", "limit" if f["cgroup"] else "RAM", 12, 4,
+                "fg"))
+    if f["zram_only"]:
+        z = f.get("zram")
+        out.append(("%.1f / %.1f GB" % z if z else g["dash"], "zram / size", "zram", 13, 3, "fg"))
+    else:
+        out.append(("%.1f / %.0f GB" % (c["swap"], c["swap_total"]), "Swap / size", "swap", 13, 3, "fg"))
+    out.append(("%.0f GB" % c["disk"], "Free disk", "disk free", 11, 5, "fg"))
+    if f["desktop"]:
+        idle = c.get("idle")
+        out.append((g["dash"] if idle is None else "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle,
+                    "Idle", "idle", 7, 6, "fg"))
+    elif f["psi"]:
+        v = stall_pct(f["some"]) + (" +" + stall_pct(f["limit"]) if f["limit"] >= 0.05 else "")
+        out.append((v, "Stalled", "stalled", 9 if f["limit"] < 0.05 else 16, 6,
+                    "crit" if f["some"] >= 10 or f["full"] >= 5 else "fg"))
+    else:
+        share = f["free_pct"] if f["free_pct"] is not None else (100 * avail / c["ram"] if c["ram"] else 0)
+        out.append(("%.0f %%" % share, "of RAM available", "of RAM avail", 12, 6, "fg"))
+    if not f["all_procs"]:
+        out.append((g["dash"], "#1 not visible", "", 18, 7, "fg"))
+    elif c.get("groups"):
+        name, gb, _ = c["groups"][0]
+        out.append(("%.1f GB" % gb, "#1 " + linux_group(name), "", 18, 7, "fg"))
+    return out
+
+
+def series_words(cur):
+    """The memory series as this machine has them, bottom to top, (name, role): a Mac's four; on Linux Kernel
+    for Wired (the same field), and only the series the machine has (03 §3.9: no Compressed without zram or
+    zswap, no Swap without swap: a swap total, swap in use or a swap file, as LinuxTab.Facts in the app)."""
+    f = (cur or {}).get("linux")
+    if f is None:
+        return SERIES_WORDS
+    sw = (cur.get("swap_total") or 0) > 0 or (cur.get("swap") or 0) > 0 or (f.get("swapfiles") or 0) > 0
+    return tuple(x for x in (("Kernel", "wired"), ("App", "app"), ("Compressed", "comp"), ("Swap", "swap"))
+                 if (x[1] != "comp" or f["comp"]) and (x[1] != "swap" or sw))
 
 
 # ------------------------------------------------------------------ the chart
@@ -1861,11 +1956,11 @@ LEGEND_ORDER_MISS = ("away", "no data", "not received", "incident")
 LEGEND_YIELD_MISS = ("away", "incident", "no data", "not received")
 
 
-def legend_items(g, caps, short, initials=False):
+def legend_items(g, caps, short, initials=False, words=SERIES_WORDS):
     mono = caps.color == "none"
     shade = dict(zip(SERIES, g["shades"]))
     names = [("Compr." if short and n == "Compressed" else n, role, shade[role] if mono else g["legend_sw"])
-             for n, role in SERIES_WORDS]
+             for n, role in words]
     if initials:
         names = [(n[0], role, s) for n, role, s in names]
     plain_band = mono or caps.color == "16"
@@ -1875,7 +1970,7 @@ def legend_items(g, caps, short, initials=False):
     return names, extra
 
 
-def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False, values=None):
+def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False, values=None, words=SERIES_WORDS, away=True):
     """The top edge of the chart box: the span selector on the left (it never gives way; below room
     for all four only the selected one stays), the legend on the right (it shortens, then goes).
     `miss`: a stretch not received is in view, and the legend explains its dots (04 §3.3). `values`
@@ -1900,9 +1995,9 @@ def draw_chart_head(fr, x, y, w, ui, caps, g, title=None, miss=False, values=Non
     chosen = None
     for short, drop, initials in ((False, 0, False), (True, 0, False), (True, 1, False), (True, 2, False),
                                   (True, 3, False), (True, 3, True)) + (((True, 4, True),) if miss else ()):
-        names, extra = legend_items(g, caps, short, initials)
+        names, extra = legend_items(g, caps, short, initials, words)
         order, yld = (LEGEND_ORDER_MISS, LEGEND_YIELD_MISS) if miss else (LEGEND_ORDER, LEGEND_YIELD)
-        items = names + [extra[k] for k in order if k not in yld[:drop]]
+        items = names + [extra[k] for k in order if k not in yld[:drop] and (away or k != "away")]
         need = sum(len(n) + 2 for n, _, _ in items) + 1
         if need <= room:
             chosen = (items, need)
@@ -1923,8 +2018,9 @@ def legend_values(model, focus):
     cur, tiles = model.get("cur") or {}, model.get("tiles") or {}
     if focus == "memory":
         sw = "%.1f/%.0f" % (cur.get("swap", 0), cur.get("swap_total", 0)) if cur.get("swap") else "%.1f" % cur.get("swap", 0)
-        return [("Wired", "%.1f" % cur.get("wired", 0), "wired"), ("App", "%.1f" % cur.get("app", 0), "app"),
-                ("Compressed", "%.1f" % cur.get("comp", 0), "comp"), ("Swap", sw, "swap"), ("GB", None, None)]
+        vals = {"wired": "%.1f" % cur.get("wired", 0), "app": "%.1f" % cur.get("app", 0), "comp": "%.1f" % cur.get("comp", 0),
+                "swap": sw}
+        return [(n, vals[role], role) for n, role in series_words(cur)] + [("GB", None, None)]
     rf = model.get("rfacts") or {}
     if focus == "cpu":
         return [("System", _g1(rf.get("sys")), "wired"), ("User", _g1(rf.get("user")), "r0"), ("cores", None, None)]
@@ -2887,7 +2983,8 @@ def draw_panel(fr, model, ui, P, caps, g):
             if items else None
     else:
         right = "newest first"
-    section(fr, 0, y0, lw, g, PANELS[panel], right, top=(where == "chart"))
+    title = "Top groups" if panel == "a" and cur.get("linux") is not None else PANELS[panel]
+    section(fr, 0, y0, lw, g, title, right, top=(where == "chart"))
     x, w = 1, lw - 2
     focus = ui.get("focus") == "panel"
     sel, off = ui.get("panel_sel", 0), ui.get("panel_off", 0)
@@ -3023,14 +3120,26 @@ def draw_right(fr, P, model, caps, g):
         fr.put(x + 2, y + 1, "No readings yet", "dim")
         return
     idle = c.get("idle")
-    rows = [("App memory", "%.1f GB" % c["app"], "app"), ("Compressed", "%.1f GB" % c["comp"], "comp"),
-            ("Wired", "%.1f GB" % c["wired"], "wired"), ("Free", "%.1f of %.0f GB" % (c["free"], c["ram"]), None),
-            ("Swap used / size", "%.1f / %.0f GB" % (c["swap"], c["swap_total"]), "swap"),
-            ("Free disk", "%.0f GB" % c["disk"], None)]
-    if c.get("unowned") is not None:
-        rows.append(("Not owned by a process", "%.1f GB" % c["unowned"], None))
-    rows.append(("Idle", (g["dash"] if idle is None else "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle) +
-                 ("" if c.get("display_on") is None else " %s display %s" % (g["mid"], "on" if c["display_on"] else "off")), None))
+    lin = c.get("linux")
+    if lin is not None:  # 03 §3.9 (T3): Kernel, what is available, zram, the stall time on a server
+        t = {lab: v for v, lab, _, _, _, _ in linux_tiles(c, g)}
+        rows = [("App memory", "%.1f GB" % c["app"], "app")] + \
+            ([("Compressed", "%.1f GB" % c["comp"], "comp")] if lin["comp"] else []) + \
+            [("Kernel", "%.1f GB" % c["wired"], "wired"), ("Available", "%.1f of %.1f GB" % (c["free"], c["ram"]), None)]
+        rows += [(lab, t[lab], "swap" if lab == "Swap / size" else None) for lab in ("zram / size", "Swap / size") if lab in t]
+        rows.append(("Free disk", "%.0f GB" % c["disk"], None))
+        rows += [("Stalled on memory" if lab == "Stalled" else lab, t[lab], None) for lab in ("Stalled", "of RAM available")
+                 if lab in t]
+    else:
+        rows = [("App memory", "%.1f GB" % c["app"], "app"), ("Compressed", "%.1f GB" % c["comp"], "comp"),
+                ("Wired", "%.1f GB" % c["wired"], "wired"), ("Free", "%.1f of %.0f GB" % (c["free"], c["ram"]), None),
+                ("Swap used / size", "%.1f / %.0f GB" % (c["swap"], c["swap_total"]), "swap"),
+                ("Free disk", "%.0f GB" % c["disk"], None)]
+        if c.get("unowned") is not None:
+            rows.append(("Not owned by a process", "%.1f GB" % c["unowned"], None))
+    if lin is None or lin["desktop"]:
+        rows.append(("Idle", (g["dash"] if idle is None else "%d min" % (idle // 60) if idle >= 120 else "%d s" % idle) +
+                     ("" if c.get("display_on") is None else " %s display %s" % (g["mid"], "on" if c["display_on"] else "off")), None))
     meter(fr, x + 2, y + 1, w - 4, [(c["wired"], "wired"), (c["app"], "app"), (c["comp"], "comp"), (c["swap"], "swap")],
           c["ram"] + c["swap"], g, caps)
     shown = rows[:max(inner - 1, 0)]
@@ -3051,7 +3160,8 @@ def draw_right(fr, P, model, caps, g):
         apps = rem
     yy = y + 2 + len(shown)
     if apps:
-        section(fr, x, yy, w, g, "Top apps", "%d processes" % c["procs"] if c.get("procs") else None)
+        section(fr, x, yy, w, g, "Top groups" if c.get("linux") is not None else "Top apps",
+                "%d processes" % c["procs"] if c.get("procs") else None)
         draw_apps(fr, x + 1, yy + 1, w - 2, apps - 1, model, caps, g)
         yy += apps
     if sess:
@@ -3530,8 +3640,8 @@ def help_pages(g, model):
                 ("", "")] + left
     away = model.get("os", "").startswith("macOS") or "os" not in model
     see = [("Chart", None),
-           ([(g["sw"], role) for _, role in SERIES_WORDS], "%s, stacked; %s is the RAM" % (
-               ", ".join(n for n, _ in SERIES_WORDS), g["ram"][1]))]
+           ([(g["sw"], role) for _, role in series_words(model.get("cur"))], "%s, stacked; %s is the RAM" % (
+               ", ".join(n for n, _ in series_words(model.get("cur"))), g["ram"][1]))]
     if away:
         see.append(([(g["legend_away"], "dim")], "away: idle for 5 min, screen locked or display off"))
     see += [([(g["hatch"], "hatch")], "no data: asleep or off, or the logger was not running"),
@@ -3871,10 +3981,21 @@ ChartEv.__doc__ = """One line of events.jsonl as the app's ChartEvent has it (a 
 HOVER_SERIES = (("App", "app"), ("Compressed", "comp"), ("Wired", "wired"), ("Swap", "swap"))
 
 
-def hover_info(pts, gaps, incidents, events, blocks, now, first, f, u, du, max_res=4, max_ev=6):
+def hover_series(cur):
+    """The hover's and the readout's series, top to bottom, (name, point key): on Linux in its words, only
+    those the machine has (series_words)."""
+    if (cur or {}).get("linux") is None:
+        return HOVER_SERIES
+    have = dict((role, n) for n, role in series_words(cur))
+    return tuple((have[k], k) for k in ("app", "comp", "wired", "swap") if k in have)
+
+
+def hover_info(pts, gaps, incidents, events, blocks, now, first, f, u, du, max_res=4, max_ev=6, series=HOVER_SERIES,
+               avail_of=None):
     """MemoryChart.hoverInfo: everything under one column of the plot (u: its middle, du: its width,
     both in 0…1), aggregated, since on the log axis one column can hold hours. pts: the thinned points;
-    gaps: (from, to); incidents: as load_incidents gives them; events: ChartEv, oldest first; blocks: stack_reservations' output."""
+    gaps: (from, to); incidents: as load_incidents gives them; events: ChartEv, oldest first; blocks: stack_reservations' output.
+    `series` and `avail_of` (a Linux machine's RAM: what is available in place of the peak, 03 §3.9) its words."""
     t0, t1 = time_at(max(u - du / 2, 0), f, first, now), time_at(min(u + du / 2, 1), f, first, now)
     tc = (t0 + t1) / 2
     info = {"t0": t0, "t1": t1, "tc": tc}
@@ -3900,7 +4021,10 @@ def hover_info(pts, gaps, incidents, events, blocks, now, first, f, u, du, max_r
     info["samples"] = len(here)
     info["readings"], info["away"], info["peak"] = [], False, 0.0
     if here:
-        info["readings"] = [(name, min(p[k] for p in here), max(p[k] for p in here)) for name, k in HOVER_SERIES]
+        info["readings"] = [(name, min(p[k] for p in here), max(p[k] for p in here)) for name, k in series]
+        if avail_of:
+            av = [max(0.0, avail_of - p["wired"] - p["app"] - p["comp"]) for p in here]
+            info["avail"] = (min(av), max(av))
         info["away"] = any(p["away"] for p in here)
         info["peak"] = max(p["wired"] + p["app"] + p["comp"] + p["swap"] for p in here)
     over = [g for g in gaps if g[0] < t1 and g[1] > t0]
@@ -3962,8 +4086,11 @@ def inspect_geometry(model, ui, P):
 
 def inspect_info(model, ui, P, max_res=6):
     f, finv, first, W, col = inspect_geometry(model, ui, P)
+    cur = model.get("cur")
+    lin = (cur or {}).get("linux") is not None
     return hover_info(model["pts"], model["gaps"], model["incidents"], model.get("cevents") or [], model.get("blocks") or [],
-                      model["now"], first, f, (col + 0.5) / W, 1.0 / W, max_res=max_res), col
+                      model["now"], first, f, (col + 0.5) / W, 1.0 / W, max_res=max_res, series=hover_series(cur),
+                      avail_of=model.get("ram") if lin else None), col
 
 
 def inspect_at(ui, model, P, col):
@@ -4022,12 +4149,16 @@ def _readout_lines(info, model, g, caps, nw=11):
     mono = caps.color == "none"
     left, right = [], []
     for k, (name, lo, hi) in enumerate(info["readings"]):
-        role = {"App": "app", "Compressed": "comp", "Wired": "wired", "Swap": "swap"}[name]
+        role = {"App": "app", "Compressed": "comp", "Wired": "wired", "Kernel": "wired", "Swap": "swap"}[name]
         a, b = "%.1f" % lo, "%.1f" % hi
         left.append((1 + k + (3 if name == "Swap" and hi == 0 else 0),
                      [(g["sw"] + " ", None if mono else role), (name.ljust(nw), "fg"),
                       ("%s GB" % (b if a == b else "%s to %s" % (a, b)), "fg")]))
-    if info["readings"]:
+    if info["readings"] and info.get("avail"):   # Linux (03 §3.9): what was available, in place of the peak
+        a, b = "%.1f" % info["avail"][0], "%.1f" % info["avail"][1]
+        left.append((5, [("available %s GB" % (b if a == b else "%s to %s" % (a, b)), "dim")] +
+                     ([(" %s away" % g["mid"], "dim")] if info["away"] else [])))
+    elif info["readings"]:
         ram = model.get("ram") or 0
         left.append((5, [("%s %.1f%s GB" % ("peak" if info["samples"] > 1 else "all four", info["peak"],
                                             " of %.0f" % ram if ram else ""),
@@ -4240,7 +4371,8 @@ def keys_main(g, model):
     open, `s sessions` moves up: "what is using the memory?" is the question then."""
     cur = model.get("cur") or {}
     hot = cur.get("pressure") not in (None, "Normal") or any(i["open"] for i in model["incidents"])
-    k = [("q", "quit"), ("?", "help"), ("a", "apps")]
+    apps = "groups" if (model.get("cur") or {}).get("linux") is not None else "apps"
+    k = [("q", "quit"), ("?", "help"), ("a", apps)]
     if hot:
         k.append(("s", "sessions"))
     k += [(g["arrows"], "span"), (g["updown"], "select")]
@@ -4276,7 +4408,8 @@ def keys_of(g, model, ui, P):
     if ui.get("panel"):
         where = panel_area(P)[2]
         k = [("esc", where)]
-        k += [(p, {"a": "apps", "s": "sessions", "e": "events"}[p]) for p in "ase" if p != ui["panel"]]
+        apps = "groups" if (model.get("cur") or {}).get("linux") is not None else "apps"
+        k += [(p, {"a": apps, "s": "sessions", "e": "events"}[p]) for p in "ase" if p != ui["panel"]]
         if ui["panel"] == "e":
             k.append((g["updown"], "scroll"))
         else:
@@ -4343,7 +4476,7 @@ def draw_footer(fr, y, g, status, keys, status_role="faint", must=("a",)):
 
 
 def too_small(W, H, caps):
-    fr = Frame(W, H, caps.glyphs == "ascii")
+    fr = Frame(W, H, caps.glyphs == "ascii", caps.glyphs == "cp437")
     lines = ["oomph top", "needs 40 x 10", "this is %d x %d" % (W, H)]
     for i, text in enumerate(lines):
         fr.put(max((W - len(text)) // 2, 0), max(H // 2 - 1, 0) + i, text, "fg" if i == 0 else "dim", None,
@@ -4379,7 +4512,7 @@ def render(model, W, H, caps, ui):
     g = GLYPHS[caps.glyphs]
     if W < 40 or H < 10:
         return too_small(W, H, caps)
-    fr = Frame(W, H, caps.glyphs == "ascii")
+    fr = Frame(W, H, caps.glyphs == "ascii", caps.glyphs == "cp437")
     P = layout(model, W, H)
     if model.get("tabs"):
         machine_tabs(fr, model, caps, g)
@@ -4470,7 +4603,9 @@ def draw_body(fr, P, model, ui, caps, g):
                 cx = min(max(int(round(x * pw)) - len(text) // 2, 0), pw - len(text))
                 fr.put(x0 + cx, P["axis_y"], text, "dim")
     else:
-        draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory", miss)
+        lx = (model.get("cur") or {}).get("linux")
+        draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, "Memory", miss, words=series_words(model.get("cur")),
+                        away=lx is None or lx["desktop"])     # no one sits at a server (03 §3.9)
         gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
     now = model["now"]
     rows, n_live, n_wait = list_rows(model, P["R"], ui)

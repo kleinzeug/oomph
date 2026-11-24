@@ -309,6 +309,7 @@ struct ChartSample: Decodable {
     var swap_used_gb: Double
     var jetsam_kills: Int?
     var away: Away?
+    var psi: Soft<PSIBlock>?
 }
 
 /// One line of events.jsonl, reduced to what the chart's hover tooltip shows.
@@ -399,6 +400,9 @@ struct Point: Identifiable {
     /// 0 no GPU figure, 1 busy time only, 2 at full speed (IOReport): a bucket never averages the two (02 §3.4.11)
     var gpuKind: UInt8 = 0
     var disk: Float = .nan
+    /// A Linux machine's stall time (PSI, % of 10 s; 03 §5.3): "some", "full" and what was taken out at a container's
+    /// own limit; NaN where a sample has none (a Mac's). A bucket keeps the highest of each (L3, the hover's line).
+    var stall: Float = .nan, stallFull: Float = .nan, stallLimit: Float = .nan
 
     var used: Double { wired + app + comp }
 
@@ -1069,10 +1073,14 @@ enum LinuxTab {
         var zswap = false
         var kills: String?
         var allProcs: Bool?
+        /// Whether it has swap (on disk; zram's own figures are its tile's): the chart has no Swap series without (L3)
+        var swap = true
         var compressed: Bool { zram || zswap }
 
-        init(desktop: Bool = false, psi: Bool? = nil, zram: Bool = false, zswap: Bool = false, kills: String? = nil, allProcs: Bool? = nil) {
+        init(desktop: Bool = false, psi: Bool? = nil, zram: Bool = false, zswap: Bool = false, kills: String? = nil, allProcs: Bool? = nil,
+             swap: Bool = true) {
             self.desktop = desktop; self.psi = psi; self.zram = zram; self.zswap = zswap; self.kills = kills; self.allProcs = allProcs
+            self.swap = swap
         }
 
         /// From the sample's own machine block, else from what the machine said when it was reached.
@@ -1081,7 +1089,8 @@ enum LinuxTab {
             let ms = dm?.measures?.v ?? info?.measures?.v
             let kind = dm?.kind ?? info?.kind ?? "server"
             self.init(desktop: kind == "desktop" || kind == "laptop", psi: ms?.psi?.v, zram: ms?.zram?.v ?? false,
-                      zswap: ms?.zswap?.v ?? false, kills: ms?.kills?.v, allProcs: s?.daemon?.all_procs?.v ?? ms?.all_procs?.v)
+                      zswap: ms?.zswap?.v ?? false, kills: ms?.kills?.v, allProcs: s?.daemon?.all_procs?.v ?? ms?.all_procs?.v,
+                      swap: s.map { $0.swap_total_gb > 0 || $0.swap_used_gb > 0 || ($0.swapfiles ?? 0) > 0 } ?? true)
         }
     }
 
@@ -1315,6 +1324,95 @@ enum LinuxTab {
                     lin ? "sudo linux/install.sh --system" : "sudo ./install.sh")
         }
     }
+
+    // MARK: L3 (1.13.4): the hover card, the capsule's tooltip, the legend, the callout and the tour in Linux words
+
+    /// The hover card's series on a Linux tab, top to bottom (03 §3.9's row budget: the ones the machine has, 2 to
+    /// 4 lines): App, Compressed where memory is compressed, Kernel, Swap where it has swap.
+    static func hoverSeries(_ f: Facts) -> [String] {
+        ["App"] + (f.compressed ? ["Compressed"] : []) + ["Kernel"] + (f.swap ? ["Swap"] : [])
+    }
+
+    /// "lo–hi" of one decimal, or one figure when both read the same (the card's ranges).
+    static func range(_ lo: Double, _ hi: Double, _ fmt: (Double) -> String) -> String {
+        let a = fmt(lo), b = fmt(hi)
+        return a == b ? b : a.replacingOccurrences(of: " %", with: "").replacingOccurrences(of: " GB", with: "") + "–" + b
+    }
+
+    /// The card's Available line, in place of the Mac's "all four, peak": what was available in the pixel
+    /// (RAM less app, kernel and compressed memory), lowest to highest.
+    static func availText(_ pts: [Point], ram: Double) -> String? {
+        guard !pts.isEmpty, ram > 0 else { return nil }
+        let av = pts.map { max(0, ram - $0.app - $0.wired - $0.comp) }
+        return range(av.min()!, av.max()!, gb)
+    }
+
+    /// The card's one Stalled line: "28–35 % · fully 10–12 %", with stall time taken out at a container's own
+    /// limit "0.0 % · +97 % at a limit"; nil where the pixel's samples have no stall time.
+    static func stallText(_ pts: [Point]) -> String? {
+        func r(_ k: KeyPath<Point, Float>) -> (Double, Double)? {
+            let v = pts.map { $0[keyPath: k] }.filter { !$0.isNaN }.map(Double.init)
+            return v.isEmpty ? nil : (v.min()!, v.max()!)
+        }
+        guard let some = r(\.stall) else { return nil }
+        var t = range(some.0, some.1, pct)
+        if let lim = r(\.stallLimit), lim.1 >= 0.05 {
+            t += " · +" + pct(lim.1) + " at a limit"
+        } else if let full = r(\.stallFull), full.1 >= 0.05 {
+            t += " · fully " + range(full.0, full.1, pct)
+        }
+        return t
+    }
+
+    /// The capsule's tooltip on a Linux tab (Mockup B): the level in Linux terms, "Stalled on memory 14 % (fully
+    /// 3 %) over the last 10 s. 2.7 GB available; zram 76 % full.", after oomph's verdict.
+    static func capsuleHelp(_ s: Sample, _ f: Facts) -> String {
+        let v = Verdict.capsule(s)
+        var lines = [brand + "'s verdict, the same as `oomph check` there: memory " + ["ok", "tight", "critical"][v.memory]]
+        var t = ""
+        let p = s.psi?.v
+        if f.psi != false, let some = p?.mem_some {
+            let full = p?.mem_full ?? 0
+            t = "Stalled on memory " + pct(some) + (full >= 0.05 ? " (fully " + pct(full) + ")" : "") + " over the last 10 s"
+            if let lim = p?.limit?.v, let more = lim.some, more >= 0.05 {
+                t += ", and " + pct(more) + " more inside " + (lim.cgroups?.first ?? "a container") + " at its own limit (not this machine's)"
+            }
+            t += ". "
+        } else {
+            t = "Stall time is not measured on this kernel (PSI is off). "
+        }
+        let avail = max(0, s.ram_gb - s.app_gb - s.wired_gb - s.compressed_gb)
+        t += String(format: "%.1f GB available", avail)
+        let lx = s.linux?.v
+        if f.zram, let tot = lx?.kswap_total_gb?.v, let free = lx?.kswap_free_gb?.v, let size = lx?.zram_disk_gb?.v, size > 0 {
+            let used = max(0, tot - free - s.swap_used_gb)
+            t += String(format: "; zram %.0f %% full", 100 * used / size)
+        } else if s.swap_total_gb > 0 {
+            t += String(format: "; swap %.1f of %.0f GB", s.swap_used_gb, s.swap_total_gb)
+        }
+        lines.append(t + ".")
+        return lines.joined(separator: "\n")
+    }
+
+    /// The chart legend's series on a Linux tab with their texts (03 §3.9): Kernel for Wired, App, Compressed and
+    /// Swap only where the machine has them; "no data" without the Mac's sleep.
+    static let legendHelp: [String: String] = [
+        "Kernel": "Kernel: slab, page tables, drivers and reserves; what is neither app memory nor available.",
+        "App": "App: anonymous and shared memory of processes; it can only be swapped, not dropped.",
+        "Compressed": "Compressed: RAM that holds compressed pages (zram, zswap).",
+        "Swap": "Swap: pages written to disk.",
+        "no data": "Hatched: no samples — the machine was off or suspended, or the logger wasn't running."]
+
+    /// The biggest-consumers callout on a Linux tab: its title and footnote (03 §3.9).
+    static let calloutTitle = "Biggest groups now"
+    static let calloutFoot = "A group is a systemd unit, a container or a program with all its processes. Sizes are private memory (anonymous + swapped); shared memory is not attributed."
+
+    /// The tour's notes that speak of the system, on a Linux tab (03 §3.9): (Right now ×2, Incidents).
+    static let tourNotes = [
+        "The glyph's colour is this machine's memory pressure: how long tasks waited for memory, and what is left. The badge on the right names it; the menu bar always shows this Mac.",
+        "Updated every 30 seconds: the figures `free` and /proc/meminfo give. Click the biggest group for the twelve largest.",
+        "Each stretch of high memory pressure, or a kill by the kernel's OOM killer, with what was killed. Red: still open. Orange: new since you last looked.",
+    ]
 
     /// State E: kills cannot be seen at all on this machine (the Incidents caption says so at the right).
     static let killsHidden = "kills are not visible on this machine"
@@ -1559,9 +1657,9 @@ final class MachineStore: ObservableObject {
     var title: String { isLocal ? "This Mac" : (entry?.label ?? info?.name ?? entry?.name ?? entry?.host ?? mid) }
     /// Whether its data may go to an AI model: this Mac's always (the person chose a provider), another's
     /// only when its owner allows it there (`oomph share ai on`; D7).
-    var allowsAI: Bool { isLocal || !isLinux && (info?.caps ?? entry?.caps ?? []).contains("ai") }
-    /// Another machine that runs Linux (03 §3.9): its tab speaks Linux; ✦ stays hidden there until the AI
-    /// prompt does (L3).
+    var allowsAI: Bool { isLocal || (info?.caps ?? entry?.caps ?? []).contains("ai") }
+    /// Another machine that runs Linux (03 §3.9): its tab speaks Linux, and since L3 (1.13.4) so does the AI
+    /// prompt, so ✦ follows its owner's consent there as on a Mac.
     var isLinux: Bool { !isLocal && (current?.os?.v ?? info?.os ?? entry?.os) == "linux" }
     /// The facts a Linux tab's tiles follow.
     var facts: LinuxTab.Facts { LinuxTab.Facts(current, info: info) }
@@ -1880,6 +1978,11 @@ final class MachineStore: ObservableObject {
             let away = s.away.map { ($0.idle_s ?? 0) >= 300 || ($0.locked ?? false) || $0.display_on == false } ?? false
             var p = Point(id: s.t, date: Date(timeIntervalSince1970: s.t), wired: s.wired_gb, app: s.app_gb,
                           comp: s.compressed_gb, swap: s.swap_used_gb, away: away, kills: s.jetsam_kills ?? 0)
+            if let q = s.psi?.v {  // a Linux machine's (L3): the hover's Stalled line
+                if let x = q.mem_some { p.stall = Float(x) }
+                if let x = q.mem_full { p.stallFull = Float(x) }
+                if let x = q.limit?.v?.some { p.stallLimit = Float(x) }
+            }
             if resourcesUIOn, let r = try? loadDecoder.decode(ChartSampleR.self, from: d) { p.take(r) }
             out.append(p)
         }
@@ -2481,6 +2584,10 @@ final class Store: ObservableObject {
         let w = slice.max { ($0.app + $0.comp + $0.swap) < ($1.app + $1.comp + $1.swap) }!
         var p = Point(id: w.id, date: w.date, wired: w.wired, app: w.app, comp: w.comp,
                       swap: w.swap, away: slice.contains { $0.away }, kills: slice.reduce(0) { $0 + $1.kills })
+        if slice.contains(where: { !$0.stall.isNaN }) {  // a Linux machine's stall time: the highest of the bucket
+            func top(_ k: KeyPath<Point, Float>) -> Float { slice.map { $0[keyPath: k] }.filter { !$0.isNaN }.max() ?? .nan }
+            p.stall = top(\.stall); p.stallFull = top(\.stallFull); p.stallLimit = top(\.stallLimit)
+        }
         if resourcesUIOn { p.aggregate(slice) }
         return p
     }
@@ -3450,6 +3557,8 @@ struct MemoryChart: View, Animatable {
     var floors: (low: Double, crit: Double)?
     /// The wired series' name: "Kernel" on a Linux tab (03 §3.9: the same field, `wired_gb`).
     var wiredName = "Wired"
+    /// A Linux tab's facts (nil on a Mac's): its hover card keeps 03 §3.9's row budget (L3).
+    var linux: LinuxTab.Facts? = nil
     @Environment(\.colorScheme) private var scheme
     /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
     @State private var hoverX: CGFloat? = renderHoverX
@@ -4062,6 +4171,10 @@ struct MemoryChart: View, Animatable {
         var reserved: [(String, Color)] = []  // reservations active under the pointer
         var moreReserved = 0
         var others: [(String, String, Color)] = []  // with the resources on: CPU, GPU and disk in this pixel
+        // a Linux tab (03 §3.9, L3): what was available in place of the peak, the one Stalled line, the row budget
+        var linux = false
+        var avail: String?
+        var stalled: String?
     }
 
     /// Everything under one horizontal pixel, aggregated: on the log axis one pixel can hold hours.
@@ -4086,7 +4199,13 @@ struct MemoryChart: View, Animatable {
         if pts.isEmpty && gapHere == nil, let near = nearest(tc), abs(near.id - tc) <= 60 { pts = [near] }
         info.samples = pts.count
         if !pts.isEmpty {
-            let cols: [(String, KeyPath<Point, Double>)] = [("App", \.app), ("Compressed", \.comp), (wiredName, \.wired), ("Swap", \.swap)]
+            var cols: [(String, KeyPath<Point, Double>)] = [("App", \.app), ("Compressed", \.comp), (wiredName, \.wired), ("Swap", \.swap)]
+            if let lf = linux {  // the series the machine has (03 §3.9's row budget)
+                let have = Set(LinuxTab.hoverSeries(lf))
+                cols = cols.filter { have.contains($0.0) }
+                info.avail = ram.flatMap { LinuxTab.availText(pts, ram: $0) }
+                info.stalled = LinuxTab.stallText(pts)
+            }
             info.readings = cols.map { (name, k) in
                 Reading(name: name, lo: pts.map { $0[keyPath: k] }.min()!, hi: pts.map { $0[keyPath: k] }.max()!)
             }
@@ -4144,15 +4263,20 @@ struct MemoryChart: View, Animatable {
                 lines.append((es.last!.text + " ×\(es.count)", es[0].alarming))
             }
         }
-        info.events = Array(lines.prefix(6))
-        info.moreEvents = max(lines.count - 6, 0)
+        // the row budget of a Linux tab (03 §3.9): one incident, two events, two reservations; the Mac's six and four
+        let lin = linux != nil
+        info.linux = lin
+        if lin { info.incidents = Array(info.incidents.prefix(1)) }
+        let maxEv = lin ? 2 : 6, maxRes = lin ? 2 : 4
+        info.events = Array(lines.prefix(maxEv))
+        info.moreEvents = max(lines.count - maxEv, 0)
         let res = reservations.filter { $0.res.requested <= t1 && $0.end >= t0 }
-        info.reserved = res.prefix(4).map { b in
+        info.reserved = res.prefix(maxRes).map { b in
             let queued = (b.res.granted ?? .infinity) > tc
             return (String(format: "%.1f GB ", b.res.gb(at: min(max(tc, b.res.requested), b.end))) + b.res.purpose
                     + (queued ? " (queued)" : ""), resourcesUIOn ? b.res.agentColor(dark: scheme == .dark) : b.res.color)
         }
-        info.moreReserved = max(res.count - 4, 0)
+        info.moreReserved = max(res.count - maxRes, 0)
         return info
     }
 
@@ -4216,6 +4340,15 @@ struct MemoryChart: View, Animatable {
             return lo == hi ? hi + " GB" : "\(lo)–\(hi) GB"
         }
 
+        /// A line of the card in the secondary colour: a name and its figure (a Linux tab's Available and Stalled).
+        func cardLine(_ name: String, _ value: String) -> some View {
+            HStack {
+                Text(name).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                Spacer(minLength: 4)
+                Text(value).font(.system(size: 10, design: .monospaced)).foregroundStyle(.secondary).lineLimit(1)
+            }
+        }
+
         var body: some View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
@@ -4235,7 +4368,10 @@ struct MemoryChart: View, Animatable {
                         Text(gb(r)).font(.system(size: 10, design: .monospaced))
                     }
                 }
-                if !info.readings.isEmpty {
+                if info.linux, !info.readings.isEmpty {  // in place of "all four, peak" (03 §3.9)
+                    if let a = info.avail { cardLine("Available" + (info.away ? " · away" : ""), a) }
+                    if let st = info.stalled { cardLine("Stalled", st) }
+                } else if !info.readings.isEmpty {
                     HStack {
                         Text((info.samples > 1 ? "all four, peak" : "all four") + (info.away ? " · away" : ""))
                             .font(.system(size: 10)).foregroundStyle(.secondary)
@@ -4257,11 +4393,11 @@ struct MemoryChart: View, Animatable {
                 }
                 if !info.incidents.isEmpty || !info.events.isEmpty { Divider().padding(.vertical, 1) }
                 ForEach(Array(info.incidents.prefix(2).enumerated()), id: \.offset) { _, t in
-                    Text(t).font(.system(size: 10, weight: .medium)).foregroundStyle(.red).lineLimit(3)
+                    Text(t).font(.system(size: 10, weight: .medium)).foregroundStyle(.red).lineLimit(info.linux ? 2 : 3)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 ForEach(Array(info.events.enumerated()), id: \.offset) { _, e in
-                    Text("• " + e.0).font(.system(size: 10)).foregroundStyle(e.1 ? Color.red : Color.primary).lineLimit(2)
+                    Text("• " + e.0).font(.system(size: 10)).foregroundStyle(e.1 ? Color.red : Color.primary).lineLimit(info.linux ? 1 : 2)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if info.moreEvents > 0 {
@@ -4439,9 +4575,12 @@ struct ReservationCard: View {
 struct ChartLegend: View {
     /// Another machine's chart with a stretch it has not received in view: the dots get an entry.
     var missing = false
-    /// A Linux tab (03 §3.9): Wired is "Kernel"; a server has no "away" entry (no one sits at it).
+    /// A Linux tab (03 §3.9): Wired is "Kernel"; a server has no "away" entry (no one sits at it); only the series the
+    /// machine has, with Linux texts (L3: no Compressed without zram or zswap, no Swap without swap).
     var linux = false
     var away = true
+    var compressed = true
+    var swap = true
     struct Item { let name: String; let help: String; let kind: Int }  // 0 swatch, 1 away, 2 hatch, 3 incident, 4 dots
     static let rows: [[Item]] = [
         [Item(name: "Wired", help: "Wired: memory the kernel and drivers hold in RAM. It is never compressed or swapped out.", kind: 0),
@@ -4476,12 +4615,23 @@ struct ChartLegend: View {
         }
     }
 
+    /// A series' colour by its name (a Linux tab may leave some out).
+    static func color(_ name: String) -> Color {
+        let i = MemoryChart.series.firstIndex(of: name == "Kernel" ? "Wired" : name) ?? 0
+        return MemoryChart.seriesColors[i]
+    }
+
     static let kernel = Item(name: "Kernel", help: "Kernel: slab, page tables, drivers and reserves; what is neither app memory nor available.", kind: 0)
 
     /// The rows as this tab shows them.
     var shownRows: [[Item]] {
         var r = ChartLegend.rows
-        if linux { r[0][0] = ChartLegend.kernel }
+        if linux {
+            r[0][0] = ChartLegend.kernel
+            r[0] = r[0].filter { ($0.name != "Compressed" || compressed) && ($0.name != "Swap" || swap) }
+                .map { Item(name: $0.name, help: LinuxTab.legendHelp[$0.name] ?? $0.help, kind: $0.kind) }
+            r[1] = r[1].map { Item(name: $0.name, help: LinuxTab.legendHelp[$0.name] ?? $0.help, kind: $0.kind) }
+        }
         if !away { r[1].removeAll { $0.kind == 1 } }
         if missing { r[1].append(ChartLegend.notReceived) }
         return r
@@ -4493,9 +4643,9 @@ struct ChartLegend: View {
         VStack(alignment: .leading, spacing: 2) {
             ForEach(Array(shownRows.enumerated()), id: \.offset) { r, row in
                 HStack(spacing: 7) {
-                    ForEach(Array(row.enumerated()), id: \.offset) { i, it in
+                    ForEach(Array(row.enumerated()), id: \.offset) { _, it in
                         HStack(spacing: 3) {
-                            swatch(it, r == 0 ? MemoryChart.seriesColors[i] : .clear)
+                            swatch(it, r == 0 ? ChartLegend.color(it.name) : .clear)
                             Text(it.name)
                         }
                         .contentShape(Rectangle())
@@ -4518,6 +4668,8 @@ struct ResourceLegend: View {
     var missing = false
     var linux = false
     var away = true
+    var compressed = true
+    var hasSwap = true
 
     struct Entry { let name: String; let value: String?; let color: Color; let line: Bool; let help: String }
 
@@ -4538,10 +4690,13 @@ struct ResourceLegend: View {
             let swap = s.map { $0.swap_used_gb > 0 ? String(format: "%.1f / %.0f", $0.swap_used_gb, $0.swap_total_gb)
                                                    : String(format: "%.1f", $0.swap_used_gb) }
             let wired = linux ? ChartLegend.kernel : ChartLegend.rows[0][0]
-            return [Entry(name: wired.name, value: f1(s?.wired_gb), color: .gray, line: false, help: wired.help),
-                    Entry(name: "App", value: f1(s?.app_gb), color: .blue, line: false, help: ChartLegend.rows[0][1].help),
-                    Entry(name: "Compressed", value: f1(s?.compressed_gb), color: .orange, line: false, help: ChartLegend.rows[0][2].help),
-                    Entry(name: "Swap", value: swap, color: .red, line: false, help: ChartLegend.rows[0][3].help)]
+            let all = [Entry(name: wired.name, value: f1(s?.wired_gb), color: .gray, line: false, help: wired.help),
+                       Entry(name: "App", value: f1(s?.app_gb), color: .blue, line: false, help: ChartLegend.rows[0][1].help),
+                       Entry(name: "Compressed", value: f1(s?.compressed_gb), color: .orange, line: false, help: ChartLegend.rows[0][2].help),
+                       Entry(name: "Swap", value: swap, color: .red, line: false, help: ChartLegend.rows[0][3].help)]
+            guard linux else { return all }  // a Linux tab: its series and texts (L3)
+            return all.filter { ($0.name != "Compressed" || compressed) && ($0.name != "Swap" || hasSwap) }
+                .map { Entry(name: $0.name, value: $0.value, color: $0.color, line: $0.line, help: LinuxTab.legendHelp[$0.name] ?? $0.help) }
         case .cpu:
             let c = s?.cpu?.v
             let user = c?.busy.map { $0 - (c?.sys ?? 0) }
@@ -4598,7 +4753,7 @@ struct ResourceLegend: View {
     }
 
     var body: some View {
-        let legend = ChartLegend(missing: missing, linux: linux, away: away)
+        let legend = ChartLegend(missing: missing, linux: linux, away: away, compressed: compressed, swap: hasSwap)
         VStack(alignment: .trailing, spacing: 2) {
             ViewThatFits(in: .horizontal) { valuesRow(0); valuesRow(1); valuesRow(2) }
             HStack(spacing: 7) {
@@ -4927,6 +5082,7 @@ struct PopoverView: View {
                     }
                 } else if live {
                     Text(p.label).background(p.color.opacity(0.2), in: Capsule()).foregroundStyle(p == .normal ? .primary : p.color)
+                        .help(m.isLinux ? LinuxTab.capsuleHelp(m.current!, m.facts) : capsuleHelp(m.current!))  // L3: Linux terms
                 } else if m.blocked {
                     Button { Store.openLocalNetworkSettings() } label: {
                         Text("Local Network settings…").padding(.horizontal, 10).padding(.vertical, 4)
@@ -5601,7 +5757,7 @@ struct PopoverView: View {
                 .offset(x: arrowX - 160)  // centre of a 320-wide bubble
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("Biggest apps now").font(.system(size: 13, weight: .semibold))
+                    Text(m.isLinux ? LinuxTab.calloutTitle : "Biggest apps now").font(.system(size: 13, weight: .semibold))
                     Spacer()
                     Text(String(format: "%.1f GB in these %d", total, gs.count))
                         .font(.system(size: 10)).foregroundStyle(.secondary)
@@ -5631,7 +5787,7 @@ struct PopoverView: View {
                     .help(g.name)
                 }
                 if gs.isEmpty { Text("No data yet").font(.system(size: 11)).foregroundStyle(.secondary) }
-                Text("An app counts all its helper processes; sizes are physical footprints like Activity Monitor's Memory column.")
+                Text(m.isLinux ? LinuxTab.calloutFoot : "An app counts all its helper processes; sizes are physical footprints like Activity Monitor's Memory column.")
                     .font(.system(size: 9.5)).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
             }
             .padding(12)
@@ -5664,13 +5820,15 @@ struct PopoverView: View {
                 Spacer(minLength: 6)
                 if resourcesUIOn {
                     let focus = store.selection(for: m).focus
-                    ResourceLegend(focus: focus, sample: m.current, missing: missingInView, linux: m.isLinux, away: m.hasPresence)
+                    ResourceLegend(focus: focus, sample: m.current, missing: missingInView, linux: m.isLinux, away: m.hasPresence,
+                                   compressed: !m.isLinux || m.facts.compressed, hasSwap: !m.isLinux || m.facts.swap)
                     Text(focus.unit).font(.caption).foregroundStyle(.secondary)
                         .help(ResourceLegend.unitHelp(focus) + (store.allHistory
                               ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
                               : "Time runs left to right up to now."))
                 } else {
-                ChartLegend(missing: missingInView, linux: m.isLinux, away: m.hasPresence)
+                ChartLegend(missing: missingInView, linux: m.isLinux, away: m.hasPresence,
+                            compressed: !m.isLinux || m.facts.compressed, swap: !m.isLinux || m.facts.swap)
                 Text("GB").font(.caption).foregroundStyle(.secondary)
                     .help("Memory in GB; the dashed line is the \(m.isLinux ? "machine" : "Mac")'s RAM. " + (store.allHistory
                           ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
@@ -5694,13 +5852,14 @@ struct PopoverView: View {
                                 bands: stripBands, smallBand: smallBandHeight, highlight: rowHighlight,
                                 focus: sel.focus, rows: smallRows, rowHeight: smallRowHeight, cores: m.current?.cpu?.v?.n,
                                 floors: pool?.watch == true ? pool.flatMap { p in p.low_gb.map { (low: $0, crit: p.crit_gb ?? 0) } } : nil,
-                                wiredName: m.isLinux ? "Kernel" : "Wired")
+                                wiredName: m.isLinux ? "Kernel" : "Wired", linux: m.isLinux ? m.facts : nil)
                         .id(sel.focus)  // a plain click cross-fades the chart area (§3.7.4)
                         .transition(.opacity)
                 } else {
                     MemoryChart(points: m.history, gaps: m.gaps, incidents: m.incidents, events: m.events,
                                 ram: m.current?.ram_gb, axis: axis,
-                                reservations: m.reservations, stripHeight: stripHeight, wiredName: m.isLinux ? "Kernel" : "Wired")
+                                reservations: m.reservations, stripHeight: stripHeight, wiredName: m.isLinux ? "Kernel" : "Wired",
+                                linux: m.isLinux ? m.facts : nil)
                         .transition(.opacity)  // fades in (0.33 s) once the history has loaded
                 }
             }
@@ -5878,7 +6037,6 @@ struct PopoverView: View {
     func startTour() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         chipHover = false
-        if m.isLinux { store.select(0) }  // the tour explains This Mac until it speaks Linux (03 §3.9, L3)
         withAnimation(.easeOut(duration: 0.2)) { showAI = false; showTopApps = false; tourStep = 0 }
     }
 
@@ -5912,12 +6070,14 @@ struct PopoverView: View {
                 TourNote(title: resourcesUIOn ? "Is anything short?" : "Memory pressure",
                          text: resourcesUIOn
                             ? "The badge at the right names it: Memory tight, Disk low … or Normal, and the chip takes its colour. In the menu bar the chip is memory (colour and free GB); a ring or a disc on it means a disk needs attention. Hover the chip here to come back to this tour."
+                            : self.m.isLinux ? LinuxTab.tourNotes[0]
                             : "The chip's colour is macOS memory pressure, and the badge on the right names it. The figure in the menu bar is free memory. Hover the chip to come back to this tour.",
                          left: m, width: half, above: false,
                          xs: [chip.midX], y: chip.maxY + 3, reach: zone.maxY - chip.maxY + 10),
                 TourNote(title: resourcesUIOn ? "Four resources" : "Live readings",
                          text: resourcesUIOn
                             ? "Memory, CPU, GPU and disk right now. Click a tile to see it alone; ⌘-click another to add it below. Click the one with the big chart again for its twelve biggest apps. One flag per tile says what needs you: critical, low, throttled, 2 waiting. Hover it for the rest."
+                            : self.m.isLinux ? LinuxTab.tourNotes[1]
                             : "Updated every 30 seconds: the same figures as Activity Monitor. Click the biggest app for the twelve largest.",
                          left: m + half + 8, width: half, above: false,
                          xs: [top.midX], y: top.maxY + 3, reach: zone.maxY - top.maxY + 10),
@@ -5927,7 +6087,8 @@ struct PopoverView: View {
             let picker = r["picker"] ?? .zero, plot = r["plot"] ?? zone
             let half = (W - 2 * m - 8) / 2
             let timeRange = TourNote(title: "Time range",
-                                     text: "∞ shows all history on a logarithmic time axis: the last hours wide, older days and weeks squeezed. 24h, 6h and 1h are linear. A blue ↻ beside it means the logger needs an update.",
+                                     text: "∞ shows all history on a logarithmic time axis: the last hours wide, older days and weeks squeezed. 24h, 6h and 1h are linear."
+                                        + (self.m.isLocal ? " A blue ↻ beside it means the logger needs an update." : ""),
                                      left: m, width: half, above: true,
                                      xs: [picker.minX + 30], y: picker.minY - 3)
             // below the zone: above it, the right half belongs to the tour's bar
@@ -5959,7 +6120,9 @@ struct PopoverView: View {
             let zone = union(["incidents"])
             return (zone, [
                 TourNote(title: "Incidents",
-                         text: "Each stretch of high memory pressure, with the apps macOS killed to free memory. Red: still open. Orange: new since you last looked. Click one for its report; right-click to copy its path or show it in Finder.",
+                         text: self.m.isLinux ? LinuxTab.tourNotes[2]
+                            : "Each stretch of high memory pressure, with the apps macOS killed to free memory. Red: still open. Orange: new since you last looked."
+                                + (self.m.isLocal ? " Click one for its report; right-click to copy its path or show it in Finder." : ""),
                          left: m, width: W * 0.62, above: true,
                          xs: [zone.minX + 40], y: zone.minY - 7),
             ])
@@ -6708,7 +6871,7 @@ struct MachineTab: View {
         if let e = m.entry { parts.append(e.address + (e.transport == "ssh" ? " (ssh)" : "")) }
         if let v = m.info?.os_version { parts.append((m.info?.os == "linux" ? "Linux " : "macOS ") + v) }
         if let v = m.info?.version { parts.append(brand + " " + v) }
-        parts.append(m.isLinux ? "AI analysis: not for Linux machines yet" : m.allowsAI ? "AI analysis allowed there" : "AI analysis not allowed there")
+        parts.append(m.allowsAI ? "AI analysis allowed there" : "AI analysis not allowed there")
         if m.linkLive { parts.append("connected") } else if let t = m.link?.last_contact {
             parts.append("last contact " + MemoryChart.when(t))
         }
@@ -8594,12 +8757,8 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
         store.building = true; store.buildVersion = "1.5.0"; store.buildProgress = "Compiling \(brand) 1.5.0"
         store.buildLines = ["==> Compiling \(brand) 1.5.0", "app/oomph.swift:42: note: building for macOS 14"]
     }
-    // `--ai tour:N` draws step N of the guided tour (1-based); on a Linux tab it selects This Mac, as a click does
+    // `--ai tour:N` draws step N of the guided tour (1-based), on the selected tab (a Linux tab's in its words, L3)
     let tour = ai.hasPrefix("tour:") ? Int(ai.dropFirst(5)).map { $0 - 1 } : nil
-    if tour != nil && store.machine.isLinux {
-        store.selected = 0
-        store.machine.refreshCurrent(); store.machine.loadIncidents(); store.machine.reloadPoints(sync: true)
-    }
     let view = PopoverView(store: store, showAI: ["callout", "dialog-connected", "dialog-error"].contains(ai), showTopApps: ai == "top",
                            tourStep: tour, showAllReservations: ai == "resmore", showRemedy: ai == "remedy")
         .background(Color(nsColor: .windowBackgroundColor))
@@ -8799,10 +8958,33 @@ func linuxVectors(_ path: String) -> Int32 {
                                 at: (c["at"] as? String) ?? "")
         return [r.0, r.1, r.2, r.3, r.4]
     }
-    out["legend"] = cases("legend").map { c -> [[String]] in
-        ChartLegend(missing: (c["missing"] as? Bool) ?? false, linux: (c["linux"] as? Bool) ?? false, away: (c["away"] as? Bool) ?? true)
-            .shownRows.map { $0.map(\.name) }
+    // a case with a sample: its series from the machine's facts, as a Linux tab's chart takes them (1.13.4)
+    func legendOf(_ c: [String: Any]) -> ChartLegend {
+        let f: LinuxTab.Facts? = json(c["sample"], Sample.self).map { LinuxTab.Facts($0, info: nil) }
+        return ChartLegend(missing: (c["missing"] as? Bool) ?? false, linux: (c["linux"] as? Bool) ?? false,
+                           away: (c["away"] as? Bool) ?? true,
+                           compressed: f.map { $0.compressed } ?? (c["compressed"] as? Bool) ?? true,
+                           swap: f.map { $0.swap } ?? (c["swap"] as? Bool) ?? true)
     }
+    out["legend"] = cases("legend").map { c -> [[String]] in legendOf(c).shownRows.map { $0.map(\.name) } }
+    // L3 (1.13.4): the legend's texts, the capsule's tooltip, the hover card's Linux lines, the callout and the tour
+    out["legend_help"] = cases("legend").map { c -> [String] in legendOf(c).shownRows.flatMap { $0.map(\.help) } }
+    out["capsule"] = cases("tiles").map { c -> Any in
+        guard let s = json(c["sample"], Sample.self) else { return NSNull() }
+        return LinuxTab.capsuleHelp(s, LinuxTab.Facts(s, info: json(c["machine"], MachineInfo.self)))
+    }
+    func num(_ x: Any?) -> Double { (x as? NSNumber)?.doubleValue ?? .nan }
+    out["hover"] = cases("hover").map { c -> [Any] in
+        let pts = ((c["points"] as? [[String: Any]]) ?? []).map { p -> Point in
+            var q = Point(id: num(p["t"]), date: Date(timeIntervalSince1970: num(p["t"])), wired: num(p["wired"]), app: num(p["app"]),
+                          comp: num(p["comp"]), swap: num(p["swap"]), away: false, kills: 0)
+            q.stall = Float(num(p["some"])); q.stallFull = Float(num(p["full"])); q.stallLimit = Float(num(p["limit"]))
+            return q
+        }
+        let f = LinuxTab.Facts(zram: (c["zram"] as? Bool) ?? false, swap: (c["swap"] as? Bool) ?? true)
+        return [LinuxTab.hoverSeries(f), opt(LinuxTab.availText(pts, ram: num(c["ram"]))), opt(LinuxTab.stallText(pts))]
+    }
+    out["words"] = [LinuxTab.calloutTitle, LinuxTab.calloutFoot] + LinuxTab.tourNotes
     out["group_name"] = cases("group_name").map { LinuxTab.groupName(($0["name"] as? String) ?? "") }
     out["labeled"] = cases("labeled").map { c -> Bool in (c["os"] as? String).map { MachineEntry.labeled.contains($0) } ?? true }
     guard let j = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }

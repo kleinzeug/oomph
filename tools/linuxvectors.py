@@ -38,7 +38,8 @@ DAEMON = os.path.join(ROOT, "daemon")
 sys.path.insert(0, DAEMON)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
-GROUPS = ("tiles", "event", "rows", "who", "remedy", "legend", "group_name", "labeled")
+GROUPS = ("tiles", "event", "rows", "who", "remedy", "legend", "group_name", "labeled",
+          "legend_help", "capsule", "hover", "words")   # (the last four: L3, 1.13.4)
 
 # the backend on a recorded machine, in a child: its sample's memory part and its machine block
 MEASURE = r"""
@@ -148,10 +149,27 @@ def cases():
               for st in ("stopped", "denied", "absent") for o, u in (("linux", "kim"), ("macos", None))]
     legend = [{"linux": a, "away": b, "missing": c} for a, b, c in
               ((False, True, False), (True, False, False), (True, True, True), (False, True, True))]
+    legend += [{"linux": True, "away": False, "missing": False, "compressed": False, "swap": True},
+               {"linux": True, "away": True, "missing": False, "compressed": True, "swap": False},
+               {"linux": True, "away": False, "missing": True, "compressed": False, "swap": False}]
+    # the series from a sample, as the app's chart and oomph top take them: a swap file without a swap total or swap
+    # in use (container-2g), no swap at all, zram as the only swap
+    legend += [{"linux": True, "away": False, "missing": False, "sample": t["sample"]} for t in tiles
+               if t["case"] in ("container-2g", "server-noswap-93pct", "zram-desktop")]
+    pt = lambda t, w, a, c, sw, some=None, full=None, limit=None: dict(  # noqa: E731
+        {"t": t, "wired": w, "app": a, "comp": c, "swap": sw},
+        **{k: v for k, v in (("some", some), ("full", full), ("limit", limit)) if v is not None})
+    hover = [
+        {"ram": 62.7, "zram": False, "swap": True, "points": [pt(1, 3.4, 14.8, 0, 0.5, 28.4, 10.2), pt(2, 3.4, 15.1, 0, 0.6, 35.0, 12.0)]},
+        {"ram": 62.7, "zram": False, "swap": False, "points": [pt(1, 3.4, 14.8, 0, 0, 0.0, 0.0, 97.0)]},
+        {"ram": 31.0, "zram": True, "swap": True, "points": [pt(1, 2.0, 20.0, 3.0, 1.0, 4.2, 0.0), pt(2, 2.1, 20.0, 3.1, 1.0, 4.2)]},
+        {"ram": 16.0, "zram": False, "swap": True, "points": [pt(1, 1.0, 8.0, 0, 0)]},   # PSI off: no Stalled line
+    ]
     names = ["docker:3f9c1a7e (nginx)", "podman:web", "pod:5d9c7e2a (runner)", "postgresql@16-main",
              "user@1000.service/app-gnome-firefox-12345.scope-long", "node"]
     return {"tiles": tiles, "event": [{"e": e} for e in ev], "rows": rows, "who": who, "remedy": remedy, "legend": legend,
-            "group_name": [{"name": n} for n in names], "labeled": [{"os": o} for o in ("macos", "linux", "freebsd")]}
+            "group_name": [{"name": n} for n in names], "labeled": [{"os": o} for o in ("macos", "linux", "freebsd")],
+            "hover": hover}
 
 
 # ---------------------------------------------------------------------------------------------- the rules
@@ -204,6 +222,7 @@ def check_rules(v):
                 bad.append("%s: the stall taken out at a limit is not shown: %r" % (who, cells[6][2]))
         if s["daemon"].get("all_procs") is False and (cells[7][1], cells[7][3]) != ("—", "not visible"):
             bad.append("%s: a logger that sees only itself, yet the group tile says %r" % (who, cells[7]))
+        bad += top_agrees(who, s, cells)
     for c, a in zip(inp["event"], exp["event"]):
         e = c["e"]
         if e["kind"] == "oom_kill":
@@ -234,6 +253,7 @@ def check_rules(v):
             bad.append("legend %r: %r" % (c, a))
         if ("away" in names) != c["away"]:
             bad.append("legend %r: away %r" % (c, a))
+    bad += l3_rules(inp, exp)
     for c, a in zip(inp["labeled"], exp["labeled"]):
         if a != (c["os"] in ("macos", "linux")):
             bad.append("labeled %r: %r" % (c, a))
@@ -262,6 +282,91 @@ def check_rules(v):
         if any(mm.get(k) != x for k, x in INVENTED.items()):
             bad.append("tiles %s: the machine's static fields are not the invented ones: %r"
                        % (c["case"], {k: mm.get(k) for k in INVENTED}))
+    return bad
+
+
+MAC_TEXT = re.compile(r"\b(macOS|(?<!this )Mac|jetsam|Activity Monitor|Wired|asleep)\b")   # ("this Mac": the viewer)
+
+
+def l3_rules(inp, exp):
+    """L3 (1.13.4): the legend shows only the series a Linux machine has, each with a Linux text; the capsule's
+    tooltip gives the level in Linux terms (stall time where it is measured, what is available); the hover
+    card's series, its Available line (RAM less app, kernel and compressed) and its one Stalled line follow the
+    points; the callout and the tour speak Linux. No Mac word anywhere in them."""
+    bad = []
+    import oomph_top
+    import oomph_view as view
+    for c, names, helps in zip(inp["legend"], exp.get("legend", []), exp.get("legend_help") or [[]] * len(inp["legend"])):
+        if not c["linux"]:
+            continue
+        flat = names[0]
+        if "sample" in c:       # the app's series from the machine's facts, and oomph top's from the same sample
+            term = [n for n, _ in view.series_words(oomph_top.readings(c["sample"]))]
+            if flat != term:
+                bad.append("legend from the sample %s: the app shows %r, oomph top %r" % (c["sample"].get("swapfiles"), flat, term))
+            import oomph
+            v = oomph._View("24h", 0, 1)           # oomph html's chart: the same rule for its Swap series
+            v.count(dict(c["sample"], t=1))
+            if v.swap != ("Swap" in flat):
+                bad.append("legend from the sample %s: the app shows %r, oomph html %s Swap"
+                           % (c["sample"].get("swapfiles"), flat, "shows" if v.swap else "leaves out"))
+        elif ("Compressed" in flat) != c.get("compressed", True) or ("Swap" in flat) != c.get("swap", True):
+            bad.append("legend %r: the series %r are not the machine's" % (c, flat))
+        if any(MAC_TEXT.search(h) for h in helps):
+            bad.append("legend %r: a Mac's text on a Linux tab: %r" % (c, [h for h in helps if MAC_TEXT.search(h)]))
+    for c, t in zip(inp["tiles"], exp.get("capsule") or []):
+        s, ms = c["sample"], c["sample"]["daemon"]["machine"].get("measures") or {}
+        avail = max(0.0, s["ram_gb"] - s["app_gb"] - s["wired_gb"] - s["compressed_gb"])
+        if not isinstance(t, str) or MAC_TEXT.search(t) or "%.1f GB available" % avail not in t:
+            bad.append("capsule %s: %r (available %.1f GB)" % (c["case"], t, avail))
+        elif ms.get("psi") is not False and s.get("psi") and "Stalled on memory" not in t:
+            bad.append("capsule %s: no stall time where it is measured: %r" % (c["case"], t))
+    for c, a in zip(inp.get("hover") or [], exp.get("hover") or []):
+        series, av, st = a
+        want = ["App"] + (["Compressed"] if c["zram"] else []) + ["Kernel"] + (["Swap"] if c["swap"] else [])
+        avs = ["%.1f" % max(0.0, c["ram"] - p["wired"] - p["app"] - p["comp"]) for p in c["points"]]
+        lo, hi = min(avs, key=float), max(avs, key=float)
+        if series != want or av != ("%s GB" % hi if lo == hi else "%s–%s GB" % (lo, hi)):
+            bad.append("hover %r: %r" % (c, a))
+        some = [p["some"] for p in c["points"] if "some" in p]
+        if (st is None) != (not some) or some and not st.startswith(LinuxTabPct(min(some)).split(" ")[0]):
+            bad.append("hover %r: the Stalled line %r" % (c, st))
+        if some and any(p.get("limit", 0) >= 0.05 for p in c["points"]) and "at a limit" not in st:
+            bad.append("hover %r: stall time at a limit not said: %r" % (c, st))
+    words = exp.get("words") or []
+    if not words or any(MAC_TEXT.search(w) for w in words) or "group" not in words[0] or "OOM killer" not in words[-1]:
+        bad.append("the callout and the tour on a Linux tab: %r" % words)
+    return bad
+
+
+def LinuxTabPct(x):
+    return "%.1f %%" % x if x < 9.95 else "%.0f %%" % x
+
+
+def top_agrees(who, s, cells):
+    """`oomph top` on the same sample (T3, 1.13.4): its tiles (oomph_view.linux_tiles) say what the app's say, in
+    the terminal's shorter labels: the same figures, App memory, Available or Compressed, Kernel, the RAM with its
+    decimal or the limit, swap or zram, stall time, Idle or what is available, the biggest group by its Linux name."""
+    import oomph_top
+    import oomph_view as view
+    g = view.GLYPHS["unicode"]
+    c = oomph_top.readings(s)
+    if c.get("linux") is None:
+        return ["%s: oomph top does not read this sample as a Linux machine's" % who]
+    top = view.linux_tiles(c, g)
+    bad = []
+    for i in range(7):
+        val, lab = top[i][0], top[i][1]
+        want_v, want_l = cells[i][1].replace("—", g["dash"]), cells[i][0]
+        same_l = lab == want_l or want_l.startswith(lab.split(" / ")[0].split()[0]) or (i == 4 and lab == "zram / size")
+        if not val.startswith(want_v) or not same_l:
+            bad.append("%s: oomph top's tile %d is %r %r, the app's %r %r" % (who, i, val, lab, want_v, want_l))
+    want_g = (cells[7][3] or "").replace("#1 ", "")
+    got_g = top[7][1].replace("#1 ", "") if len(top) > 7 else "–"     # no group yet: the terminal drops the tile
+    if got_g != want_g:
+        bad.append("%s: oomph top's group tile %r, the app's %r" % (who, got_g, want_g))
+    if any(w in " ".join(t[1] for t in top) for w in ("Wired", "biggest app")):
+        bad.append("%s: oomph top says a Mac's word: %r" % (who, [t[1] for t in top]))
     return bad
 
 

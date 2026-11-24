@@ -1073,6 +1073,71 @@ MACHINE_ROWS = [
 ]
 
 
+def test_linux_desktop_rows():
+    """T3 (1.13.4): a Linux laptop whose only swap is zram, at 100x30 with the inspect readout, as rows (it was a
+    golden frame; 04 §10 closes their list): the machine line says what is available, the tiles zram and Kernel,
+    the legend the series it has (no Swap: no swap file, no swap total), the readout Kernel and available; no
+    Mac word anywhere."""
+    base = tempfile.mkdtemp(prefix="oomph-toptest-")
+    try:
+        fr = topfixture.frames(base, topfixture.ROW_FRAMES)["100x30-linux-desktop.ans"][1]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    rows = fr.text().rstrip("\n").split("\n")
+    legend = next((r for r in rows if "Memory" in r and "■" in r), "")
+    want = (len(rows) == 30 and "avail" in rows[0] and "zram / size" in rows[2] and "Kernel" in rows[2] and
+            "■Kernel ■App ■Compressed" in legend and "Swap" not in legend and
+            any("Inspect" in r for r in rows) and any("■ Kernel" in r for r in rows) and
+            any(r.startswith("│ available ") for r in rows) and
+            not re.search(r"Wired|[Uu]nowned|jetsam|Activity Monitor", "\n".join(rows)))
+    check(want, "Linux laptop with zram, 100x30, inspect: available, zram and Kernel, the legend without Swap, the "
+                "readout in Linux words (%r)" % (rows[:3] if not want else legend.strip()[:60]))
+
+
+def test_linux_server_rows():
+    """T3 (1.13.4): a Linux server at 80x24 in 256 colours, as rows (04 §10 closes the list of goldens; the console
+    frame of the same scenario is the golden): the machine line says avail, the tiles Available, Kernel, Swap / size
+    and Stalled, the legend Kernel, App and Swap (no Compressed: no zram or zswap); no Mac word anywhere."""
+    base = tempfile.mkdtemp(prefix="oomph-toptest-")
+    try:
+        fr = topfixture.frames(base, topfixture.ROW_FRAMES)["80x24-linux-server.ans"][1]
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    rows = fr.text().rstrip("\n").split("\n")
+    legend = rows[3] if len(rows) > 3 else ""
+    want = (len(rows) == 24 and "9.5G avail" in rows[0] and
+            all(w in rows[2] for w in ("App memory", "Available", "Kernel", "RAM total", "Swap / size", "Stalled")) and
+            "■Kernel ■App ■Swap" in legend and "Compressed" not in legend and "no data" in legend and
+            any("Incidents" in r for r in rows) and
+            not re.search(r"Wired|[Uu]nowned|jetsam|Activity Monitor|Compressed", "\n".join(rows)))
+    check(want, "Linux server, 80x24: avail, Available, Kernel, Swap / size and Stalled, the legend without "
+                "Compressed, no Mac word (%r)" % (rows[:4] if not want else legend.strip()[:60]))
+
+
+def test_linux_live():
+    """T3 (1.13.4): oomph top on Linux with no logger draws a live sample, which has no logger's machine block: the
+    machine's own (oomph_linux.machine, read once) gives its words. A zram desktop then has Compressed in the
+    legend and the tiles, zram as its only swap and Idle, as with a logger."""
+    with open(os.path.join(ROOT, "tools", "vectors", "linux.json"), encoding="utf-8") as f:
+        case = next(c for c in json.load(f)["inputs"]["tiles"] if c["case"] == "desktop, no idle time")
+    s = dict(case["sample"], source="live")
+    machine = s.pop("daemon")["machine"]
+    saved = list(T._LIVE_MACHINE)
+    try:
+        T._LIVE_MACHINE[:] = [machine]
+        c = T.readings(s)
+        T._LIVE_MACHINE[:] = [None]                 # not on Linux, or not known: the defaults, never a crash
+        bare = T.readings(s)
+    finally:
+        T._LIVE_MACHINE[:] = saved
+    names = [n for n, _ in V.series_words(c)]
+    labels = [x[1] for x in V.linux_tiles(c, V.GLYPHS["unicode"])]
+    check(names == ["Kernel", "App", "Compressed"] and "Compressed" in labels and "zram / size" in labels and
+          "Idle" in labels and "Available" not in labels and bare.get("linux") is not None,
+          "Linux, no logger: a live zram desktop's legend has Compressed, its tiles Compressed, zram / size and "
+          "Idle (%s; %s)" % (names, labels))
+
+
 def test_machine_rows():
     """04 §8: the machine frames beyond the four goldens, as rows (from the same fixture and model)."""
     base = tempfile.mkdtemp(prefix="oomph-toptest-")
@@ -1462,8 +1527,7 @@ def test_pty_machines(base):
     with open(fake, "w") as f:
         f.write(FAKE_REMOTE)
     flog = os.path.join(base, "remote.log")
-    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_TOP_REMOTE=json.dumps([PY, "-I", fake]), FAKE_REMOTE_LOG=flog,
-               OOMPH_TOP_TABS="1")
+    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_TOP_REMOTE=json.dumps([PY, "-I", fake]), FAKE_REMOTE_LOG=flog)
     r1 = subprocess.run(top("--once", "--machine", "build-box", "--size", "80x24", "--format", "text"), env=env,
                         capture_output=True, text=True, timeout=30)
     r2 = subprocess.run(top("--once", "--machine", "nope", "--size", "80x24"), env=env, capture_output=True, text=True,
@@ -1643,6 +1707,63 @@ def test_pty_machines(base):
           "machines: with the mouse on, a click on a tab shows it and a click on + opens Connect")
 
 
+def test_viewer(base):
+    """T3 (1.13.4): this machine as a viewer, on a Mac and on Linux alike, with nothing but the defaults (no
+    switch, no OOMPH_STATE_DIR, no OOMPH_MACHINES_DIR): `oomph remote add` over a stand-in ssh that runs
+    `oomph serve --stdio` on a Mac's logs (the fixture, its machine block saying macos), the mirror in the state
+    folder (on Linux the XDG state folder, $XDG_STATE_HOME/oomph/machines), the Mac's frame in its own words from
+    `oomph top --once --machine studio`, and its tab in the full-screen program."""
+    os.makedirs(base)
+    env, log, led = fixture_env(base)
+    env.pop("OOMPH_STATE_DIR", None)
+    home, xdg = os.path.join(base, "home"), os.path.join(base, "xdg")
+    os.makedirs(home)
+    with open(os.path.join(log, "current.json")) as f:
+        cur = json.load(f)
+    cur["daemon"] = dict(cur["daemon"], machine={"id": "m-5d1e0c2b3a495867", "name": "studio", "os": "macos",
+                                                 "os_version": "27.2", "kind": "desktop", "arch": "arm64"})
+    with open(os.path.join(log, "current.json"), "w") as f:
+        json.dump(cur, f)
+    fake = os.path.join(base, "fakessh")
+    with open(fake, "w") as f:
+        f.write("#!%s -I\nimport os, sys\nos.execv(%r, [%r, '-I', '-B', %r, 'serve', '--stdio'])\n" % (PY, PY, PY, CLI))
+    os.chmod(fake, 0o755)
+    env.update(HOME=home, XDG_STATE_HOME=xdg, OOMPH_SSH=fake,   # (top.json is found by the password database's
+               OOMPH_TOP_CONFIG=os.path.join(base, "top.json"))  # home: kept here, never the owner's real one)
+    env.pop("OOMPH_MACHINES_DIR", None)
+    r = subprocess.run([PY, "-I", "-B", CLI, "remote", "add", "sam@studio", "--name", "mac-studio", "--json"],
+                       env=env, capture_output=True, text=True, timeout=60)
+    try:
+        m = json.loads(r.stdout)["machine"]
+    except (ValueError, KeyError):
+        check(False, "viewer: remote add over the stand-in ssh (%s %s)" % (r.stdout[-300:], r.stderr[-300:]))
+        return
+    where = os.path.join(xdg, "oomph") if sys.platform != "darwin" else os.path.join(home, "Library", "Application Support",
+                                                                                   "oomph")
+    mirror = os.path.join(where, "machines", m["mid"])
+    check(m.get("os") == "macos" and os.path.isfile(os.path.join(mirror, "log", "current.json")) and
+          os.path.isfile(os.path.join(where, "machines", "machines.json")),
+          "viewer: remote add keeps the Mac and its first mirror in this system's state folder (%s)"
+          % os.path.relpath(where, base))
+    r = subprocess.run([PY, "-I", "-B", CLI, "top", "--once", "--machine", "mac-studio", "--size", "100x30", "--format", "text",
+                        "--no-probe"], env=env, capture_output=True, text=True, timeout=60)
+    first = r.stdout.splitlines()[:3]
+    check(r.returncode == 0 and "mac-studio" in r.stdout and "Wired" in r.stdout and "Compressed" in r.stdout and
+          "Kernel" not in r.stdout and "mac-studio" in (first[0] if first else ""),
+          "viewer: oomph top --once --machine studio draws the Mac's mirror in a Mac's words (%s %s)"
+          % (r.returncode, (r.stderr or r.stdout)[-300:]))
+    p = Pty([PY, "-I", "-B", CLI, "top", "--no-probe", "--no-connect"], env)
+    try:
+        p.pump(8, until=b"mac-studio")
+        top_row = screen(p, 80, 24).splitlines()[0]
+        p.send("q", wait=0.2)
+        rc = p.wait(5)
+    finally:
+        p.close()
+    check("mac-studio" in top_row and rc == 0,
+          "viewer: the full-screen program has the Mac as a tab (%r, rc %s)" % (top_row, rc))
+
+
 def _lock_free(path):
     fd = os.open(path, os.O_RDWR)
     try:
@@ -1686,7 +1807,7 @@ def test_pty_engine(base):
     with open(fake, "w") as f:
         f.write("#!%s -I\nimport os, sys\nos.execv(%r, [%r, '-I', '-B', %r, 'serve', '--stdio'])\n" % (PY, PY, PY, CLI))
     os.chmod(fake, 0o755)
-    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_SSH=fake, OOMPH_TOP_TABS="1")
+    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_SSH=fake)
     r = subprocess.run([PY, "-I", "-B", CLI, "remote", "add", "sam@atlas", "--name", "atlas", "--no-mirror", "--json"],
                        env=env, capture_output=True, text=True, timeout=60)
     try:
@@ -2179,6 +2300,18 @@ def test_readonly_ssh(base):
                   % (" ".join(args[1:]), rc))
         finally:
             p.close()
+    con = {"TERM": "linux", "LANG": "C.UTF-8"}
+    check(T.detect_glyphs("auto", con) == "cp437" and T.far_glyphs("auto", con) == "unicode" and
+          T.far_glyphs("cp437", con, "cp437") == "cp437" and T.far_glyphs("cp437", con) == "unicode" and
+          T.far_glyphs("auto", {"TERM": "xterm", "LANG": "C"}) == "ascii",
+          "--ssh from a Linux console asks the far side for unicode (an oomph before 1.13.4 refuses cp437), and "
+          "for cp437 only when typed on the command line, not when top.json remembers it")
+    r = subprocess.run([PY, "-I", "-B", CLI, "top", "--once", "--from-ssh", "--glyphs", "braille", "--size", "40x10",
+                        "--format", "text"], env=env, capture_output=True, text=True, timeout=30)
+    r2 = subprocess.run([PY, "-I", "-B", CLI, "top", "--once", "--glyphs", "braille", "--size", "40x10"], env=env,
+                        capture_output=True, text=True, timeout=30)
+    check(r.returncode == 0 and r2.returncode == 2, "a far side takes a newer viewer's --glyphs as auto; typed here, "
+                                                    "an unknown --glyphs still exits 2 (rc %s, %s)" % (r.returncode, r2.returncode))
     p = Pty([PY, "-I", "-B", CLI, "top", "--no-probe", "--ssh", "build-box"],
             dict(env, OOMPH_STATE_DIR="/usr/oomph-not-ours", FAKE_SSH_RC="0"))
     try:
@@ -2425,6 +2558,9 @@ def main():
     test_mirror_gaps()
     test_connect_rows()
     test_machine_rows()
+    test_linux_desktop_rows()
+    test_linux_server_rows()
+    test_linux_live()
     base = tempfile.mkdtemp(prefix="oomph-toptest-")
     try:
         test_pty(os.path.join(base, "pty"))
@@ -2437,6 +2573,7 @@ def main():
         test_children(os.path.join(base, "children"))
         test_machines_units(os.path.join(base, "units"))
         test_pty_machines(os.path.join(base, "machines"))
+        test_viewer(os.path.join(base, "viewer"))
         test_pty_engine(os.path.join(base, "engine"))
     finally:
         shutil.rmtree(base, ignore_errors=True)

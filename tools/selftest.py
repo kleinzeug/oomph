@@ -2809,6 +2809,10 @@ for i in range(60):
              top_gpu=[{"pid": 2, "name": "WindowServer", "gpu": 5.0}])
     seq3.append(x)
 sm = oomph.summarize(seq3, [])
+lx = [dict(seq3[0], os="linux", ram_gb=32.0, app_gb=20.0, wired_gb=2.0, compressed_gb=0.0), dict(seq3[1], os="linux", ram_gb=None),
+      {k: v for k, v in dict(seq3[2], os="linux").items() if k != "ram_gb"}]
+check(oomph.summarize(lx, []).get("min_available_gb") == 10.0,
+      "summary: a Linux sample without a RAM figure after a good one leaves the least available as it was")
 olds = [{k: v for k, v in x.items() if k not in ("cpu", "gpu", "disks", "top_cpu", "top_gpu", "top_io")} for x in seq3]
 so = oomph.summarize(olds, [])
 check(sm["max_cpu_busy"] == 11.0 and sm["cpu_n"] == 14 and sm["max_gpu_busy"] == 84.0 and sm["max_gpu_util"] == 36.0 and

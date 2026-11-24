@@ -145,7 +145,8 @@ jobs:
           # the connect popover (1.10.2): links, codes, addresses and its messages, as the CLI reads them
           /usr/bin/python3 -I -B tools/connectvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
           # a Linux tab (1.13.3, behind machinesUI): the tile matrix, kills, quiet incidents and remedies, held to the
-          # logger's samples and the gate's rules (no Wired, no Idle 0 s, no biggest app)
+          # logger's samples and the gate's rules (no Wired, no Idle 0 s, no biggest app); from 1.13.4 (L3) also the
+          # legend's series and texts, the capsule's tooltip, the hover card's lines, the callout and the tour
           /usr/bin/python3 -I -B tools/linuxvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
 
       - name: Renders repeat themselves
@@ -201,6 +202,14 @@ jobs:
               --fixture "$RUNNER_TEMP/lfx-$v" --ai remedy -aiOn NO -machinesUI YES -resourcesUI NO \
               -selectedMachine m-3f9c1a7e5b2d4c10 -lastSeenIncident 99999999-999999
             test -s "$RUNNER_TEMP/linux-$v.png"
+          done
+          # its hover card, the tour and the biggest groups in Linux words (1.13.4, L3), still behind machinesUI
+          for st in hover:395 tour:1 tour:3 top; do
+            png="$RUNNER_TEMP/linux-$(printf %s "$st" | tr : -).png"
+            "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" --render-popup "$png" \
+              --fixture "$RUNNER_TEMP/lfx-server" --ai "$st" -aiOn NO -machinesUI YES -resourcesUI NO \
+              -selectedMachine m-3f9c1a7e5b2d4c10 -lastSeenIncident 99999999-999999
+            test -s "$png"
           done
           # and under layout C (resourcesUI on, gap G3): the four tiles with Linux words, the remedy in their place
           for v in server denied; do

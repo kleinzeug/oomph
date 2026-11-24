@@ -45,12 +45,12 @@ CHART_EVENTS = 5000         # the inspector keeps the newest this many (the budg
 INCIDENTS_SHOWN = 30
 INCIDENT_ID = re.compile(r"\d{8}-\d{6}$")
 CHOICES = {"--color": ("auto", "truecolor", "256", "16", "never"), "--theme": ("auto", "dark", "light"),
-           "--glyphs": ("auto", "unicode", "cells", "ascii")}
+           "--glyphs": ("auto", "unicode", "cells", "ascii", "cp437")}
 LIVE_S, LIVE_KEEP = 30, 720  # no logger: measure every 30 s as the logger would (about 60 ms each), keep 6 h
 ROOT_LEDGER_S = 30          # under sudo the reservations lag by up to this (04 §4.10)
 CELLS_TERMINALS = ()        # TERM_PROGRAM values that seam at their default profile (04 §8): none so far
 USAGE = ("usage: oomph top [--span inf|24h|6h|1h] [--color auto|truecolor|256|16|never] [--theme auto|dark|light]\n"
-         "                 [--glyphs auto|unicode|cells|ascii] [--bell | --no-bell] [--mouse | --no-mouse] [--no-probe]\n"
+         "                 [--glyphs auto|unicode|cells|ascii|cp437] [--bell | --no-bell] [--mouse | --no-mouse] [--no-probe]\n"
          "                 [--machine NAME] [--no-connect] [--ssh [USER@]HOST [--ssh-port N]]\n"
          "                 [--once [--size COLSxROWS] [--format text|ansi|golden] [--now UNIXTIME]]")
 
@@ -280,13 +280,66 @@ def readings(s):
            for x in _list(s.get("top"))[:25] if isinstance(x, dict)]
     a = s.get("away") if isinstance(s.get("away"), dict) else {}
     ram, app, wired, comp = (_num(s.get(k)) for k in ("ram_gb", "app_gb", "wired_gb", "compressed_gb"))
-    return dict(app=app, comp=comp, wired=wired, swap=_num(s.get("swap_used_gb")), swap_total=_num(s.get("swap_total_gb")),
-                ram=ram, disk=_num(s.get("disk_free_gb")),
-                idle=None if _num(a.get("idle_s"), None) is None else int(a["idle_s"]),  # None: not known (Linux)
-                display_on=a.get("display_on") if isinstance(a.get("display_on"), bool) else None,
-                pressure=pressure, free=max(0.0, ram - app - wired - comp),
-                unowned=s.get("unowned_gb") if isinstance(s.get("unowned_gb"), (int, float)) else None,
-                procs=int(_num(s.get("procs"), 0)) or None, groups=groups, claude=claude, top=top)
+    out = dict(app=app, comp=comp, wired=wired, swap=_num(s.get("swap_used_gb")), swap_total=_num(s.get("swap_total_gb")),
+               ram=ram, disk=_num(s.get("disk_free_gb")),
+               idle=None if _num(a.get("idle_s"), None) is None else int(a["idle_s"]),  # None: not known (Linux)
+               display_on=a.get("display_on") if isinstance(a.get("display_on"), bool) else None,
+               pressure=pressure, free=max(0.0, ram - app - wired - comp),
+               unowned=s.get("unowned_gb") if isinstance(s.get("unowned_gb"), (int, float)) else None,
+               procs=int(_num(s.get("procs"), 0)) or None, groups=groups, claude=claude, top=top)
+    if s.get("os") == "linux":
+        out["linux"] = linux_facts(s)
+    return out
+
+
+def linux_facts(s):
+    """What a Linux machine's frame says in its own words (03 §3.9, T3), from its sample and the machine block
+    the logger puts in it: the facts the tiles follow (its kind, whether stall time is measured, whether memory
+    is compressed there, zram as the only swap, a container's limit, whether the logger sees every process) and
+    the figures they show (as LinuxTab in the app; tools/linuxvectors.py holds the two together)."""
+    d = s.get("daemon") if isinstance(s.get("daemon"), dict) else {}
+    m = d.get("machine") if isinstance(d.get("machine"), dict) else {}
+    if not m and s.get("source") == "live":     # no logger: this machine's own block, as the logger would put it
+        m = live_machine() or {}
+    ms = m.get("measures") if isinstance(m.get("measures"), dict) else {}
+    p = s.get("psi") if isinstance(s.get("psi"), dict) else {}
+    lim = p.get("limit") if isinstance(p.get("limit"), dict) else {}
+    sc = s.get("scope") if isinstance(s.get("scope"), dict) else {}
+    lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+    zram, zswap = ms.get("zram") is True, ms.get("zswap") is True
+
+    def pct(x, default=None):       # a share in %: a mirror's file is another machine's, so bounded here
+        v = _num(x, None)
+        return default if v is None else min(max(v, 0.0), 100.0)
+    some = pct(p.get("mem_some"))
+    f = dict(desktop=m.get("kind") in ("desktop", "laptop"), psi=ms.get("psi") is not False and some is not None,
+             some=some, full=pct(p.get("mem_full"), 0.0), comp=zram or zswap,
+             limit=pct(lim.get("some"), 0.0), limit_who=next((str(c)[:64] for c in _list(lim.get("cgroups"))), None),
+             cgroup=sc.get("kind") == "cgroup", host=_num(sc.get("host_ram_gb"), None),
+             all_procs=d.get("all_procs") is not False and ms.get("all_procs") is not False,
+             free_pct=pct(s.get("free_pct")), kills=ms.get("kills") if isinstance(ms.get("kills"), str) else None)
+    f["swapfiles"] = int(min(max(_num(s.get("swapfiles"), 0), 0), 999))   # (the legend's Swap: as LinuxTab.Facts)
+    f["zram_only"] = zram and not zswap and not f["swapfiles"] and _num(s.get("swap_total_gb")) < 0.05
+    if f["zram_only"] and all(_num(lx.get(k), None) is not None for k in ("zram_disk_gb", "kswap_total_gb", "kswap_free_gb")):
+        f["zram"] = (max(0.0, lx["kswap_total_gb"] - lx["kswap_free_gb"] - _num(s.get("swap_used_gb"))), lx["zram_disk_gb"])
+    return f
+
+
+_LIVE_MACHINE = []
+
+
+def live_machine():
+    """This Linux machine's `machine` block (oomph_linux.machine: its kind, what it measures), for a live sample
+    when no logger runs: read once per run (it does not change while oomph top runs). None elsewhere."""
+    if not _LIVE_MACHINE:
+        m = None
+        if sys.platform.startswith("linux"):
+            try:
+                m = oomph.plat().machine()
+            except Exception:
+                m = None
+        _LIVE_MACHINE.append(m if isinstance(m, dict) else None)
+    return _LIVE_MACHINE[0]
 
 
 def _card_summary(summ):
@@ -1462,14 +1515,24 @@ def detect_theme(opt, env):
 
 
 def detect_glyphs(opt, env):
-    if opt in ("unicode", "cells", "ascii"):
+    if opt in ("unicode", "cells", "ascii", "cp437"):
         return opt
     loc = env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG") or ""
     if loc and "UTF-8" not in loc.upper().replace("UTF8", "UTF-8"):
         return "ascii"
+    if env.get("TERM") == "linux":      # the Linux console: its font has no eighth blocks (04 §3.11, T3)
+        return "cp437"
     if env.get("TERM_PROGRAM") in CELLS_TERMINALS:
         return "cells"
     return "unicode"
+
+
+def far_glyphs(opt, env, typed=None):
+    """The glyph set --ssh asks the far side for. cp437 only when typed on this command line (`typed`): an
+    oomph older than 1.13.4 refuses it (exit 2), so a detected Linux console, or cp437 remembered in
+    top.json, asks for unicode, as 1.13.3 did."""
+    g = detect_glyphs(opt, env)
+    return "unicode" if g == "cp437" and typed != "cp437" else g
 
 
 # ------------------------------------------------------------------ input: bytes → keys
@@ -2226,7 +2289,7 @@ class App:
         now = self.now()
         self.ui["detected"] = self.detected()
         if self.model is None:
-            fr = view.Frame(W, H, self.caps.glyphs == "ascii")
+            fr = view.Frame(W, H, self.caps.glyphs == "ascii", self.caps.glyphs == "cp437")
             fr.put(1, 0, "%s top: reading…" % oomph.CMD, "dim")
         else:
             m = self.at(now)
@@ -2238,7 +2301,7 @@ class App:
                 tb = traceback.format_exc()
                 if not self.readonly:
                     write_crash(state_dir(), tb)
-                fr = view.Frame(W, H, self.caps.glyphs == "ascii")
+                fr = view.Frame(W, H, self.caps.glyphs == "ascii", self.caps.glyphs == "cp437")
                 fr.put(1, 0, "%s top" % oomph.CMD, "fg", None, view.BOLD)
                 fr.put(1, 2, "can't draw this frame (%s); the details are in top-crash.log" % tb.strip().splitlines()[-1][:80],
                        "warntx")
@@ -2388,7 +2451,7 @@ class App:
                 ui.pop("overlay")
             return
         if y == 0 and m.get("tabs") and not button & 64:      # row 0: a tab, a counter, the +
-            fr = view.Frame(self.size[0], 1, self.caps.glyphs == "ascii")
+            fr = view.Frame(self.size[0], 1, self.caps.glyphs == "ascii", self.caps.glyphs == "cp437")
             view.machine_tabs(fr, m, self.caps, view.GLYPHS[self.caps.glyphs])
             for x0, x1, kind, which in fr.tab_hits:
                 if x0 <= x < x1:
@@ -3285,6 +3348,9 @@ def cmd_top(args, out=None, env=None):
         return 2
     for o, allowed in CHOICES.items():
         if opts.get(o, "auto") not in allowed:
+            if "--from-ssh" in opts:            # a newer viewer's value: auto, and named (as an option is)
+                ignored.append("%s %s" % (o, opts.pop(o)))
+                continue
             print("oomph top: %s takes %s" % (o, ", ".join(allowed)), file=sys.stderr)
             return 2
     tty = out.isatty() if hasattr(out, "isatty") else False
@@ -3393,7 +3459,7 @@ def cmd_top(args, out=None, env=None):
         remote = ["--span", span,
                   "--color", detect_color(color if color != "auto" else found.get("color", "auto"), True, env),
                   "--theme", detect_theme(theme if theme != "auto" else found.get("theme", "auto"), env),
-                  "--glyphs", detect_glyphs(glyphs, env), "--no-probe", "--from-ssh", "--bell" if bell else "--no-bell"]
+                  "--glyphs", far_glyphs(glyphs, env, opts.get("--glyphs")), "--no-probe", "--from-ssh", "--bell" if bell else "--no-bell"]
         if mouse:                                    # (a far side older than 1.9.5 names it as ignored)
             remote.append("--mouse")
         remember()
@@ -3428,13 +3494,11 @@ def cmd_top(args, out=None, env=None):
 
 def no_tabs_reason(readonly):
     """Why this run has no machine tabs, or None: they need the state folder writable and not root
-    (04 §4.10), and on Linux they come with T3 (roadmap §3.1, 1.13.2: the engine's files there)."""
+    (04 §4.10). On Linux too since 1.13.4 (T3): the engine's files are in the XDG state folder there."""
     if readonly:
         return "read-only"
     if os.geteuid() == 0:
         return "running as root"
-    if sys.platform != "darwin" and not os.environ.get("OOMPH_TOP_TABS"):
-        return "not on Linux yet"
     return None
 
 

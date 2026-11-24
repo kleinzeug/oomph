@@ -358,13 +358,23 @@ at most every 15 minutes. Other machines are tabs in it ([below](#other-machines
 oomph top                       # this Mac
 oomph top --ssh build-mac       # another Mac, over ssh: needs oomph there, nothing else
 ssh -t build-mac /usr/local/bin/oomph top   # the same by hand: sshd's PATH lacks /usr/local/bin
-oomph top --once                # one frame as text (--span, --size 100x30, --glyphs cells|ascii)
+oomph top --once                # one frame as text (--span, --size 100x30, --glyphs cells|ascii|cp437)
 ```
 
 `--glyphs cells` draws the chart with whole cells only, for a font or line spacing that shows thin
-lines between block characters; `--glyphs ascii` uses no Unicode at all. The span, `--bell`, the mouse and
+lines between block characters; `--glyphs ascii` uses no Unicode at all; `--glyphs cp437` is the
+Linux console's (`TERM=linux` picks it, with 16 colours): blocks to the half cell, square corners.
+
+On Linux (1.13.4) `oomph top` speaks the machine's words, as a Linux tab in the app does: *Kernel*
+for Wired, *Available* where nothing is compressed, *Stalled* (the stall time of the last 10 s)
+where a Mac says Idle on a server, *zram / size* where zram is the only swap, the RAM with its
+decimal or a container's *Memory limit*, the biggest *group*; the legend lists only the series the
+machine has (no Compressed without zram or zswap, no Swap without swap, no *away* on a server), the
+header says how much is *avail*able, and the inspect readout gives what was available in place of
+the peak. A remote Linux tab is drawn the same way, from wherever `oomph top` runs. The span, `--bell`, the mouse and
 a `--glyphs`, `--color` or `--theme` you give are remembered in
-`~/Library/Application Support/oomph/top.json` (`--glyphs auto` forgets the glyph set); under
+`~/Library/Application Support/oomph/top.json` on a Mac and in `$XDG_STATE_HOME/oomph/top.json`
+(`~/.local/state/oomph/top.json`) on Linux (`--glyphs auto` forgets the glyph set); under
 `sudo` the dashboard writes nothing, its reservations lag by up to 30 seconds, and it refuses
 `--ssh`. `--ssh` needs oomph 1.9.0 or newer on the other Mac and says so when it is missing or
 older.
@@ -642,8 +652,16 @@ restart oomphd`), *No access* (this account may not read its logs) or *No logger
 from a checkout there: `sudo linux/install.sh --system`; the same command opens closed logs).
 With the four resource tiles (`resourcesUI`) a Linux tab keeps them; its Memory tile says the RAM
 with its decimal, the biggest group as above and *stalled* where tasks wait for memory, and the
-remedy still stands in the tiles' place. ✦ stays hidden on a Linux tab, and the tour explains
-This Mac.
+remedy still stands in the tiles' place. From 1.13.4 the rest speaks Linux as well: the legend
+lists only the series the machine has, with Linux texts; the hover card shows what was available
+and one *Stalled* line (`28–35 % · fully 10–12 %`) in place of the Mac's peak, with at most one
+incident, two events and two reservations; the capsule's tooltip gives the level in Linux terms
+("Stalled on memory 14 % (fully 3 %) over the last 10 s. 2.7 GB available; zram 76 % full.");
+the callout is *Biggest groups now*; the tour explains the Linux tab. `oomph report`, `oomph html`
+and `oomph ai-report` on a Linux machine's logs speak Linux too: what is available and the stall
+time per step, Kernel, groups, OOM kills, and a system prompt for the model that explains the OOM
+killer, stall time and containers at their own limit instead of jetsam (the machine must still
+allow it there: `sudo oomph share ai on`).
 
 With the switch on (1.10.2), a **+** sits on the line under the header (at the end of the tabs
 once there are some). It opens a popover: type an address, a name or `user@host`, or paste the
@@ -674,8 +692,13 @@ connection per machine, and either can quit without the other going stale. `ctrl
 the connections until `fg`. `--machine NAME` starts on that tab (otherwise it is the tab of the
 last run, unless this machine has something to say: critical pressure, an open incident or a
 silent logger), and `--no-connect` shows the mirrors without connecting (`oomph top --ssh host`
-always runs so on the far side); `oomph top --once --machine NAME` prints that tab's frame. On a Mac for now:
-a Linux machine becomes a viewer in a later release.
+always runs so on the far side); `oomph top --once --machine NAME` prints that tab's frame.
+
+**A Linux machine is a viewer too** (1.13.4): `oomph remote add user@mac` there adds a Mac (or
+another Linux machine) over ssh, and `oomph top` shows it as a tab, in that machine's own words.
+Its mirrors are kept in `$XDG_STATE_HOME/oomph/machines` (`~/.local/state/oomph/machines`). Linux
+opens no port of its own: other machines watch it over ssh (the rest of `oomph share` is macOS's;
+`sudo oomph share ai on` works on both).
 
 ## Files
 

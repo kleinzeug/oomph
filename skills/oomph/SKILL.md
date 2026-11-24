@@ -265,4 +265,5 @@ session's own work.
   pressure was most likely killed by it. Where the machine's logger is installed
   (`oomph doctor` says "logger running"), `oomph incidents` and `oomph incident latest`
   name what was killed and when; kills of a container at its own memory limit are quiet
-  incidents (`oomph incidents --all`).
+  incidents (`oomph incidents --all`). A Linux summary also carries `min_available_gb` (the
+  least available) and `max_stall_pct` (the most stall time).

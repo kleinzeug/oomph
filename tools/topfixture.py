@@ -262,7 +262,9 @@ def write_fixture(d, scenario):
     """One machine's log and ledger directories for a scenario: default, critical, silent (the
     logger stopped at 13:02), fresh (a first run: 14 minutes of history, nothing on record), hostile
     (text that must not reach the terminal as it is), resources (the default week with the other
-    resources in every sample and agents on the reservations: 1.11.0's four resources)."""
+    resources in every sample and agents on the reservations: 1.11.0's four resources); linux-server (the
+    same week as a Linux server with no compressed memory: Kernel, Available, stall time, groups, an OOM
+    kill; T3) and linux-desktop (a Linux laptop whose only swap is zram)."""
     log, led = os.path.join(d, "log"), os.path.join(d, "ledger")
     os.makedirs(log)
     os.makedirs(led)
@@ -306,12 +308,25 @@ def write_fixture(d, scenario):
                             {"pid": 413, "name": "WindowServer", "g": "WindowServer", "gpu": 6.2}],
                    top_io=[{"pid": 2215, "name": "python", "g": "python", "w": 71.0}, {"pid": 1201, "name": "OrbStack Helper",
                                                                                      "g": "OrbStack", "w": 12.4}])
+    if scenario.startswith("linux"):
+        linuxify(pts, cur, desktop=scenario == "linux-desktop")
+        # (the samples again: a Linux machine's, every day's file rewritten)
+        for day, ps in sorted(by_day.items()):
+            text = "".join(json.dumps(p, separators=(",", ":")) + "\n" for p in ps).encode()
+            if day == today:
+                with open(os.path.join(log, "samples-%s.jsonl" % day), "wb") as f:
+                    f.write(text)
+            else:
+                with gzip.GzipFile(os.path.join(log, "samples-%s.jsonl.gz" % day), "wb", mtime=0) as f:
+                    f.write(text)
     if scenario == "hostile":
         cur["groups"][0]["name"] = "\x1b[2J\x1b[Hevil\x07 app"
         cur["groups"][1]["name"] = "\u202eppA dooG"
     with open(os.path.join(log, "current.json"), "w") as f:
         json.dump(cur, f)
-    events = list(EVENTS)
+    events = list(EVENTS) if not scenario.startswith("linux") else \
+        [e for e in EVENTS if e[1] not in ("jetsam", "unowned_memory")] + [(T(19, 14, 24), "oom_kill", {"kills": 2, "cgroup": 0, "ooms": 2,
+                                                                                "by": {"kernel": 2}, "top": {"java": 2}})]
     if crisis:
         events += [(T(20, 13, 24), "pressure_change", {"old": 2, "new": 4}), (T(20, 13, 23), "jetsam", {"kills": 3})]
     with open(os.path.join(log, "events.jsonl"), "w") as f:
@@ -338,6 +353,43 @@ def write_fixture(d, scenario):
         with open(os.path.join(led, "ledger.json"), "w") as f:
             json.dump(ledger, f)
     return log, led
+
+
+def linuxify(pts, cur, desktop=False):
+    """The week as a Linux machine's (03 §6.1, §3.9): `os`, stall time from PSI (high while it swapped), the
+    machine block with what it measures; a server compresses nothing (its compressed series is folded into app
+    memory), a desktop's only swap is zram. In place."""
+    for p in pts:
+        if not desktop:
+            p["app_gb"] = round(p["app_gb"] + p["compressed_gb"] * 0.4, 2)
+            p["compressed_gb"] = 0.0
+            p["away"] = {"idle_s": None, "display_on": None, "locked": False}
+        p["os"] = "linux"
+        sw = p["swap_used_gb"]
+        p["psi"] = {"mem_some": round(min(60.0, sw * 6.5), 1), "mem_full": round(min(30.0, sw * 2.0), 1)}
+    last = pts[-1]
+    cur.update(os="linux", app_gb=last["app_gb"], compressed_gb=last["compressed_gb"], psi=dict(last["psi"], mem_some=2.4,
+                                                                                               mem_full=0.3),
+               away=last["away"], cached_gb=14.2, free_gb=3.1, free_pct=36, unowned_gb=None,
+               groups=[{"name": n, "mb": int(gb * 1024), "n": k} for n, gb, k in LINUX_GROUPS],
+               top=[{"pid": pid, "ppid": 1, "name": n, "uid": 1000, "mb": mb, "g": g, "s": ses}
+                    for pid, n, mb, g, ses in LINUX_PROCS])
+    cur.pop("unowned_gb")
+    cur["daemon"] = dict(cur["daemon"], version="1.13.4", root=False, all_procs=True,
+                         machine={"os": "linux", "kind": "laptop" if desktop else "server",
+                                  "measures": {"psi": True, "zram": desktop, "zswap": False, "kills": "journal",
+                                               "all_procs": True}})
+    if desktop:
+        cur.update(swap_total_gb=0.0, swap_used_gb=0.0, swapfiles=0,
+                   linux={"avail_gb": 12.0, "kswap_total_gb": 8.0, "kswap_free_gb": 5.6, "zram_disk_gb": 8.0})
+    else:
+        cur.update(swap_total_gb=8.0, swapfiles=1)
+
+
+LINUX_GROUPS = [("docker:3f9c1a7e (postgres)", 6.8, 9), ("node", 3.4, 22), ("java", 2.6, 1),
+                ("user@1000.service", 1.5, 41), ("systemd-journald", 0.2, 1)]
+LINUX_PROCS = [(2211, "postgres", 4120, "docker:3f9c1a7e (postgres)", None), (640, "claude", 980, "node", 640),
+               (651, "java", 2660, "java", 640), (3120, "node", 1310, "node", None)]
 
 
 # ------------------------------------------------------------------ machines (T2: 04 §3.7, from 01's formats)
@@ -527,6 +579,16 @@ FRAMES = [
     # with the CPU's plot and the others as sparklines, from 30 rows (04 §3.14, 02 §3.7.12)
     ("80x24-resources", "resources", 80, 24, "24h", "256", "unicode", "dark", "golden", "C"),
     ("80x32-resources-cpu", "resources", 80, 32, "6h", "256", "unicode", "dark", "golden", "c M G D"),
+    # T3 (1.13.4): a Linux server in its own words (Kernel, Available, stall time, groups) on the Linux console
+    # (16 colours, the cp437 glyphs); the same server in 256 colours and a laptop whose only swap is zram are held
+    # to row rules (ROW_FRAMES: 04 §10 closes the list of goldens)
+    ("80x24-linux-console", "linux-server", 80, 24, "24h", "16", "cp437", "dark", "golden"),
+]
+# frames drawn as the goldens are, held to row expectations in tools/toptest.py instead of a file
+ROW_FRAMES = [
+    ("80x24-linux-server", "linux-server", 80, 24, "24h", "256", "unicode", "dark", "rows"),
+    ("100x30-linux-desktop", "linux-desktop", 100, 30, "6h", "256", "unicode", "dark", "rows",
+     "i shift-left shift-left shift-left"),
 ]
 
 
@@ -560,20 +622,22 @@ def press_keys(model, w, h, span, keys):
     return ui
 
 
-def frames(base):
-    """{name: (text, frame)} for every golden frame, from fixtures written under `base`."""
+def frames(base, which=None):
+    """{name: (text, frame)} for every golden frame (or those of `which`, e.g. ROW_FRAMES), from fixtures written
+    under `base`."""
     import oomph
     import oomph_top
     import oomph_view as view
     dirs, out = {}, {}
-    for name, scen, w, h, span, color, glyphs, theme, fmt, *keys in FRAMES:
+    for name, scen, w, h, span, color, glyphs, theme, fmt, *keys in (FRAMES if which is None else which):
         if scen not in dirs:
             dirs[scen] = write_fixture(os.path.join(base, scen), scen)
         log, led = dirs[scen]
         oomph.LEDGER_DIR = led
         model = oomph_top.load_model(span, NOW, log_dir=log, live=False,
                                      rv={"sel": ["memory"], "focus": "memory"} if scen == "resources" else None)
-        model.update(host=HOST if scen != "hostile" else "st\x1b[2Judio\u202e", os=OS)
+        model.update(host=HOST if scen != "hostile" else "st\x1b[2Judio\u202e", os=OS if not scen.startswith("linux") else
+                     "Linux 6.8.0")
         caps = view.Caps(color, glyphs, theme)
         fr = view.render(model, w, h, caps, press_keys(model, w, h, span, keys[0] if keys else None))
         if fmt == "golden":
@@ -582,6 +646,8 @@ def frames(base):
         else:
             text = fr.ansi(caps)
         out[name + "." + ("golden" if fmt == "golden" else "ans")] = (text, fr)
+    if which is not None:
+        return out
     import oomph_sync  # noqa: F401  (the machine frames need oomph remote's formats)
     for name, mid, w, h, span, glyphs, ov, more in MACHINE_FRAMES:
         fr = machine_frame(base, dirs, mid, w, h, span, glyphs, ov, more)

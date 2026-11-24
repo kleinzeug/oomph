@@ -3,7 +3,7 @@
 
   oomph status
   oomph report [--last 2h | --since ISO [--until ISO]]
-  oomph top [--span inf|24h|6h|1h] [--glyphs unicode|cells|ascii] [--bell]
+  oomph top [--span inf|24h|6h|1h] [--glyphs unicode|cells|ascii|cp437] [--bell]
                                      the popup's dashboard, full screen (? lists its keys)
   oomph top --ssh [USER@]HOST       the same on another Mac or Linux machine, over ssh
   oomph top --once [--size 80x24]   one frame of it, as text
@@ -635,6 +635,14 @@ def _fin(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
 
 
+def available_gb(s):
+    """What is available on a Linux machine (03 §3.9, the canonical figure): RAM less app, kernel and
+    compressed memory; None where the sample has no RAM figure."""
+    if not _fin(s.get("ram_gb")):
+        return None
+    return max(0.0, s["ram_gb"] - sum(s[k] for k in ("app_gb", "wired_gb", "compressed_gb") if _fin(s.get(k))))
+
+
 def cpu_busy(s):
     """(cores busy, cores) of a sample, or None: a sample before 1.9.1, or the first after a gap."""
     c = s.get("cpu")
@@ -695,6 +703,7 @@ class _Summary:
     def __init__(self):
         self.n = self.kills = self.away = 0
         self.cg_kills = None  # Linux: victims at a cgroup's own limit (03 §6.3)
+        self.avail = self.psi = None  # Linux: the least available, the most stall time (03 §3.9, L3)
         self.first = self.last = self.peak = self.onset = None
         self.swap = self.swap_total = self.disk = self.used = self.unowned = self.stall = None
         self.groups, self.top = _Risers("groups"), _Risers("top")
@@ -715,6 +724,13 @@ class _Summary:
         self.kills += s.get("jetsam_kills", 0)
         if isinstance(s.get("cgroup_kills"), int):
             self.cg_kills = (self.cg_kills or 0) + s["cgroup_kills"]
+        if s.get("os") == "linux":
+            av = available_gb(s)
+            if av is not None:
+                self.avail = _less(self.avail, av)
+            p = s.get("psi") if isinstance(s.get("psi"), dict) else {}
+            if _fin(p.get("mem_some")):
+                self.psi = _more(self.psi, p["mem_some"])
         self.away += is_away(s)
         self.swap = _more(self.swap, s.get("swap_used_gb", 0))
         self.swap_total = _more(self.swap_total, s.get("swap_total_gb", 0))
@@ -795,6 +811,8 @@ class _Summary:
             "group_risers": self.groups.result(),
             "process_risers": self.top.result(),
             **({"cgroup_kills": self.cg_kills, "oom_victims": victims} if self.cg_kills is not None else {}),
+            **({"min_available_gb": round(self.avail, 1)} if self.avail is not None else {}),
+            **({"max_stall_pct": self.psi} if self.psi is not None else {}),
             **self._resources()
         }
 
@@ -1139,9 +1157,18 @@ class _View:
     def __init__(self, key, a, b):
         self.key, self.a, self.b = key, a, b
         self.n, self.t0, self.t1, self.peaks = 0, None, None, {}
+        # a Linux machine's words (03 §3.9, L3): Kernel, only the series it has shown, no "away" where no one sits
+        self.lin = self.comp = self.swap = self.presence = False
 
     def count(self, s):
         self.n += 1
+        if s.get("os") == "linux":
+            self.lin = True
+            self.comp = self.comp or (s.get("compressed_gb") or 0) > 0
+            self.swap = self.swap or any(_fin(s.get(k)) and s[k] > 0       # as LinuxTab.Facts and oomph top
+                                         for k in ("swap_total_gb", "swap_used_gb", "swapfiles"))
+            a = s.get("away") if isinstance(s.get("away"), dict) else {}
+            self.presence = self.presence or a.get("idle_s") is not None or a.get("display_on") is not None
         if self.t0 is None:
             self.t0 = s["t"]
         self.t1 = s["t"]
@@ -1308,15 +1335,18 @@ def _view_html(view, events, meta, key, t0, t1):
              for e in events if e.get("kind") in ("incident_open", "incident_close") and not e.get("quiet")]
     bands = view.bands
     draw = view.draw
-    mem_series = [("wired", lambda s: s.get("wired_gb"), "var(--c-wired)"),
+    lin = view.lin
+    mem_series = [("kernel" if lin else "wired", lambda s: s.get("wired_gb"), "var(--c-wired)"),
                   ("app memory", lambda s: s.get("app_gb"), "var(--c-app)"),
                   ("compressed", lambda s: s.get("compressed_gb"), "var(--c-comp)"),
                   ("swap used", lambda s: s.get("swap_used_gb"), "var(--c-swap)")]
+    if lin:  # only the series this machine has shown (03 §3.9): no Compressed without zram or zswap, no Swap without swap
+        mem_series = [x for x in mem_series if (x[0] != "compressed" or view.comp) and (x[0] != "swap used" or view.swap)]
     ram = summ["ram_gb"]
     colors = ["var(--k1)", "var(--k2)", "var(--k3)", "var(--k4)", "var(--k5)"]
     grp_series = [(n, (lambda s, i=i: s["g"][i]), c) for i, (n, c) in enumerate(zip(view.top5, colors))]
     if len(view.peaks) > len(view.top5):
-        grp_series.append(("other recorded apps", lambda s: s["rest"], "var(--k6)"))
+        grp_series.append(("other recorded groups" if lin else "other recorded apps", lambda s: s["rest"], "var(--k6)"))
     disk_series = [("free disk GB", lambda s: s.get("disk_free_gb"), "var(--k3)"),
                    ("swap total GB", lambda s: s.get("swap_total_gb"), "var(--c-swap)")]
     o = summ.get("onset") or {}
@@ -1328,6 +1358,13 @@ def _view_html(view, events, meta, key, t0, t1):
           (summ.get("max_unowned_gb") or 0) >= unowned_limit_gb(summ.get("ram_gb"))),
          ("Away during window", "%d%%" % round(100 * summ["away_fraction"]), False),
          ("Idle at onset", ("%d min" % (o["idle_s"] // 60)) if o.get("idle_s") is not None else "–", False)]
+    if lin:  # 03 §3.9: what is available and the stall time; away only where someone sits; no unowned memory
+        ram_ = summ.get("ram_gb") or 0
+        k = [x for x in k if x[0] != "Max unowned memory" and (view.presence or x[0] not in ("Away during window", "Idle at onset"))]
+        av = summ.get("min_available_gb")
+        k.insert(3, ("Least available", "%.1f GB" % av if av is not None else "–", av is not None and ram_ and av < 0.05 * ram_))
+        if summ.get("max_stall_pct") is not None:
+            k.insert(4, ("Most stalled on memory", "%.1f %%" % summ["max_stall_pct"], summ["max_stall_pct"] >= 10))
     if summ.get("max_stall_s"):
         k.append(("Longest stall (awake)", "%d s" % summ["max_stall_s"], summ["max_stall_s"] >= 60))
     if summ.get("max_cpu_busy") is not None:
@@ -1348,7 +1385,7 @@ def _view_html(view, events, meta, key, t0, t1):
         '<div class="kpis %s">%s</div>' % (cls, kpis),
         '<div class="%s"><h2>System memory (stacked) vs. RAM</h2><div class=card>%s</div>' % (cls, _svg_chart(
             draw, mem_series, True, marks, bands, refline=ram, bars=(lambda s: s.get("jetsam_kills"), "var(--bad)"), **rng)),
-        "<h2>Top 5 apps / process groups (GB, stacked)</h2><div class=card>%s</div>" % _svg_chart(
+        "<h2>%s (GB, stacked)</h2><div class=card>%%s</div>" % ("Top 5 groups" if lin else "Top 5 apps / process groups") % _svg_chart(
             draw, grp_series, True, marks, bands, **rng),
         "<h2>Free disk and swap size (GB)</h2><div class=card>%s</div>" % _svg_chart(
             draw, disk_series, False, marks, bands, height=160, **rng),
@@ -1470,6 +1507,7 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
             if v.a <= s["t"] <= v.b:
                 v.count(s)
     meta, users, sessions = fold.result()
+    lin = any(v.lin for v in prep)
     for v in prep:
         v.start(meta)
     for s in samples:
@@ -1512,8 +1550,8 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
         intro_html,
         "".join(heads[:1]) + "".join(heads[1:]),
         reasons_html,
-        '<div class=hrow><h2>Biggest risers — apps</h2><div class=ctl>%s</div></div>'
-        '<div class=card><div id=r-apps></div></div>' % seg("r-apps"),
+        '<div class=hrow><h2>Biggest risers — %s</h2><div class=ctl>%s</div></div>'
+        '<div class=card><div id=r-apps></div></div>' % ("groups" if lin else "apps", seg("r-apps")),
         '<div class=hrow><h2>Biggest risers — processes</h2><div class=ctl>%s</div></div>'
         '<div class=card><div id=r-procs></div></div>' % seg("r-procs"),
         "".join(tails),
@@ -2106,7 +2144,12 @@ def cmd_report(args):
         return 1
     span = samples[-1]["t"] - samples[0]["t"]
     bucket = max(60, int(span / 36 // 60 * 60) or 60)
-    print("%-8s %-8s %6s %6s %6s %6s %5s %4s  %s" % ("time", "pressure", "app", "compr", "swap", "disk", "kills", "away", "biggest app"))
+    lin = samples[-1].get("os") == "linux"   # 03 §3.9 (L3): what is available and the stall time, groups
+    if lin:
+        print("%-8s %-8s %6s %6s %6s %6s %5s %6s  %s" % ("time", "level", "app", "avail", "swap", "disk", "kills", "stall",
+                                                       "biggest group"))
+    else:
+        print("%-8s %-8s %6s %6s %6s %6s %5s %4s  %s" % ("time", "pressure", "app", "compr", "swap", "disk", "kills", "away", "biggest app"))
     cur, rows = None, []
     for s in samples:
         b = int(s["t"] // bucket)
@@ -2119,13 +2162,21 @@ def cmd_report(args):
         worst = max(r, key=lambda s: (s.get("pressure", 0), s.get("swap_used_gb", 0)))
         g = (worst.get("groups") or [{}])[0]
         size = " %.1fG" % (g.get("mb", 0) / 1024)
+        if lin:
+            st = [x["psi"]["mem_some"] for x in r if isinstance(x.get("psi"), dict) and _fin(x["psi"].get("mem_some"))]
+            print("%-8s %-8s %6.1f %6.1f %6.1f %6.0f %5d %6s  %s%s" % (
+                datetime.datetime.fromtimestamp(r[0]["t"]).strftime("%H:%M"), PRESSURE.get(worst.get("pressure", 0)),
+                worst["app_gb"], available_gb(worst) or 0, worst["swap_used_gb"], worst["disk_free_gb"],
+                sum(s.get("jetsam_kills", 0) for s in r), "%.1f%%" % max(st) if st else "–",
+                fit_group(term_text(g.get("name", "")), w - 60 - len(size)), size))
+            continue
         print("%-8s %-8s %6.1f %6.1f %6.1f %6.0f %5d %4s  %s%s" % (
             datetime.datetime.fromtimestamp(r[0]["t"]).strftime("%H:%M"), PRESSURE.get(worst.get("pressure", 0)),
             worst["app_gb"], worst["compressed_gb"], worst["swap_used_gb"], worst["disk_free_gb"],
             sum(s.get("jetsam_kills", 0) for s in r), "yes" if any(is_away(s) for s in r) else "",
             fit_group(term_text(g.get("name", "")), w - 58 - len(size)), size))
     summ = summarize(samples, events)
-    for title, key in (("apps", "group_risers"), ("processes", "process_risers")):
+    for title, key in (("groups" if lin else "apps", "group_risers"), ("processes", "process_risers")):
         print("\nbiggest risers (%s):" % title)
         for x in summ[key][:8]:
             print("  +%6d MB  %-*s peak %d MB at %s" % (x["rise_mb"], w - 56, fit_group(term_text(x["name"]), w - 56),
