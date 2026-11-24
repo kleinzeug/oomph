@@ -9,9 +9,14 @@ process next to this checkout's, on one ledger directory, in both directions:
      memory, agent keys, users, scopes, sessions, "grant" records, the outcomes "refused" and
      "volume_gone"): it does not fail, keeps every field it does not know, and what it writes
      there (an end without the newer fields) still reads as a vector through the merging reader.
-  B  this code on the same ledger: it keeps every v2 field and the lease without memory, grants
-     no vector request and lets no request pass one, writes the vector into the end of a vector
-     lease, and 1.8.1 reads all it wrote and tells the same outcomes.
+  B  this code on the same ledger: it keeps every v2 field and the lease without memory, weighs the
+     vector requests pool by pool (B1, 1.12.0: cores granted from what can be reserved, the memory
+     requests behind passing), writes a grant record and the vector into the end of a vector lease,
+     and 1.8.1 reads all it wrote and tells the same outcomes. Then old code on what this code wrote
+     (02 §9.3, §13): a cores request that 1.8.1 granted by its gb is back in the queue after the next
+     evaluation here, a lease without `v` that 1.8.1 granted stays granted, and (with the tag
+     v1.11.2, the readers of B0) an old client's request stuck behind a vector request that waits
+     for cores is granted by the next refresh.
   A2 1.9.1 (1.8.4 to 1.9.1 validate leases) on the same v2 ledger, when the tag is in this clone: it
      keeps the v2 fields but drops a lease without memory (gb 0) and the `res` of each segment when
      it writes; pinned, for B1. (CI clones have tags up to v1.8.4 only: A2 runs locally.)
@@ -87,12 +92,14 @@ DEAD = p.pid
 PROCS = {ME: {"pid": ME, "ppid": 1, "uid": os.getuid(), "name": "python3", "start": START, "fp": 0, "rss": 0,
               "path": sys.executable}}
 SAMPLE = {"t": time.time(), "ram_gb": 64.0, "app_gb": 20.0, "wired_gb": 4.0, "compressed_gb": 2.0, "pressure": 1,
-          "disk_free_gb": 200.0, "swap_used_gb": 0.0, "swap_total_gb": 0.0, "os": "macos"}
+          "disk_free_gb": 200.0, "swap_used_gb": 0.0, "swap_total_gb": 0.0, "os": "macos",
+          "cpu": {"n": 14, "busy": 2.0}}  # 14 cores, 2 of them kept back: 12 can be reserved
 HOLDER = {"pid": ME, "start": START, "kind": "session", "project": "/work/atlas"}
 
 
 class Procs:
     OS = "macos"
+    RESERVES_CPU = True      # cores can be reserved here (B1)
 
     @staticmethod
     def collect_procs():
@@ -101,6 +108,10 @@ class Procs:
     @staticmethod
     def is_agent(p):
         return p.get("name") == "claude"
+
+    @staticmethod
+    def cpu_ticks():  # it reads its cores' ticks: cores can be reserved here (B1); the numbers are SAMPLE's
+        return None
 
 
 old._oomphd = Procs          # 1.8.1 asks oomphd for the process table
@@ -304,14 +315,20 @@ d = use("b")
 want = plant_v2(d)
 st = quietly(new.reserve, 0.5, "new client", HOLDER)
 L1 = raw(d)
-check(isinstance(st, dict) and st.get("status") == "queued" and st.get("position") == 3,
-      "B a request queues behind the vector request it cannot weigh (%s)" % (st.get("status") if isinstance(st, dict)
-                                                                             else repr(st)))
-check(lease(L1, "r2")["state"] == "queued" and lease(L1, "r3")["state"] == "queued",
-      "B no vector request is granted here, and nobody passes one")
-for rid in ("r1", "r2"):
-    ok, bad = kept(L1, want, rid)
-    check(ok, "B this code writes back %s with every v2 field (%s)" % (rid, bad or "all kept"))
+r2 = lease(L1, "r2") or {}
+check(isinstance(st, dict) and st.get("status") == "granted" and r2.get("state") == "granted"
+      and (r2.get("res") or {}).get("cpu", {}).get("got") == 6 and lease(L1, "r3")["state"] == "granted",
+      "B this code weighs the vector request: its cores granted from what can be reserved (6 of 12 asked, 6 "
+      "held), the memory requests behind it pass (%s, r2 %s)" % (st.get("status") if isinstance(st, dict) else repr(st),
+                                                                 (r2.get("res") or {}).get("cpu")))
+check(r2.get("res_granted") and "waiting_on" not in r2 and "hold" not in r2 and r2.get("v") == 2,
+      "B the grant is marked res_granted; waiting_on and hold are cleared")
+grant2 = [r for r in log(d) if r["id"] == "r2" and r.get("event") == "grant"]
+check(len(grant2) == 1 and grant2[0].get("res") == {"cpu": 6} and grant2[0].get("v") == 2
+      and agent_is(grant2[0].get("agent"), AGENT["key"]), "B a grant record carries the granted vector, v and agent "
+      "(%s)" % grant2)
+ok, bad = kept(L1, want, "r1")
+check(ok, "B this code writes back r1 with every v2 field (%s)" % (bad or "all kept"))
 check(all(L1.get(k) == want[k] for k in ("v", "boot", "sessions")), "B the ledger's v, boot and sessions are kept")
 check(seg_res(L1, "r1") == seg_res(want, "r1") == [{"ram": 2.0, "cpu": 6, "disk": 20}],
       "B this code writes back the res of a vector lease's segments (%s)" % seg_res(L1, "r1"))
@@ -321,16 +338,20 @@ check(lease(L1, "r6") is not None and lease(L1, "r7") is None and lease(L1, "r5"
       "that is further off than any writer sets), a run ends when it stops stamping seen")
 mine = lease(L1, st.get("id"))
 check(mine and agent_is(mine.get("agent"), new.agent_key(ME, START)) and "v" not in mine and "res" not in mine,
-      "B a new lease is what 1.8.1 writes plus agent {key, slot} (%s)" % (mine or {}).get("agent"))
+      "B a new lease of memory alone is what 1.8.1 writes plus agent {key, slot} (%s)" % (mine or {}).get("agent"))
 end4 = [r for r in log(d) if r["id"] == "r4" and r["event"] == "end"]
 check(len(end4) == 1 and end4[0].get("res") == {"ram": 3.0, "gpu": 60, "vram": 4.0} and end4[0].get("peak") == {"gpu": 71}
       and end4[0].get("agent") == {"key": "3f9a0c21", "slot": 1} and end4[0].get("v") == 2
       and end4[0].get("user") == "x" and end4[0]["gb"] == 7.0,
       "B this code's end record of a vector lease carries its res, peak, agent, v and user")
-for rid in ("r2", "r3"):  # the vector request goes, and the line moves on
+bad = [k for k in V2_FIELDS + ("future_field",) if k in want["leases"][1] and k not in ("res", "waiting_on", "hold")
+       and r2.get(k) != want["leases"][1][k]]
+check(not bad and r2.get("gb") == 0.0 and r2["res"]["cpu"]["ask"] == 12,
+      "B the lease without memory keeps its fields and gb 0 (%s)" % (bad or "all kept"))
+for rid in ("r2", "r3"):  # the vector request goes
     new.release(rid)
 st2 = quietly(new.reserve, 0.5, "new client", HOLDER, ticket=st.get("id"))
-check(isinstance(st2, dict) and st2.get("status") == "granted", "B with the vector request gone, the line moves on")
+check(isinstance(st2, dict) and st2.get("status") == "granted", "B a poll of a granted ticket stays granted")
 am = quietly(new.amend, st.get("id"), gb=0.75)
 ed = [r for r in log(d) if r["id"] == st.get("id") and r["event"] == "edit"]
 check(isinstance(am, dict) and ed and agent_is(ed[-1].get("agent"), new.agent_key(ME, START)),
@@ -414,6 +435,54 @@ check(og == ng and len(og) == 3, "C 1.8.1 and this code tell the same history of
 old.release("all", ME)
 check(new.read_ledger()["leases"] == [], "C this code reads 1.8.1's release")
 
+# ======================================= E: old code on a ledger this code writes with vectors (02 §9.3, §13)
+d = use("e")
+new.reserve(1.0, "new mem", HOLDER)
+cores = new.reserve(0, "new cores", HOLDER, cpu=6, cpu_min=6)
+exact = new.reserve(0, "exactly twelve", HOLDER, cpu=12, cpu_min=12)
+L0 = raw(d)
+check(cores.get("status") == "granted" and exact.get("status") == "queued" and lease(L0, exact["id"])["gb"] == new.NO_MEM_GB
+      and lease(L0, exact["id"]).get("v") == 2, "E this code writes a cores request as a vector lease, with the gb "
+      "mirror %s that 1.8.4 to 1.9.1 keep" % new.NO_MEM_GB)
+st = quietly(old.reserve, 0.5, "1.8.1 client", HOLDER)
+L1 = raw(d)
+check(isinstance(st, dict) and st.get("status") == "granted" and lease(L1, exact["id"])["state"] == "granted"
+      and not lease(L1, exact["id"]).get("res_granted"), "E 1.8.1 grants the waiting cores request by its gb (as designed)")
+co = new.coordination(ME)
+L2 = raw(d)
+x = lease(L2, exact["id"])
+check(x["state"] == "queued" and not {"granted", "expires", "baseline_gb", "used_gb", "peak_gb"} & set(x)
+      and x.get("waiting_on") == ["cpu"] and L2["leases"].index(x) == L1["leases"].index(lease(L1, exact["id"])),
+      "E the next evaluation here puts it back in the queue at its place, its grant cleared (%s)" % x.get("state"))
+check(lease(L2, st["id"])["state"] == "granted" and "v" not in lease(L2, st["id"]),
+      "E a lease without v that 1.8.1 granted stays granted")
+if mid:
+    L = raw(d)
+    L["leases"] = [x for x in L["leases"] if x["id"] != exact["id"]]  # 1.9.1 would drop nothing here: gb is 0.01
+    put(d, "ledger.json", json.dumps(L))
+    quietly(mid.reserve, 0.25, "1.9.1 client", HOLDER)
+    check(any(x["id"] == cores["id"] for x in raw(d)["leases"]),
+          "E 1.9.1 keeps a lease without memory that has the gb mirror (B0's finding, answered)")
+b0 = old_module("v1.11.2")  # the readers of B0 (1.9.2 to 1.11.2): a queued vector request holds their line
+if b0 is None:
+    print("skip  E an old client's request stuck behind a vector request: tag v1.11.2 is not in this clone")
+else:
+    b0._plat = Procs
+    b0._sample_override = lambda: dict(SAMPLE)
+    b0.LEDGER_DIR = d
+    new.release("all", ME)
+    hold = new.reserve(0, "cores, 6", HOLDER, cpu=6, cpu_min=6)
+    turn = new.reserve(0, "exactly twelve", HOLDER, cpu=12, cpu_min=12)
+    stuck = b0.reserve(0.5, "an old client", HOLDER)
+    check(hold.get("status") == "granted" and turn.get("status") == "queued" and stuck.get("status") == "queued",
+          "E 1.11.2 cannot weigh the vector request waiting for cores, so its own request waits behind it")
+    new.refresh_ledger(dict(SAMPLE), Procs.collect_procs())
+    again = b0.reserve(0.5, "an old client", HOLDER, ticket=stuck["id"])
+    check(again.get("status") == "granted" and lease(raw(d), turn["id"])["state"] == "queued",
+          "E the next refresh grants the old client's request on its behalf; the cores request still waits (%s)"
+          % again.get("status"))
+new.release("all", ME)
+
 # ======================================= D: the normaliser, on v2 fields anyone could have planted
 base = {"id": "r30", "state": "granted", "gb": 1.0, "purpose": "p", "holder": {"pid": ME, "start": START},
         "requested": NOW, "granted": NOW}
@@ -470,7 +539,24 @@ check([x["state"] for x in L["leases"]] == ["queued", "granted"],
       "D a queued v2 request of another scope does not hold the host's line")
 L = {"leases": [V(dict(q, id="r42", v=2, res={"cpu": {"ask": 4}})), V(dict(q, id="r43"))], "history": []}
 new._evaluate(L, dict(SAMPLE), Procs.collect_procs(), NOW)
-check([x["state"] for x in L["leases"]] == ["queued", "queued"], "D a queued v2 request of the host holds the line")
+check([x["state"] for x in L["leases"]] == ["granted", "granted"] and L["leases"][0]["res"]["cpu"]["got"] == 4,
+      "D a queued v2 request of the host is weighed (its 4 cores granted), and the line moves on")
+L = {"leases": [V(dict(q, id="r44", v=2, res={"cpu": {"ask": 13, "min": 13}})), V(dict(q, id="r45"))], "history": []}
+new._evaluate(L, dict(SAMPLE), Procs.collect_procs(), NOW)
+check([x["state"] for x in L["leases"]] == ["queued", "granted"] and L["leases"][0]["waiting_on"] == ["cpu"],
+      "D a request waiting for its turn at the cores holds up only the cores: memory passes it")
+for i, res in enumerate(({"gpu": {"ask": 100}}, {"ram": {"ask": 500.0}, "disk": {"ask": 500}},
+                         {"cpu": {"ask": 5000}}, {"cpu": {"ask": 4}, "gpu": {"ask": 50}})):
+    keep = {"waiting_on": ["gpu"], "hold": ["gpu"]}
+    L = {"leases": [V(dict(q, id="r6%d" % i, v=2, gb=new.NO_MEM_GB if "ram" not in res else 500.0, res=res, **keep)),
+                    V(dict(q, id="r7%d" % i)), V(dict(q, id="r8%d" % i, v=2, res={"cpu": {"ask": 2}}))], "history": []}
+    new._evaluate(L, dict(SAMPLE), Procs.collect_procs(), NOW)
+    x = L["leases"][0]
+    check([y["state"] for y in L["leases"]] == ["queued"] * 3 and not x.get("res_granted")
+          and all(not isinstance(v, dict) or "got" not in v for v in x["res"].values())
+          and {k: x.get(k) for k in keep} == keep and not L["history"],
+          "D a v2 request this code cannot weigh (res %s) is not granted and holds the line, as in 1.9.2 to 1.11: "
+          "memory and cores requests behind it wait; its waiting_on and hold are left as they are" % sorted(res))
 import oomph_view as view  # noqa: E402
 ns_lease = dict(base, holder={"pid": DEAD, "start": START, "ns": OTHER_NS}, key="k50", id="r50", seen=NOW)
 for own, gone in ((None, False), (OTHER_NS, True)):

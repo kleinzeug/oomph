@@ -29,10 +29,12 @@ for agents and scripts (work without the daemon too — they measure live):
   oomph wait [--timeout 10m] [--free 4G]   block until memory is ok again; exit 1 on timeout
   oomph status --json               the latest full sample
 
-coordinating memory between sessions (a shared first-come-first-served ledger):
-  oomph run --reserve 6G [--for "what"] [--wait 30m] -- <cmd…>   wait for a grant, run, release; records the peak
-  oomph reserve <6G> --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]   exit 0 granted, 75 not (yet)
-  oomph amend <id> [--gb 3G] [--ttl 20m] [--for "what"] [--json]   change a reservation: shrinking applies at
+coordinating memory and cores between sessions (a shared first-come-first-served ledger):
+  oomph run [--reserve 6G] [--cpu 4..12] [--for "what"] [--wait 30m] -- <cmd…>   wait for a grant, run, release;
+                                    records the peak; {cpu} in the command is the cores granted (also exported)
+  oomph reserve [6G] [--cpu 8] --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]   exit 0 granted, 75
+                                    not (yet); --cpu 8 grants 4 to 8 logical cores, 8..8 exactly 8 (or waits)
+  oomph amend <id> [--gb 3G] [--cpu 6] [--ttl 20m] [--for "what"] [--json]   change a reservation: shrinking applies at
                                     once; growing a grant only if it fits now with nobody queued (else refused:
                                     reserve the extra separately); --ttl counts from now; exit 0 ok, 75 refused
   oomph release <id | all>          give a reservation back (all = this session's)
@@ -373,7 +375,7 @@ SAMPLE_KEYS = dict(
                            "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident", "cpu", "gpu", "io",
                            "psi", "scope", "cgroup_kills", "killed")]  # the last four: Linux (03 §6.1), as 01 asked
     + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu", "top_io", "disks",
-                             "linux", "cpu_names")]
+                             "linux", "cpu_names", "pools")]  # pools: this machine's admission (02 §5.2), not the wire's
     + [("daemon", "full")])
 SLIM_STR = 64        # characters of a string in a slim sample
 AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
@@ -2540,7 +2542,11 @@ def cmd_status_json():
 # ------------------------------------------------- more resources: CPU, GPU, disks (roadmap 02 §3.6, §7.1)
 # The logger records them from 1.9.1; only memory can be reserved yet (cores, GPU and disk from 1.12).
 THERMAL = {0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"}
-RESERVABLE = ("memory",)
+
+
+def reservable():
+    """What can be reserved on this machine: memory, and cores where they are measured (cpu_reservable)."""
+    return ["memory"] + (["cpu"] if cpu_reservable() else [])
 NOT_MEASURED = "not measured (logging is off; `oomph check --measure` takes a quarter-second reading)"
 NOT_LOGGED = "not recorded by the logger, which is older than 1.9.1 (`oomph check --measure` reads it now)"
 NOT_READ = "not read by the logger this time (`oomph check --measure` reads it now)"
@@ -2806,7 +2812,11 @@ def _resources(s, c=None):
     if c:
         out["memory"].update(reserved_gb=c["reserved_gb"], left_gb=c["available_gb"], others_gb=c["reserved_by_others_gb"])
     cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else None
-    out["cpu"] = dict({k: cpu[k] for k in ("n", "p", "e", "busy", "therm") if k in cpu}, reservable=False) if cpu else None
+    out["cpu"] = dict({k: cpu[k] for k in ("n", "p", "e", "busy", "therm") if k in cpu}, reservable=cpu_reservable()) \
+        if cpu else None
+    if out["cpu"] is not None and c and isinstance(c.get("cpu"), dict):  # the pool (02 §7.2): reserved, left, idle
+        out["cpu"].update(margin=c["cpu"]["margin"], reserved=c["cpu"]["reserved"], left=c["cpu"]["available"],
+                          **({"idle": c["cpu"]["idle"]} if "idle" in c["cpu"] else {}))
     gpus = s.get("gpu") if isinstance(s.get("gpu"), list) else None
     out["gpu"] = None if gpus is None else [dict({k: g[k] for k in ("id", "name", "util", "active", "src", "mem_gb",
                                                                     "mem_alloc_gb", "mem_limit_gb", "mem_limit_est",
@@ -2816,13 +2826,14 @@ def _resources(s, c=None):
                                             "low_gb", "crit_gb", "pinned") if k in d},
                          watched=bool(d.get("watch")), reservable=False)
                     for d in disk_rows(s, pinned) if d["id"] not in hidden]
-    out["reservable"] = list(RESERVABLE)
+    out["reservable"] = reservable()
     return out
 
 
 def cmd_resources(args):
     """The resources of this machine: capacity, use, what is reserved and left, and which of them
-    can be reserved here (only memory so far): what an agent asks before reserving anything else."""
+    can be reserved here (memory, and cores where they are measured): what an agent asks before
+    reserving anything else."""
     try:
         opts, _ = _strict(args, flags=("--json",), npos=0)
     except UsageError as e:
@@ -2842,11 +2853,17 @@ def cmd_resources(args):
     line = lambda label, text: print(wrap(text, w, "  %-7s " % label, 10))
     line("memory", "%.0f GB · %.1f free%s · reservable" % (m["ram_gb"] or 0, m["free_gb"], (
         " · %.1f GB reserved · %.1f GB left to reserve" % (m["reserved_gb"], m["left_gb"])) if "left_gb" in m else ""))
+    cpu = r.get("cpu") or {}
     for label, text in resource_lines(s, *volume_prefs()):
-        if label in ("cpu", "gpu") and not text.startswith("not measured"):
-            text += " · not reservable yet"
+        if label == "cpu" and cpu.get("reservable") and "left" in cpu:
+            text += " · %s reserved · %s left to reserve%s" % (
+                cores_text(cpu["reserved"]), cores_text(max(0.0, cpu["left"])),
+                " (%s idle)" % cores_text(max(0.0, cpu["idle"])) if "idle" in cpu else "")
+        elif label in ("cpu", "gpu") and not text.startswith("not measured"):
+            text += " · not reservable yet" if label == "gpu" or not cpu.get("reservable") else " · reservable"
         line(label, text)
-    print(wrap("Only memory can be reserved with this version: `oomph reserve 6G --for \"what\"`.", w, "  "))
+    print(wrap("Memory%s can be reserved with this version: `oomph reserve 6G%s --for \"what\"`." % (
+        " and cores" if "cpu" in r["reservable"] else "", " --cpu 8" if "cpu" in r["reservable"] else ""), w, "  "))
     return 0
 
 
@@ -2974,6 +2991,68 @@ _sample_override = None      # tests: a function returning the sample to decide 
 def margin_gb(ram):
     """Memory kept free on top of all reservations, on a Mac (margin_for: by the sample's system)."""
     return max(1.5, 0.05 * (ram or 0))
+
+
+# ----- cores (B1, 1.12.0; 02 §6.1, §6.4): a rate pool of logical cores, granted elastically
+NO_MEM_GB = 0.01             # the gb mirror of a lease without memory: 1.8.4 to 1.9.1 drop a lease of gb 0 when
+                             # they write the ledger (02 §9.3, found at B0), and 0.01 GB is nothing to anyone's sums
+POOLS_MAX_AGE_S = 45         # current.json's `pools` count while this fresh (as the sample itself)
+CPU_MAX = 4096               # cores in one request: more than any machine has, to keep the arithmetic sane
+
+
+def cpu_margin(n):
+    """Cores no reservation can have, for the person at the machine: max(1, round(n / 8)), 2 of 14, 1 of 8."""
+    return max(1, int(n / 8.0 + 0.5))
+
+
+def cpu_reservable():
+    """Can cores be reserved here? Only where this machine measures them (roadmap §4.4: what a machine cannot
+    measure cannot be reserved there) and its backend says so on purpose (`RESERVES_CPU`): macOS. Linux opts in
+    with its own margins in a later step (roadmap gap G2), not as a side effect of reading the ticks (L2)."""
+    try:
+        return getattr(plat(), "RESERVES_CPU", False) is True and hasattr(plat(), "cpu_ticks")
+    except Unsupported:
+        return False
+
+
+def _cn(x):
+    """A number of cores as written to JSON: an int when whole (6, not 6.0: `-j` takes integers, 02 §6.1)."""
+    return int(x) if float(x).is_integer() else float(x)
+
+
+def _cores(x, asked):
+    """A number of cores as granted: whole unless a fraction was asked for (-j takes integers), rounded down."""
+    return int(math.floor(x + 1e-9)) if float(asked).is_integer() else _cn(math.floor(x * 10 + 1e-9) / 10.0)
+
+
+def cores_text(x):
+    """6, 2.5: how a number of cores is written (no ".0")."""
+    return "%d" % x if float(x).is_integer() else "%.1f" % x
+
+
+def elastic_min(ask):
+    """The least an elastic request for `ask` cores accepts: half, rounded up (02 §6.4, §15.5: half to all)."""
+    return int(math.ceil(ask / 2.0)) if float(ask).is_integer() else _cn(math.ceil(ask * 5 - 1e-9) / 10.0)
+
+
+def parse_cores(x):
+    """`--cpu 8` (elastic: 4 to 8), `--cpu 8..8` (exactly 8), `--cpu 1..8`; numbers with one decimal.
+    Returns (ask, min); raises ValueError."""
+    lo, sep, hi = str(x).partition("..")
+    vals = []
+    for v in ((lo, hi) if sep else (lo,)):
+        try:
+            f = float(v)
+        except ValueError:
+            raise ValueError("not a number of cores: %s (use e.g. 8, 4..8 or 8..8)" % x)
+        if not (math.isfinite(f) and 0 < f <= CPU_MAX) or abs(f * 10 - round(f * 10)) > 1e-6:
+            raise ValueError("cores take a number from 0.1 to %d with at most one decimal, not %s" % (CPU_MAX, v))
+        vals.append(_cn(round(f, 1)))
+    if len(vals) == 1:
+        return vals[0], elastic_min(vals[0])
+    if vals[0] > vals[1]:
+        raise ValueError("--cpu %s: the fewest cores come first (e.g. 4..8)" % x)
+    return vals[1], vals[0]
 
 
 def _home_short(p):
@@ -3622,6 +3701,29 @@ def lease_res(r):
     return {"ram": ram, "mem": mem}
 
 
+def no_memory(r):
+    """Does a lease hold no memory: a vector lease (v 2) with no `ram`, whose gb is the mirror NO_MEM_GB
+    (or 0). Its gb still counts in the memory sums, as every older reader counts it: 10 MB at most."""
+    return ledger_version(r) >= 2 and "ram" not in (r.get("res") or {}) and r["gb"] <= NO_MEM_GB + 0.005
+
+
+def _cpu_of(r):
+    """A lease's cores part (`res.cpu` with an `ask`), or None."""
+    c = (r.get("res") or {}).get("cpu") if ledger_version(r) >= 2 else None
+    return c if isinstance(c, dict) and _num(c.get("ask"), 0.1, CPU_MAX) else None
+
+
+def lease_need(r):
+    """What a lease asks of each pool, as (least, wanted): `ram` (its gb, the mirror an older writer's amend
+    moves, so it always counts) unless it holds no memory, and `cpu` (its minimum to what it asked)."""
+    need = {} if no_memory(r) else {"ram": (r["gb"], r["gb"])}
+    c = _cpu_of(r)
+    if c:
+        lo = c.get("min") if _num(c.get("min"), 0.1, c["ask"]) else elastic_min(c["ask"])
+        need["cpu"] = (lo, c["ask"])
+    return need
+
+
 def _record_vector(r):
     """What an end, edit or history entry carries of a newer writer's lease beyond 1.8.1's fields:
     its `v`, `user` and, from a v2 lease's `res`, the amounts granted (asked, if never granted) and
@@ -3882,8 +3984,9 @@ class Ledger:
 def _read_ledger_at(dfd):
     L = _valid_ledger(loads_untrusted(read_bounded("ledger.json", LIMITS["ledger"], dfd, shared=True)))
     if L is None:
-        # a fresh (or lost) ledger: continue the numbering of the history log, so ids don't repeat
-        L = {"seq": _history_max_seq(dfd), "leases": [], "history": []}
+        # a fresh (or lost) ledger: continue the numbering of the history log, so ids don't repeat; made by
+        # vector-aware code, so of version 2 (set at creation only, 02 §6.2)
+        L = {"v": 2, "seq": _history_max_seq(dfd), "leases": [], "history": []}
     return L
 
 
@@ -4144,15 +4247,135 @@ def _retire(L, r, outcome, now, at=None):
         pass  # the log is a record, not the ledger: never let it block coordination
 
 
-def _evaluate(L, s, procs, now):
-    """Drop dead, expired and abandoned entries, account for what grants already use, then grant
-    queued requests strictly in arrival order while they fit.
+def _tree_cpu(procs, children, root):
+    """Cores the process tree at `root` keeps busy: the sum of its processes' rates (`cpu`, given by the logger)."""
+    stack, seen, tot = [root], set(), 0.0
+    while stack:
+        x = stack.pop()
+        if x in seen or x not in procs:
+            continue
+        seen.add(x)
+        c = procs[x].get("cpu")
+        tot += c if _num(c, 0, CPU_MAX) else 0.0
+        stack.extend(children.get(x, []))
+    return tot
 
-    Leases of version 2 (newer writers, 02 §9.3) count with their memory mirror (gb) like any
-    other, but this code grants none: it cannot weigh their other resources. A queued one holds
-    the line, as a request that does not fit does, until vector-aware code (the logger's child
-    after an update, or its own writer's next poll) grants it. A request of another scope (a
-    cgroup, 03 §7.3) is granted only by a process in it, and does not hold the line here."""
+
+def _normalize(L):
+    """Leases of version 2 that older code changed (02 §9.3). One it granted (granted, but no `res_granted`)
+    goes back to the queue at its own place with its grant cleared, and is granted below if it fits: nobody
+    was told "granted" (older code answers only its own callers about its own leases, and a v2 lease is new
+    code's). One whose gb an older amend moved gets its ram from gb (lease_res). A lease without `v` is
+    never re-queued: older code made it and may have told its owner "granted"."""
+    for r in L["leases"]:
+        res = r.get("res") if ledger_version(r) >= 2 else None
+        if not isinstance(res, dict):
+            continue
+        if r["state"] == "granted" and not r.get("res_granted"):
+            r["state"] = "queued"
+            for k in ("granted", "expires", "baseline_gb", "used_gb", "peak_gb", "note"):
+                r.pop(k, None)
+            for k, x in res.items():
+                for f in (("used", "peak") if k == "mem" else ("got", "used", "peak")):
+                    x.pop(f, None)
+        mem = res.get("mem")
+        if isinstance(mem, dict) and _num(mem.get("got")) and abs(mem["got"] - r["gb"]) > 0.005:
+            fixed = lease_res(r)
+            res.update((k, fixed[k]) for k in ("ram", "vram", "mem") if k in fixed)
+
+
+def _charge_cpu(L, procs, children):
+    """Cores each grant's process tree keeps busy (`res.cpu.used`, and its `peak`), from the logger's rates
+    per process: only the logger's child has them (02 §6.3, who measures); every other evaluation leaves the
+    figures as they are. Grants watching the same tree share its load in grant order, as memory does, and
+    the last takes the rest: what a holder burns beyond its grant shows in its own `used`, while admission
+    charges a grant no more than it got (cpu_pool)."""
+    groups = {}
+    for r in L["leases"]:
+        c = _cpu_of(r)
+        if r["state"] == "granted" and c and _num(c.get("got")):
+            groups.setdefault(r.get("watch"), []).append(r)
+    for w, rs in groups.items():
+        rs.sort(key=lambda r: r["granted"])
+        load = 0.0 if w is None or w not in procs else _tree_cpu(procs, children, w)
+        for i, r in enumerate(rs):
+            c = r["res"]["cpu"]
+            share = load if i == len(rs) - 1 else min(c["got"], load)
+            load -= share
+            c["used"] = round(share, 2)
+            c["peak"] = round(max(c.get("peak", 0), share), 2)
+
+
+def cpu_pool(s, leases, now):
+    """The pool of cores as admission sees it (02 §6.1): `cap` logical cores, `margin` kept back for the person
+    at the machine, `reserved` (what grants got), `room` = cap − margin − reserved (what can still be reserved:
+    a request waits for this only, never for load), `others` (load that holds no reservation) and `idle` =
+    room − others (what an elastic request is given now; None when nothing says how busy the cores are).
+    `others` is the logger's smoothed figure from current.json's `pools` while fresh, else the sample's busy
+    cores less what the grants are charged (each at most what it got; a use not measured counts as none)."""
+    pools = s.get("pools") if isinstance(s.get("pools"), dict) else {}
+    pc = pools.get("cpu") if isinstance(pools.get("cpu"), dict) and _t(pools.get("t")) \
+        and abs(now - pools["t"]) <= POOLS_MAX_AGE_S else {}
+    cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
+    n = pc["cap"] if _int(pc.get("cap"), 1, CPU_MAX) else cpu["n"] if _int(cpu.get("n"), 1, CPU_MAX) \
+        else (os.cpu_count() or 1)
+    grants = [c for c in (_cpu_of(r) for r in leases if r["state"] == "granted") if c and _num(c.get("got"))]
+    reserved = sum(c["got"] for c in grants)
+    margin = cpu_margin(n)
+    room = n - margin - reserved
+    if _num(pc.get("others"), 0, CPU_MAX):
+        others = pc["others"]
+    elif _num(cpu.get("busy"), 0, CPU_MAX):
+        others = max(0.0, cpu["busy"] - sum(min(c.get("used") if _num(c.get("used")) else 0.0, c["got"])
+                                            for c in grants))
+    else:
+        others = None
+    return {"cap": n, "margin": margin, "reserved": reserved, "room": room, "others": others,
+            "idle": None if others is None else room - others}
+
+
+RATE_POOLS = frozenset(("cpu",))  # pools that saturate rather than run out (02 §6.1)
+POOLS = frozenset(("ram", "cpu"))   # every pool this code weighs
+KNOWN_RES = frozenset(("ram", "cpu", "mem"))  # the parts of a `res` it knows (mem: the memory mirror)
+
+
+def weighable(r):
+    """Can this code weigh every part of a lease? A 1.8-shaped lease always; a vector lease only when its `res`
+    names nothing beyond ram, cpu and mem, its cores part is one this code reads, and it asks for something.
+    A later writer's GPU or disk lease is not: this code neither grants it nor lets anyone pass it (02 §9.3,
+    as 1.9.2 to 1.11 did with every vector lease), so no stale process hands out what it cannot weigh."""
+    if ledger_version(r) < 2:
+        return True
+    res = r.get("res") or {}
+    if not set(res) <= KNOWN_RES or ("cpu" in res and _cpu_of(r) is None):
+        return False
+    return bool(lease_need(r))
+
+
+def _waits(r, waiting, hold):
+    """A queued vector lease's `waiting_on` (what it is short of or queued behind) and `hold` (what it has
+    ever been short of). A 1.8-shaped lease asks for memory alone and gets neither: _status tells it."""
+    if ledger_version(r) >= 2:
+        r["waiting_on"], r["hold"] = sorted(waiting), sorted(hold)
+
+
+def _evaluate(L, s, procs, now, rated=False):
+    """Drop dead, expired and abandoned entries, put back in the queue what older code granted of a
+    vector lease, account for what grants already use, then grant queued requests in arrival order,
+    pool by pool (02 §6.4).
+
+    A request needs some pools: `ram` (its gb, unless it holds no memory) and `cpu` (between its
+    minimum and what it asked). It is granted all of them at once or none: memory when it fits (or,
+    as before, when no grant holds memory and the level is ok: alone), cores when what can still be
+    reserved (room) covers its minimum, and then as many as are idle, between its minimum and what it
+    asked. Nothing is granted while memory is critical. A request that waits holds up the pools it waits
+    for, so nobody behind it takes them; while it waits for a turn at the cores (a rate pool) it holds up
+    only those (and the rate pools it has ever been short of), so memory requests pass it; once its turn
+    has come it holds up everything it has ever been short of, so it cannot alternate between two
+    shortages. With memory alone this is today's strict first come, first served. A request of another
+    scope (a cgroup, 03 §7.3) is granted only by a process in it, and does not hold the line here.
+    `rated`: the process table carries the logger's CPU rates (the logger's child), so each grant's
+    cores are charged."""
     keep = []
     bid = _boot_id()
     if bid and L.get("boot") and L["boot"] != bid:  # written before the last boot: no holder is alive
@@ -4179,6 +4402,7 @@ def _evaluate(L, s, procs, now):
         else:
             keep.append(r)
     L["leases"] = keep
+    _normalize(L)
     _give_slots(L, now)  # the agent's colour (D11), before any grant record is written
 
     # Memory a grant's processes have added since it was granted counts against the grant, so
@@ -4197,6 +4421,8 @@ def _evaluate(L, s, procs, now):
             grown -= share
             r["used_gb"] = round(min(r["gb"], share), 2)
             r["peak_gb"] = round(max(r.get("peak_gb", 0), share), 2)
+    if rated:
+        _charge_cpu(L, procs, children)
 
     v = verdict(s)
     free = free_physical_gb(s)
@@ -4213,43 +4439,103 @@ def _evaluate(L, s, procs, now):
     if mine != "host" and _num(sc.get("host_avail_gb")) and _num(sc.get("host_margin_gb")):
         avail = min(avail, sc["host_avail_gb"] - out_all - sc["host_margin_gb"])
     big = oversize_for(s)
+    cpu = cpu_pool(s, L["leases"], now)
+    blocked, recs = set(), []
     for r in [x for x in L["leases"] if x["state"] == "queued"]:
-        if v["level"] == "critical":
-            break
         if (r.get("scope") or "host") != mine:  # granted only by a process that can measure its scope
             continue
+        if not weighable(r):  # a later writer's: it holds the line, its waiting_on and hold as they are
+            blocked |= POOLS
+            continue
+        need = lease_need(r)
+        if v["level"] == "critical":  # nothing new starts: anything new adds load
+            _waits(r, {"critical"}, r.get("hold") or ())
+            continue
+        short, note = set(), None
+        if "ram" in need and r["gb"] > avail:
+            alone = "ram" not in blocked and v["level"] == "ok" and \
+                not any(x["state"] == "granted" and "ram" in lease_need(x) for x in L["leases"])
+            if not alone:
+                short.add("ram")
+            elif big is None or r["gb"] <= big:
+                note = ("larger than the %.1f GB available now; granted because no other work is reserved — "
+                        "expect swapping" % max(0.0, avail)) if big is None else (
+                       "leaves less than the %.1f GB %s keeps free here: expect tight, and swapping"
+                       % (margin, BRAND))
+            else:  # Linux: even alone it would not fit (03 §5.3, §7.3)
+                lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
+                sw = lx.get("swap_room_gb") if _num(lx.get("swap_room_gb"), 0, 1e6) else lx.get("kswap_free_gb") or 0
+                floor = lx.get("floor_gb") if _num(lx.get("floor_gb"), 0, 1e6) else max(0.0, free + sw - big)
+                r["note"] = ("%.1f GB does not fit: %.1f GB is available, %s, and %.1f GB must stay free. Ask for at "
+                             "most %.1f GB." % (r["gb"], free, "swap can take %.1f GB more" % sw if sw >= 0.1 else
+                                                "there is no swap to spare", floor, big))
+                _retire(L, r, "refused", now)
+                L["leases"].remove(r)
+                continue
+        if "cpu" in need and cpu["room"] < need["cpu"][0] - 1e-9:
+            short.add("cpu")
+        behind = set(need) & blocked
+        if short or behind:
+            hold = set(r.get("hold") or ()) & set(need) | short
+            _waits(r, short | behind, hold)
+            turn = (short | behind) & RATE_POOLS  # waiting for a turn at the cores: holds up only those
+            blocked |= (turn | (hold & RATE_POOLS)) if turn else (short | behind | hold)
+            continue
+        r["state"], r["granted"] = "granted", round(now, 1)
+        r["expires"] = round(now + r["ttl"], 1) if r.get("ttl") else None
+        w = r.get("watch")
+        r["baseline_gb"] = round(_tree_gb(procs, children, w), 3) if w in procs else 0.0
+        r["used_gb"], r["peak_gb"] = 0.0, 0.0
+        same = [x for x in L["leases"] if x is not r and x["state"] == "granted" and x.get("watch") == w]
+        if same:  # share the first grant's baseline (see above)
+            r["baseline_gb"] = min(x.get("baseline_gb", 0) for x in same)
+        avail -= r["gb"]
+        outstanding += r["gb"]
+        notes = [note] if note else []
         if ledger_version(r) >= 2:
-            break
-        alone = not granted()
-        if r["gb"] <= avail or (alone and v["level"] == "ok" and (big is None or r["gb"] <= big)):
-            if r["gb"] > avail:
-                r["note"] = ("larger than the %.1f GB available now; granted because no other work is reserved — "
-                             "expect swapping" % max(0.0, avail)) if big is None else (
-                            "leaves less than the %.1f GB %s keeps free here: expect tight, and swapping"
-                            % (margin, BRAND))
-            r["state"], r["granted"] = "granted", round(now, 1)
-            r["expires"] = round(now + r["ttl"], 1) if r.get("ttl") else None
-            w = r.get("watch")
-            r["baseline_gb"] = round(_tree_gb(procs, children, w), 3) if w in procs else 0.0
-            r["used_gb"], r["peak_gb"] = 0.0, 0.0
-            same = [x for x in L["leases"] if x is not r and x["state"] == "granted" and x.get("watch") == w]
-            if same:  # share the first grant's baseline (see above)
-                r["baseline_gb"] = min(x.get("baseline_gb", 0) for x in same)
-            avail -= r["gb"]
-            outstanding += r["gb"]
-        elif alone and v["level"] == "ok":  # Linux: even alone it would not fit (03 §5.3, §7.3)
-            lx = s.get("linux") if isinstance(s.get("linux"), dict) else {}
-            sw = lx.get("swap_room_gb") if _num(lx.get("swap_room_gb"), 0, 1e6) else lx.get("kswap_free_gb") or 0
-            floor = lx.get("floor_gb") if _num(lx.get("floor_gb"), 0, 1e6) else max(0.0, free + sw - big)
-            r["note"] = ("%.1f GB does not fit: %.1f GB is available, %s, and %.1f GB must stay free. Ask for at most "
-                         "%.1f GB." % (r["gb"], free, "swap can take %.1f GB more" % sw if sw >= 0.1 else
-                                       "there is no swap to spare", floor, big))
-            _retire(L, r, "refused", now)
-            L["leases"].remove(r)
-        else:
-            break
+            res = r.setdefault("res", {})
+            if "ram" in need:
+                res["ram"] = dict(res.get("ram") or {}, ask=r["gb"], got=r["gb"])
+                res["mem"] = dict(res.get("mem") or {}, got=r["gb"])
+            if "cpu" in need:
+                lo, hi = need["cpu"]
+                top = min(hi, cpu["room"])
+                got = _cn(max(lo, _cores(top if cpu["idle"] is None else min(max(0.0, cpu["idle"]), top), hi)))
+                if got < hi:
+                    if cpu["idle"] is not None and cpu["idle"] < top:
+                        notes.append("the cores are busy with work that holds no reservation (%.1f of %d): granted "
+                                     "%s of the %s cores asked" % (cpu["others"], cpu["cap"], cores_text(got),
+                                                                    cores_text(hi)))
+                    else:
+                        notes.append("other reservations hold %s of the %d cores that can be reserved: granted %s of "
+                                     "the %s asked" % (cores_text(cpu["reserved"]), cpu["cap"] - cpu["margin"],
+                                                       cores_text(got), cores_text(hi)))
+                res["cpu"] = dict(res["cpu"], got=got)
+                cpu["room"] -= got
+                cpu["reserved"] += got
+                if cpu["idle"] is not None:
+                    cpu["idle"] -= got
+            segs = r.get("segments")
+            if segs:
+                segs[-1]["res"] = {k: x.get("got", x.get("ask")) for k, x in res.items()
+                                   if k in ("ram", "cpu") and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
+            r["res_granted"] = round(now, 1)
+            r.pop("waiting_on", None)
+            r.pop("hold", None)
+            recs.append(_record(r, "grant", now))
+        if notes:
+            r["note"] = "; ".join(notes)
+    if recs:
+        try:
+            _append_history(L, recs, now)
+        except (OSError, LedgerError):
+            pass  # the log is a record, not the ledger
     L["state"] = {"t": round(now, 1), "level": v["level"], "free_gb": free, "margin_gb": round(margin, 1),
-                  "reserved_gb": round(outstanding, 1), "available_gb": round(avail, 1)}
+                  "reserved_gb": round(outstanding, 1), "available_gb": round(avail, 1),
+                  "cpu_cap": cpu["cap"], "cpu_margin": cpu["margin"], "cpu_reserved": round(cpu["reserved"], 1),
+                  "cpu_available": round(cpu["room"], 1)}
+    if cpu["idle"] is not None:
+        L["state"]["cpu_idle"] = round(cpu["idle"], 1)
 
 
 # ----- root callers: the ledger operation runs in a child as the invoking user (H0)
@@ -4441,22 +4727,45 @@ def _cmd_ledger_call(name):
 def _decide_inputs(s=None):
     if _given:  # an unprivileged child: root measured them
         return s or _given[0], _given[1], time.time()
-    s = s or (_sample_override() if _sample_override else live_sample(with_procs=False))
+    s = s or (_sample_override() if _sample_override else _with_pools(live_sample(with_procs=False)))
     return s, plat().collect_procs(), time.time()
 
 
+def _with_pools(s):
+    """A live sample with what only the logger knows well, while its current.json is fresh (02 §5.2, §6.1): the
+    pools (`others` on the cores) and its cpu block (how busy the cores were); else as it is."""
+    d = _daemon_sample()
+    if d:
+        s.update((k, d[k]) for k in ("pools", "cpu") if isinstance(d.get(k), dict) and k not in s)
+    return s
+
+
 def _brief(r, now):
-    b = {"id": r["id"], "state": r["state"], "gb": r["gb"], "purpose": r["purpose"],
+    b = {"id": r["id"], "state": r["state"], "gb": 0.0 if no_memory(r) else r["gb"], "purpose": r["purpose"],
          "project": os.path.basename(r.get("project") or "") or None, "holder_pid": r["holder"]["pid"]}
     if r.get("user"):
         b["user"] = r["user"]
+    c = _cpu_of(r)
+    if c:  # cores: what it got, or while queued what it asked
+        b["cpu"] = c["got"] if r["state"] == "granted" and _num(c.get("got")) else c["ask"]
     if r["state"] == "granted":
         b.update(used_gb=r.get("used_gb", 0), for_min=round((now - r["granted"]) / 60, 1))
+        if c and _num(c.get("used")):
+            b["cpu_used"] = c["used"]
         if r.get("expires"):
             b["expires_in_min"] = round((r["expires"] - now) / 60, 1)
     else:
         b["waiting_min"] = round((now - r["requested"]) / 60, 1)
     return b
+
+
+def _available(st):
+    """What can still be reserved, by resource, from the ledger's state (cores only once evaluated by this code)."""
+    out = {"ram_gb": st.get("available_gb")}
+    for k, f in (("cpu_cores", "cpu_available"), ("cpu_idle", "cpu_idle")):
+        if _num(st.get(f)):
+            out[k] = st[f]
+    return out
 
 
 def _status(L, rid, now):
@@ -4471,27 +4780,57 @@ def _status(L, rid, now):
         return {"status": "gone", "id": rid, "outcome": h and h["outcome"],
                 "advice": "This reservation no longer exists (%s). Request a new one if you still need it."
                           % (h["outcome"] if h else "unknown id")}
-    out = {"status": r["state"], "id": r["id"], "gb": r["gb"], "purpose": r["purpose"],
+    nm, c, need = no_memory(r), _cpu_of(r), lease_need(r)
+    out = {"status": r["state"], "id": r["id"], "gb": 0.0 if nm else r["gb"], "purpose": r["purpose"],
            "available_gb": st.get("available_gb"), "reserved_gb": st.get("reserved_gb"),
            "free_gb": st.get("free_gb"), "level": st.get("level")}
+    if c:  # a vector request: what it asked, and what can be had (02 §7.2)
+        out["asked"] = dict({} if nm else {"ram_gb": r["gb"]}, cpu_cores=_cn(c["ask"]), cpu_min=_cn(need["cpu"][0]))
+        out["available"] = _available(st)
+    heavy = "heavy" if c else "memory-heavy"
     if r["state"] == "granted":
         out["expires_in_min"] = round((r["expires"] - now) / 60, 1) if r.get("expires") else None
         if r.get("note"):
             out["note"] = r["note"]
-        out["advice"] = ("Granted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
-                         "memory-heavy part is over%s." % (r["id"], "" if not r.get("expires") else
-                                                           "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
+        run = ""
+        if c and _num(c.get("got")):
+            got = _cn(c["got"])
+            out["granted"] = dict({} if nm else {"ram_gb": r["gb"]}, cpu_cores=got)
+            out["run_with"] = {"cpu_cores": got}
+            run = "Run with %s cores (-j%d): you asked for %s%s. " % (
+                cores_text(got), max(1, int(got)), cores_text(c["ask"]),
+                "" if got >= c["ask"] else ", and %s are what can be had now" % cores_text(got))
+        out["advice"] = ("%sGranted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
+                         "%s part is over%s." % (run, r["id"], heavy, "" if not r.get("expires") else
+                                                 "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
     else:
         queued = [x for x in L["leases"] if x["state"] == "queued"]
-        pos = [x["id"] for x in queued].index(r["id"]) + 1
+        before = [x for x in queued[:queued.index(r)] if set(lease_need(x)) & set(need)]
+        pos = len(before) + 1  # in the lines of the pools it asks for
         out["position"] = pos
         out["ahead"] = [_brief(x, now) for x in L["leases"]
-                        if x["state"] == "granted" or (x["state"] == "queued" and x["id"] in [q["id"] for q in queued[:pos - 1]])]
-        why = ("memory is critical" if st.get("level") == "critical" else
-               "%d request(s) are ahead of you" % (pos - 1) if pos > 1 else
-               "only %.1f GB is available for new reservations" % max(0.0, st.get("available_gb") or 0))
+                        if (x["state"] == "granted" and set(lease_need(x)) & set(need)) or x in before]
+        waiting = r.get("waiting_on") if isinstance(r.get("waiting_on"), list) else ["ram"]
+        if c:
+            out["waiting_on"] = waiting
+        room = st.get("cpu_available")
+        why = ["memory is critical"] if st.get("level") == "critical" or "critical" in waiting else []
+        if not why and pos > 1:
+            why.append("%d request(s) are ahead of you" % (pos - 1))
+        if not why and "cpu" in waiting and _num(room):
+            why.append("you asked for %s %s cores, and %s can be reserved now while other reservations hold %s" % (
+                "exactly" if need["cpu"][0] >= c["ask"] else "at least", cores_text(need["cpu"][0]),
+                cores_text(max(0.0, room)), cores_text(st.get("cpu_reserved") or 0)))
+        if not why and "ram" in waiting:
+            why.append("only %.1f GB is available for new reservations" % max(0.0, st.get("available_gb") or 0))
+        hint = ""
+        if c and "cpu" in waiting and _num(room) and room >= 1 and need["cpu"][0] > _cores(room, c["ask"]):
+            n = _cores(room, c["ask"])
+            hint = " Or ask with cpu_min %s (`--cpu %s..%s`) to start now with %s." % (
+                cores_text(n), cores_text(n), cores_text(c["ask"]), cores_text(n))
         out["advice"] = ("Queued #%d (%s). Don't start this work yet. Ask again with the same ticket (%s) within %d s to "
-                         "keep your place — meanwhile do light work or wait." % (pos, why, r["id"], QUEUE_STALE_S))
+                         "keep your place — meanwhile do light work or wait.%s"
+                         % (pos, "; ".join(why) or "waiting", r["id"], QUEUE_STALE_S, hint))
     return out
 
 
@@ -4523,26 +4862,83 @@ def _on_ram(s):
     return "on a machine with %s GB RAM" % gb if _scope_id(s) == "host" else "in a cgroup limited to %s GB" % gb
 
 
+def _cpu_busy(s, now):
+    """The sample with a reading of how busy the cores are, for an elastic request (02 §6.1): as it is when
+    the logger's `pools` are fresh or the sample has its busy cores; else one quarter-second window, measured
+    here and marked `window_s` (only a request with an elastic part pays for it)."""
+    pools = s.get("pools") if isinstance(s.get("pools"), dict) else {}
+    if (isinstance(pools.get("cpu"), dict) and _t(pools.get("t")) and abs(now - pools["t"]) <= POOLS_MAX_AGE_S) \
+            or _num((s.get("cpu") or {}).get("busy") if isinstance(s.get("cpu"), dict) else None):
+        return s
+    try:
+        blocks = _daemon_module().measure()[0]
+    except Exception:  # the grant is then what can be reserved, not what is idle
+        return s
+    return dict(s, cpu=blocks["cpu"], window_s=blocks.get("window_s")) if isinstance(blocks.get("cpu"), dict) else s
+
+
+def _refuse_cpu(s, cpu, cpu_min):
+    """Why a request for cores cannot be made here, or None (02 §6.4: refusals; roadmap §4.4)."""
+    if not cpu_reservable():
+        return ("Cores can't be reserved on this machine: %s does not measure them here yet. Reserve memory alone, "
+                "or run the work with fewer jobs." % BRAND)
+    pool = cpu_pool(s, [], time.time())
+    most = pool["cap"] - pool["margin"]
+    if cpu_min > most:
+        return ("Can't reserve %s cores %s: it has %d, %d of them are kept for the person at it, so at most %d can be "
+                "reserved. Ask for fewer, or for a range that starts lower (cpu_min / `--cpu %d..%s`)." % (
+                    cores_text(cpu_min), "on this Mac" if s.get("os", "macos") == "macos" else "on this machine",
+                    pool["cap"], pool["margin"], most, max(1, most // 2), cores_text(cpu)))
+    return None
+
+
+def _to_weigh(ticket):
+    """Will this reserve() call weigh a grant: a new request, or a ticket still queued? A granted ticket's
+    re-poll only extends it, so it need not measure how busy the cores are (a quarter second, no logger)."""
+    if not ticket:
+        return True
+    try:
+        return any(r.get("id") == ticket and r.get("state") == "queued" for r in read_ledger()["leases"])
+    except Exception:  # noqa: B902 — measure, as for a new request
+        return True
+
+
 @_unprivileged(inputs=True)
-def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder"):
-    """Request (or re-poll with `ticket`) a reservation. Returns its status dict."""
+def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder", cpu=None, cpu_min=None):
+    """Request (or re-poll with `ticket`) a reservation of `gb` of memory and, with `cpu`, cores: between
+    `cpu_min` (default half, rounded up) and `cpu`. A request with cores is a lease of version 2 (02 §6.2);
+    one for memory alone keeps the shape every older reader writes. Returns its status dict."""
     s, procs, now = _decide_inputs()
+    if cpu is not None:
+        cpu = _cn(round(float(cpu), 1))
+        cpu_min = elastic_min(cpu) if cpu_min is None else _cn(min(round(float(cpu_min), 1), cpu))
+        if cpu_min < cpu and cpu_reservable() and _to_weigh(ticket):
+            s = _cpu_busy(s, now)
     with Ledger() as L:
         r = next((x for x in L["leases"] if x["id"] == ticket), None) if ticket else None
         if ticket and r is None:
             return _status(L, ticket, now)
         if r is None:
             ram = s.get("ram_gb") or 0
-            if gb <= 0 or (ram and gb > 0.9 * ram):
+            why = _refuse_cpu(s, cpu, cpu_min) if cpu is not None else None
+            if why or (gb <= 0 and cpu is None) or gb < 0 or (ram and gb > 0.9 * ram):
                 return {"status": "refused", "gb": gb,
-                        "advice": "Can't reserve %.1f GB %s. Split the work or lower its parallelism." % (gb, _on_ram(s))}
+                        "advice": why or "Can't reserve %.1f GB %s. Split the work or lower its parallelism."
+                                         % (gb, _on_ram(s))}
             L["seq"] += 1
-            r = {"id": "r%d" % L["seq"], "state": "queued", "gb": round(gb, 2), "purpose": (purpose or "?")[:80],
+            mirror = round(gb, 2) if gb > 0 else NO_MEM_GB
+            r = {"id": "r%d" % L["seq"], "state": "queued", "gb": mirror, "purpose": (purpose or "?")[:80],
                  "project": holder.get("project"), "holder": {k: holder.get(k) for k in ("pid", "start", "kind")},
                  "watch": holder["pid"] if watch == "holder" else watch,
                  "ttl": None if ttl_s is None else min(max(60, ttl_s), MAX_TTL_S),
                  "requested": round(now, 1), "seen": round(now, 1),
-                 "segments": [{"t": round(now, 1), "gb": round(gb, 2)}]}
+                 "segments": [{"t": round(now, 1), "gb": mirror}]}
+            if cpu is not None:  # a vector (02 §6.2): `v` once, at creation
+                r["v"] = 2
+                r["res"] = {"cpu": {"ask": cpu, "min": cpu_min}}
+                if gb > 0:
+                    r["res"].update(ram={"ask": mirror}, mem={"got": mirror})
+                r["segments"][0]["res"] = dict({"ram": mirror} if gb > 0 else {}, cpu=cpu)
             r["key"] = _key(r)
             r["user"] = _whoami()  # who asked (03 §6.5): shown once several accounts hold reservations
             r["holder"]["uid"] = os.getuid()
@@ -4561,17 +4957,22 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                 r["ttl"] = min(max(60, ttl_s), MAX_TTL_S)  # the limit the grant now has (_holder_gone)
                 r["expires"] = round(now + r["ttl"], 1)
         _evaluate(L, s, procs, now)
-        return _status(L, r["id"], now)
+        out = _status(L, r["id"], now)
+        if s.get("window_s") and out.get("status") == "granted" and "run_with" in out:
+            out["window_s"] = s["window_s"]  # how busy the cores were, measured just now (no logger)
+        return out
 
 
-def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, watch="holder", progress=None):
-    st = reserve(gb, purpose, holder, ttl_s, ticket, watch)
+def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, watch="holder", progress=None,
+            cpu=None, cpu_min=None):
+    kw = {"cpu": cpu, "cpu_min": cpu_min} if cpu is not None else {}
+    st = reserve(gb, purpose, holder, ttl_s, ticket, watch, **kw)
     t0 = time.time()
     while st["status"] == "queued" and time.time() - t0 < wait_s:
         if progress:
             progress(st)
         time.sleep(min(POLL_S, max(0.1, wait_s - (time.time() - t0))))
-        st = reserve(gb, purpose, holder, ttl_s, st["id"], watch)
+        st = reserve(gb, purpose, holder, ttl_s, st["id"], watch, **kw)
     return st
 
 
@@ -4592,15 +4993,56 @@ def release(rid, holder_pid=None, outcome="released"):
                 "next_granted": [r["id"] for r in L["leases"] if r["state"] == "granted" and r.get("granted") == round(now, 1)]}
 
 
+def _amend_cpu(L, r, cpu, cpu_min):
+    """amend's cores (02 §6.4, today's rules per resource): (change, refusal). Shrinking applies at once;
+    growing a grant only if the extra cores can be reserved now and nobody is queued for cores; a queued
+    request takes the new range, and a bigger one goes to the back of the line; 0 drops the cores."""
+    c = _cpu_of(r)
+    if c is None:
+        return None, ("%s holds no cores, and a reservation of memory made before cores could be reserved cannot "
+                      "take them: reserve the cores separately (reserve cpu_cores=%s / `oomph reserve --cpu %s --for "
+                      "\"…\"`)." % (r["id"], cores_text(cpu), cores_text(cpu))) if cpu else (None, None)
+    was = c["got"] if r["state"] == "granted" and _num(c.get("got")) else c["ask"]
+    if cpu == 0:
+        if no_memory(r):
+            return None, "%s holds nothing but cores: release it instead (release_memory / `oomph release %s`)." % (
+                r["id"], r["id"])
+        del r["res"]["cpu"]
+        return [was, 0], None
+    if r["state"] == "granted":
+        if cpu > was:
+            st = L.get("state", {})
+            room = st.get("cpu_available") if _num(st.get("cpu_available")) else 0
+            waiting = [x for x in L["leases"] if x["state"] == "queued" and ("cpu" in lease_need(x) or not weighable(x))]
+            if waiting or cpu - was > room:
+                return None, ("Can't grow %s from %s to %s cores now: %s. Keep the %s and reserve the extra %s "
+                              "separately (`oomph reserve --cpu %s --for \"…\"`): it queues fairly." % (
+                                  r["id"], cores_text(was), cores_text(cpu),
+                                  "%d request(s) for cores are queued and come first" % len(waiting) if waiting else
+                                  "only %s more can be reserved" % cores_text(max(0.0, room)),
+                                  cores_text(was), cores_text(cpu - was), cores_text(cpu - was)))
+        c.update(ask=cpu, got=cpu, min=min(cpu, c.get("min", cpu)))
+    else:
+        c.update(ask=cpu, min=elastic_min(cpu) if cpu_min is None else _cn(min(cpu_min, cpu)))
+        if cpu > was:  # a bigger request takes a new place in line
+            L["leases"].remove(r)
+            L["leases"].append(r)
+    return [was, cpu], None
+
+
 @_unprivileged(inputs=True)
-def amend(rid, gb=None, ttl_s=None, purpose=None):
-    """Change a reservation in place: its size, its time to live (from now) or its purpose.
+def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None):
+    """Change a reservation in place: its size, its cores, its time to live (from now) or its purpose.
     Shrinking applies at once and hands the room to whoever waits. Growing a grant applies only
-    when the extra memory would be granted to a new request right now (it fits, and nobody is
-    queued); otherwise it is refused, with advice to reserve the extra separately, which queues
-    fairly. Growing a queued request moves it to the back of the queue. Every applied change is
-    written to the history log, and a new size starts a new segment of the reservation's span."""
+    when the extra would be granted to a new request right now (it fits, and nobody is queued
+    for it); otherwise it is refused, with advice to reserve the extra separately, which queues
+    fairly. Growing a queued request moves it to the back of the queue. A reservation with cores
+    can drop its memory or its cores (0), not both. Every applied change is written to the history
+    log, and a new size starts a new segment of the reservation's span."""
     s, procs, now = _decide_inputs()
+    if cpu is not None:
+        cpu = _cn(round(float(cpu), 1))
+        cpu_min = None if cpu_min is None else _cn(round(float(cpu_min), 1))
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         r = next((x for x in L["leases"] if x["id"] == rid), None)
@@ -4608,14 +5050,19 @@ def amend(rid, gb=None, ttl_s=None, purpose=None):
             return _status(L, rid, now)
         ram = s.get("ram_gb") or 0
         change, refused = {}, None
-        if gb is not None and round(gb, 2) != r["gb"]:
+        vec = _cpu_of(r) is not None
+        before, order = json.loads(json.dumps(r)), list(L["leases"])  # all or nothing: restored when refused
+        if gb is not None and round(gb, 2) != (0.0 if no_memory(r) else r["gb"]):
             gb = round(gb, 2)
-            if gb <= 0 or (ram and gb > 0.9 * ram):
+            old = 0.0 if no_memory(r) else r["gb"]
+            if gb == 0 and vec and cpu != 0:
+                pass  # a reservation with cores drops its memory
+            elif gb <= 0 or (ram and gb > 0.9 * ram):
                 refused = ("Can't reserve %.1f GB %s. Release the reservation instead "
                            "(release_memory / `oomph release %s`) if the work is done." % (gb, _on_ram(s), rid))
-            elif gb > r["gb"] and r["state"] == "granted":
-                extra, st = gb - r["gb"], L["state"]
-                waiting = [x for x in L["leases"] if x["state"] == "queued"]
+            elif gb > old and r["state"] == "granted":
+                extra, st = gb - old, L["state"]
+                waiting = [x for x in L["leases"] if x["state"] == "queued" and ("ram" in lease_need(x) or not weighable(x))]
                 if waiting or extra > st["available_gb"] or st["level"] == "critical":
                     why = ("%d request(s) are queued and come first" % len(waiting) if waiting else
                            "memory is critical" if st["level"] == "critical" else
@@ -4623,19 +5070,45 @@ def amend(rid, gb=None, ttl_s=None, purpose=None):
                     refused = ("Can't grow %s from %.1f to %.1f GB now: %s. Keep the %.1f GB grant and reserve the "
                                "extra %.1f GB separately (reserve_memory gb=%.1f / `oomph reserve %.1fG --for \"…\"`): "
                                "it queues fairly and is granted when it fits." % (
-                                   rid, r["gb"], gb, why, r["gb"], extra, extra, extra))
+                                   rid, old, gb, why, old, extra, extra, extra))
             if refused is None:
-                change["gb"] = [r["gb"], gb]
-                if gb > r["gb"] and r["state"] == "queued":  # a bigger request takes a new place in line
+                change["gb"] = [old, gb]
+                if gb > old and r["state"] == "queued":  # a bigger request takes a new place in line
                     L["leases"].remove(r)
                     L["leases"].append(r)
                     change["requeued"] = True
-                r["gb"] = gb
-                r.setdefault("segments", [{"t": r.get("granted") or r["requested"], "gb": change["gb"][0]}])
-                if r["segments"][-1]["t"] >= round(now, 1):
-                    r["segments"][-1]["gb"] = gb
-                else:
-                    r["segments"].append({"t": round(now, 1), "gb": gb})
+                r["gb"] = gb if gb > 0 else NO_MEM_GB
+                if vec:  # the vector follows its memory mirror
+                    if gb > 0:
+                        r["res"]["ram"] = dict(r["res"].get("ram") or {}, ask=gb, **({"got": gb} if r["state"] == "granted" else {}))
+                        r["res"]["mem"] = dict(r["res"].get("mem") or {}, got=gb)
+                    else:
+                        r["res"].pop("ram", None)
+                        r["res"].pop("mem", None)
+        if refused is None and cpu is not None and (vec or cpu):
+            ch, refused = _amend_cpu(L, r, cpu, cpu_min)
+            if ch and ch[0] != ch[1]:
+                change["cpu"] = ch
+                if ch[1] > ch[0] and r["state"] == "queued":
+                    change["requeued"] = True
+            if refused and "gb" in change:  # the memory part is not applied alone
+                refused += " Nothing was changed."
+        if refused:
+            r.clear()
+            r.update(before)
+            L["leases"][:] = order
+            change = {}
+        if "gb" in change or "cpu" in change:
+            seg = {"t": round(now, 1), "gb": r["gb"]}
+            if vec:
+                seg["res"] = {k: x.get("got", x.get("ask")) for k, x in r["res"].items()
+                              if k in ("ram", "cpu") and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
+            r.setdefault("segments", [{"t": r.get("granted") or r["requested"],
+                                       "gb": change["gb"][0] or NO_MEM_GB if "gb" in change else r["gb"]}])
+            if r["segments"][-1]["t"] >= round(now, 1):
+                r["segments"][-1].update(seg, t=r["segments"][-1]["t"])
+            else:
+                r["segments"].append(seg)
         if refused is None and ttl_s:
             ttl = min(max(60, ttl_s), MAX_TTL_S)
             r["ttl"] = ttl
@@ -4657,7 +5130,10 @@ def amend(rid, gb=None, ttl_s=None, purpose=None):
                 pass
         out = _status(L, rid, now)
         if refused:
-            out.update(status="refused", id=rid, gb=r["gb"], requested_gb=gb, advice=refused, keeps=r["state"])
+            out.update(status="refused", id=rid, gb=0.0 if no_memory(r) else r["gb"], requested_gb=gb,
+                       advice=refused, keeps=r["state"])
+            if cpu is not None:
+                out["requested_cpu"] = cpu
         else:
             out["changed"] = change
         return out
@@ -4684,11 +5160,16 @@ def coordination(mine=None, s=None):
         own = [r for r in L["leases"] if _held_by(r, mine)]
         others = [r for r in L["leases"] if r not in own]
         others_out = sum(r["gb"] - r.get("used_gb", 0) for r in others if r["state"] == "granted")
+        cpu = {"cores": st["cpu_cap"], "margin": st["cpu_margin"], "reserved": st["cpu_reserved"],
+               "available": st["cpu_available"], "reservable": cpu_reservable()}
+        if "cpu_idle" in st:
+            cpu["idle"] = st["cpu_idle"]
         return {
             "free_gb": st["free_gb"], "margin_gb": st["margin_gb"], "reserved_gb": st["reserved_gb"],
             "available_gb": st["available_gb"], "grantable_gb": st["available_gb"], "ledger": ledger_info(),
             "reserved_by_others_gb": round(others_out, 1),
             "available_to_me_gb": round(st["free_gb"] - others_out - st["margin_gb"], 1),
+            "cpu": cpu,
             "others": [_brief(r, now) for r in others], "mine": [_brief(r, now) for r in own],
             "history": [dict(h, project=os.path.basename(h.get("project") or "") or None)
                         for h in L["history"][-15:]][::-1],
@@ -4710,6 +5191,13 @@ def _span(rec, now):
            "held_min": round(((end or now) - start) / 60, 1) if rec.get("granted") else 0}
     if len(rec.get("segments") or []) > 1:
         out["gb_changes"] = [{"at": iso(x["t"]), "gb": x["gb"]} for x in rec["segments"]]
+    vec = _record_vector(rec)  # a vector's amounts (granted, or asked while queued) and peaks by resource
+    if vec.get("res"):
+        out["res"] = vec["res"]
+        if "ram" not in vec["res"] and rec["gb"] <= NO_MEM_GB + 0.005:  # holds no memory: its gb is the mirror
+            out["gb"] = 0.0
+    if vec.get("peak"):
+        out["peak"] = vec["peak"]
     return out
 
 
@@ -4767,26 +5255,35 @@ def ledger_view(since=None):
 
 
 @_unprivileged()
-def refresh_ledger(s, procs):
+def refresh_ledger(s, procs, rated=False):
     """The daemon's tick: retire leases whose holder died or that expired, close to when it
-    happened, and keep the usage figures current. Skips the lock when nothing is reserved."""
+    happened, and keep the usage figures current (with `rated`, the cores too: the process table
+    carries the logger's CPU rates). Skips the lock when nothing is reserved."""
     if not read_ledger()["leases"]:
         return
     with Ledger() as L:
-        _evaluate(L, s, procs, time.time())
+        _evaluate(L, s, procs, time.time(), rated=rated)
 
 
 PROC_KEYS = ("pid", "ppid", "uid", "name", "start", "fp", "rss", "path")  # what the ledger's child is told of a process
 
 
-def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S):
+def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None):
     """The daemon's ledger work for one sample: refresh_ledger, then the snapshot of live
     reservations for the sample, both in a child — as nobody when the daemon is root (root
     never opens anything in the shared directory, to read or to write), as the same user when
     it isn't. Its answer is at most LIMITS["tick"] bytes of JSON, read within `timeout`, and the
     sample's block is rebuilt from it field by field (sample_leases). Returns (leases, error
-    or None). The daemon calls this from a thread of its own: the sampler never waits on it."""
-    payload = json.dumps({"s": s, "procs": [{k: p[k] for k in PROC_KEYS if k in p} for p in procs.values()]},
+    or None). The daemon calls this from a thread of its own: the sampler never waits on it.
+    `rates`: the cores each process kept busy over the last interval ({pid: cores}, the logger's
+    Meter); given, the child's input is of version 2 (02 §5.2) and it charges every grant's cores."""
+    rows = [{k: p[k] for k in PROC_KEYS if k in p} for p in procs.values()]
+    if rates is not None:
+        for x in rows:
+            c = rates.get(x["pid"])
+            if _num(c, 0, CPU_MAX):
+                x["cpu"] = round(c, 3)
+    payload = json.dumps(dict({"s": s, "procs": rows}, **({"v": 2} if rates is not None else {})),
                          default=str).encode()
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"], payload,
                                LIMITS["tick"], timeout, **_drop_to("nobody", "nobody"))
@@ -4811,7 +5308,7 @@ def _cmd_ledger_refresh():
         fd = _ledger_dir()  # readers see a directory replaced by a link as empty; the daemon should hear of it
         if fd is not None:
             os.close(fd)
-        refresh_ledger(d["s"], procs)
+        refresh_ledger(d["s"], procs, rated=d.get("v") == 2)
     except Exception as e:  # the snapshot is still worth having
         out["error"] = "%s: %s" % (type(e).__name__, e) if not isinstance(e, LedgerError) else str(e)
     out["leases"] = sample_leases(ledger_snapshot(procs))
@@ -4853,7 +5350,7 @@ def ledger_snapshot(procs=None):
     return out
 
 
-SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min")
+SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min", "cpu", "cpu_used")
 
 
 def sample_leases(x):
@@ -4898,10 +5395,13 @@ def coordination_verdict(v, c):
 def _fmt_brief(b, purpose_w=22):
     """A reservation as one row: id, state, size, purpose (cut at the end), project (cut in the
     middle, 10), what it uses or how long it waits. 78 columns with the default budget."""
-    tail = ("using %.1fG, %.0f min" % (b.get("used_gb", 0), b["for_min"]) if b["state"] == "granted"
-            else "waiting %.0f min" % b["waiting_min"])
-    return "%-5s %-7s %5.1fG  %-*s %-10s %s" % (b["id"], b["state"], b["gb"], purpose_w, cut_end(b["purpose"], purpose_w),
-                                               cut_middle(b.get("project") or "", 10), tail)
+    cores = ("%s cores%s, " % (cores_text(b["cpu"]), " (%.1f busy)" % b["cpu_used"] if _num(b.get("cpu_used")) else "")
+             if _num(b.get("cpu")) else "")
+    tail = cores + ((("using %.1fG, " % b.get("used_gb", 0)) if b["gb"] > 0 else "") + "%.0f min" % max(0.0, b["for_min"])
+                    if b["state"] == "granted" else "waiting %.0f min" % max(0.0, b["waiting_min"]))
+    size = "%5.1fG" % b["gb"] if b["gb"] > 0 or not cores else "%6s" % "-"
+    return "%-5s %-7s %s  %-*s %-10s %s" % (b["id"], b["state"], size, purpose_w, cut_end(b["purpose"], purpose_w),
+                                           cut_middle(b.get("project") or "", 10), tail)
 
 
 def _opt(args, name, default=None):
@@ -4955,17 +5455,30 @@ def _usage_error(cmd, e, text):
     return 2
 
 
-RESERVE_USAGE = "usage: oomph reserve <size, e.g. 6G> --for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]"
+RESERVE_USAGE = ("usage: oomph reserve [size, e.g. 6G] [--cpu 8 | --cpu 4..8 | --cpu 8..8] --for \"what\" [--wait 10m] "
+                 "[--ttl 30m] [--ticket rN] [--json]")
 RELEASE_USAGE = "usage: oomph release <id | all>   (all = every reservation held by this session)"
-AMEND_USAGE = "usage: oomph amend <id> [--gb 3G] [--ttl 20m] [--for \"what\"] [--json]"
-RUN_USAGE = "usage: oomph run --reserve 6G [--for \"what\"] [--wait 30m] -- <command> [args…]"
+AMEND_USAGE = "usage: oomph amend <id> [--gb 3G] [--cpu 6] [--ttl 20m] [--for \"what\"] [--json]"
+RUN_USAGE = ("usage: oomph run [--reserve 6G] [--cpu 4..12] [--for \"what\"] [--wait 30m] -- <command> [args…]   "
+             "({cpu} in the command is the number of cores granted)")
+
+
+def _cpu_opt(o):
+    """--cpu's (ask, min), or (None, None); UsageError when it is not a number of cores."""
+    if "--cpu" not in o:
+        return None, None
+    try:
+        return parse_cores(o["--cpu"])
+    except ValueError as e:
+        raise UsageError(str(e))
 
 
 def cmd_reserve(args):
     try:
-        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid"), ("--json", "--help", "-h"))
+        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu"), ("--json", "--help", "-h"))
         ticket = o.get("--ticket")
-        if "--help" in o or "-h" in o or (not pos and not ticket):
+        cpu, cpu_min = _cpu_opt(o)
+        if "--help" in o or "-h" in o or (not pos and not ticket and cpu is None):
             print(RESERVE_USAGE)
             return 2
         gb = _size(pos[0]) if pos else 0
@@ -4976,7 +5489,7 @@ def cmd_reserve(args):
         return _usage_error("reserve", e, RESERVE_USAGE)
     holder = holder_for(int(pid) if pid is not None else None)
     st = acquire(gb, o.get("--for", "unspecified"), holder, parse_dur(o.get("--ttl", "30m")),
-                 parse_dur(o.get("--wait", "0s")), ticket)
+                 parse_dur(o.get("--wait", "0s")), ticket, cpu=cpu, cpu_min=cpu_min)
     if "--json" in o:
         print(json.dumps(st))
     else:
@@ -5004,8 +5517,11 @@ def cmd_release(args):
         print("oomph: nothing to release")
         return 1
     for h in res["released"]:
-        print("oomph: released %s (%s) — reserved %.1fG, peak %.1fG, held %ds" % (
-            h["id"], h["purpose"], h["gb"], h["peak_gb"], h["held_s"]))
+        cpu, peak = (h.get("res") or {}).get("cpu"), (h.get("peak") or {}).get("cpu")
+        mem = "%.1fG, peak %.1fG" % (h["gb"], h["peak_gb"]) if "ram" in (h.get("res") or {}) or not _num(cpu) else ""
+        cores = "%s cores%s" % (cores_text(cpu), ", peak %.1f busy" % peak if _num(peak) else "") if _num(cpu) else ""
+        print("oomph: released %s (%s) — reserved %s, held %ds" % (
+            h["id"], h["purpose"], " and ".join(x for x in (mem, cores) if x), h["held_s"]))
     if res["next_granted"]:
         print("oomph: now granted to " + ", ".join(res["next_granted"]))
     return 0
@@ -5013,20 +5529,22 @@ def cmd_release(args):
 
 def cmd_amend(args):
     try:
-        o, pos = _strict(args, ("--gb", "--ttl", "--for"), ("--json", "--help", "-h"))
-        if not pos or not any(k in o for k in ("--gb", "--ttl", "--for")) or "--help" in o or "-h" in o:
+        o, pos = _strict(args, ("--gb", "--ttl", "--for", "--cpu"), ("--json", "--help", "-h"))
+        if not pos or not any(k in o for k in ("--gb", "--ttl", "--for", "--cpu")) or "--help" in o or "-h" in o:
             print(AMEND_USAGE)
             return 2
         gb = _size(o["--gb"]) if "--gb" in o else None
+        cpu, cpu_min = (0.0, None) if o.get("--cpu") == "0" else _cpu_opt(o)
     except UsageError as e:
         return _usage_error("amend", e, AMEND_USAGE)
     rid = pos[0]
-    st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"))
+    st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"), cpu=cpu, cpu_min=cpu_min)
     if "--json" in o:
         print(json.dumps(st))
     else:
         ch = st.get("changed") or {}
         what = ", ".join(("%.1fG → %.1fG" % tuple(v)) if k == "gb" else
+                         ("%s → %s cores" % tuple(cores_text(x) for x in v)) if k == "cpu" else
                          ("expires in %.0f min" % v[1]) if k == "expires_in_min" else
                          ("ttl %.0f min" % v) if k == "ttl_min" else
                          ("for \"%s\"" % v[1]) if k == "purpose" else "back of the queue"
@@ -5046,6 +5564,8 @@ def cmd_reservation_history(args):
         when = (x["granted"] or x["requested"])[5:16].replace("T", " ")
         end = (x["ended"] or "now")[11:16] if x["ended"] else "now"
         gbs = " → ".join("%.1fG" % c["gb"] for c in x.get("gb_changes", [])) or "%.1fG" % x["gb"]
+        if "cpu" in (x.get("res") or {}):  # and its cores
+            gbs = ("%s cores" if not x["gb"] else gbs + " %sc") % cores_text(x["res"]["cpu"])
         print("  %-6s %s–%-5s %-13s peak %4.1fG  %-26s %-14s %s" % (
             x["id"], when, end, gbs, x["peak_gb"], x["purpose"][:26], (x["project"] or "")[:14], x["outcome"]))
     return 0
@@ -5083,20 +5603,49 @@ def cmd_reservations(args):
     return 0
 
 
+JOB_VARS = ("CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL", "GOMAXPROCS", "OMP_NUM_THREADS", "RAYON_NUM_THREADS",
+            "PYTEST_XDIST_AUTO_NUM_WORKERS")  # what common tools read for their number of jobs (02 §7.1)
+
+
+def run_env(st, env):
+    """The environment of `oomph run`'s command for grant `st` (02 §7.1): OOMPH_RESERVATION, OOMPH_RAM_GB and,
+    with cores, OOMPH_CPU_CORES; and, only where not already set, the job counts that common tools read
+    (JOB_VARS, MAKEFLAGS=-jN): on by default (02 §15.9)."""
+    out = dict(env, OOMPH_RESERVATION=st["id"])
+    if st.get("gb"):
+        out["OOMPH_RAM_GB"] = "%g" % st["gb"]
+    got = (st.get("run_with") or {}).get("cpu_cores")
+    if _num(got, 0.1, CPU_MAX):
+        out["OOMPH_CPU_CORES"] = cores_text(got)
+        jobs = str(max(1, int(got)))
+        for k in JOB_VARS:
+            out.setdefault(k, jobs)
+        out.setdefault("MAKEFLAGS", "-j" + jobs)
+    return out
+
+
+def run_argv(cmd, st):
+    """The command with every `{cpu}` replaced by the number of cores granted (in the argument vector itself,
+    never through a shell); unchanged without cores."""
+    got = (st.get("run_with") or {}).get("cpu_cores")
+    if not _num(got, 0.1, CPU_MAX):
+        return list(cmd)
+    jobs = str(max(1, int(got)))
+    return [c.replace("{cpu}", jobs) for c in cmd]
+
+
 def cmd_run(args):
-    if "--" not in args or "--reserve" not in args:
+    if "--" not in args or not ("--reserve" in args[:args.index("--")] or "--cpu" in args[:args.index("--")]):
         print(RUN_USAGE)
         return 2
     i = args.index("--")
     cmd = args[i + 1:]
     try:
-        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait"), npos=0)
-        gb = _size(opts["--reserve"]) if "--reserve" in opts else None
+        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu"), npos=0)
+        gb = _size(opts["--reserve"]) if "--reserve" in opts else 0
+        cpu, cpu_min = _cpu_opt(opts)
     except UsageError as e:
         return _usage_error("run", e, RUN_USAGE)
-    if gb is None:
-        print(RUN_USAGE)
-        return 2
     if not cmd:
         print("oomph run: no command given")
         return 2
@@ -5108,18 +5657,20 @@ def cmd_run(args):
           "kind": "run", "project": ses["project"] if ses["kind"] == "session" else os.getcwd(),
           "agent": agent_key(ses["pid"], ses["start"]) if ses["kind"] == "session" else None}
     last = [0.0]
+    want = " and ".join(([("%.1fG" % gb)] if gb else []) + (["%s cores" % cores_text(cpu_min if cpu_min == cpu else cpu)]
+                                                           if cpu else []))
 
     def progress(st):
         if time.time() - last[0] >= 30:
             last[0] = time.time()
             ahead = ", ".join("%s %.1fG %s (%s)" % (b["id"], b["gb"], b["purpose"], b.get("project") or "?")
                               for b in st.get("ahead", [])[:3])
-            sys.stderr.write(wrap("waiting for %.1fG — queued #%s, %.1fG available%s" % (
-                gb, st.get("position"), st.get("available_gb") or 0, "; ahead: " + ahead if ahead else ""),
+            sys.stderr.write(wrap("waiting for %s — queued #%s, %.1fG available%s" % (
+                want, st.get("position"), st.get("available_gb") or 0, "; ahead: " + ahead if ahead else ""),
                 first="oomph: ") + "\n")
             sys.stderr.flush()
 
-    st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress)
+    st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress, cpu=cpu, cpu_min=cpu_min)
     if st["status"] != "granted":
         if st["status"] == "queued":
             _quietly(release, st["id"])
@@ -5130,7 +5681,7 @@ def cmd_run(args):
         sys.stderr.write("oomph: note — %s\n" % st["note"])
     t0 = time.time()
     try:
-        child = subprocess.Popen(cmd)
+        child = subprocess.Popen(run_argv(cmd, st), env=run_env(st, os.environ))
     except OSError as e:
         _quietly(release, st["id"])
         sys.stderr.write("oomph run: %s\n" % e)
@@ -5150,8 +5701,12 @@ def cmd_run(args):
     finally:
         res = _quietly(release, st["id"]) or {"released": []}  # else it ends when this process does
     h = (res["released"] or [{}])[0]
-    sys.stderr.write("oomph: %s — reserved %.1fG, peak %.1fG, %ds\n" % (
-        st["id"], gb, h.get("peak_gb", 0), time.time() - t0))
+    cores = (h.get("peak") or {}).get("cpu")
+    sys.stderr.write("oomph: %s — %s%s, %ds\n" % (
+        st["id"], "reserved %.1fG, peak %.1fG" % (gb, h.get("peak_gb", 0)) if gb else "",
+        ("%s%s cores, peak %.1f busy" % (", " if gb else "", cores_text(st["run_with"]["cpu_cores"]), cores))
+        if _num(cores) else (("%s%s cores" % (", " if gb else "", cores_text(st["run_with"]["cpu_cores"])))
+                             if st.get("run_with") else ""), time.time() - t0))
     return rc if rc >= 0 else 128 - rc
 
 
@@ -5263,9 +5818,18 @@ MCP_TOOLS = [
                     "isn't. Returns status granted (start now), queued (do NOT start yet; call again with ticket=id "
                     "within 180 s to keep your place, and see who is ahead) or refused. Calling again with the ticket "
                     "of a granted reservation extends it. Change its size, ttl or purpose with update_reservation, "
-                    "and release it with release_memory when the heavy part is over.",
-     "inputSchema": {"type": "object", "required": ["gb", "purpose"], "additionalProperties": False, "properties": {
-         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB"},
+                    "and release it with release_memory when the heavy part is over. For parallel work (builds, test "
+                    "runners, -j) also ask for cpu_cores, in the same call: what its parallelism would use. You are "
+                    "granted between half of that and all of it, and the answer's run_with.cpu_cores is the number "
+                    "to run with (-jN), not the number you asked for.",
+     "inputSchema": {"type": "object", "required": ["purpose"], "additionalProperties": False, "properties": {
+         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB (gb or "
+                                                                        "cpu_cores, or both)"},
+         "cpu_cores": {"type": "number", "exclusiveMinimum": 0, "description": "logical cores the work would use "
+                                                                               "(e.g. its -j); granted half to all"},
+         "cpu_min": {"type": "number", "exclusiveMinimum": 0, "description": "the fewest cores to start with (default "
+                                                                             "half of cpu_cores; equal to it: exactly "
+                                                                             "that many, or wait)"},
          "purpose": {"type": "string", "description": "short label, e.g. 'gradle assembleDebug' — reuse the same "
                                                        "label for the same work so its measured peak can guide estimates"},
          "wait_s": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120,
@@ -5288,7 +5852,9 @@ MCP_TOOLS = [
                     "To end a reservation use release_memory.",
      "inputSchema": {"type": "object", "required": ["id"], "additionalProperties": False, "properties": {
          "id": {"type": "string", "description": "the reservation's id, e.g. r12"},
-         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "new size in GB"},
+         "gb": {"type": "number", "minimum": 0, "description": "new size in GB (0 drops the memory of a "
+                                                                 "reservation that also holds cores)"},
+         "cpu_cores": {"type": "number", "minimum": 0, "description": "new number of cores (0 drops them)"},
          "ttl_min": {"type": "integer", "minimum": 1, "maximum": 480, "description": "expire this many minutes from now"},
          "purpose": {"type": "string", "description": "new short label"}}}},
     {"name": "reservations",
@@ -5304,7 +5870,9 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "hours": {"type": "number", "minimum": 0.1, "maximum": 336, "default": 24},
          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
-         "purpose": {"type": "string", "description": "only reservations whose purpose contains this text"}}}},
+         "purpose": {"type": "string", "description": "only reservations whose purpose contains this text"},
+         "resource": {"type": "string", "enum": ["memory", "cpu"],
+                      "description": "only reservations that held this resource"}}}},
     {"name": "my_session",
      "description": "Memory used by the Claude Code session this server belongs to: its whole process tree, total, "
                     "and the biggest child processes (pid, name, MB). Use it to find what to stop when memory is tight.",
@@ -5335,7 +5903,7 @@ class ToolArgError(ValueError):
     """A tool call's arguments don't fit its schema; the caller gets an error result saying so."""
 
 
-_MCP_NEEDS = {"reserve_memory": ("gb",)}  # purpose is asked for, but a call without it is "unspecified"
+_MCP_NEEDS = {"reserve_memory": ()}  # purpose is asked for, but a call without it is "unspecified"; gb or cpu_cores
 
 
 def _mcp_args(name, a):
@@ -5356,6 +5924,28 @@ def _mcp_args(name, a):
     if extra:
         raise ToolArgError("%s takes no argument %s (it takes %s)" % (
             name, ", ".join(extra), ", ".join(sch["properties"])))
+    for k in ("cpu_cores", "cpu_min"):  # numbers, as the schema says (gb is read as before: float() of it)
+        if a.get(k) is not None and not _num(a[k], 0, 1e6):
+            raise ToolArgError("%s: %s takes a number from 0 up, not %r" % (name, k, a[k]))
+    if name == "reserve_memory":
+        if not (a.get("gb") or a.get("cpu_cores")):
+            raise ToolArgError("reserve_memory needs gb or cpu_cores (or both)")
+        if a.get("cpu_min") is not None and not a.get("cpu_cores"):
+            raise ToolArgError("reserve_memory: cpu_min comes with cpu_cores")
+        if a.get("cpu_cores"):
+            try:
+                parse_cores(a["cpu_cores"])
+                if a.get("cpu_min") is not None:
+                    parse_cores(a["cpu_min"])
+            except ValueError as e:
+                raise ToolArgError("reserve_memory: %s" % e)
+            if a.get("cpu_min") is not None and a["cpu_min"] > a["cpu_cores"]:
+                raise ToolArgError("reserve_memory: cpu_min (%g) is more than cpu_cores (%g)" % (a["cpu_min"], a["cpu_cores"]))
+    if name == "update_reservation" and a.get("cpu_cores"):
+        try:
+            parse_cores(a["cpu_cores"])
+        except ValueError as e:
+            raise ToolArgError("update_reservation: %s" % e)
 
 
 def _mcp_call(name, a):
@@ -5364,21 +5954,29 @@ def _mcp_call(name, a):
         return checked_verdict()
     if name == "reserve_memory":
         ttl = min(max(int(a.get("ttl_min", 30)), 1), 480) * 60
-        return acquire(float(a["gb"]), str(a.get("purpose", "unspecified")), holder_for(), ttl,
-                       min(max(int(a.get("wait_s", 120)), 0), 300), a.get("ticket"))
+        cpu = parse_cores(a["cpu_cores"])[0] if a.get("cpu_cores") else None
+        return acquire(float(a.get("gb") or 0), str(a.get("purpose", "unspecified")), holder_for(), ttl,
+                       min(max(int(a.get("wait_s", 120)), 0), 300), a.get("ticket"), cpu=cpu,
+                       cpu_min=round(float(a["cpu_min"]), 1) if cpu and a.get("cpu_min") is not None else None)
     if name == "release_memory":
         rid = str(a.get("id", ""))
         return release(rid, holder_for()["pid"] if rid == "all" else None)
     if name == "update_reservation":
         return amend(str(a["id"]), float(a["gb"]) if a.get("gb") is not None else None,
                      min(max(int(a["ttl_min"]), 1), 480) * 60 if a.get("ttl_min") else None,
-                     str(a["purpose"]) if a.get("purpose") else None)
+                     str(a["purpose"]) if a.get("purpose") else None,
+                     cpu=(parse_cores(a["cpu_cores"])[0] if a["cpu_cores"] else 0.0)
+                     if a.get("cpu_cores") is not None else None)
     if name == "reservations":
         return coordination(holder_for()["pid"])
     if name == "reservation_history":
         h = reservation_history(min(max(float(a.get("hours", 24)), 0.1), 336) * 3600, 500)
         if a.get("purpose"):
             h["reservations"] = [x for x in h["reservations"] if str(a["purpose"]).lower() in x["purpose"].lower()]
+        if a.get("resource") == "cpu":
+            h["reservations"] = [x for x in h["reservations"] if "cpu" in (x.get("res") or {})]
+        elif a.get("resource") == "memory":
+            h["reservations"] = [x for x in h["reservations"] if x["gb"] > 0]
         h["reservations"] = h["reservations"][:int(a.get("limit", 50))]
         return h
     if name == "my_session":
@@ -5427,7 +6025,8 @@ MCP_SELFCHECK_S = 5      # the new code's time to answer `mcp --selfcheck` (a te
 MCP_INSTRUCTIONS = (
     "%s reports %s memory, swap and disk, and coordinates memory between Claude sessions and other agents. "
     "Before memory-heavy work call reserve_memory with the work's estimated peak (reservation_history shows what "
-    "similar work really needed); start only when granted. Shrink or extend it with update_reservation as the work "
+    "similar work really needed), and for parallel work its cores (cpu_cores; run with run_with.cpu_cores); start "
+    "only when granted. Shrink or extend it with update_reservation as the work "
     "changes, and release_memory when done. Call memory_check periodically and back off when it says tight or "
     "critical.")
 

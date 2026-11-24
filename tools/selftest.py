@@ -811,7 +811,7 @@ hang = threading.Event()
 calls = []
 
 
-def slow_tick(s, procs):
+def slow_tick(s, procs, **kw):  # rates=…: the Meter's cores per process, from the second sample on
     calls.append(s["t"])
     hang.wait(20)
     return [], None
@@ -1167,20 +1167,23 @@ bl = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "br
                     text=True, timeout=60)
 check(bl.returncode == 0, "brandlint: prose and identifiers kept apart (%s)" % bl.stdout.strip().splitlines()[-1:])
 
-# --- strict options: an option this oomph doesn't know is refused, never taken for gigabytes
+# --- strict options: an option this oomph doesn't know is refused, never taken for gigabytes (since 1.12.0 it
+# knows --cpu: the GPU's --gpu, of a later release, stands in for an option from a newer oomph)
 oomph._sample_override = lambda: dict(fixed)
 n_before = len(oomph.read_ledger()["leases"])
-for args in (["reserve", "--cpu", "8", "5G", "--for", "x"], ["reserve", "5G", "8", "--for", "x"],
-             ["reserve", "5G", "--for"], ["reserve", "lots", "--for", "x"],
-             ["amend", "r1", "--gb", "3G", "--cpu", "2"], ["release", "r1", "r2"], ["release", "--all"],
-             ["run", "--reserve", "1G", "--cpu", "2", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
+for args in (["reserve", "--gpu", "60", "5G", "--for", "x"], ["reserve", "5G", "8", "--for", "x"],
+             ["reserve", "5G", "--for"], ["reserve", "lots", "--for", "x"], ["reserve", "--cpu", "lots", "--for", "x"],
+             ["reserve", "--cpu", "8..4", "--for", "x"], ["reserve", "--cpu", "2.25", "--for", "x"],
+             ["amend", "r1", "--gb", "3G", "--gpu", "2"], ["release", "r1", "r2"], ["release", "--all"],
+             ["run", "--reserve", "1G", "--gpu", "2", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
+             ["run", "--cpu", "two", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
              ["run", "--reserve", "1G", "8", "--", "/usr/bin/touch", os.path.join(LOG, "ran")]):
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
         rc = oomph.main(args)
     check(rc == 2 and "usage: oomph %s" % args[0] in err.getvalue() and
           ("unknown option" in err.getvalue() or "unexpected argument" in err.getvalue() or
-           "needs a value" in err.getvalue() or "not a size" in err.getvalue()),
+           "needs a value" in err.getvalue() or "not a size" in err.getvalue() or "cores" in err.getvalue()),
           "strict: `oomph %s` exits 2 (%s)" % (" ".join(args), err.getvalue().splitlines()[0] if err.getvalue() else rc))
 check(len(oomph.read_ledger()["leases"]) == n_before and not os.path.exists(os.path.join(LOG, "ran")),
       "strict: nothing was reserved and nothing ran")
@@ -1200,7 +1203,7 @@ if MAC:  # MCP argument checks in a child process
     resp2 = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
     errs = [resp2.get(20 + i, {}).get("result", {}) for i in range(4)]
     check(all(e.get("isError") for e in errs) and "takes no argument cpu" in errs[0]["content"][0]["text"] and
-          "needs gb" in errs[3]["content"][0]["text"],
+          "needs gb or cpu_cores" in errs[3]["content"][0]["text"],
           "MCP: the reservation tools refuse unknown and missing arguments (%s)" % [e.get("isError") for e in errs])
     ok2 = [resp2.get(24 + i, {}).get("result", {}) for i in range(2)]
     check(all(e and not e.get("isError") for e in ok2),
@@ -2570,14 +2573,18 @@ buf = io.StringIO()
 with redirect_stdout(buf):
     rc = oomph.main(["resources", "--json"])
 d = json.loads(buf.getvalue())
-check(rc == 0 and d["reservable"] == ["memory"] and d["memory"]["reservable"] and d["cpu"]["n"] == 14 and
-      not d["cpu"]["reservable"] and d["gpu"][0]["name"] == "Apple M3 Max" and not d["gpu"][0]["reservable"] and
+check(rc == 0 and d["reservable"] == ["memory"] + (["cpu"] if oomph.cpu_reservable() else []) and
+      d["memory"]["reservable"] and d["cpu"]["n"] == 14 and d["cpu"]["reservable"] == oomph.cpu_reservable() and
+      (not oomph.cpu_reservable() or {"reserved", "left", "margin"} <= set(d["cpu"])) and
+      d["gpu"][0]["name"] == "Apple M3 Max" and not d["gpu"][0]["reservable"] and
       [x["id"] for x in d["disks"]] == ["data", "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"] and d["disks"][0]["watched"],
-      "oomph resources --json: memory reservable; cores, GPU and disks listed, not yet reservable")
+      "oomph resources --json: memory reservable, cores where they are measured (with what is reserved and left); "
+      "GPU and disks listed, not yet reservable")
 buf = io.StringIO()
 with redirect_stdout(buf):
     rc = oomph.main(["resources"])
-check(rc == 0 and "not reservable yet" in buf.getvalue() and "Only memory can be reserved" in buf.getvalue(),
+check(rc == 0 and "not reservable yet" in buf.getvalue() and
+      ("Memory and cores can be reserved" if oomph.cpu_reservable() else "Memory can be reserved") in buf.getvalue(),
       "oomph resources: says what can be reserved")
 oomph.LOG_DIR = saved_log
 oomph._sample_override = None
@@ -3013,6 +3020,259 @@ check([c["text"] for c, _ in got_caps] == [w for _, w in caps_cases],
       % [c["text"] for c, _ in got_caps])
 check(all(c["level"] == v["exit_code"] for c, v in got_caps),
       "capsule: its level is always `oomph check`'s (the chip agrees with the verdict)")
+
+# --- B1 (1.12.0): cores, reserved elastically and admitted per pool (roadmap 02 §6.1, §6.4, §7, §13)
+b1_dir = os.path.join(LOG, "ledger-b1")
+saved_ld, saved_env_ld, saved_res = oomph.LEDGER_DIR, os.environ["OOMPH_LEDGER_DIR"], oomph.cpu_reservable
+oomph.LEDGER_DIR = os.environ["OOMPH_LEDGER_DIR"] = b1_dir  # the refresh child and `oomph run` too
+oomph.cpu_reservable = lambda: True  # a machine that measures its cores (a Mac; the stand-in backend elsewhere)
+b1 = dict(ram_gb=36.0, app_gb=20.0, wired_gb=4.0, compressed_gb=2.0, pressure=1, disk_free_gb=60.0,
+          swap_used_gb=0.0, swap_total_gb=0.0, os="macos", t=time.time(), cpu={"n": 14, "busy": 0.0})
+oomph._sample_override = lambda: json.loads(json.dumps(b1))
+sleepers = [subprocess.Popen(["/bin/sleep", "120"]) for _ in range(3)]
+H = [{"pid": x.pid, "start": None, "kind": "session", "project": "/tmp/b1-%d" % i} for i, x in enumerate(sleepers)]
+b1l = lambda rid: next((x for x in oomph.read_ledger()["leases"] if x["id"] == rid), {})  # noqa: E731
+b1recs = lambda rid: [json.loads(x) for x in open(os.path.join(b1_dir, "reservations.jsonl"))  # noqa: E731
+                      if json.loads(x)["id"] == rid] if os.path.exists(os.path.join(b1_dir, "reservations.jsonl")) else []
+
+
+def b1_clear():
+    for h in H + [me]:
+        oomph.release("all", h["pid"])
+    b1.update(pressure=1, cpu={"n": 14, "busy": 0.0})
+    b1.pop("pools", None)
+
+
+try:
+    check([oomph.parse_cores(x) for x in ("8", "8..8", "1..8", "7", "2.5")] == [(8, 4), (8, 8), (8, 1), (7, 4), (2.5, 1.3)]
+          and oomph.cpu_margin(14) == 2 and oomph.cpu_margin(8) == 1 and oomph.cpu_margin(4) == 1,
+          "cores: --cpu 8 is 4..8, 8..8 exactly, a fraction keeps one decimal; 2 of 14 and 1 of 8 are kept back")
+    # (d) nothing reserved, unreserved load on all 14 cores: granted the minimum at once, with the reason
+    b1["cpu"]["busy"] = 14.0
+    d = oomph.reserve(0, "busy machine", H[0], cpu=8)
+    check(d["status"] == "granted" and d.get("run_with") == {"cpu_cores": 4} and "holds no reservation" in d.get("note", "")
+          and d["advice"].startswith("Run with 4 cores (-j4)"),
+          "(d) cores busy with unreserved work: cpu 8 granted its minimum of 4 at once, with the note (%s)" % d.get("run_with"))
+    lz = b1l(d["id"])
+    check(lz.get("v") == 2 and lz["gb"] == oomph.NO_MEM_GB and lz["res"] == {"cpu": {"ask": 8, "min": 4, "got": 4}}
+          and lz.get("res_granted") and oomph.no_memory(lz) and oomph._brief(lz, time.time())["gb"] == 0.0,
+          "a request for cores alone: a vector lease (v 2), granted by this code, gb only the mirror %s" % oomph.NO_MEM_GB)
+    check(type(d["run_with"]["cpu_cores"]) is int and type(d["granted"]["cpu_cores"]) is int
+          and all(type(lz["res"]["cpu"][k]) is int for k in ("ask", "min", "got")) and '"cpu_cores": 4}' in json.dumps(d)
+          and oomph.parse_cores("2.5")[0] == 2.5, "cores are whole numbers in JSON (4, not 4.0: -j takes integers), "
+          "fractions stay fractions")
+    import oomph_linux
+    import types
+    real_plat = oomph._plat
+    oomph._plat = types.SimpleNamespace(OS="linux", cpu_ticks=lambda: None, **{
+        k: getattr(oomph_linux, k) for k in ("RESERVES_CPU",) if hasattr(oomph_linux, k)})
+    try:
+        lin_res = saved_res()
+    finally:
+        oomph._plat = real_plat
+    check(getattr(oomph_linux, "RESERVES_CPU", False) is not True and not lin_res,
+          "cores are not reservable on Linux, even once it reads the cores' ticks (L2): it opts in on purpose (G2)")
+    check([r.get("res") for r in b1recs(d["id"]) if r.get("event") == "grant"] == [{"cpu": 4}],
+          "history log: a grant record with the granted vector")
+    oomph.release(d["id"])
+    end = [r for r in b1recs(d["id"]) if r.get("event") == "end"]
+    check(end and end[-1].get("res") == {"cpu": 4} and end[-1].get("v") == 2, "history log: the end record carries res")
+    b1_clear()
+    # (e) six of twelve reservable cores granted, 2.1 idle (the logger's figure): cpu 4 gets 2, 8..8 waits
+    g6 = oomph.reserve(0, "six", H[0], cpu=6, cpu_min=6)
+    b1["pools"] = {"t": time.time(), "cpu": {"cap": 14, "margin": 2, "reserved": 6, "busy": 9.9, "others": 3.9}}
+    e4 = oomph.reserve(0, "four", H[1], cpu=4)
+    e8 = oomph.reserve(0, "eight exactly", H[1], cpu=8, cpu_min=8)
+    check(g6["run_with"] == {"cpu_cores": 6} and e4["status"] == "granted" and e4.get("run_with") == {"cpu_cores": 2}
+          and e4.get("asked") == {"cpu_cores": 4, "cpu_min": 2},
+          "(e) with 6 of 12 granted and 2.1 idle: cpu 4 (2..4) is granted 2 at once (%s)" % e4.get("run_with"))
+    check(e8["status"] == "queued" and e8.get("waiting_on") == ["cpu"] and "cpu_min 4" in e8["advice"]
+          and b1l(e8["id"]).get("hold") == ["cpu"],
+          "(e) 8..8 waits for cores (waiting_on, hold), and is told it could start now with 4 (%s)" % e8["advice"][:60])
+    a2 = oomph.reserve(0.5, "memory meanwhile", H[2])
+    check(a2["status"] == "granted", "a memory request passes a request that waits for its turn at the cores")
+    b1_clear()
+    # (c) behind an exact request that waits under an `oomph run` grant: short of memory and cores
+    run12 = oomph.reserve(0, "a run with every core", dict(H[2], kind="run"), cpu=12, cpu_min=12)
+    m4 = oomph.reserve(4, "memory held", H[1])
+    big = oomph.reserve(20, "big and parallel", H[0], cpu=8, cpu_min=8)
+    small = oomph.reserve(2, "small", H[1])
+    check(run12["status"] == m4["status"] == "granted" and big["status"] == "queued"
+          and big.get("waiting_on") == ["cpu", "ram"] and small["status"] == "granted",
+          "(c) a 2 GB request is granted while an earlier one waits, short of memory and of the cores a run holds "
+          "(%s, %s)" % (big.get("waiting_on"), small["status"]))
+    oomph.release(run12["id"])
+    later_m = oomph.reserve(1, "later memory", H[1])
+    later_c = oomph.reserve(0, "later cores", H[2], cpu=2)
+    lb = b1l(big["id"])
+    check(lb.get("waiting_on") == ["ram"] and lb.get("hold") == ["cpu", "ram"] and later_m["status"] == "queued"
+          and later_c["status"] == "queued" and later_c.get("waiting_on") == ["cpu"],
+          "(c) once the cores are free and it lacks only memory, it holds up memory and the cores it was short of: "
+          "no later request takes either (no alternation)")
+    oomph.release(m4["id"])
+    oomph.release(small["id"])
+    lb = b1l(big["id"])
+    check(lb.get("state") == "granted" and lb["res"]["cpu"]["got"] == 8 and lb["res"]["ram"] == {"ask": 20, "got": 20}
+          and lb["res"]["mem"]["got"] == 20 and lb["gb"] == 20 and "no other work is reserved" in lb.get("note", ""),
+          "(c) and then it is granted all at once: memory alone (the note), its 8 cores; the mirrors agree")
+    b1_clear()
+    # (f) two requests in one pass: the second is not "alone" once the first was granted
+    hold2 = oomph.reserve(2, "holds memory", H[2])
+    f1, f2 = oomph.reserve(20, "first big", H[0]), oomph.reserve(20, "second big", H[1])
+    rel = oomph.release(hold2["id"])
+    check(f1["status"] == f2["status"] == "queued" and rel["next_granted"] == [f1["id"]] and b1l(f2["id"])["state"] == "queued",
+          "(f) two big requests, one pass: the first is granted alone, the second is not alone after it (%s)"
+          % rel["next_granted"])
+    b1_clear()
+    # memory critical blocks everything; refusals
+    b1["pressure"] = 4
+    cr = oomph.reserve(0, "cores while critical", H[0], cpu=2)
+    check(cr["status"] == "queued" and cr.get("waiting_on") == ["critical"], "memory critical: nothing new starts, "
+          "cores neither (%s)" % cr.get("waiting_on"))
+    b1_clear()
+    rf = oomph.reserve(0, "too many", H[0], cpu=14, cpu_min=13)
+    check(rf["status"] == "refused" and "at most 12" in rf["advice"], "refused: a minimum above the cores that can be "
+          "reserved (14 less 2) (%s)" % rf["advice"][:70])
+    oomph.cpu_reservable = lambda: False
+    rf = oomph.reserve(1, "elsewhere", H[0], cpu=2)
+    oomph.cpu_reservable = lambda: True
+    check(rf["status"] == "refused" and "does not measure" in rf["advice"] and not oomph.read_ledger()["leases"],
+          "refused: cores where the machine does not measure them (roadmap §4.4), nothing written")
+    # a grant using 13 of its 6 cores: charged 6, the other 7 are others'; others never negative
+    g6 = oomph.reserve(0, "six on a tree", H[0], cpu=6, cpu_min=6)
+    procs_b1 = P.collect_procs()
+    payload = json.dumps({"v": 2, "s": dict(b1, t=time.time()), "procs": [
+        dict({k: x[k] for k in oomph.PROC_KEYS if k in x}, **({"cpu": 13.0} if x["pid"] == H[0]["pid"] else {}))
+        for x in procs_b1.values()]}, default=str)
+    rr = subprocess.run([sys.executable, "-I", "-B", oomph.__file__, "_ledger-refresh"], input=payload,
+                        capture_output=True, text=True, env=dict(os.environ), timeout=60)
+    snap = (json.loads(rr.stdout or "{}").get("leases") or [{}])[0]
+    c6 = b1l(g6["id"]).get("res", {}).get("cpu", {})
+    check(rr.returncode == 0 and c6.get("used") == 13.0 and c6.get("peak") == 13.0 and snap.get("cpu") == 6
+          and snap.get("cpu_used") == 13.0, "the refresh child (input v2, the logger's rates) charges a grant its "
+          "tree's cores and samples the peak; the snapshot carries them (%s, %s)" % (c6, rr.stderr[-200:]))
+    pool = oomph.cpu_pool(dict(b1, cpu={"n": 14, "busy": 13.0}), oomph.read_ledger()["leases"], time.time())
+    check(pool["others"] == 7.0 and pool["room"] == 6 and pool["idle"] == -1.0,
+          "a grant using 13 of its 6 cores: charged 6, others 7, room unchanged by the excess (%s)" % pool)
+    blk = oomphd.cpu_pool_block({"n": 14, "busy": 13.0}, [snap])
+    blk2 = oomphd.cpu_pool_block({"n": 14, "busy": 3.0}, [snap], blk["others"])
+    check(blk == {"cap": 14, "margin": 2, "reserved": 6, "busy": 13.0, "others": 7.0} and blk2["others"] == 3.5
+          and oomphd.cpu_pool_block({}, []) is None, "the logger's pools.cpu: others = busy less what grants are charged, "
+          "never negative, smoothed by half (%s, %s)" % (blk, blk2))
+    # amend per resource
+    time.sleep(0.15)
+    sh = oomph.amend(g6["id"], cpu=4)
+    q8 = oomph.reserve(0, "waits for cores", H[1], cpu=10, cpu_min=10)
+    gr = oomph.amend(g6["id"], cpu=6)
+    dr = oomph.amend(g6["id"], cpu=0)
+    check(sh.get("changed", {}).get("cpu") == [6, 4] and b1l(g6["id"])["res"]["cpu"]["got"] == 4
+          and q8["status"] == "queued" and gr["status"] == "refused" and "queued" in gr["advice"]
+          and b1l(g6["id"])["res"]["cpu"]["got"] == 4 and dr["status"] == "refused" and "release it instead" in dr["advice"],
+          "amend: shrinking cores applies at once; growing while a request for cores waits is refused; a reservation "
+          "of cores alone cannot drop them (%s)" % [sh.get("changed"), gr["status"], dr["status"]])
+    sh2 = oomph.amend(g6["id"], cpu=2)
+    check(b1l(q8["id"]).get("state") == "granted" and sh2.get("available", {}).get("cpu_cores") == 0
+          and oomph.read_ledger()["state"]["cpu_reserved"] == 12,
+          "amend: a shrink hands the cores to the request that waits for them in the same call, and the answer shows "
+          "the pool after it (%s)" % sh2.get("available"))
+    oomph.release(q8["id"])
+    both = oomph.reserve(1, "memory and cores", H[2], cpu=2)
+    nomem = oomph.amend(both["id"], gb=0)
+    lb = b1l(both["id"])
+    check(nomem.get("changed", {}).get("gb") == [1, 0] and lb["gb"] == oomph.NO_MEM_GB and "ram" not in lb["res"]
+          and lb["segments"][-1].get("res") == {"cpu": 2}, "amend: a reservation with cores can drop its memory "
+          "(gb back to the mirror, the segment says so)")
+    nocpu = oomph.amend(both["id"], gb=1, cpu=0)
+    lb = b1l(both["id"])
+    check(nocpu.get("changed", {}).get("cpu") == [2, 0] and lb["gb"] == 1 and "cpu" not in lb["res"],
+          "amend: and back to memory alone, without its cores")
+    v1 = oomph.reserve(0.5, "memory, as before", H[1])
+    add = oomph.amend(v1["id"], cpu=2)
+    check(add["status"] == "refused" and "separately" in add["advice"] and "v" not in b1l(v1["id"])
+          and "res" not in b1l(v1["id"]), "amend: a lease of memory alone (1.8's shape) takes no cores: reserve them "
+          "separately")
+    b1_clear()
+    # oomph run: the granted number into {cpu} and the job counts, where not already set
+    out_f = os.path.join(LOG, "b1-run.txt")
+    os.environ["MAKEFLAGS"] = "-j1"  # already set: kept
+    try:
+        rc = oomph.main(["run", "--cpu", "2..4", "--for", "b1 run", "--", "/bin/sh", "-c",
+                         'echo "{cpu} $OOMPH_CPU_CORES $MAKEFLAGS $CARGO_BUILD_JOBS $OOMPH_RESERVATION" > ' + out_f])
+    finally:
+        os.environ.pop("MAKEFLAGS", None)
+    words = open(out_f).read().split() if os.path.exists(out_f) else []
+    check(rc == 0 and words[:4] == ["4", "4", "-j1", "4"] and words[4:5] and re.fullmatch(r"r\d+", words[4]),
+          "oomph run --cpu 2..4: the grant in {cpu} and OOMPH_CPU_CORES, CARGO_BUILD_JOBS set, a MAKEFLAGS of "
+          "the caller's kept (%s)" % words)
+    check(not oomph.read_ledger()["leases"] and oomph.read_ledger()["history"][-1]["res"] == {"cpu": 4},
+          "oomph run --cpu: released afterwards, its history keeps the cores")
+    # MCP: the tools take vectors
+    tl = {t["name"]: t for t in oomph.MCP_TOOLS}
+    check({"cpu_cores", "cpu_min"} <= set(tl["reserve_memory"]["inputSchema"]["properties"])
+          and tl["reserve_memory"]["inputSchema"]["required"] == ["purpose"]
+          and "cpu_cores" in tl["update_reservation"]["inputSchema"]["properties"]
+          and "resource" in tl["reservation_history"]["inputSchema"]["properties"],
+          "MCP: reserve_memory takes cpu_cores and cpu_min (gb no longer required), update_reservation cpu_cores, "
+          "reservation_history a resource")
+    mc = oomph._mcp_call("reserve_memory", {"purpose": "mcp cores", "cpu_cores": 6, "wait_s": 0})
+    mu = oomph._mcp_call("update_reservation", {"id": mc.get("id", "r0"), "cpu_cores": 3})
+    mh = oomph._mcp_call("reservation_history", {"resource": "cpu", "hours": 1})
+    mr = oomph._mcp_call("reservations", {})
+    check(mc.get("status") == "granted" and mc.get("run_with") == {"cpu_cores": 6} and mc.get("granted") == {"cpu_cores": 6}
+          and mu.get("changed", {}).get("cpu") == [6, 3] and mr.get("cpu", {}).get("reserved") == 3
+          and mc["id"] in [x["id"] for x in mh["reservations"]] and all("cpu" in x.get("res", {}) for x in mh["reservations"]),
+          "MCP: reserve_memory with cpu_cores answers run_with; update_reservation and the history by resource "
+          "(%s)" % mc.get("run_with"))
+    bad = []
+    for a in ({"purpose": "x"}, {"purpose": "x", "cpu_min": 2}, {"purpose": "x", "cpu_cores": 2, "cpu_min": 4},
+              {"purpose": "x", "cpu_cores": "8"}, {"purpose": "x", "cpu_cores": 2.25}):
+        try:
+            oomph._mcp_args("reserve_memory", a)
+        except oomph.ToolArgError as e:
+            bad.append(str(e))
+    check(len(bad) == 5, "MCP: reserve_memory refuses no amount, a minimum without cores or above them, cores that are "
+          "not a number of cores (%d of 5)" % len(bad))
+    oomph._mcp_call("release_memory", {"id": mc.get("id", "r0")})
+    if MAC:  # no logger and no busy figure: an elastic request measures a quarter-second window
+        b1.pop("cpu")
+        w = oomph.reserve(0, "measured", H[0], cpu=2)
+        check(w["status"] == "granted" and w.get("window_s") == 0.25, "no logger: an elastic request measures how busy "
+              "the cores are in a quarter-second window, and says so (%s)" % w.get("window_s"))
+        w2 = oomph.reserve(0, "measured", H[0], cpu=2, ticket=w["id"])
+        check(w2["status"] == "granted" and "window_s" not in w2 and oomph._to_weigh(None)
+              and not oomph._to_weigh(w["id"]), "no logger: a granted ticket's re-poll (an extension) measures no window")
+        b1_clear()
+        # the logger: pools in current.json (not in the samples), the grant's cores in the snapshot
+        g = oomph.reserve(0, "logger sees cores", {"pid": os.getpid(), "start": None, "kind": "process", "project": ROOT},
+                          cpu=2)
+        oomph._sample_override = None
+        dd3 = oomphd.Daemon()
+        dd3.notify = lambda *a: None
+        dd3.ledger.FORCE_EVERY = 0
+        dd3.ledger.start()
+        for _ in range(3):
+            n0 = dd3.ledger.runs
+            dd3.sample()
+            for _ in range(100):
+                if dd3.ledger.runs > n0:
+                    break
+                time.sleep(0.05)
+        s3_ = dd3.sample()
+        cur = json.load(open(os.path.join(LOG, "current.json")))
+        pc = (cur.get("pools") or {}).get("cpu") or {}
+        mine = [x for x in s3_.get("leases", []) if x["id"] == g["id"]]
+        check(pc.get("cap") == cur["cpu"]["n"] and pc.get("margin") == oomph.cpu_margin(pc.get("cap") or 1)
+              and pc.get("reserved") == 2 and "others" in pc and "pools" not in s3_ and mine and mine[0].get("cpu") == 2
+              and "cpu_used" in mine[0], "the logger: pools.cpu in current.json (cap, margin, reserved, busy, others), "
+              "not in the samples; the snapshot carries the grant's cores and their use (%s)" % pc)
+        oomph.release(g["id"])
+finally:
+    for x in sleepers:
+        x.kill()
+        x.wait()
+    oomph.LEDGER_DIR, oomph.cpu_reservable = saved_ld, saved_res
+    os.environ["OOMPH_LEDGER_DIR"] = saved_env_ld
+    oomph._sample_override = None
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,

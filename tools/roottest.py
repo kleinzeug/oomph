@@ -250,6 +250,28 @@ check(r6[0] in (0, 1, 2) and dc.get("ledger", {}).get("level") == "ok" and "1 li
       % [r6[0], dc.get("ledger"), r6[2][-200:]])
 no_hits("plain")
 
+# 1b. cores (1.12.0): a vector request as root, decided and measured in the child; the logger's pools
+p = case("cores")
+oomph._sample_override = lambda: dict(fake, cpu={"n": 14, "busy": 0.0})  # the grant, whatever the runner's cores
+try:
+    with Watch():
+        tick()
+        rc_ = cli("reserve", "--cpu", "2", "--for", "roottest cores", "--json")
+        tick()
+        s, dt, ran = tick()
+        got = json.loads(rc_[1] or "{}")
+        rr = cli("release", got.get("id", "r0"), "--json")
+finally:
+    oomph._sample_override = lambda: dict(fake)
+cur = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json")))
+check(rc_[0] == 0 and (got.get("run_with") or {}).get("cpu_cores") == 2 and rr[0] == 0
+      and [x.get("cpu") for x in s.get("leases", [])] == [2],
+      "cores: `oomph reserve --cpu 2` as root is granted through a child, the sample carries its cores (%s)"
+      % [rc_[0], got.get("run_with"), rc_[2][-200:]])
+check(sys.platform != "darwin" or ((cur.get("pools") or {}).get("cpu") or {}).get("cap") == cur["cpu"]["n"],
+      "cores: the logger as root writes pools.cpu into current.json (%s)" % (cur.get("pools") or {}).get("cpu"))
+no_hits("cores")
+
 # 2. symbolic links planted at ledger.json and reservations.jsonl, to files only root may read and write
 p = case("symlink")
 secret = victim("root-ledger", json.dumps({"seq": 7, "history": [], "leases": [

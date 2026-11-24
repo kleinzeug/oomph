@@ -422,10 +422,11 @@ What a session gets:
 | | |
 |---|---|
 | `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations, then a line each for CPU, GPU and disks; exit code 0 / 1 / 2; `--json`; `--measure` reads CPU and GPU for a quarter second when the logger is off |
-| `oomph resources` | this Mac's memory, cores, GPU and disks, and which of them can be reserved (memory only so far) |
+| `oomph resources` | this Mac's memory, cores, GPU and disks, and which of them can be reserved (memory, and from 1.12.0 cores on a Mac) |
 | `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
-| `oomph reserve 6G --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
-| `oomph amend r7 --gb 2G [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
+| `oomph run --cpu 4..12 -- make -j{cpu}` | the same for cores: `{cpu}` becomes the number granted, which also goes to `OOMPH_CPU_CORES` and, where not already set, to `MAKEFLAGS`, `CARGO_BUILD_JOBS`, `GOMAXPROCS` and friends |
+| `oomph reserve 6G [--cpu 8] --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
+| `oomph amend r7 --gb 2G [--cpu 4] [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
 | `oomph reservations` | who holds or waits for how much (project, purpose, memory actually used), what's available, and the measured peaks of recent work |
 | `oomph reservations --history --last 3d` | every reservation of the last 14 days, also of sessions that are gone: span, size changes, reserved vs. peak, how it ended |
 | `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
@@ -465,6 +466,12 @@ session B  → granted r8, tests start
   Nothing is granted while memory pressure is critical. A request bigger than what's
   free is granted only when nothing else holds a reservation, so it runs alone instead
   of waiting forever; one bigger than 90 % of RAM is refused.
+- **Cores** (1.12.0, on a Mac): `--cpu 8` (MCP `cpu_cores: 8`) asks for logical cores and is
+  granted between half and all of them: all while that many are idle, fewer while the Mac is
+  busy with work nobody reserved, never fewer than half. It waits only when other reservations
+  leave less than its minimum; `--cpu 8..8` means exactly eight. A grant names the number to
+  run with (`run_with`); a core or two (one in eight) always stays with the person at the Mac.
+  A request waiting for cores holds up only cores, so memory requests pass it.
 - **No double counting:** as a granted job's processes grow, the growth is taken off its
   reservation, so memory is never counted once as used and again as reserved. That
   growth is also how the real peak gets measured, and `oomph reservations` shows it next

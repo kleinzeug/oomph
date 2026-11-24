@@ -777,6 +777,26 @@ def ledger_signature():
         return (e.errno,)
 
 
+def cpu_pool_block(cpu, leases, prev_others=None):
+    """current.json's `pools.cpu` (02 §5.2): what admission needs that only the logger knows well. `cap` logical
+    cores, `margin`, `reserved` (Σ granted cores, from the last ledger snapshot), and with a reading `busy` and
+    `others`: the load that holds no reservation, busy less what each grant is charged (its measured use, at
+    most what it got), smoothed as new = ½ old + ½ measured (about a minute). None without a core count."""
+    n = cpu.get("n") if isinstance(cpu, dict) else None
+    if not (isinstance(n, int) and n > 0):
+        return None
+    clamp = lambda x: min(max(float(x), 0.0), float(n)) if isinstance(x, (int, float)) else 0.0  # noqa: E731
+    got = [(clamp(l["cpu"]), clamp(l.get("cpu_used"))) for l in leases or () if l.get("state") == "granted"
+           and isinstance(l.get("cpu"), (int, float))]  # from the ledger, which anyone writes: within the machine
+    out = {"cap": n, "margin": oomph.cpu_margin(n), "reserved": round(sum(g for g, _ in got), 1)}
+    busy = cpu.get("busy")
+    if isinstance(busy, (int, float)):
+        measured = max(0.0, busy - sum(min(u, g) for g, u in got))
+        others = measured if prev_others is None else 0.5 * prev_others + 0.5 * measured
+        out.update(busy=round(busy, 2), others=round(others, 2))
+    return out
+
+
 class LedgerWorker:
     """The daemon's ledger work (oomph.ledger_tick: retire dead and expired reservations, take
     the snapshot of live ones) on a thread of its own, so the sampler never waits on the shared
@@ -801,9 +821,11 @@ class LedgerWorker:
         threading.Thread(target=self.loop, name="ledger", daemon=True).start()
         return self
 
-    def offer(self, s, procs):
+    def offer(self, s, procs, rates=None):
+        """The newest sample and process table, and the cores each process kept busy ({pid: cores}, when the
+        Meter had an interval): the child charges every grant's cores from them (02 §6.3)."""
         with self.cond:
-            self.slot = (s, procs)
+            self.slot = (s, procs, rates)
             self.cond.notify()
 
     def latest(self, max_age):
@@ -816,23 +838,23 @@ class LedgerWorker:
             with self.cond:
                 while self.slot is None:
                     self.cond.wait()
-                (s, procs), self.slot = self.slot, None
+                (s, procs, rates), self.slot = self.slot, None
             try:
-                self.run_once(s, procs)
+                self.run_once(s, procs, rates)
             except Exception as e:
                 self.sig = None
                 self.error(str(e) if isinstance(e, oomph.LedgerError) else repr(e))
                 with self.cond:
                     self.runs += 1
 
-    def run_once(self, s, procs):
+    def run_once(self, s, procs, rates=None):
         sig, now = ledger_signature(), time.time()
         if not self.leases and sig == self.sig and now - self.last_run < self.FORCE_EVERY:
             with self.cond:
                 self.at = now  # still nothing reserved
             return
         self.sig, self.last_run = sig, now
-        leases, err = self.tick(s, procs)
+        leases, err = self.tick(s, procs, rates=rates) if rates is not None else self.tick(s, procs)
         if err:  # e.g. busy: the snapshot still counts
             self.sig = None
             self.error(err)
@@ -897,6 +919,7 @@ class Daemon:
         self.filling = {}          # pool id -> when its disk_filling was last told (while it fills)
         self.fill_at, self.fill_told = {}, {}
         self.prev_pools = None     # pool id -> (watched, mount, name), for the volume events
+        self.cpu_others = None     # the smoothed load on the cores that holds no reservation (pools.cpu.others)
         self.vol_at, self.vol_held = {}, {}   # pool id -> its last volume event; -> [state told, changes held]
 
     # -- events
@@ -1248,10 +1271,16 @@ class Daemon:
         # the daemon never opens anything in it: its thread hands the work to an unprivileged
         # child and the sample carries the last snapshot that child answered with (none if it
         # is older than two intervals).
-        self.ledger.offer({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
-                           and k not in TOP_RATES},
-                          procs)
         leases = self.ledger.latest(2 * (HOT_INTERVAL if self.hot else INTERVAL))
+        pools = None
+        cp = cpu_pool_block(s.get("cpu"), leases, self.cpu_others)
+        if cp is not None:  # what only the logger knows well, for admission (02 §5.2): current.json only
+            self.cpu_others = cp.get("others", self.cpu_others)
+            pools = {"t": s["t"], "cpu": cp}
+        rates = {pid: u["cpu"] for pid, u in use.items() if "cpu" in u} if use else None
+        self.ledger.offer(dict({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
+                                and k not in TOP_RATES}, **({"pools": pools} if pools else {})),
+                          procs, rates or None)
         if leases:
             s["leases"] = leases  # memory sessions have reserved through oomph's ledger
         if gone:
@@ -1263,6 +1292,8 @@ class Daemon:
         with self.lock:
             append_json(os.path.join(LOG_DIR, "samples-%s.jsonl" % day), s)
         cur = dict(s)
+        if pools:
+            cur["pools"] = pools
         if self.machine is None:
             try:
                 self.machine = P.machine()

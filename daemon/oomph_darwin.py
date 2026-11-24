@@ -51,6 +51,7 @@ import subprocess
 import time
 
 OS = "macos"
+RESERVES_CPU = True  # cores can be reserved here (1.12.0): a backend opts in on purpose, with its margins
 MB = 1024 * 1024
 GB = 1024 * MB
 
