@@ -230,12 +230,28 @@ struct GPUBlock: Decodable { var id: String?; var name: String?; var util: Doubl
                              var mem_gb: Double?; var mem_alloc_gb: Double?; var mem_limit_gb: Double? }
 struct DiskPool: Decodable { var id: String?; var name: String?; var free_gb: Double?; var total_gb: Double?
                              var roles: [String]?; var watch: Bool?; var low_gb: Double?; var crit_gb: Double?; var level: String? }
-/// What the verdict reads of a Linux sample's own block (oomph._verdict_parts: strict overcommit).
-struct LinuxBlock: Decodable { var overcommit: Soft<Double>?; var commit_pct: Soft<Double>? }
+/// What the verdict reads of a Linux sample's own block (oomph._verdict_parts: strict overcommit), and what a
+/// Linux tab's tiles read of it (03 §3.9): the kernel's swap figures, zram's size.
+struct LinuxBlock: Decodable { var overcommit: Soft<Double>?; var commit_pct: Soft<Double>?
+                               var kswap_total_gb: Soft<Double>?; var kswap_free_gb: Soft<Double>?; var zram_disk_gb: Soft<Double>? }
+/// A Linux sample's memory stall time (`psi`, % of the last 10 s; 03 §5.3) and the part of it taken out for
+/// containers at their own limit (`limit`).
+struct PSILimit: Decodable { var some: Double?; var full: Double?; var cgroups: [String]? }
+struct PSIBlock: Decodable { var mem_some: Double?; var mem_full: Double?; var limit: Soft<PSILimit>? }
+/// A Linux logger inside a limited cgroup (`scope`, 03 §5.14): the figures are the cgroup's, the host's are here.
+struct ScopeBlock: Decodable { var kind: String?; var id: String?; var limit_gb: Double?; var host_ram_gb: Double?
+                               var host_avail_gb: Double? }
+/// What a machine's logger can measure (`machine.measures`, 03 §6.4): the facts a Linux tab's tiles follow.
+/// zswap is "unseen" on a kernel without its fields: that reads as nil.
+struct Measures: Decodable { var psi: Soft<Bool>?; var kills: Soft<String>?; var zram: Soft<Bool>?; var zswap: Soft<Bool>?
+                             var all_procs: Soft<Bool>? }
+/// The machine block the logger puts into current.json (`daemon.machine`): its kind and measures.
+struct DaemonMachine: Decodable { var kind: String?; var measures: Soft<Measures>? }
 struct RateProc: Decodable { var name: String?; var g: String?; var cpu: Double?; var gpu: Double?; var w: Double? }
 struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
-struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool? }
+struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool?
+                               var machine: Soft<DaemonMachine>?; var all_procs: Soft<Bool>? }
 
 struct Sample: Decodable {
     var t: Double
@@ -264,6 +280,11 @@ struct Sample: Decodable {
     var unowned_gb: Soft<Double>?
     var os: Soft<String>?
     var linux: Soft<LinuxBlock>?
+    // a Linux sample's own (03 §3.9): stall time, a cgroup's scope, file cache and unused memory
+    var psi: Soft<PSIBlock>?
+    var scope: Soft<ScopeBlock>?
+    var cached_gb: Soft<Double>?
+    var free_gb: Soft<Double>?
 
     var isAway: Bool {
         guard let a = away else { return false }
@@ -298,7 +319,15 @@ struct ChartEvent {
     var kills = 0
     var top: [String: Int] = [:]
     var seconds = 0.0
-    var alarming: Bool { ["jetsam", "stall", "unowned_memory", "disk_low", "disk_filling", "pressure_flapping", "daemon_error"].contains(kind) }
+    /// An oom_kill that is no news: kills only at a cgroup's own limit, routine on a container host (03 §5.6;
+    /// oomph.calm_event).
+    var calm = false
+    /// An oom_kill's own counts (kills, cgroup, by, top), for the hover's merged line.
+    var raw: [String: Any] = [:]
+    var alarming: Bool {
+        kind == "oom_kill" ? !calm
+            : ["jetsam", "stall", "unowned_memory", "disk_low", "disk_filling", "pressure_flapping", "daemon_error"].contains(kind)
+    }
     static let thermal = [0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"]
     static let volumeWord = ["mounted": "mounted", "unmounted": "unmounted", "watched": "watched", "unwatched": "no longer watched"]
 
@@ -344,6 +373,13 @@ struct ChartEvent {
         case "daemon_error": text = "logger error (\(e["where"] as? String ?? "?"))"
         case "notified": text = "notified: \(e["title"] as? String ?? "")"
         case "log": text = "system log: " + String((e["msg"] as? String ?? "").prefix(60))
+        case "oom_kill":  // a Linux machine's (03 §3.9): named, counted, or at a cgroup's own limit
+            let k = LinuxTab.killText(e)
+            text = k.0; calm = k.1; kills = k.2; top = k.3
+            raw = e.filter { ["kills", "cgroup", "by", "top"].contains($0.key) }
+        case "limit_stall":
+            let who = ["cgroup", "name"].lazy.compactMap { e[$0] as? String }.first { !$0.isEmpty } ?? "a container"
+            text = String(who.prefix(64)) + " stalled at its limit"
         case "incident_open", "incident_close": return nil   // shown from the incidents themselves
         default: text = kind.replacingOccurrences(of: "_", with: " ")
         }
@@ -413,6 +449,7 @@ struct Reservation: Identifiable {
     var purpose: String
     var project: String?
     var holder: String?                  // session / process / run
+    var user: String?                    // the account that asked (03 §6.5; the ledger open to every account)
     var segments: [(t: Double, gb: Double)]  // its size over time (one entry unless edited)
     var requested: Double
     var granted: Double?
@@ -506,6 +543,7 @@ struct Reservation: Identifiable {
         purpose = (o["purpose"] as? String) ?? "?"
         project = o["project"] as? String
         holder = (o["holder"] as? String) ?? ((o["holder"] as? [String: Any])?["kind"] as? String)
+        user = (o["user"] as? String).flatMap { $0.isEmpty ? nil : String($0.prefix(32)) }
         requested = req
         granted = num("granted")
         self.ended = ended ?? num("ended")
@@ -1013,6 +1051,276 @@ struct Tile {
     }
 }
 
+// MARK: - A Linux tab (roadmap 03 §3.9, the Linux-tab gate; 1.13.3, behind machinesUI)
+
+/// What a tab whose machine runs Linux says in place of the Mac's words: the tile matrix (a tile's meaning
+/// follows facts of the machine, never its momentary state), Kernel for Wired, the OOM killer's kills, quiet
+/// incidents folded, who holds a reservation, and the texts of a machine that is reached but has little to
+/// show (states A to E). Pure functions over a sample and the machine's facts: `oomph --linux-vectors FILE`
+/// runs them over tools/vectors/linux.json (tools/linuxvectors.py).
+enum LinuxTab {
+    /// The facts the tiles follow (03 §3.9 "Which figure goes where"): the machine's kind (a desktop or laptop
+    /// has presence, a server or container stall time), whether stall time is measured (PSI), whether memory is
+    /// compressed there (zram or zswap), how kills are seen, whether the logger sees every process.
+    struct Facts: Equatable {
+        var desktop = false
+        var psi: Bool?
+        var zram = false
+        var zswap = false
+        var kills: String?
+        var allProcs: Bool?
+        var compressed: Bool { zram || zswap }
+
+        init(desktop: Bool = false, psi: Bool? = nil, zram: Bool = false, zswap: Bool = false, kills: String? = nil, allProcs: Bool? = nil) {
+            self.desktop = desktop; self.psi = psi; self.zram = zram; self.zswap = zswap; self.kills = kills; self.allProcs = allProcs
+        }
+
+        /// From the sample's own machine block, else from what the machine said when it was reached.
+        init(_ s: Sample?, info: MachineInfo?) {
+            let dm = s?.daemon?.machine?.v
+            let ms = dm?.measures?.v ?? info?.measures?.v
+            let kind = dm?.kind ?? info?.kind ?? "server"
+            self.init(desktop: kind == "desktop" || kind == "laptop", psi: ms?.psi?.v, zram: ms?.zram?.v ?? false,
+                      zswap: ms?.zswap?.v ?? false, kills: ms?.kills?.v, allProcs: s?.daemon?.all_procs?.v ?? ms?.all_procs?.v)
+        }
+    }
+
+    /// One tile: its figure, a small grey figure after it, its label, a line under it (the group tile's name),
+    /// its tooltip, and whether the figure is red.
+    struct Cell: Equatable {
+        var label: String
+        var value: String
+        var small: String? = nil
+        var sub: String? = nil
+        var help = ""
+        var red = false
+    }
+
+    static func gb(_ x: Double) -> String { String(format: "%.1f GB", x) }
+    /// A stall figure: one decimal under 10 %, whole numbers above.
+    static func pct(_ x: Double) -> String { x < 9.95 ? String(format: "%.1f %%", x) : String(format: "%.0f %%", x) }
+
+    /// Does the stall pair fit the 96 pt column (03 §3.9 state 3)? Measured in the tile's own fonts.
+    static func fits(_ value: String, _ small: String) -> Bool {
+        let a = NSAttributedString(string: value, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)])
+        let b = NSAttributedString(string: small, attributes: [.font: NSFont.systemFont(ofSize: 9.5)])
+        let w: CGFloat = a.size().width + 4 + b.size().width
+        return w <= statColumn
+    }
+
+    /// A Linux group's name as a tile shows it (03 §3.9 state 7): a container's program first and its runtime
+    /// after it ("nginx · docker"), shortened in the middle beyond 22 characters; the full name is the tooltip's.
+    static func groupName(_ n: String) -> String {
+        var out = n
+        let re = try! NSRegularExpression(pattern: #"^(docker|podman|pod):[^ ]+ \((.+)\)$"#)
+        if let m = re.firstMatch(in: n, range: NSRange(n.startIndex..., in: n)),
+           let kind = Range(m.range(at: 1), in: n), let prog = Range(m.range(at: 2), in: n) {
+            out = String(n[prog]) + " · " + String(n[kind])
+        }
+        return Tile.midFit(out, 22)
+    }
+
+    /// The eight tiles of a Linux tab, in the Mac's places: App, the second (Available, or Compressed where
+    /// memory is compressed), Kernel, RAM (or the cgroup's limit); swap (or zram), free disk, the seventh (stall
+    /// time on a server, Idle on a desktop, what is available where PSI is off), the biggest group.
+    static func tiles(_ s: Sample, _ f: Facts, name: String) -> [Cell] {
+        let avail = max(0, s.ram_gb - s.app_gb - s.wired_gb - s.compressed_gb)
+        let scope = s.scope?.v
+        let cg = scope?.kind == "cgroup"
+        var out: [Cell] = [Cell(label: "App memory", value: gb(s.app_gb))]
+        if f.compressed {
+            out.append(Cell(label: "Compressed", value: gb(s.compressed_gb),
+                            help: "Compressed: RAM that holds compressed pages (zram, zswap)."))
+        } else {
+            var h = "Available: what processes can still get without swapping."
+            if let c = s.cached_gb?.v, let u = s.free_gb?.v {
+                h += String(format: " Of it %.1f GB is file cache that the kernel gives back on demand; %.1f GB is unused.", c, u)
+            }
+            out.append(Cell(label: "Available", value: gb(avail), help: h))
+        }
+        out.append(Cell(label: "Kernel", value: gb(s.wired_gb),
+                        help: "Kernel: slab, page tables, drivers and reserves; what is neither app memory nor available."))
+        // the RAM tile carries at most one small figure, by precedence: "N available" where the second tile is
+        // Compressed, else the host's RAM in a cgroup's scope (then with both the host moves into the label)
+        var ram = Cell(label: cg ? "Memory limit" : "RAM total", value: gb(s.ram_gb))
+        let host = scope?.host_ram_gb
+        if f.compressed {
+            ram.small = String(format: "%.1f available", avail)
+            if cg, let h = host { ram.label += String(format: " · host %.1f GB", h) }
+        } else if cg, let h = host {
+            ram.small = String(format: "host %.1f", h)
+        }
+        if cg {
+            ram.help = String(format: "This logger runs inside a container: every figure is about the container's %.1f GB limit.", s.ram_gb)
+                + (scope?.host_avail_gb.map { String(format: " The host has %.1f GB available.", $0) } ?? "")
+        }
+        out.append(ram)
+        // swap, or zram where it is the machine's only swap: there zram's fullness drives the level
+        let lx = s.linux?.v
+        if f.zram && !f.zswap && (s.swapfiles ?? 0) == 0 && s.swap_total_gb < 0.05 {
+            let help = "zram: swap kept compressed in RAM, this machine's only swap. How full it is counts towards the level."
+            if let size = lx?.zram_disk_gb?.v, let tot = lx?.kswap_total_gb?.v, let free = lx?.kswap_free_gb?.v {
+                let used = max(0, tot - free - s.swap_used_gb)
+                out.append(Cell(label: "zram used / size", value: String(format: "%.1f / %.1f GB", used, size), help: help))
+            } else {  // a logger before 1.13.3 does not send zram's figures: none rather than "0.0 / 0.0 GB"
+                out.append(Cell(label: "zram used / size", value: "—",
+                                help: help + " The \(brand) on this machine is too old to report zram's figures; a newer one does."))
+            }
+        } else {
+            out.append(Cell(label: "Swap used / size", value: String(format: "%.1f / %.0f GB", s.swap_used_gb, s.swap_total_gb)))
+        }
+        out.append(Cell(label: "Free disk", value: String(format: "%.0f GB", s.disk_free_gb), red: s.disk_free_gb < 20))
+        out.append(seventh(s, f, avail: avail))
+        out.append(group(s, f, name: name))
+        return out
+    }
+
+    /// The Memory tile of the four-resource row (layout C, 02 §3.7) on a Linux tab (gap G3, settled in 1.13.3):
+    /// layout C keeps its four tiles; the eight tiles' words move into Memory's. The RAM (or the cgroup's limit)
+    /// with its decimal, the biggest group by its Linux name (none where the logger sees only its own
+    /// processes), and "stalled" in the flag slot where tasks wait for memory as the stall tile turns red and no
+    /// graver flag is there. Kernel is the chart's legend's and hover's word already.
+    static func memoryTile(_ t: Tile, _ s: Sample, _ f: Facts) -> Tile {
+        var t = t
+        t.reading = String(format: "%.1f / %.1f GB", s.app_gb + s.wired_gb + s.compressed_gb, s.ram_gb)
+        t.top = f.allProcs == false ? nil : s.groups?.first(where: { !$0.name.isEmpty }).map { groupName($0.name) }
+        if t.flag == nil, !f.desktop, f.psi != false, let p = s.psi?.v, let some = p.mem_some, some >= 10 || (p.mem_full ?? 0) >= 5 {
+            t.flag = "stalled"
+        }
+        return t
+    }
+
+    /// The seventh tile: Idle on a desktop ("—" where it reports no idle time), stall time on a server in its
+    /// three forms, or what is available where stall time is not measured (03 §3.9 states 1 to 4).
+    static func seventh(_ s: Sample, _ f: Facts, avail: Double) -> Cell {
+        if f.desktop {
+            guard let idle = s.away?.idle_s else {
+                return Cell(label: "Idle", value: "—",
+                            help: "This desktop does not report idle time. A locked screen or a display that is off still counts as away.")
+            }
+            return Cell(label: "Idle", value: idle >= 120 ? "\(idle / 60) min" : "\(idle) s")
+        }
+        let p = s.psi?.v
+        guard f.psi != false, let some = p?.mem_some else {
+            let share = s.free_pct.map(Double.init) ?? (s.ram_gb > 0 ? 100 * avail / s.ram_gb : 0)
+            return Cell(label: "of RAM available", value: String(format: "%.0f %%", share),
+                        help: "Stall time is not measured on this kernel (PSI is off: boot with psi=1). The level comes from what is available, and stops at Warning.")
+        }
+        let full = p?.mem_full ?? 0
+        var c = Cell(label: "Stalled on memory", value: pct(some), red: some >= 10 || full >= 5)
+        c.help = "Tasks waited for memory " + pct(some) + " of the last 10 s" + (full >= 0.05 ? "; all of them at once (fully stalled) " + pct(full) : "") + "."
+        if let lim = p?.limit?.v, let more = lim.some, more >= 0.05 {
+            // stall time taken out for containers at their own limit: a quiet addition, never red (state 4)
+            let who = lim.cgroups?.first.map { $0 } ?? "a container"
+            c.small = "+" + pct(more) + " ▣"
+            c.help += " " + pct(more) + " more inside \(who), which is at its own limit. That is the container's stall time, not this machine's."
+        } else if full >= 0.05 {
+            let tail = "· fully " + pct(full)
+            c.small = fits(c.value, tail) ? tail : "●"   // the long form: the second figure is read in the tooltip
+        }
+        return c
+    }
+
+    /// The biggest group (a systemd unit, a container or a program with all its processes); "—" over "not
+    /// visible" where the logger sees only its own processes (state D).
+    static func group(_ s: Sample, _ f: Facts, name: String) -> Cell {
+        if f.allProcs == false {
+            return Cell(label: "biggest group", value: "—", sub: "not visible",
+                        help: "The logger on \(name) sees only its own processes (/proc is mounted with hidepid). Groups, sessions and what a reservation uses are not known. `oomph doctor` there names the two ways to change that.")
+        }
+        guard let g = s.groups?.first(where: { !$0.name.isEmpty }) else { return Cell(label: "biggest group", value: "–", sub: "#1 –") }
+        let size = Double(g.mb) / 1024
+        return Cell(label: "biggest group", value: gb(size), sub: "#1 " + groupName(g.name),
+                    help: "Biggest group: \(g.name) — " + gb(size) + (g.n.map { " in \($0) processes" } ?? "") + " · click for the biggest groups")
+    }
+
+    /// An oom_kill event (03 §5.5): "3 killed by the OOM killer: java ×2, node", by systemd-oomd or earlyoom when
+    /// they did it, "(names not known)" where kills are only counted, and kills at a cgroup's own limit said so:
+    /// alone ("6 killed at their cgroup's limit"), or after the machine's own ("5 killed by the OOM killer (+1 at
+    /// their limit)"): those are the container's, not the machine's.
+    /// (text, whether it is no news (oomph.calm_event: only kills at a limit), all kills, names)
+    static func killText(_ e: [String: Any]) -> (String, Bool, Int, [String: Int]) {
+        func int(_ x: Any?) -> Int { (x as? NSNumber).map { max(0, min($0.intValue, 1_000_000)) } ?? 0 }
+        let machine = int(e["kills"]), atLimit = int(e["cgroup"]), all = machine + atLimit
+        var top: [String: Int] = [:]
+        for (k, v) in ((e["top"] as? [String: Any]) ?? [:]).prefix(64) where int(v) > 0 { top[String(k.prefix(64))] = int(v) }
+        let by = ((e["by"] as? [String: Any]) ?? [:]).filter { $0.key != "cgroup" && int($0.value) > 0 }.map(\.key)
+        let killer = by.count == 1 && by[0] == "systemd-oomd" ? "systemd-oomd" : by.count == 1 && by[0] == "earlyoom" ? "earlyoom"
+            : "the OOM killer"
+        let head = machine == 0 && atLimit > 0 ? "\(atLimit) killed at their cgroup's limit"
+            : "\(max(machine, 1)) killed by \(killer)" + (atLimit > 0 ? " (+\(atLimit) at their limit)" : "")
+        let names = top.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        let calm = e["cgroup"] != nil && machine == 0
+        guard !names.isEmpty else { return (head + " (names not known)", calm, all, top) }
+        let list = names.prefix(3).map { $0.value > 1 ? "\($0.key) ×\($0.value)" : $0.key }.joined(separator: ", ")
+        return (head + ": " + list + (names.count > 3 ? ", …" : ""), calm, all, top)
+    }
+
+    /// The oom_kill events of one pixel as one (the hover's line): the kills, those at a limit, the killers and
+    /// the names added up; a cgroup count only where an event had one (oomph.calm_event).
+    static func merged(_ es: [[String: Any]]) -> [String: Any] {
+        func add(_ a: inout [String: Int], _ x: Any?) {
+            for (k, v) in ((x as? [String: Any]) ?? [:]).prefix(64) { a[k, default: 0] += (v as? NSNumber)?.intValue ?? 0 }
+        }
+        var kills = 0, atLimit = 0, by: [String: Int] = [:], top: [String: Int] = [:]
+        for e in es {
+            kills += (e["kills"] as? NSNumber)?.intValue ?? 0; atLimit += (e["cgroup"] as? NSNumber)?.intValue ?? 0
+            add(&by, e["by"]); add(&top, e["top"])
+        }
+        var out: [String: Any] = ["kind": "oom_kill", "kills": kills, "by": by, "top": top]
+        if es.contains(where: { $0["cgroup"] != nil }) { out["cgroup"] = atLimit }
+        return out
+    }
+
+    /// The incidents list of a tab (03 §3.9 state 9): the machine's own incidents, and the quiet ones (containers
+    /// at their own limit) folded into one grey row for the latest with how many came before it, in date order.
+    enum Row: Hashable { case incident(String), quiet(String, earlier: Int) }
+    static func rows(_ incidents: [Incident], quiet: [Incident]) -> [Row] {
+        var out: [(Double, Row)] = incidents.map { ($0.start, .incident($0.id)) }
+        if let q = quiet.max(by: { $0.start < $1.start }) { out.append((q.start, .quiet(q.id, earlier: quiet.count - 1))) }
+        return out.sorted { $0.0 > $1.0 }.map(\.1)
+    }
+
+    /// Whether the reservation rows say who holds them: once more than one account holds a live one (state 8).
+    static func showsWho(_ live: [Reservation]) -> Bool { Set(live.compactMap(\.user)).count > 1 }
+
+    /// A machine that is reached but has little to show (03 §3.9, states A to C), as the capsule, the status
+    /// line and the remedy say it: A its logger stopped (`at`: when it last wrote), B this account may not
+    /// read the logs, C nothing is logged there. (capsule, status line, title, text, the command to copy)
+    enum Quiet: String { case stopped, denied, absent }
+    static func remedy(_ q: Quiet, os: String?, name: String, user: String?, at: String) -> (String, String, String, String, String) {
+        let lin = os == "linux"
+        let who = user ?? "this Mac's account"
+        switch q {
+        case .stopped:
+            if !lin {  // a Mac's: Activate in its app, or the command its doctor gives (with the reason)
+                return ("No readings", "Connected, but its logger stopped at \(at)", "The logger on \(name) is not running.",
+                        "It wrote its last reading at \(at). Start it there with Activate in its \(brand) app; the command below, run on \(name), says why it stopped and how to start it.",
+                        "oomph doctor")
+            }
+            return ("No readings", "Connected, but its logger stopped at \(at)", "The logger on \(name) is not running.",
+                    "It wrote its last reading at \(at). Start it there. If it stops again: journalctl -u oomphd -n 20 and oomph doctor on \(name) say why.",
+                    "sudo systemctl restart oomphd")
+        case .denied:
+            return ("No access", "Connected, but \(who) may not read the logs there", "The logs on \(name) are closed to \(who).",
+                    (user.map { "This Mac connects as \($0), who may not read them there." } ?? "This Mac may not read them there.")
+                        + (lin ? " The logger there is running; an administrator there can open its logs to every account again, in the checkout on \(name) (it puts the log folder and its files right):"
+                               : " The logger there is running; on \(name), this says why:"),
+                    lin ? "sudo linux/install.sh --system" : "oomph doctor")
+        case .absent:
+            return ("No logger", "Connected, but nothing is logged there",
+                    lin ? "\(brand) on \(name) runs from a checkout." : "\(name) has no logger.",
+                    "Agents take turns there, but nothing is recorded: no history, no incidents. To get both, in the checkout on \(name)"
+                        + (lin ? ":" : " (or Activate in its \(brand) app):"),
+                    lin ? "sudo linux/install.sh --system" : "sudo ./install.sh")
+        }
+    }
+
+    /// State E: kills cannot be seen at all on this machine (the Incidents caption says so at the right).
+    static let killsHidden = "kills are not visible on this machine"
+    static let killsHiddenHelp = "This kernel has no kill counter and the logger cannot read the kernel log, so an OOM kill shows only as a process that disappeared. `oomph doctor` there says how to change that."
+}
+
 // MARK: - One machine
 
 /// A mirror's status.json: the state of the link to that machine (roadmap 01 §5.7).
@@ -1057,6 +1365,10 @@ struct MachineInfo: Decodable {
     var oldest: Double?
     /// What it serves; "ai" when its owner allows AI analysis of its data (D7, off by default).
     var caps: [String]?
+    /// What its logger can measure (a Linux machine's tiles follow it), and whether its logs can be read:
+    /// "ok", "absent" (nothing is logged there), "denied" (03 §3.9, states B and C).
+    var measures: Soft<Measures>?
+    var logs: Soft<String>?
 }
 
 /// A machine of machines.json (roadmap 01 §5.6), as `oomph remote` writes it. The app reads it and
@@ -1079,10 +1391,13 @@ struct MachineEntry: Decodable {
     var addrs: [String]?
     var last_connected: Double?
 
+    /// The systems the app can label (01 §4.3: a machine of another os is not drawn). Linux from 1.13.3, the
+    /// Linux-tab gate (03 §3.9, ROADMAP's LG row): Kernel, the tile matrix, its kills and quiet incidents.
+    static let labeled: Set<String> = ["macos", "linux"]
+
     /// The pinned machines (tabs), in the order they were added; entries whose mirror name is not of
-    /// the fixed pattern are skipped, since that name becomes a path. Only Macs (or a machine not yet
-    /// reached): the app does not know Linux's words until 1.13, so a Linux machine is watched from
-    /// the terminal for now (roadmap G5, the LG row; 01 §4.3: an unknown os is not drawn).
+    /// the fixed pattern are skipped, since that name becomes a path. Only systems the app can label (or a
+    /// machine not yet reached).
     static func load(_ dir: String) -> [MachineEntry] {
         loadAll(dir).filter { $0.pinned == true }.sorted { ($0.order ?? 0) < ($1.order ?? 0) }
     }
@@ -1093,7 +1408,7 @@ struct MachineEntry: Decodable {
         guard let d = readShared(dir + "/machines.json", cap: 4 << 20),
               let f = try? JSONDecoder().decode(File.self, from: d) else { return [] }
         return (f.machines ?? []).filter { e in
-            (e.os == nil || e.os == "macos")
+            (e.os == nil || labeled.contains(e.os!))
                 && e.mid.range(of: #"^m-[0-9a-f]{16}(-[0-9a-f]{8})?$"#, options: .regularExpression) != nil
         }
     }
@@ -1139,6 +1454,9 @@ final class MachineStore: ObservableObject {
     var liveReservations: [Reservation] { Reservation.listOrder(reservations.map(\.res).filter(\.live), flagsFirst: resourcesUIOn) }
     private var eventsStamp = ""
     @Published var incidents: [Incident] = []
+    /// A Linux machine's quiet incidents (containers at their own limit, 03 §5.6), newest first: one folded grey
+    /// row, never unseen, never on the tab's badge.
+    @Published var quiet: [Incident] = []
     /// A mirror's link, coverage and machine (nil for this Mac).
     @Published var link: LinkStatus?
     @Published var sync: SyncState?
@@ -1241,7 +1559,33 @@ final class MachineStore: ObservableObject {
     var title: String { isLocal ? "This Mac" : (entry?.label ?? info?.name ?? entry?.name ?? entry?.host ?? mid) }
     /// Whether its data may go to an AI model: this Mac's always (the person chose a provider), another's
     /// only when its owner allows it there (`oomph share ai on`; D7).
-    var allowsAI: Bool { isLocal || (info?.caps ?? entry?.caps ?? []).contains("ai") }
+    var allowsAI: Bool { isLocal || !isLinux && (info?.caps ?? entry?.caps ?? []).contains("ai") }
+    /// Another machine that runs Linux (03 §3.9): its tab speaks Linux; ✦ stays hidden there until the AI
+    /// prompt does (L3).
+    var isLinux: Bool { !isLocal && (current?.os?.v ?? info?.os ?? entry?.os) == "linux" }
+    /// The facts a Linux tab's tiles follow.
+    var facts: LinuxTab.Facts { LinuxTab.Facts(current, info: info) }
+    /// A server (or a container) sits in no one's room: no "away" for it.
+    var hasPresence: Bool { !isLinux || facts.desktop }
+    /// A machine that is reached but has little to show (03 §3.9, states A to C): connected, and its logger
+    /// stopped writing, or this account may not read its logs, or nothing is logged there.
+    var quietState: LinuxTab.Quiet? {
+        guard !isLocal, linkLive else { return nil }
+        let logs = info?.logs?.v
+        if logs == "denied" { return .denied }
+        guard let c = current else { return logs == "absent" ? .absent : nil }
+        // a current.json left by an earlier logger is old, not live; while catching up it is not rewritten yet
+        // (as the terminal dashboard: oomph_view.link_view)
+        guard link?.state != "catching_up" else { return nil }
+        return currentAge > 3 * (c.daemon?.interval ?? 30) + 15 ? .stopped : nil
+    }
+    /// The texts of that state.
+    var remedy: (capsule: String, status: String, title: String, text: String, command: String)? {
+        guard let q = quietState else { return nil }
+        let at = current.map { MemoryChart.when($0.t - (sync?.offset_s ?? 0)) } ?? "?"
+        let r = LinuxTab.remedy(q, os: info?.os ?? entry?.os, name: title, user: entry?.user, at: at)
+        return (r.0, r.1, r.2, r.3, r.4)
+    }
     /// Pressure as a tab shows it: critical only while live.
     var critical: Bool { (isLocal ? daemonRunning : linkLive) && current?.pressure == 4 }
     /// An incident open there now (the red badge).
@@ -1544,14 +1888,20 @@ final class MachineStore: ObservableObject {
 
     func loadIncidents() {
         let dir = logDir + "/incidents"
-        let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >).prefix(30)
-        incidents = ids.compactMap { id in
+        // newest first until 30 of the machine's own, with every quiet one among them (at most 200 folders: a mirror
+        // keeps 90 days): on a container host that opens a quiet one a day they would otherwise push the real ones
+        // out, and "+N earlier" would stop at 29
+        let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >).prefix(200)
+        var own: [Incident] = [], still: [Incident] = []
+        for id in ids where own.count < 30 {
             let p = "\(dir)/\(id)/incident.json"
-            guard let d = FileManager.default.contents(atPath: p), var inc = try? decoder.decode(Incident.self, from: d),
-                  inc.quiet != true else { return nil }
+            guard let d = FileManager.default.contents(atPath: p), var inc = try? decoder.decode(Incident.self, from: d) else { continue }
             inc.dir = "\(dir)/\(id)"
-            return inc
+            if inc.quiet == true { still.append(inc) } else { own.append(inc) }
         }
+        incidents = own
+        // only a Linux tab folds them into its list (This Mac never has any)
+        quiet = isLinux ? still : []
     }
 }
 
@@ -2745,6 +3095,29 @@ struct Stat: View {
     }
 }
 
+/// A tile of a Linux tab (03 §3.9): Stat with a small grey figure after the value (the RAM tile's
+/// "available" or host, stall time's "· fully N %", "+97 % ▣" or "●") and a tooltip.
+struct LinuxStat: View {
+    let cell: LinuxTab.Cell
+    var wide = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(cell.value).font(.system(size: 13, weight: .semibold)).monospacedDigit().foregroundStyle(cell.red ? .red : .primary)
+                    .lineLimit(1).fixedSize()
+                if let s = cell.small {
+                    Text(s).font(.system(size: 9.5)).foregroundStyle(s == "●" && cell.red ? Color.red : Color.secondary)
+                        .lineLimit(1).fixedSize()
+                }
+            }
+            Text(cell.label).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+        }
+        .frame(minWidth: statColumn, maxWidth: wide ? .infinity : statColumn, alignment: .leading)
+        .contentShape(Rectangle())
+        .help(cell.help)
+    }
+}
+
 // MARK: - Time axis
 
 /// The time axis every chart row shares (roadmap 02 §8): where a moment lies across the plot and back
@@ -3075,6 +3448,8 @@ struct MemoryChart: View, Animatable {
     var rowHeight: CGFloat = 22
     var cores: Double?
     var floors: (low: Double, crit: Double)?
+    /// The wired series' name: "Kernel" on a Linux tab (03 §3.9: the same field, `wired_gb`).
+    var wiredName = "Wired"
     @Environment(\.colorScheme) private var scheme
     /// The pointer's x over the chart (overlay coordinates), nil when it isn't hovering.
     @State private var hoverX: CGFloat? = renderHoverX
@@ -3711,7 +4086,7 @@ struct MemoryChart: View, Animatable {
         if pts.isEmpty && gapHere == nil, let near = nearest(tc), abs(near.id - tc) <= 60 { pts = [near] }
         info.samples = pts.count
         if !pts.isEmpty {
-            let cols: [(String, KeyPath<Point, Double>)] = [("App", \.app), ("Compressed", \.comp), ("Wired", \.wired), ("Swap", \.swap)]
+            let cols: [(String, KeyPath<Point, Double>)] = [("App", \.app), ("Compressed", \.comp), (wiredName, \.wired), ("Swap", \.swap)]
             info.readings = cols.map { (name, k) in
                 Reading(name: name, lo: pts.map { $0[keyPath: k] }.min()!, hi: pts.map { $0[keyPath: k] }.max()!)
             }
@@ -3757,6 +4132,9 @@ struct MemoryChart: View, Animatable {
                 let names = top.sorted { $0.value > $1.value }.prefix(2).map { "\($0.key) ×\($0.value)" }.joined(separator: ", ")
                 lines.append((kills > 0 ? "\(kills) killed by jetsam" + (names.isEmpty ? "" : " · " + names)
                                         : "\(es.count) jetsam reports", true))
+            case "oom_kill":  // a Linux machine's kills in one pixel (03 §3.9)
+                let k = LinuxTab.killText(LinuxTab.merged(es.map(\.raw)))  // the same words as each event's
+                lines.append((k.0, !k.1))
             case "pressure_change":
                 lines.append(("pressure changed \(es.count)× · last: " + es.last!.text.replacingOccurrences(of: "pressure ", with: ""), false))
             case "sleep_gap", "stall":
@@ -3831,7 +4209,7 @@ struct MemoryChart: View, Animatable {
 
     struct HoverCard: View {
         let info: HoverInfo
-        static let colors: [String: Color] = ["App": .blue, "Compressed": .orange, "Wired": .gray, "Swap": .red]
+        static let colors: [String: Color] = ["App": .blue, "Compressed": .orange, "Wired": .gray, "Kernel": .gray, "Swap": .red]
 
         func gb(_ r: Reading) -> String {
             let lo = String(format: "%.1f", r.lo), hi = String(format: "%.1f", r.hi)
@@ -4061,6 +4439,9 @@ struct ReservationCard: View {
 struct ChartLegend: View {
     /// Another machine's chart with a stretch it has not received in view: the dots get an entry.
     var missing = false
+    /// A Linux tab (03 §3.9): Wired is "Kernel"; a server has no "away" entry (no one sits at it).
+    var linux = false
+    var away = true
     struct Item { let name: String; let help: String; let kind: Int }  // 0 swatch, 1 away, 2 hatch, 3 incident, 4 dots
     static let rows: [[Item]] = [
         [Item(name: "Wired", help: "Wired: memory the kernel and drivers hold in RAM. It is never compressed or swapped out.", kind: 0),
@@ -4095,11 +4476,22 @@ struct ChartLegend: View {
         }
     }
 
+    static let kernel = Item(name: "Kernel", help: "Kernel: slab, page tables, drivers and reserves; what is neither app memory nor available.", kind: 0)
+
+    /// The rows as this tab shows them.
+    var shownRows: [[Item]] {
+        var r = ChartLegend.rows
+        if linux { r[0][0] = ChartLegend.kernel }
+        if !away { r[1].removeAll { $0.kind == 1 } }
+        if missing { r[1].append(ChartLegend.notReceived) }
+        return r
+    }
+
     static let notReceived = Item(name: "not received", help: "Dotted: this Mac has not received this stretch from that machine — it was not connected then. It fills in when the machine is back; a stretch older than what it keeps never will.", kind: 4)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            ForEach(Array((missing ? [ChartLegend.rows[0], ChartLegend.rows[1] + [ChartLegend.notReceived]] : ChartLegend.rows).enumerated()), id: \.offset) { r, row in
+            ForEach(Array(shownRows.enumerated()), id: \.offset) { r, row in
                 HStack(spacing: 7) {
                     ForEach(Array(row.enumerated()), id: \.offset) { i, it in
                         HStack(spacing: 3) {
@@ -4124,6 +4516,8 @@ struct ResourceLegend: View {
     let focus: Resource
     let sample: Sample?
     var missing = false
+    var linux = false
+    var away = true
 
     struct Entry { let name: String; let value: String?; let color: Color; let line: Bool; let help: String }
 
@@ -4143,7 +4537,8 @@ struct ResourceLegend: View {
         case .memory:
             let swap = s.map { $0.swap_used_gb > 0 ? String(format: "%.1f / %.0f", $0.swap_used_gb, $0.swap_total_gb)
                                                    : String(format: "%.1f", $0.swap_used_gb) }
-            return [Entry(name: "Wired", value: f1(s?.wired_gb), color: .gray, line: false, help: ChartLegend.rows[0][0].help),
+            let wired = linux ? ChartLegend.kernel : ChartLegend.rows[0][0]
+            return [Entry(name: wired.name, value: f1(s?.wired_gb), color: .gray, line: false, help: wired.help),
                     Entry(name: "App", value: f1(s?.app_gb), color: .blue, line: false, help: ChartLegend.rows[0][1].help),
                     Entry(name: "Compressed", value: f1(s?.compressed_gb), color: .orange, line: false, help: ChartLegend.rows[0][2].help),
                     Entry(name: "Swap", value: swap, color: .red, line: false, help: ChartLegend.rows[0][3].help)]
@@ -4203,11 +4598,11 @@ struct ResourceLegend: View {
     }
 
     var body: some View {
-        let legend = ChartLegend(missing: missing)
+        let legend = ChartLegend(missing: missing, linux: linux, away: away)
         VStack(alignment: .trailing, spacing: 2) {
             ViewThatFits(in: .horizontal) { valuesRow(0); valuesRow(1); valuesRow(2) }
             HStack(spacing: 7) {
-                ForEach(Array((missing ? ChartLegend.rows[1] + [ChartLegend.notReceived] : ChartLegend.rows[1]).enumerated()), id: \.offset) { _, it in
+                ForEach(Array(legend.shownRows[1].enumerated()), id: \.offset) { _, it in
                     HStack(spacing: 3) {
                         legend.swatch(it, .clear)
                         Text(it.name)
@@ -4240,6 +4635,8 @@ struct PopoverView: View {
     @State var showAllReservations = false  // the callout behind "+N more"
     /// The reservation whose row the pointer is on: its blocks are outlined in every band (02 §3.4.5, resources on).
     @State var hoveredRow: String? = nil
+    /// The callout of a quiet machine's capsule: its logger stopped, and what starts it again (03 §3.9 state A).
+    @State var showRemedy = false
     @State private var shakes: [Resource: Int] = [:]  // a refused ⌘-click shakes its tile (§3.7.2)
     @Environment(\.colorScheme) private var scheme
     private let series = ["Wired", "App", "Compressed", "Swap"]
@@ -4265,10 +4662,14 @@ struct PopoverView: View {
                 Divider()
             }
             VStack(alignment: .leading, spacing: 10) {
-                if resourcesUIOn {
-                    if m.stale { tilesRow.grayscale(1).opacity(0.5).tourAnchor("stats") } else { tilesRow.opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
+                if let r = m.remedy, m.quietState != .stopped {
+                    remedyBlock(r).tourAnchor("stats")   // no tiles there: the remedy stands in their place (B, C)
+                } else if resourcesUIOn {
+                    if m.stale || m.quietState == .stopped { tilesRow.grayscale(1).opacity(0.5).tourAnchor("stats") }
+                    else { tilesRow.opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
                 } else if let c = m.current, m.showsStats {
-                    if m.stale { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") } else { stats(c).opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
+                    if m.stale || m.quietState == .stopped { stats(c).grayscale(1).opacity(0.5).tourAnchor("stats") }
+                    else { stats(c).opacity(m.inGrace ? 0.6 : 1).tourAnchor("stats") }
                 }
                 chart.tourAnchor("chart").zIndex(1)
                 if !m.reservations.isEmpty || m.fetchingLedger { reservedList(m.liveReservations).tourAnchor("leases") }
@@ -4347,6 +4748,24 @@ struct PopoverView: View {
                 }
             }
         }
+        .overlayPreferenceValue(RemedyAnchorKey.self) { anchor in
+            GeometryReader { geo in
+                if showRemedy, let anchor, let r = m.remedy {
+                    let a = geo[anchor]
+                    let w: CGFloat = 300
+                    let left = min(max(8, a.midX - w + 40), geo.size.width - w - 8)
+                    ZStack(alignment: .topLeading) {
+                        Color.black.opacity(0.001)
+                            .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showRemedy = false } }
+                        remedyCallout(r, arrowX: a.midX - left, width: w)
+                            .frame(width: w)
+                            .padding(.leading, left)
+                            .padding(.top, a.maxY + 2)
+                            .transition(.opacity.combined(with: .scale(scale: 0.96, anchor: .topTrailing)))
+                    }
+                }
+            }
+        }
         .overlayPreferenceValue(MoreAnchorKey.self) { anchor in
             GeometryReader { geo in
                 if showAllReservations, let anchor {
@@ -4380,7 +4799,7 @@ struct PopoverView: View {
         }
         .animation(.easeOut(duration: 0.2), value: store.showChangelog)
         .animation(.easeOut(duration: 0.25), value: store.building)
-        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false; showAllReservations = false; tourStep = nil } }
+        .onExitCommand { withAnimation(.easeOut(duration: 0.15)) { showTopApps = false; showAI = false; showAllReservations = false; showRemedy = false; tourStep = nil } }
         .onChange(of: store.calloutAsked) { _, _ in
             withAnimation(.easeOut(duration: 0.15)) { showTopApps.toggle(); showAI = false }
         }
@@ -4468,7 +4887,7 @@ struct PopoverView: View {
     /// its pressure, its state in the status line and the capsule. Not connected: the tile and
     /// the capsule's fill are grey, the capsule's words stay in the primary colour.
     var mirrorHeader: some View {
-        let live = !m.stale && m.current != nil
+        let live = !m.stale && m.current != nil && m.remedy == nil
         let p = live ? (Pressure(rawValue: m.current!.pressure) ?? .unknown) : .unknown
         let tint: Color = live ? p.color : .secondary
         let icon = ["laptop": "laptopcomputer", "server": "server.rack", "container": "shippingbox"][m.info?.kind ?? ""] ?? "desktopcomputer"
@@ -4494,7 +4913,19 @@ struct PopoverView: View {
             }
             Spacer(minLength: 8)
             SwiftUI.Group {
-                if live {
+                if let r = m.remedy {  // reached, but little to show (03 §3.9, A to C): grey; A's opens its remedy
+                    if m.quietState == .stopped {
+                        Button { withAnimation(.easeOut(duration: 0.15)) { showRemedy.toggle(); showTopApps = false } } label: {
+                            Text(r.capsule).padding(.horizontal, 10).padding(.vertical, 4)
+                                .background(Color.gray.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
+                        }
+                        .buttonStyle(.plain).padding(.horizontal, -10).padding(.vertical, -4)
+                        .help(r.title + " Click for what starts it again.")
+                        .anchorPreference(key: RemedyAnchorKey.self, value: .bounds) { $0 }
+                    } else {
+                        Text(r.capsule).background(Color.gray.opacity(0.22), in: Capsule()).foregroundStyle(.primary)
+                    }
+                } else if live {
                     Text(p.label).background(p.color.opacity(0.2), in: Capsule()).foregroundStyle(p == .normal ? .primary : p.color)
                 } else if m.blocked {
                     Button { Store.openLocalNetworkSettings() } label: {
@@ -4563,6 +4994,7 @@ struct PopoverView: View {
 
     var mirrorStatusLine: String {
         let last = m.knownUntil.map { MemoryChart.when($0) } ?? "never"
+        if let r = m.remedy { return r.status }
         if !m.stale {
             if m.link?.state == "catching_up" { return "Catching up: fetching missed history…" }
             var s = "Logging every \(Int(m.current?.daemon?.interval ?? 30)) s"
@@ -4611,7 +5043,11 @@ struct PopoverView: View {
         return s
     }
 
-    func stats(_ c: Sample) -> some View {
+    @ViewBuilder func stats(_ c: Sample) -> some View {
+        if m.isLinux { linuxStats(c) } else { macStats(c) }
+    }
+
+    func macStats(_ c: Sample) -> some View {
         let idle = c.away?.idle_s ?? 0
         return VStack(spacing: 8) {
             HStack {
@@ -4629,6 +5065,77 @@ struct PopoverView: View {
         }
     }
 
+    /// A Linux tab's tiles (03 §3.9): LinuxTab's matrix in the Mac's two rows of four, the biggest group last.
+    func linuxStats(_ c: Sample) -> some View {
+        let cells = LinuxTab.tiles(c, m.facts, name: m.title)
+        return VStack(spacing: 8) {
+            HStack {
+                LinuxStat(cell: cells[0]); LinuxStat(cell: cells[1]); LinuxStat(cell: cells[2])
+                LinuxStat(cell: cells[3], wide: true)
+            }
+            HStack {
+                LinuxStat(cell: cells[4]); LinuxStat(cell: cells[5]); LinuxStat(cell: cells[6])
+                groupTile(cells[7])
+            }
+        }
+    }
+
+    /// The biggest group: its size, its name below; a click lists the biggest groups (not where the logger
+    /// sees only its own processes).
+    func groupTile(_ cell: LinuxTab.Cell) -> some View {
+        let visible = m.facts.allProcs != false
+        return Button {
+            guard visible else { return }
+            NSApp.keyWindow?.makeFirstResponder(nil)
+            withAnimation(.easeOut(duration: 0.15)) { showTopApps.toggle(); showAI = false; showRemedy = false }
+        } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(cell.value).font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                    Text(cell.label).font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+                HStack(spacing: 3) {
+                    Text(cell.sub ?? "").lineLimit(1).truncationMode(.middle)
+                    if visible { Image(systemName: showTopApps ? "chevron.up" : "chevron.down").font(.system(size: 7, weight: .bold)) }
+                }
+                .font(.system(size: 10)).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .focusable(false)
+        .focusEffectDisabled()
+        .tourAnchor("topapp")
+        .help(cell.help)
+        .anchorPreference(key: TopAppAnchorKey.self, value: .bounds) { $0 }
+    }
+
+    /// A command for the other machine and its Copy button (03 §3.9: inside the frame, never cut off).
+    func commandRow(_ cmd: String) -> some View {
+        HStack(spacing: 6) {
+            Text(cmd).font(.system(size: 10.5, design: .monospaced)).lineLimit(1).truncationMode(.middle)
+                .padding(.horizontal, 6).padding(.vertical, 3)
+                .background(Color.primary.opacity(0.07), in: RoundedRectangle(cornerRadius: 4))
+            Button("Copy") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(cmd, forType: .string)
+            }
+            .controlSize(.small).focusable(false)
+            .help("Copy the command, to run it on \(m.title)")
+        }
+    }
+
+    /// States B and C (03 §3.9): there are no tiles, so the remedy stands in their place.
+    func remedyBlock(_ r: (capsule: String, status: String, title: String, text: String, command: String)) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            (Text(r.title).fontWeight(.semibold) + Text(" " + r.text))
+                .font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
+            commandRow(r.command)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     // MARK: four resources (roadmap 02 §3.4.1, §3.7; with resourcesUI)
 
     /// The tiles, in the place of the two stats rows: the summary of every resource and the selector of what
@@ -4637,7 +5144,8 @@ struct PopoverView: View {
     var tilesRow: some View {
         let sel = store.selection(for: m)
         let live = m.current != nil && (m.isLocal ? m.daemonRunning : true)
-        let facts: [Resource: Tile] = live ? Tile.facts(m.current!, Verdict.capsule(m.current!), waiting: m.waiting) : [:]
+        var facts: [Resource: Tile] = live ? Tile.facts(m.current!, Verdict.capsule(m.current!), waiting: m.waiting) : [:]
+        if m.isLinux, let s = m.current, let t = facts[.memory] { facts[.memory] = LinuxTab.memoryTile(t, s, m.facts) }
         let avail = Resource.available(m.current)
         // equal tiles (02 §3.4.1: four of 108 pt, three of 146): the panel's content width shared out
         let n = CGFloat(avail.count)
@@ -4832,7 +5340,9 @@ struct PopoverView: View {
             // with the resources on, the project gives way first, then the purpose in its middle (02 §3.4.6)
             Text(r.purpose).font(.system(size: 11)).lineLimit(1)
                 .truncationMode(resourcesUIOn ? .middle : .tail).layoutPriority(resourcesUIOn ? 1 : 0)
-            if let p = r.projectName { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
+            if let p = rowDetail(r) {
+                Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            }
             Spacer(minLength: 4)
             Text(reservationTail(r, now: now)).font(.system(size: 10, weight: flagged ? .semibold : .regular))
                 .foregroundStyle(flagged ? .primary : .secondary).monospacedDigit()
@@ -4920,8 +5430,21 @@ struct PopoverView: View {
         .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
     }
 
+    /// "who · project" on a Linux tab once several accounts hold reservations there (03 §3.9 state 8).
+    var showsWho: Bool { m.isLinux && LinuxTab.showsWho(m.liveReservations) }
+    /// After the purpose: the project, or "who · project".
+    func rowDetail(_ r: Reservation) -> String? {
+        let parts: [String] = [showsWho ? r.user : nil, r.projectName].compactMap { $0 }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
     func reservationTail(_ r: Reservation, now: Double) -> String {
         if m.stale { return r.granted == nil ? "was waiting" : String(format: "was using %.1fG", r.used ?? 0) }
+        // what a reservation uses is not known where the logger sees only its own processes, or nothing is
+        // logged (03 §3.9 states C and D)
+        if m.isLinux && (m.facts.allProcs == false || m.quietState == .absent) && r.granted != nil {
+            return r.expires.map { MemoryChart.shortDuration($0 - now) + " left" } ?? "granted"
+        }
         if resourcesUIOn {  // its flag, what it waits for, one use figure (02 §3.4.6)
             let sel = store.selection(for: m)
             return r.statusText(shown: sel.shown, focus: sel.focus, now: now)
@@ -5041,6 +5564,30 @@ struct PopoverView: View {
         .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
     }
 
+    /// State A's callout from the capsule (03 §3.9): the logger on the other machine stopped, and the command
+    /// that starts it again there.
+    func remedyCallout(_ r: (capsule: String, status: String, title: String, text: String, command: String), arrowX: CGFloat,
+                       width: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            CalloutArrow()
+                .fill(.regularMaterial)
+                .overlay(CalloutArrow().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+                .frame(width: 16, height: 8)
+                .rotationEffect(.degrees(180))
+                .offset(x: arrowX - width / 2)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(r.title).font(.system(size: 12, weight: .semibold))
+                Text(r.text).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                commandRow(r.command)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
+        }
+        .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
+    }
+
     func topAppsCallout(arrowX: CGFloat) -> some View {
         let gs = Array((m.current?.groups ?? []).prefix(12))
         let maxMB = Double(gs.first?.mb ?? 1)
@@ -5117,15 +5664,15 @@ struct PopoverView: View {
                 Spacer(minLength: 6)
                 if resourcesUIOn {
                     let focus = store.selection(for: m).focus
-                    ResourceLegend(focus: focus, sample: m.current, missing: missingInView)
+                    ResourceLegend(focus: focus, sample: m.current, missing: missingInView, linux: m.isLinux, away: m.hasPresence)
                     Text(focus.unit).font(.caption).foregroundStyle(.secondary)
                         .help(ResourceLegend.unitHelp(focus) + (store.allHistory
                               ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
                               : "Time runs left to right up to now."))
                 } else {
-                ChartLegend(missing: missingInView)
+                ChartLegend(missing: missingInView, linux: m.isLinux, away: m.hasPresence)
                 Text("GB").font(.caption).foregroundStyle(.secondary)
-                    .help("Memory in GB; the dashed line is the Mac's RAM. " + (store.allHistory
+                    .help("Memory in GB; the dashed line is the \(m.isLinux ? "machine" : "Mac")'s RAM. " + (store.allHistory
                           ? "∞: all history on a logarithmic time axis — the last hours wide, older days squeezed."
                           : "Time runs left to right up to now."))
                 }
@@ -5146,13 +5693,14 @@ struct PopoverView: View {
                                 reservations: m.reservations, stripHeight: stripHeight,
                                 bands: stripBands, smallBand: smallBandHeight, highlight: rowHighlight,
                                 focus: sel.focus, rows: smallRows, rowHeight: smallRowHeight, cores: m.current?.cpu?.v?.n,
-                                floors: pool?.watch == true ? pool.flatMap { p in p.low_gb.map { (low: $0, crit: p.crit_gb ?? 0) } } : nil)
+                                floors: pool?.watch == true ? pool.flatMap { p in p.low_gb.map { (low: $0, crit: p.crit_gb ?? 0) } } : nil,
+                                wiredName: m.isLinux ? "Kernel" : "Wired")
                         .id(sel.focus)  // a plain click cross-fades the chart area (§3.7.4)
                         .transition(.opacity)
                 } else {
                     MemoryChart(points: m.history, gaps: m.gaps, incidents: m.incidents, events: m.events,
                                 ram: m.current?.ram_gb, axis: axis,
-                                reservations: m.reservations, stripHeight: stripHeight)
+                                reservations: m.reservations, stripHeight: stripHeight, wiredName: m.isLinux ? "Kernel" : "Wired")
                         .transition(.opacity)  // fades in (0.33 s) once the history has loaded
                 }
             }
@@ -5204,10 +5752,16 @@ struct PopoverView: View {
 
     var incidentsList: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Incidents").font(.caption).foregroundStyle(.secondary)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Incidents").font(.caption).foregroundStyle(.secondary)
+                if m.isLinux && m.facts.kills == "none" {  // 03 §3.9 state E
+                    Spacer()
+                    Text(LinuxTab.killsHidden).font(.system(size: 10)).foregroundStyle(.tertiary).help(LinuxTab.killsHiddenHelp)
+                }
+            }
             if m.fetchingIncidents {
                 Text("fetching…").font(.caption).foregroundStyle(.tertiary)
-            } else if m.incidents.isEmpty {
+            } else if m.incidents.isEmpty && m.quiet.isEmpty {
                 Text("None recorded").font(.caption).foregroundStyle(.tertiary)
             } else if resourcesUIOn && store.compactLevel >= 5, let inc = m.incidents.first {
                 // the last resort (§3.4.8): the list becomes one line
@@ -5216,6 +5770,14 @@ struct PopoverView: View {
                         .font(.system(size: 11)).foregroundStyle(inc.open == true ? Color.red : Color.secondary).lineLimit(1)
                 }
                 .buttonStyle(.plain)
+            } else if !m.quiet.isEmpty {
+                // a Linux tab: the quiet incidents fold into one grey row for the latest (03 §3.9 state 9). A render
+                // draws the rows without the scroll view, whose content ImageRenderer leaves out
+                if renderMode {
+                    linuxRows.frame(maxHeight: resourcesUIOn && store.compactLevel >= 1 ? 68 : 130, alignment: .top).clipped()
+                } else {
+                    ScrollView { linuxRows }.frame(maxHeight: resourcesUIOn && store.compactLevel >= 1 ? 68 : 130)
+                }
             } else {
                 ScrollView {
                     VStack(spacing: 2) {
@@ -5234,6 +5796,56 @@ struct PopoverView: View {
                         }
                     }
                 }.frame(maxHeight: resourcesUIOn && store.compactLevel >= 1 ? 68 : 130)
+            }
+        }
+    }
+
+    var linuxRows: some View {
+        VStack(spacing: 2) {
+            ForEach(LinuxTab.rows(m.incidents, quiet: m.quiet), id: \.self) { row in
+                switch row {
+                case .incident(let id):
+                    if let inc = m.incidents.first(where: { $0.id == id }) { incidentButton(inc) }
+                case .quiet(let id, let earlier):
+                    if let inc = m.quiet.first(where: { $0.id == id }) { quietRow(inc, earlier: earlier) }
+                }
+            }
+        }
+    }
+
+    func incidentButton(_ inc: Incident) -> some View {
+        Button { if m.isLocal { store.open(inc) } } label: { row(inc) }
+            .buttonStyle(.plain)
+            .contextMenu {
+                Button("Copy path") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(inc.dir, forType: .string)
+                }
+                Button("Reveal in Finder") { NSWorkspace.shared.selectFile(inc.dir + "/incident.json", inFileViewerRootedAtPath: inc.dir) }
+            }
+    }
+
+    /// The quiet incidents of a Linux machine, folded (03 §3.9 state 9): grey, "· quiet" after the date, how many
+    /// came before it where the kills sit; never orange, never on the tab's badge.
+    func quietRow(_ inc: Incident, earlier: Int) -> some View {
+        let f = DateFormatter(); f.dateFormat = "EEE d MMM HH:mm"
+        return HStack(alignment: .top, spacing: 6) {
+            Circle().fill(Color.secondary.opacity(0.4)).frame(width: 6, height: 6).padding(.top, 5)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(f.string(from: Date(timeIntervalSince1970: inc.start)) + " · quiet" + (inc.open == true ? " · open" : ""))
+                    .font(.system(size: 11, weight: .medium)).foregroundStyle(.secondary)
+                Text(inc.reasons.first?.desc ?? "containers at their own limit").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer()
+            if earlier > 0 { Text("+\(earlier) earlier").font(.system(size: 10)).foregroundStyle(.secondary) }
+        }
+        .padding(.vertical, 3).padding(.horizontal, 4)
+        .contentShape(Rectangle())
+        .help("Containers at their own memory limit: kept, never news. Their stall time and kills are the containers', not this machine's.")
+        .contextMenu {
+            Button("Copy path") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(inc.dir, forType: .string)
             }
         }
     }
@@ -5266,6 +5878,7 @@ struct PopoverView: View {
     func startTour() {
         NSApp.keyWindow?.makeFirstResponder(nil)
         chipHover = false
+        if m.isLinux { store.select(0) }  // the tour explains This Mac until it speaks Linux (03 §3.9, L3)
         withAnimation(.easeOut(duration: 0.2)) { showAI = false; showTopApps = false; tourStep = 0 }
     }
 
@@ -6095,7 +6708,7 @@ struct MachineTab: View {
         if let e = m.entry { parts.append(e.address + (e.transport == "ssh" ? " (ssh)" : "")) }
         if let v = m.info?.os_version { parts.append((m.info?.os == "linux" ? "Linux " : "macOS ") + v) }
         if let v = m.info?.version { parts.append(brand + " " + v) }
-        parts.append(m.allowsAI ? "AI analysis allowed there" : "AI analysis not allowed there")
+        parts.append(m.isLinux ? "AI analysis: not for Linux machines yet" : m.allowsAI ? "AI analysis allowed there" : "AI analysis not allowed there")
         if m.linkLive { parts.append("connected") } else if let t = m.link?.last_contact {
             parts.append("last contact " + MemoryChart.when(t))
         }
@@ -6151,6 +6764,12 @@ struct MoreAnchorKey: PreferenceKey {
 }
 
 struct TopAppAnchorKey: PreferenceKey {
+    static var defaultValue: Anchor<CGRect>? = nil
+    static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
+}
+
+/// Where a quiet machine's capsule is: its remedy's callout hangs from it (03 §3.9 state A).
+struct RemedyAnchorKey: PreferenceKey {
     static var defaultValue: Anchor<CGRect>? = nil
     static func reduce(value: inout Anchor<CGRect>?, nextValue: () -> Anchor<CGRect>?) { value = value ?? nextValue() }
 }
@@ -7975,10 +8594,14 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
         store.building = true; store.buildVersion = "1.5.0"; store.buildProgress = "Compiling \(brand) 1.5.0"
         store.buildLines = ["==> Compiling \(brand) 1.5.0", "app/oomph.swift:42: note: building for macOS 14"]
     }
-    // `--ai tour:N` draws step N of the guided tour (1-based)
+    // `--ai tour:N` draws step N of the guided tour (1-based); on a Linux tab it selects This Mac, as a click does
     let tour = ai.hasPrefix("tour:") ? Int(ai.dropFirst(5)).map { $0 - 1 } : nil
+    if tour != nil && store.machine.isLinux {
+        store.selected = 0
+        store.machine.refreshCurrent(); store.machine.loadIncidents(); store.machine.reloadPoints(sync: true)
+    }
     let view = PopoverView(store: store, showAI: ["callout", "dialog-connected", "dialog-error"].contains(ai), showTopApps: ai == "top",
-                           tourStep: tour, showAllReservations: ai == "resmore")
+                           tourStep: tour, showAllReservations: ai == "resmore", showRemedy: ai == "remedy")
         .background(Color(nsColor: .windowBackgroundColor))
         .frame(minHeight: store.connectShown ? 820 : nil, alignment: .top)  // room for the popover under the +
         .environment(\.colorScheme, dark ? .dark : .light)
@@ -8125,6 +8748,65 @@ func connectVectors(_ path: String) -> Int32 {
     }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)
+    FileHandle.standardOutput.write("\n".data(using: .utf8)!)
+    return 0
+}
+
+/// `oomph --linux-vectors FILE`: runs a Linux tab's words (LinuxTab, 03 §3.9; 1.13.3) over the inputs of FILE
+/// (tools/vectors/linux.json) and prints their answers as JSON; tools/linuxvectors.py compares them with the
+/// file's expected values and holds those to the CLI and to the gate's rules (no Wired, no "Idle 0 s" …).
+@MainActor
+func linuxVectors(_ path: String) -> Int32 {
+    guard let data = FileManager.default.contents(atPath: path),
+          let v = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+        FileHandle.standardError.write("oomph: --linux-vectors: can't read \(path)\n".data(using: .utf8)!)
+        return 2
+    }
+    func cases(_ k: String) -> [[String: Any]] { (v[k] as? [[String: Any]]) ?? [] }
+    func json<T: Decodable>(_ x: Any?, _ t: T.Type) -> T? {
+        guard let x, JSONSerialization.isValidJSONObject(x), let d = try? JSONSerialization.data(withJSONObject: x) else { return nil }
+        return try? JSONDecoder().decode(t, from: d)
+    }
+    func opt(_ x: String?) -> Any { x.map { $0 as Any } ?? NSNull() }
+    var out: [String: Any] = [:]
+    out["tiles"] = cases("tiles").map { c -> Any in
+        guard let s = json(c["sample"], Sample.self) else { return NSNull() }
+        let f = LinuxTab.Facts(s, info: json(c["machine"], MachineInfo.self))
+        return LinuxTab.tiles(s, f, name: (c["name"] as? String) ?? "build-01").map { x -> [Any] in
+            [x.label, x.value, opt(x.small), opt(x.sub), x.help, x.red]
+        }
+    }
+    out["event"] = cases("event").map { c -> Any in
+        guard let e = ChartEvent((c["e"] as? [String: Any]) ?? [:]) else { return NSNull() }
+        return [e.text, e.alarming] as [Any]
+    }
+    out["rows"] = cases("rows").map { c -> [[Any]] in
+        let a: [Incident] = json(c["incidents"], [Incident].self) ?? [], q: [Incident] = json(c["quiet"], [Incident].self) ?? []
+        return LinuxTab.rows(a, quiet: q).map { r -> [Any] in
+            switch r {
+            case .incident(let id): return ["incident", id]
+            case .quiet(let id, let n): return ["quiet", id, n]
+            }
+        }
+    }
+    out["who"] = cases("who").map { c -> Bool in
+        let rs = ((c["leases"] as? [[String: Any]]) ?? []).compactMap { Reservation($0) }
+        return LinuxTab.showsWho(rs)
+    }
+    out["remedy"] = cases("remedy").map { c -> Any in
+        guard let q = LinuxTab.Quiet(rawValue: (c["state"] as? String) ?? "") else { return NSNull() }
+        let r = LinuxTab.remedy(q, os: c["os"] as? String, name: (c["name"] as? String) ?? "", user: c["user"] as? String,
+                                at: (c["at"] as? String) ?? "")
+        return [r.0, r.1, r.2, r.3, r.4]
+    }
+    out["legend"] = cases("legend").map { c -> [[String]] in
+        ChartLegend(missing: (c["missing"] as? Bool) ?? false, linux: (c["linux"] as? Bool) ?? false, away: (c["away"] as? Bool) ?? true)
+            .shownRows.map { $0.map(\.name) }
+    }
+    out["group_name"] = cases("group_name").map { LinuxTab.groupName(($0["name"] as? String) ?? "") }
+    out["labeled"] = cases("labeled").map { c -> Bool in (c["os"] as? String).map { MachineEntry.labeled.contains($0) } ?? true }
+    guard let j = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
+    FileHandle.standardOutput.write(j)
     FileHandle.standardOutput.write("\n".data(using: .utf8)!)
     return 0
 }
@@ -8316,6 +8998,9 @@ struct Main {
         }
         if let i = args.firstIndex(of: "--connect-vectors"), i + 1 < args.count {
             exit(connectVectors(args[i + 1]))
+        }
+        if let i = args.firstIndex(of: "--linux-vectors"), i + 1 < args.count {
+            exit(MainActor.assumeIsolated { linuxVectors(args[i + 1]) })
         }
         if let i = args.firstIndex(of: "--render-chip"), i + 1 < args.count {
             MainActor.assumeIsolated { renderChip(to: args[i + 1], dark: args.contains("--dark")) }

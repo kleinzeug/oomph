@@ -169,8 +169,13 @@ def gb_ok(row, ram, disk_keys=("disk_free_gb",)):
     machine's RAM, at most 65,536 (roadmap 01 §4.3: what the chart can be handed is bounded); the
     sizes of disks (`disk_free_gb`, anything in a `disks` block, and in an event the `free_gb` of the
     disk it is about: `disk_keys`) up to DISK_GB instead, since a disk is bigger than 16 times the
-    RAM of most Macs."""
+    RAM of most Macs. A logger inside a cgroup reports the limit as its RAM, but the host's figures in
+    `scope` and `linux` (its RAM, what it has available, its swap): those are bounded by 16 times the
+    host's RAM (scope.host_ram_gb) instead."""
     top = min(16 * ram, 65536.0) if oomph._num(ram, 0.1, 65536) else 65536.0
+    sc = row.get("scope") if isinstance(row, dict) else None
+    host = sc.get("host_ram_gb") if isinstance(sc, dict) else None
+    wide = max(top, min(16 * host, 65536.0)) if oomph._num(host, 0.1, 65536) else 65536.0
     stack = [(row, top)]
     while stack:
         x, lim = stack.pop()
@@ -180,7 +185,7 @@ def gb_ok(row, ram, disk_keys=("disk_free_gb",)):
                         not oomph._num(v, 0, DISK_GB if k in disk_keys else lim):
                     return False
                 if isinstance(v, (dict, list)):
-                    stack.append((v, DISK_GB if k == "disks" else lim))
+                    stack.append((v, DISK_GB if k == "disks" else wide if x is row and k in ("scope", "linux") else lim))
         elif isinstance(x, list):
             stack.extend((y, lim) for y in x)
     return True
@@ -2444,9 +2449,9 @@ def cmd_remote(args):
                       "oomph remote sync (the app's tabs: defaults write local.oomph.menubar machinesUI -bool YES)"
                       % (net.clean(str(label(e)), 64), e["transport"], show_target(e), counts["samples"],
                          counts["incidents"], counts["leases"]))
-                if e.get("os") not in (None, "macos"):
-                    print("It is watched from the terminal for now (oomph remote sync, oomph top); the app gives "
-                          "it a tab once it knows that system's words (1.13).")
+                if e.get("os") not in (None, "macos", "linux"):  # the systems the app can label (1.13.3: Linux)
+                    print("It is watched from the terminal for now (oomph remote sync, oomph top); this app does not "
+                          "know that system's words yet.")
             return 0
         book = Book()
         if sub == "list":

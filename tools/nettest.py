@@ -367,10 +367,11 @@ os.unlink(os.path.join(led, "ledger.json"))
 with open(os.path.join(led, "ledger.json"), "w") as f:
     json.dump({"seq": 5, "leases": [{"id": "r5", "state": "granted", "gb": 2.0, "purpose": "p" * 5000, "requested": t - 60,
                                      "granted": t - 60, "holder": {"pid": 5, "start": 1, "kind": "session", "x": "y"},
-                                     "extra": {"deep": 1}}, {"id": "r6", "gb": "lots"}], "history": []}, f)
+                                     "extra": {"deep": 1}, "user": "kim"}, {"id": "r6", "gb": "lots"}], "history": []}, f)
 snap = json.loads(net.unpack(rpc(hs, "ledger")["data"])[0])
 check(len(snap["leases"]) == 1 and len(snap["leases"][0]["purpose"]) == 200 and "extra" not in snap["leases"][0]
       and set(snap["leases"][0]["holder"]) == {"pid", "start", "kind"}, "ledger: malformed leases dropped, fields named and cut")
+check(snap["leases"][0].get("user") == "kim", "ledger: a lease says which account asked (a Linux tab's who · project, 1.13.3)")
 
 # ------------------------------------------------------------------ the stdio front end
 use(fx)

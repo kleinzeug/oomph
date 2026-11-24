@@ -625,6 +625,26 @@ popup then has a tab per machine added with `oomph remote add`: the header and e
 belong to the selected tab, the menu-bar chip stays this Mac's, and the popup opens on the tab
 it was closed on unless this Mac is critical, has an incident or its logger is silent.
 
+A **Linux machine** gets a tab too (1.13.3, with the same switch; add it with `oomph remote add
+user@host`, over ssh). Its tab speaks Linux: *Kernel* where a Mac says Wired; *Available*
+where nothing is compressed (zram or zswap); *Stalled on memory* (the share of the last 10 s
+tasks waited for memory, `· fully N %` when all of them did; a quiet `+97 % ▣` for stall time
+inside a container at its own limit, which is the container's, not the machine's) where a Mac
+says Idle, or *Idle* on a desktop (`—` where it reports none), or *of RAM available* where the
+kernel measures no stall time; *zram used / size* where zram is the only swap; *Memory limit*
+when the logger runs in a container; the RAM with one decimal; the *biggest group* (a systemd
+unit, a container as `nginx · docker`, or a program). Kills read "3 killed by the OOM killer:
+java ×2, node" (kills at a container's own limit after them, "(+1 at their limit)"); containers that keep hitting their own limit fold into one grey row, "· quiet",
+with "+N earlier", never news; a reservation says *who · project* once two accounts hold one
+there. A machine that is reached but has little to show says so in its capsule, with the command
+for the other machine and a Copy button: *No readings* (its logger stopped: `sudo systemctl
+restart oomphd`), *No access* (this account may not read its logs) or *No logger* (oomph runs
+from a checkout there: `sudo linux/install.sh --system`; the same command opens closed logs).
+With the four resource tiles (`resourcesUI`) a Linux tab keeps them; its Memory tile says the RAM
+with its decimal, the biggest group as above and *stalled* where tasks wait for memory, and the
+remedy still stands in the tiles' place. ✦ stays hidden on a Linux tab, and the tour explains
+This Mac.
+
 With the switch on (1.10.2), a **+** sits on the line under the header (at the end of the tabs
 once there are some). It opens a popover: type an address, a name or `user@host`, or paste the
 link Share this Mac shows (`oomph://K7QF-2M9X-D4TR@studio.local`); Recents brings back a machine

@@ -5,6 +5,7 @@ Samples the real system into a temporary log directory, feeds the daemon a synth
 jetsam storm, checks that an incident opens and closes with a report, and runs every
 CLI command against the result. Run: /usr/bin/python3 -I tools/selftest.py
 """
+import gzip
 import io
 import json
 import os
@@ -2467,6 +2468,18 @@ check(sl["cpu"].get("busy") == 9.12 and "load" not in sl["cpu"] and sl["gpu"][0]
       "names, no disks, no per-process lists (%d bytes more)" % (len(json.dumps(sl)) - len(json.dumps(oomph.slim_sample(cur)))))
 check("disks" not in fu and fu["top_cpu"][0]["cpu"] == 5.2 and fu["gpu"][0]["name"] == "Apple M3 Max",
       "full sample: the GPU's name and the top lists; no disks")
+# a Linux tab's tiles (1.13.3) read the kernel's swap, zram's size, the stall time at a container's limit and whether
+# the logger sees every process: in the full current sample only, named fields, three cgroups at most, cut
+lxs = dict(cur, os="linux", psi={"mem_some": 1.0, "mem_full": 0.0, "limit": {"some": 97.0, "full": 41.0, "x": {"y": 1},
+                                 "cgroups": ["docker:9d02c41b (node)", 5, "c" * 500, "d", "e"]}},
+           linux={"avail_gb": 4.0, "kswap_total_gb": 8.0, "kswap_free_gb": 2.0, "zram_disk_gb": 8.0, "commit_pct": 40},
+           daemon=dict(cur.get("daemon") or {}, all_procs=False, user="oomphd"))
+lfu, lsl = oomph.full_sample(lxs), oomph.slim_sample(lxs)
+check(lfu["psi"]["limit"] == {"some": 97.0, "full": 41.0, "cgroups": ["docker:9d02c41b (node)", "c" * oomph.LIMITS["str"]]}
+      and lfu["linux"] == {"avail_gb": 4.0, "kswap_total_gb": 8.0, "kswap_free_gb": 2.0, "zram_disk_gb": 8.0}
+      and lfu["daemon"].get("all_procs") is False and "user" not in lfu["daemon"] and "linux" not in lsl
+      and "limit" not in lsl.get("psi", {}), "full sample of a Linux machine: what its tab reads (zram, the stall at a "
+      "limit, all processes seen), named and cut; slim samples carry none of it")
 import oomph_sync  # noqa: E402
 eight = dict(cur, ram_gb=8.0, disk_free_gb=900.0, **dict(RES_EXAMPLE, disks=[dict(RES_EXAMPLE["disks"][0], total_gb=1000.0,
                                                                                   free_gb=900.0)]))
@@ -3782,6 +3795,64 @@ r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "con
                    text=True, timeout=60)
 check(r.returncode == 0, "the popover reads links, codes and addresses as the CLI does (tools/connectvectors.py): %s"
       % ([x for x in r.stdout.splitlines() if "FAIL" in x] or r.stdout.strip().splitlines()[-1:] or [r.stderr[-300:]])[0])
+
+# a Linux tab (1.13.3, 03 §3.9): the app's words held to the gate and to the logger (tools/vectors/linux.json), and a
+# Linux machine mirrored through the real serve and sync as the app draws it: its os and measures, its quiet incidents
+# kept quiet, the account that asked on each lease (who · project)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "linuxvectors.py")], capture_output=True,
+                   text=True, timeout=60)
+check(r.returncode == 0, "a Linux tab's tiles, kills, quiet incidents and remedies keep the gate (tools/linuxvectors.py): %s"
+      % ([x for x in r.stdout.splitlines() if "FAIL" in x] or r.stdout.strip().splitlines()[-1:] or [r.stderr[-300:]])[0])
+lfx = os.path.join(tempfile.mkdtemp(prefix="oomph-linux-tab-"), "fx")
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "mirrorfixture.py"), lfx, "linux", "container"],
+                   capture_output=True, text=True, timeout=120,
+                   env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_MACHINES_DIR")})
+try:
+    lm = json.load(open(os.path.join(lfx, "mirror", "machine.json")))
+    lq = [json.load(open(os.path.join(lfx, "mirror", "log", "incidents", i, "incident.json")))
+          for i in os.listdir(os.path.join(lfx, "mirror", "log", "incidents"))]
+    ll = json.load(open(os.path.join(lfx, "mirror", "ledger", "ledger.json")))["leases"]
+    lmj = json.load(open(os.path.join(lfx, "machines", "machines.json")))["machines"]
+except (OSError, ValueError) as e:
+    lm, lq, ll, lmj = {}, [], [], []
+    print("      linux tab: %s %s" % (e, r.stderr[-300:]))
+check(r.returncode == 0 and lm.get("os") == "linux" and lm.get("kind") == "container" and
+      (lm.get("measures") or {}).get("zswap") is True and len([i for i in lq if i.get("quiet") is True]) == 3 and
+      len([i for i in lq if not i.get("quiet")]) >= 1 and {x.get("user") for x in ll} == {"ada", "kim"} and
+      [e["os"] for e in lmj] == ["linux"],
+      "a Linux machine mirrored for its tab: os, kind and measures, 3 quiet incidents beside its own, who asked each lease")
+# what its tiles read crosses serve, ingest and the mirror: a 2 GB container on a 62.7 GB host (the host's figures are
+# more than 16 x the limit), and the stall at a container's limit on the host
+try:
+    lc = json.load(open(os.path.join(lfx, "mirror", "log", "current.json")))
+    lh = [json.loads(x) for n in sorted(os.listdir(os.path.join(lfx, "mirror", "log"))) if n.startswith("samples-")
+          for x in (lambda b: gzip.decompress(b) if n.endswith(".gz") else b)(
+              open(os.path.join(lfx, "mirror", "log", n), "rb").read()).splitlines()]
+    lsy = json.load(open(os.path.join(lfx, "mirror", "sync.json")))
+except (OSError, ValueError) as e:
+    lc, lh, lsy = {}, [], {}
+    print("      linux tab current: %s" % e)
+check(lc.get("ram_gb") == 2.0 and (lc.get("scope") or {}).get("host_ram_gb") == 62.7 and
+      (lc.get("linux") or {}).get("kswap_total_gb") == 8.0 and (lc.get("daemon") or {}).get("all_procs") is True and
+      len(lh) > 100 and all((x.get("scope") or {}).get("host_ram_gb") == 62.7 for x in lh) and
+      not any((lsy.get("dropped") or {}).values()),
+      "a 2 GB container on a 62.7 GB host mirrored whole: current.json with its scope, its linux block and all_procs, "
+      "every history sample with the host's RAM, none dropped (%d samples)" % len(lh))
+shutil.rmtree(os.path.dirname(lfx), ignore_errors=True)
+lfx = os.path.join(tempfile.mkdtemp(prefix="oomph-linux-tab-"), "fx")
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "mirrorfixture.py"), lfx, "linux", "limit"],
+                   capture_output=True, text=True, timeout=120,
+                   env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_MACHINES_DIR")})
+try:
+    lc = json.load(open(os.path.join(lfx, "mirror", "log", "current.json")))
+except (OSError, ValueError) as e:
+    lc = {}
+    print("      linux tab limit: %s %s" % (e, r.stderr[-300:]))
+check(r.returncode == 0 and ((lc.get("psi") or {}).get("limit") or {}).get("some") == 97.0 and
+      (lc["psi"]["limit"].get("cgroups") or [None])[0] == "docker:9d02c41b (node)" and
+      (lc.get("linux") or {}).get("zram_disk_gb") == 0.0,
+      "the stall at a container's limit and the linux block cross serve, ingest and the mirror")
+shutil.rmtree(os.path.dirname(lfx), ignore_errors=True)
 
 # remote machines (1.10.0): the peer gate, pairing and tokens, TLS, the share commands, remote over TCP and ssh,
 # the engine (tools/sharetest.py, a file of its own)

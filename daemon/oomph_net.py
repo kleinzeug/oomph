@@ -284,12 +284,13 @@ def scrub(v, cut=200, depth=4, n=64):
     return None
 
 
+# `user`: the account that asked, which a Linux tab shows once several accounts hold reservations (03 §3.9; 1.13.3)
 LEASE_FIELDS = ("key", "id", "state", "gb", "purpose", "project", "ttl", "requested", "seen", "granted", "expires",
-                "used_gb", "peak_gb", "baseline_gb", "note")
+                "used_gb", "peak_gb", "baseline_gb", "note", "user")
 FINISHED_FIELDS = ("key", "id", "purpose", "project", "gb", "holder", "peak_gb", "outcome", "requested", "granted",
-                   "ended", "waited_s", "held_s")
+                   "ended", "waited_s", "held_s", "user")
 RECORD_FIELDS = ("event", "t", "key", "id", "purpose", "project", "holder", "gb", "requested", "granted", "ended",
-                 "outcome", "peak_gb", "used_gb", "expires", "change", "backfilled", "waited_s", "held_s")
+                 "outcome", "peak_gb", "used_gb", "expires", "change", "backfilled", "waited_s", "held_s", "user")
 INCIDENT_FIELDS = ("id", "start", "start_iso", "last_trigger", "open", "end", "end_iso", "opened_by", "continues",
                    "quiet", "repeats", "more")
 

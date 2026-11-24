@@ -436,7 +436,10 @@ SLIM_BLOCKS = {"cpu": (None, ("n", "p", "e", "busy", "user", "sys", "p_busy", "e
                "scope": (None, ("kind", "limit_gb", "by", "host_ram_gb", "host_avail_gb", "host_pressure")),
                "killed": (3, ("name", "mb", "by"))}
 # ... and in the full current sample with what names and describes them
-FULL_BLOCKS = {"gpu": (4, SLIM_BLOCKS["gpu"][1] + ("name", "unified", "mem_limit_gb", "mem_limit_est"))}
+# A Linux machine's own figures that its tab's tiles read (1.13.3, 03 §3.9): what is available, the kernel's swap and
+# zram's size (the zram tile), in the current sample only
+FULL_BLOCKS = {"gpu": (4, SLIM_BLOCKS["gpu"][1] + ("name", "unified", "mem_limit_gb", "mem_limit_est")),
+               "linux": (None, ("avail_gb", "kswap_total_gb", "kswap_free_gb", "zram_disk_gb"))}
 # The full current sample is rebuilt from these fields only, each list capped (CONTEXT §3.2).
 FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "pn", "s", "cpu", "gpu", "w")),
               "groups": (15, ("name", "mb", "n", "cpu", "gpu")),
@@ -448,7 +451,7 @@ FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "p
               "top_gpu": (5, ("pid", "name", "g", "s", "gpu")),
               "top_io": (5, ("pid", "name", "g", "s", "w")),
               "cpu_names": (5, ("name", "cpu", "n"))}
-FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root")
+FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root", "all_procs")
 FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
 
 
@@ -531,7 +534,7 @@ def full_sample(s):
     """The latest sample as it may leave the machine whole (current.json, for the stat tiles):
     what slim_sample keeps, plus the GPU block with its names, the per-process lists
     and the daemon block rebuilt from the fields of FULL_BLOCKS, FULL_LISTS, FULL_DAEMON and
-    FULL_MACHINE with their types, strings cut to
+    FULL_MACHINE with their types (and a Linux sample's stall time at a limit), strings cut to
     LIMITS["str"] characters, lists to their caps."""
     out = slim_sample(s)
     n = LIMITS["str"]
@@ -539,6 +542,12 @@ def full_sample(s):
         v = _block(s.get(k), cap, keys, n)
         if v is not _NOT:
             out[k] = v
+    # stall time taken out for containers at their own limit (Linux, 03 §5.3), and the first three of them
+    lim = s["psi"].get("limit") if isinstance(s.get("psi"), dict) else None
+    if isinstance(lim, dict) and isinstance(out.get("psi"), dict):
+        out["psi"]["limit"] = dict(_fields(lim, ("some", "full"), n),
+                                   cgroups=[x[:n] for x in (lim.get("cgroups") or [])[:3] if isinstance(x, str)]
+                                   if isinstance(lim.get("cgroups"), list) else [])
     for k, (cap, keys) in FULL_LISTS.items():
         if isinstance(s.get(k), list):
             out[k] = [_fields(x, keys, n, {"biggest": ("name", "pid", "mb")}) for x in s[k][:cap] if isinstance(x, dict)]

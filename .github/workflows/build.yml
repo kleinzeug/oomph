@@ -35,7 +35,7 @@ jobs:
           bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
           sh -n linux/install.sh linux/uninstall.sh linux/system.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/sharetest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/connectvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/renderfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/sharetest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/connectvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/renderfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py tools/linuxvectors.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
@@ -144,6 +144,9 @@ jobs:
           /usr/bin/python3 -I -B tools/chartvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
           # the connect popover (1.10.2): links, codes, addresses and its messages, as the CLI reads them
           /usr/bin/python3 -I -B tools/connectvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
+          # a Linux tab (1.13.3, behind machinesUI): the tile matrix, kills, quiet incidents and remedies, held to the
+          # logger's samples and the gate's rules (no Wired, no Idle 0 s, no biggest app)
+          /usr/bin/python3 -I -B tools/linuxvectors.py --app "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph"
 
       - name: Renders repeat themselves
         # The app's --render-popup with --fixture DIR, --now T and --no-liveness (1.10.6, roadmap 02 §8): every
@@ -190,6 +193,22 @@ jobs:
             OOMPH_MACHINES_DIR="$RUNNER_TEMP/rfx/machines" "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" \
               --render-popup "$RUNNER_TEMP/plus-${st%%:*}.png" --ai "$st" -aiOn NO -machinesUI YES
             test -s "$RUNNER_TEMP/plus-${st%%:*}.png"
+          done
+          # a Linux tab (1.13.3), also behind machinesUI: a server, and its logger stopped with the remedy open
+          for v in server stopped; do
+            /usr/bin/python3 -I -B tools/mirrorfixture.py "$RUNNER_TEMP/lfx-$v" linux "$v"
+            "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" --render-popup "$RUNNER_TEMP/linux-$v.png" \
+              --fixture "$RUNNER_TEMP/lfx-$v" --ai remedy -aiOn NO -machinesUI YES -resourcesUI NO \
+              -selectedMachine m-3f9c1a7e5b2d4c10 -lastSeenIncident 99999999-999999
+            test -s "$RUNNER_TEMP/linux-$v.png"
+          done
+          # and under layout C (resourcesUI on, gap G3): the four tiles with Linux words, the remedy in their place
+          for v in server denied; do
+            /usr/bin/python3 -I -B tools/mirrorfixture.py "$RUNNER_TEMP/lfxc-$v" linux "$v"
+            "$RUNNER_TEMP/dist/oomph.app/Contents/MacOS/oomph" --render-popup "$RUNNER_TEMP/linux-c-$v.png" \
+              --fixture "$RUNNER_TEMP/lfxc-$v" -aiOn NO -machinesUI YES -resourcesUI YES \
+              -selectedMachine m-3f9c1a7e5b2d4c10 -lastSeenIncident 99999999-999999
+            test -s "$RUNNER_TEMP/linux-c-$v.png"
           done
 
       - name: Verify app bundle
