@@ -1,0 +1,12 @@
+# Starts oomph-alert.service whenever the logger writes an alert record (an incident opened, something
+# was killed in it, it closed) into /var/log/oomph/alerts. The logger rewrites alerts/.beat with every
+# sample while a record is young, so a record written while the runner was finishing starts it again.
+[Unit]
+Description=oomph: alert hooks when an incident opens, kills or closes
+Documentation=https://github.com/kleinzeug/oomph
+
+[Path]
+PathChanged=/var/log/oomph/alerts
+
+[Install]
+WantedBy=multi-user.target

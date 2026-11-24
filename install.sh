@@ -16,8 +16,11 @@
 # needed, no launchd, no memwatch migration, files owned by whoever runs it. Run as root, it is
 # honoured only for a directory that root owns all the way up and nobody else can change.
 set -euo pipefail
-# On Linux there is no root install yet: linux/install.sh installs for the user who runs it (1.9.4).
-if [ "$(uname -s)" = Linux ]; then exec "$(dirname "$0")/linux/install.sh" "$@"; fi
+# On Linux: linux/install.sh; under sudo for the machine (--system: the logger as a service, 1.13.0)
+if [ "$(uname -s)" = Linux ]; then
+  if [ "$(id -u)" = 0 ] && [ -n "${SUDO_UID:-}" ]; then exec "$(dirname "$0")/linux/install.sh" --system "$@"; fi
+  exec "$(dirname "$0")/linux/install.sh" "$@"
+fi
 root_only() {  # root_only DIR: DIR and every folder above it root's, not writable by others (sticky is fine)
   local d u m
   d=$(cd "$1" && pwd -P) || return 1

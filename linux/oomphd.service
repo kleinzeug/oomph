@@ -1,0 +1,71 @@
+# oomph's logger on Linux (roadmap 03 §8.3, Appendix A, C.3 rows 14 to 16): one Python process and its
+# journalctl child, as the system user oomphd, with no capability, no network and no devices. It reads what
+# every local user can read in /proc and, through group systemd-journal, the kernel's OOM lines; it writes
+# its logs, its state and the machine's ledger, nothing else. linux/install.sh --system writes this file
+# with @PY@ replaced by the Python it chose and, for --no-journal or a system without that group, without
+# the SupplementaryGroups line. `systemd-analyze security oomphd` rates it at most 2.5 (CI checks it).
+[Unit]
+Description=oomph memory papertrail (logger)
+Documentation=https://github.com/kleinzeug/oomph
+After=local-fs.target systemd-journald.service
+# a logger that keeps crashing shows as failed (five starts in five minutes), not as forever restarting
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=@PY@ -I -B /usr/local/libexec/oomph/oomphd.py
+User=oomphd
+Group=oomphd
+SupplementaryGroups=systemd-journal
+# no capability, and none to be had
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+# the logs are readable by every local account, as on a Mac (D16); the ledger's files are 0666 by fchmod
+UMask=0022
+SyslogIdentifier=oomphd
+
+Restart=always
+RestartSec=10
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+OOMScoreAdjust=-900
+MemoryMax=256M
+TasksMax=64
+
+# no network, ever
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+IPAddressDeny=any
+
+# file system: its logs, its state, and the machine's ledger (the tick runs in a child of its own)
+ProtectSystem=strict
+ReadWritePaths=/var/log/oomph /var/lib/oomph/daemon -/var/lib/oomph/ledger
+# read-only, not hidden: a separate /home disk stays visible to statvfs and in mountinfo as what it is
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+KeyringMode=private
+RemoveIPC=yes
+
+# system calls
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged process_vm_readv process_vm_writev process_madvise kcmp pidfd_getfd ptrace
+SystemCallErrorNumber=EPERM
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

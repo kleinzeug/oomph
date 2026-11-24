@@ -1,0 +1,50 @@
+# Runs the administrator's scripts in /etc/oomph/alert.d for each new alert record (roadmap 03 §5.13,
+# Appendix A): only scripts that are root's and writable by root only, 30 s each, with variables cut to a
+# safe alphabet and the record as JSON on stdin. A throwaway account (DynamicUser) that may reach the
+# network, which the logger may not, and can write nothing but its cursor. Hardened (C.3 row 28):
+# `systemd-analyze security oomph-alert.service` at most 2.5. A hook that needs more (a JIT, another
+# account) gets a drop-in: sudo systemctl edit oomph-alert.service. Secrets (a webhook's URL, a topic, a
+# password) go into /etc/oomph/alert.secret (root's, 0600; KEY=value lines), never into the scripts, which
+# every account can read: the unit hands it to the hooks as $CREDENTIALS_DIRECTORY/alert.
+[Unit]
+Description=oomph: run the alert hooks in /etc/oomph/alert.d
+Documentation=https://github.com/kleinzeug/oomph
+
+[Service]
+Type=oneshot
+ExecStart=@PY@ -I -B /usr/local/libexec/oomph/oomph.py alert --run-hooks
+DynamicUser=yes
+StateDirectory=oomph-alert
+LoadCredential=alert:/etc/oomph/alert.secret
+TimeoutStartSec=300
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+KeyringMode=private
+RemoveIPC=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+MemoryMax=256M
+TasksMax=64

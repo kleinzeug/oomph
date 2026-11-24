@@ -96,8 +96,6 @@ def _procs(root, procs, self_cg):
         _w(root, "/proc/%d/cgroup" % pid, "0::%s\n" % cg)
         _w(root, "/proc/%d/cmdline" % pid, "".join(a + "\0" for a in argv))
     _w(root, "/proc/self/cgroup", "0::%s\n" % self_cg)
-    _w(root, "/proc/self/mountinfo", "22 26 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
-                                     "25 26 0:23 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw,nsdelegate\n")
 
 
 def _machine(root, distro="Ubuntu 24.04.3 LTS", mid="3f9c1a7e5b2d4c10a1b2c3d4e5f60718"):
@@ -129,6 +127,53 @@ def _pressure(root, mem, cpu=None, io=None):
     _w(root, "/proc/pressure/io", io or psi(0.3, 0.1))
 
 
+def _cpu(root, n=4, busy=0):
+    """/proc/stat: `n` cores, each with `busy` ticks more of user time than a fresh machine (two readings of
+    a fixture differ by what the test writes in between), and the boot time."""
+    rows = ["cpu%d %d 10 %d %d 50 0 5 0 0 0\n" % (i, 1000 + busy, 400, 90000 + busy // 3) for i in range(n)]
+    _w(root, "/proc/stat", "cpu  %d 40 1600 360000 200 0 20 0 0 0\n" % (4000 + n * busy) + "".join(rows) +
+       "intr 1 0\nctxt 100\nbtime 1795100000\nprocesses 5000\n")
+
+
+def _disks(root, read_mb=1000, written_mb=500):
+    """/proc/diskstats and /sys/block: sda (a disk), its partition, a loop and a device-mapper device whose
+    bytes must not count twice; a second disk sdb, and a USB stick sdc."""
+    sec = lambda mb: int(mb * 2048)  # noqa: E731  (sectors of 512 bytes)
+    _w(root, "/proc/diskstats", "".join("%4d %7d %s 100 0 %d 50 200 0 %d 80 0 100 130\n" % (maj, mi, n, sec(r), sec(w))
+                                        for maj, mi, n, r, w in ((8, 0, "sda", read_mb, written_mb),
+                                                                 (8, 1, "sda1", read_mb, written_mb),
+                                                                 (8, 16, "sdb", 10, 20), (8, 17, "sdb1", 10, 20),
+                                                                 (7, 0, "loop0", 3000, 0), (253, 0, "dm-0", 900, 900))))
+    for disk, parts, removable, usb in (("sda", ("sda1", "sda2"), 0, False), ("sdb", ("sdb1",), 0, False),
+                                        ("sdc", ("sdc1",), 1, True)):
+        dev = "devices/pci0000:00/0000:00:1f.2/%sblock/%s" % ("usb1/1-1/" if usb else "", disk)
+        _w(root, "/sys/%s/removable" % dev, "%d\n" % removable)
+        os.makedirs(os.path.join(root, "sys", "block"), exist_ok=True)
+        os.symlink("../" + dev, os.path.join(root, "sys", "block", disk))
+        for i, part in enumerate(parts):
+            _w(root, "/sys/%s/%s/partition" % (dev, part), "%d\n" % (i + 1))
+            mm = {"sda1": "8:1", "sda2": "8:2", "sdb1": "8:17", "sdc1": "8:33"}[part]
+            os.makedirs(os.path.join(root, "sys", "dev", "block"), exist_ok=True)
+            os.symlink("../../%s/%s" % (dev, part), os.path.join(root, "sys", "dev", "block", mm))
+    for v in ("loop0", "dm-0"):
+        _w(root, "/sys/devices/virtual/block/%s/removable" % v, "0\n")
+        os.symlink("../devices/virtual/block/" + v, os.path.join(root, "sys", "block", v))
+    _w(root, "/run/udev/data/b8:17", "S:disk/by-uuid/5e1f0c2a-9d3b-4c47-8e21-0a1b2c3d4e5f\nE:ID_FS_UUID=5e1f0c2a-9d3b-"
+                                     "4c47-8e21-0a1b2c3d4e5f\nE:ID_FS_LABEL=scratch\nE:ID_FS_TYPE=ext4\n")
+    for d in ("boot/efi", "mnt/scratch", "media/ada/STICK", "srv/share", "snap/core22/1380"):
+        os.makedirs(os.path.join(root, d), exist_ok=True)
+    _w(root, "/proc/self/mountinfo", "22 26 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n"
+       "25 26 0:23 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw,nsdelegate\n"
+       "26 1 8:1 / / ro,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro\n"   # ro: a sandbox's view of it
+       "27 26 8:2 / /boot/efi rw,relatime - vfat /dev/sda2 rw\n"
+       "28 26 8:17 / /mnt/scratch rw,relatime - ext4 /dev/sdb1 rw\n"
+       "29 26 8:33 / /media/ada/STICK rw,nosuid - vfat /dev/sdc1 rw\n"
+       "30 26 0:50 / /srv/share rw - nfs4 nas:/export rw,vers=4.2\n"
+       "31 26 7:0 / /snap/core22/1380 ro - squashfs /dev/loop0 ro\n"
+       "32 26 0:60 / /run/user/1000 rw - tmpfs tmpfs rw\n")
+    os.makedirs(os.path.join(root, "run", "systemd", "system"), exist_ok=True)
+
+
 def base(root, mem, swaprows=(), pressure=psi(), self_cg="/user.slice/user-1000.slice/session-4.scope", **kw):
     _machine(root, **kw)
     _cgroup_v2(root)
@@ -138,6 +183,99 @@ def base(root, mem, swaprows=(), pressure=psi(), self_cg="/user.slice/user-1000.
     if pressure is not None:
         _pressure(root, pressure)
     _procs(root, HOST_PROCS, self_cg)
+    _cpu(root)
+    _disks(root)
+
+
+NVIDIA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "nvidia")
+FAKE_SMI = """#!/bin/sh
+# nvidia-smi as recorded (tools/fixtures/nvidia): the answer to each of the three questions oomph asks
+D=$(dirname "$0")/../share/nvidia
+case "$*" in
+  --query-gpu=*) cat "$D/query-gpu.csv" ;;
+  "pmon -c 1 -s um") [ -f "$D/pmon.txt" ] && cat "$D/pmon.txt" || exit 6 ;;
+  --query-compute-apps=*) cat "$D/compute-apps.csv" ;;
+  *) exit 2 ;;
+esac
+"""
+
+
+def nvidia(root, busy=False, pmon=True):
+    """nvidia-smi on the machine: a script that prints what the real one printed (tools/fixtures/nvidia);
+    `busy`: card 0 at 87 %, the process on it at 85 % of its SMs and a second one on card 1 (the recorded
+    columns, other figures); `pmon` False: a driver without pmon (memory per process from compute apps)."""
+    d = os.path.join(root, "usr", "share", "nvidia")
+    os.makedirs(d, exist_ok=True)
+    for f in ("query-gpu.csv", "pmon.txt", "compute-apps.csv"):
+        with open(os.path.join(NVIDIA, f)) as src:
+            text = src.read()
+        if busy and f == "query-gpu.csv":
+            text = text.replace("RTX 4090, 0, 24564, 396", "RTX 4090, 87, 24564, 18432").replace(
+                "RTX 4090, 0, 24564, 4", "RTX 4090, 12, 24564, 2052")
+        if busy and f == "pmon.txt":
+            text = text.replace("    0    48211     C      -      -      -      -      -      -    386",
+                                "    0    48211     C     85     40      -      -      -      -  18000").replace(
+                "    1          -     -      -      -      -      -      -      -      -      -    -       ",
+                "    1     1610     C     12      3      -      -      -      -   2048      0    java    ")
+        if f == "pmon.txt" and not pmon:
+            if os.path.exists(os.path.join(d, f)):
+                os.remove(os.path.join(d, f))
+            continue
+        with open(os.path.join(d, f), "w") as out:
+            out.write(text)
+    _w(root, "/usr/bin/nvidia-smi", FAKE_SMI)
+    os.chmod(os.path.join(root, "usr", "bin", "nvidia-smi"), 0o755)
+
+
+# Kernel and killer lines the fact spike captured (03 Appendix C.3, spike-results: row 9 a group kill on
+# ubuntu-24.04, kernel 7.0; row 10 a machine-wide kill in the Ubuntu 24.04 guest, 6.8; row 33 earlyoom 1.7),
+# verbatim, then two made up from Appendix B's formats: a hostile name, and a kill line whose header was
+# rate-limited away. (seconds after the first, unit, message)
+JOURNAL = [
+    (0.000, "", "python3 invoked oom-killer: gfp_mask=0xcc0(GFP_KERNEL), order=0, oom_score_adj=500"),
+    (0.001, "", "memory: usage 98304kB, limit 98304kB, failcnt 34"),
+    (0.001, "", "Tasks state (memory values in pages):"),
+    (0.002, "", "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=spike9.slice,mems_allowed=0,oom_memcg=/spike9.slice/"
+                "spike-r9.scope,task_memcg=/spike9.slice/spike-r9.scope,task=python3,pid=2888,uid=0"),
+    (0.002, "", "Memory cgroup out of memory: Killed process 2888 (python3) total-vm:219800kB, anon-rss:45556kB, file-rss:6284kB, "
+                "shmem-rss:0kB, UID:0 pgtables:144kB oom_score_adj:500"),
+    (0.002, "", "Tasks in /spike9.slice/spike-r9.scope are going to be killed due to memory.oom.group set"),
+    (0.002, "", "Memory cgroup out of memory: Killed process 2888 (python3) total-vm:219800kB, anon-rss:45556kB, file-rss:6284kB, "
+                "shmem-rss:0kB, UID:0 pgtables:144kB oom_score_adj:500"),
+    (0.002, "", "Memory cgroup out of memory: Killed process 2893 (python3) total-vm:40600kB, anon-rss:29460kB, file-rss:3344kB, "
+                "shmem-rss:0kB, UID:0 pgtables:112kB oom_score_adj:500"),
+    (0.002, "", "Memory cgroup out of memory: Killed process 2894 (python3) total-vm:40600kB, anon-rss:29460kB, file-rss:3340kB, "
+                "shmem-rss:0kB, UID:0 pgtables:112kB oom_score_adj:500"),
+    (5.000, "", "python3 invoked oom-killer: gfp_mask=0x140dca(GFP_HIGHUSER_MOVABLE|__GFP_COMP|__GFP_ZERO), order=0, oom_score_adj=1000"),
+    (5.001, "", "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/system.slice/"
+                "spike-r10.scope,task=python3,pid=12943,uid=0"),
+    (5.001, "", "Out of memory: Killed process 12943 (python3) total-vm:1784924kB, anon-rss:1770880kB, file-rss:2560kB, shmem-rss:0kB, "
+                "UID:0 pgtables:3528kB oom_score_adj:1000"),
+    (9.000, "earlyoom.service", 'sending SIGTERM to process 5502 uid 0 "python3": badness 1869, VmRSS 1593 MiB'),
+    (9.600, "earlyoom.service", "escalating to SIGKILL after 0.6 seconds"),
+    (12.00, "", "Out of memory: Killed process 777 (x\x1b]0;pwn\x07) (b) total-vm:4000kB, anon-rss:2048000kB, file-rss:0kB, "
+                "shmem-rss:0kB, UID:1000 pgtables:12kB oom_score_adj:0"),
+    (20.00, "", "Memory cgroup out of memory: Killed process 31337 (node) total-vm:9000kB, anon-rss:900000kB, file-rss:0kB, "
+                "shmem-rss:0kB, UID:1000 pgtables:12kB oom_score_adj:0"),
+]
+
+
+def journal_lines(t0, rows=JOURNAL, boot="0f1e2d3c4b5a69788796a5b4c3d2e1f0", mono=None):
+    """`journalctl -o json` lines for `rows` from time t0 on, with cursors as systemd writes them; with `mono`
+    also their monotonic time from that on (seconds of CLOCK_MONOTONIC)."""
+    out = []
+    for i, (dt, unit, msg) in enumerate(rows):
+        e = {"__CURSOR": "s=66cda7637cae41059f2352731f38f40d;i=%x;b=%s;m=%x;t=%x;x=%016x" % (0x3600 + i, boot, i, int((t0 + dt) * 1e6), i),
+             "__REALTIME_TIMESTAMP": str(int((t0 + dt) * 1e6)), "_BOOT_ID": boot, "PRIORITY": "3" if unit else "6",
+             "MESSAGE": msg}
+        if mono is not None:
+            e["__MONOTONIC_TIMESTAMP"] = str(int((mono + dt) * 1e6))
+        if unit:
+            e.update(_SYSTEMD_UNIT=unit, _TRANSPORT="stdout")
+        else:
+            e.update(_TRANSPORT="kernel", SYSLOG_IDENTIFIER="kernel")
+        out.append(json.dumps(e))
+    return out
 
 
 def s_ubuntu_idle(root):
@@ -174,6 +312,12 @@ def s_zram_desktop(root):
     gb = 1 << 30
     _w(root, "/sys/block/zram0/mm_stat", "%d %d %d 0 %d 0 0 0 0\n" % (6.1 * gb, 2.8 * gb, 2.9 * gb, 3 * gb))
     _w(root, "/sys/block/zram0/disksize", "%d\n" % (8 * gb))
+
+
+def s_epyc_nvidia(root):
+    """A workstation with two RTX 4090 (the cards as nvidia-smi described a real one) and 251 GB."""
+    base(root, meminfo(251, 230.0, anon=15.0, free=200.0, swap_total=8.0), [("/swap.img", "file", 8.0, 0.0)])
+    nvidia(root)
 
 
 def s_hugepages(root):
@@ -242,6 +386,7 @@ SCENARIOS = {
     "vm-32g-noswap": (s_vm_32g_noswap, {"pressure": 1, "level": "ok", "margin_gb": 4.8}),
     "pain-critical": (s_pain_critical, {"pressure": 4, "level": "critical"}),
     "zram-desktop": (s_zram_desktop, {"pressure": 2, "compressed_gb": 2.9, "swap_total_gb": 0.0, "swap_used_gb": 0.0}),
+    "epyc-nvidia": (s_epyc_nvidia, {"pressure": 1, "level": "ok", "ram_gb": 251.0}),
     "fresh-boot-hugepages": (s_hugepages, {"free_gb": 30.0, "identity": True}),
     "container-2g": (s_container_2g, {"scope": "cgroup", "ram_gb": 2.0, "level": "ok"}),
     "container-2g-neighbour-thrash": (s_container_2g_neighbour_thrash, {"scope": "cgroup", "ram_gb": 2.0, "pressure": 2,

@@ -1,0 +1,13 @@
+#!/bin/sh
+# oomph alert hook: push to an ntfy topic. Copy to /etc/oomph/alert.d/ (root's, mode 755: every account can read
+# it, and the unit's throwaway account must) and put the topic into /etc/oomph/alert.secret (root's, 0600), which
+# oomph-alert.service hands to the hook as $CREDENTIALS_DIRECTORY/alert:  NTFY_URL=https://ntfy.sh/your-topic
+# Rules for every hook: quote each expansion; never eval; the variables are already cut to a safe alphabet; a
+# secret goes to curl in a config on fd 3, never on its command line (which other accounts can read in /proc).
+secret() { sed -n "s/^$1=//p" "${CREDENTIALS_DIRECTORY:-/nonexistent}/alert" 2>/dev/null | head -n 1 | sed 's/[\\"]/\\&/g'; }
+URL=$(secret NTFY_URL)
+[ -n "$URL" ] || { echo "no NTFY_URL= line in /etc/oomph/alert.secret" >&2; exit 1; }
+[ "$OOMPH_EVENT" = close ] && exit 0            # tell about open and kill, not about the end
+exec curl -fsS -m 20 -H "Title: $OOMPH_TITLE" -H "Priority: high" --data-raw "$OOMPH_MESSAGE" -K /dev/fd/3 3<<END
+url = "$URL"
+END

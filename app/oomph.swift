@@ -794,8 +794,10 @@ struct Incident: Decodable, Identifiable {
     var open: Bool?
     var reasons: [Reason]
     var summary: IncidentSummary?
+    /// A Linux machine's containers at their own limit (03 §5.6): kept, never news.
+    var quiet: Bool?
     var dir: String = ""
-    enum CodingKeys: String, CodingKey { case id, start, end, open, reasons, summary }
+    enum CodingKeys: String, CodingKey { case id, start, end, open, reasons, summary, quiet }
 }
 
 enum Pressure: Int { case unknown = 0, normal = 1, warn = 2, critical = 4
@@ -1545,7 +1547,8 @@ final class MachineStore: ObservableObject {
         let ids = ((try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? []).sorted(by: >).prefix(30)
         incidents = ids.compactMap { id in
             let p = "\(dir)/\(id)/incident.json"
-            guard let d = FileManager.default.contents(atPath: p), var inc = try? decoder.decode(Incident.self, from: d) else { return nil }
+            guard let d = FileManager.default.contents(atPath: p), var inc = try? decoder.decode(Incident.self, from: d),
+                  inc.quiet != true else { return nil }
             inc.dir = "\(dir)/\(id)"
             return inc
         }

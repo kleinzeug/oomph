@@ -1,0 +1,18 @@
+#!/bin/sh
+# oomph alert hook: a message to a Slack incoming webhook. Copy to /etc/oomph/alert.d/ (root's, mode 755) and put
+# the webhook's URL into /etc/oomph/alert.secret (root's, 0600; the unit hands it to the hook as
+# $CREDENTIALS_DIRECTORY/alert):  SLACK_URL=https://hooks.slack.com/services/...
+# The JSON body is built by Python from the record on stdin (never by pasting variables into JSON by hand), with
+# & < > escaped as Slack asks (a process named "<!channel>" would otherwise ping the channel); the URL goes to
+# curl in a config on fd 3, never on its command line (which other accounts can read in /proc).
+secret() { sed -n "s/^$1=//p" "${CREDENTIALS_DIRECTORY:-/nonexistent}/alert" 2>/dev/null | head -n 1 | sed 's/[\\"]/\\&/g'; }
+URL=$(secret SLACK_URL)
+[ -n "$URL" ] || { echo "no SLACK_URL= line in /etc/oomph/alert.secret" >&2; exit 1; }
+[ "$OOMPH_EVENT" = close ] && exit 0
+python3 -I -c 'import json, sys
+r = json.load(sys.stdin)
+esc = lambda x: str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+print(json.dumps({"text": "%s: %s (%s)" % tuple(esc(r.get(k, "")) for k in ("title", "message", "event"))}))' |
+  exec curl -fsS -m 20 -H "Content-Type: application/json" --data-binary @- -K /dev/fd/3 3<<END
+url = "$URL"
+END

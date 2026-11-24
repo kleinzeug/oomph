@@ -15,7 +15,6 @@ import html
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.error
@@ -225,9 +224,13 @@ class Logs:
         if not inc:
             raise AIError("no incident %r" % iid)
         p = os.path.join(inc["dir"], "syslog.txt")
-        if not os.path.exists(p):
+        if not os.path.lexists(p):
             return {"note": "no syslog.txt for this incident"}
-        lines = open(p, errors="replace").read().splitlines()
+        try:                            # the logger's file (oomphd's on Linux): never through a link, bounded
+            with oomph.open_log(p) as f:
+                lines = f.read(SYSLOG_CAP).splitlines()
+        except (OSError, ValueError, EOFError):
+            return {"note": "syslog.txt of this incident cannot be read"}
         killed = {}
         for ln in lines:
             m = re.search(r"\[[^\]]*?/([^\s/\]]+) \[\d+\]:\] exited .*OS_REASON_JETSAM", ln)
@@ -732,6 +735,9 @@ linear-gradient(135deg,#8b5cf6,#3b82f6 55%,#06b6d4) border-box;border:1.5px soli
 
 
 # ------------------------------------------------------------------ CLI
+SYSLOG_CAP = 16 << 20       # characters of an incident's syslog.txt the syslog tool reads
+
+
 def _opt(args, name, default=None):
     return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else default
 
@@ -833,7 +839,6 @@ def cmd_ai_report(args):
     token = os.environ.get("OOMPH_AI_TOKEN") or os.environ.get(
         {"claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "ollama": "OLLAMA_API_KEY"}[pk]) or ""
     since, until = oomph.window(args, "24h")
-    out = _opt(args, "-o") or os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-ai-report.html")
     t0 = time.time()
     try:
         emit(progress="Reading %s of logs" % oomph._dur_label(until - since))
@@ -846,8 +851,9 @@ def cmd_ai_report(args):
         emit(progress="Building the report")
         sec = ai_section(md, pk, prov.model, log, round(time.time() - t0))
         page = oomph.render_html(samples, events, "Memory report", extra_css=AI_CSS, intro_html=sec)
-        with open(out, "w") as f:
-            f.write(page)
+        out = oomph._report_write("%s-ai-report" % oomph.CMD, page, _opt(args, "-o"))   # -o, or new and private
+        if out is None:
+            raise AIError("no folder of your own to write the report into: name one with -o FILE")
     except AIError as e:
         emit(error=str(e))
         return 3
@@ -856,7 +862,7 @@ def cmd_ai_report(args):
         return 130
     emit(done=out, seconds=round(time.time() - t0), tool_calls=len(log))
     if "--open" in args:
-        subprocess.run(["/usr/bin/open", out])
+        oomph._open_report(out)
     return 0
 
 

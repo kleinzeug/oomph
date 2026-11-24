@@ -1123,7 +1123,9 @@ mac_paths = oomph.PATHS["darwin"]
 check(oomph.CMD == "oomph" and mac_paths["log"] == "/Library/Logs/oomph" and mac_paths["ledger"] == "/Users/Shared/oomph"
       and mac_paths["state"] == "~/Library/Application Support/oomph" and
       'LOG_DIR = os.environ.get("OOMPH_DIR", PATHS_HERE["log"])' in src["oomph.py"] and
-      'LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR") or _path("ledger")' in src["oomph.py"] and
+      'LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR") or _ledger_default()' in src["oomph.py"] and
+      'return shared if shared and os.path.lexists(shared) else _path("ledger")' in src["oomph.py"] and
+      "shared_ledger" not in mac_paths and oomph.PATHS["linux"]["shared_ledger"] == "/var/lib/oomph/ledger" and
       oomph.SKILL_URL == "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md" and
       'os.environ.get("OOMPH_REPO", "https://github.com/kleinzeug/oomph.git")' in src["oomph_upgrade.py"] and
       mac_paths["config"] == "/Library/Application Support/oomph/config.json" and

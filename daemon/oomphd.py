@@ -29,6 +29,11 @@ import oomph  # noqa: E402  (shared paths + HTML/summary rendering)
 
 VERSION = oomph.VERSION
 LOG_DIR = oomph.LOG_DIR
+# The logger's own state (the journal cursor and the kill counter on Linux, 03 §8.1): /var/lib/oomph/daemon
+# beside the system's log folder, else (a test, a logger run by hand) the log folder itself.
+STATE_DIR = os.environ.get("OOMPH_DAEMON_DIR") or (
+    oomph.PATHS_HERE.get("daemon_state") if LOG_DIR == oomph.PATHS_HERE["log"] and oomph.PATHS_HERE.get("daemon_state")
+    else LOG_DIR)
 
 # Names that measured here until 1.8.7 and now live in the backend. oomph.py 1.6.2 to 1.8.7 calls
 # them on this module, and an MCP server of those versions started from a real
@@ -65,6 +70,9 @@ STALL_TRIGGER_S = 60      # the daemon not running this long while the Mac is aw
 UNOWNED_SUSTAIN_S = 60    # unowned memory must stay above the limit this long to count
 FLAP_WINDOW = 60          # pressure changes closer than this are batched into one event
 FLAP_REPORT_EVERY = 15 * 60
+QUIET_RETAIN_DAYS = 14    # quiet incidents (containers at their own limit, 03 §5.6) are kept like samples
+ALERT_KEEP_S = 86400      # alert records for /etc/oomph/alert.d are pruned after a day ...
+ALERT_BEAT_S = 600        # ... and while one is younger than this, every sample rewrites alerts/.beat (03 App. A)
 # events of the other resources (roadmap 02 §5.3)
 CPU_SAT = 0.9             # busy on this share of the cores ...
 CPU_SAT_S = 600           # ... for this long is saturated
@@ -241,19 +249,21 @@ class Meter:
             if prev and ticks and prev["ticks"] and len(prev["ticks"]) == len(ticks):
                 cpu.update(self._busy(prev["ticks"], ticks, topo.get("e_ids")))
 
-        cur = {(p["pid"], p["start"]): (p["cpu_s"], p["child_s"], p["ppid"], p["rd"], p["wr"])
+        disk = self._get("disk_bytes") if hasattr(self.P, "disk_bytes") else None
+        cur = {(p["pid"], p["start"]): (p["cpu_s"], p["child_s"], p["ppid"], p.get("rd", 0), p.get("wr", 0),
+                                        p.get("t0", p["start"]))  # Linux: start is ticks since boot, t0 the date
                for p in procs.values() if "cpu_s" in p}
         if prev:
             for k, v in prev["procs"].items():  # gone since the last reading: what was counted becomes a debt
                 if k not in cur and (k[0] not in procs or procs[k[0]]["start"] != k[1]):
                     self.debts.setdefault(v[2], []).append([v[0] + v[1], k[0], 0])
             r_sum = w_sum = 0.0
-            for k, (c, ch, _pp, rd, wr) in cur.items():
+            for k, (c, ch, _pp, rd, wr, t0) in cur.items():
                 last = prev["procs"].get(k)
                 if last is None:
-                    if k[1] < prev["t"] - 1:
+                    if t0 < prev["t"] - 1:
                         continue  # seen for the first time, but older: no basis to say what it did
-                    last = (0.0, 0.0, 0, 0, 0)
+                    last = (0.0, 0.0, 0, 0, 0, t0)
                 own, reaped = max(0.0, c - last[0]), max(0.0, ch - last[1])
                 for d in self.debts.get(k[0], ()):
                     pay = min(reaped, d[0])
@@ -266,6 +276,9 @@ class Meter:
                 r_sum, w_sum = r_sum + rb, w_sum + wb
                 x["w"] = wb
             out["io"] = {"r_mb_s": round(r_sum, 2), "w_mb_s": round(w_sum, 2)}
+            if disk and prev.get("disk"):  # Linux: every disk's bytes (other users' processes' io cannot be read)
+                out["io"] = {"r_mb_s": round(max(0, disk[0] - prev["disk"][0]) / dt / MB, 2),
+                             "w_mb_s": round(max(0, disk[1] - prev["disk"][1]) / dt / MB, 2)}
             busy = out.get("cpu", {}).get("busy")
             total = sum(x["cpu"] for x in use.values())
             self.scaled = 0.0
@@ -278,6 +291,10 @@ class Meter:
 
         if not prev:
             self.gpu_apart = {}
+        if hasattr(self.P, "gpu_cards"):  # Linux: NVIDIA cards through nvidia-smi
+            self._cards(out, use, procs)
+            self.prev = {"t": t, "up": up, "ticks": ticks, "procs": cur, "gpu": [], "disk": disk}
+            return out, use
         devs = self._get("gpu_registry")
         fig = None
         if self.full is not None:
@@ -324,8 +341,42 @@ class Meter:
                 out["gpu"].append(g)
         elif devs == []:
             out["gpu"] = []
-        self.prev = {"t": t, "up": up, "ticks": ticks, "procs": cur, "gpu": gstate}
+        self.prev = {"t": t, "up": up, "ticks": ticks, "procs": cur, "gpu": gstate, "disk": disk}
         return out, use
+
+    def _cards(self, out, use, procs):
+        """The `gpu` block of a machine with NVIDIA cards (roadmap §11): per card its busy time (the share of
+        the last sample period the driver saw a kernel run: the GPU's `util` here as the Mac's busy time is),
+        the memory in use and on the card (`mem_limit_gb`), and the processes on it biggest first (`procs`,
+        names from this table, never from the driver); per process its SM share on all cards (`gpu`)."""
+        cards = self._get("gpu_cards")
+        if cards is None:
+            return
+        out["gpu"] = []
+        for c in cards:
+            g = {"id": "gpu%d" % c["index"], "name": c["name"], "unified": False, "src": "nvidia-smi"}
+            if c.get("util") is not None:
+                g["util"] = g["now"] = round(c["util"], 1)
+            if c.get("used_mb") is not None:
+                g["mem_gb"] = round(c["used_mb"] / 1024.0, 2)
+            if c.get("total_mb"):
+                g["mem_limit_gb"] = round(c["total_mb"] / 1024.0, 1)
+            if c.get("uuid"):
+                g["uuid"] = c["uuid"]
+            rows = []
+            for pid, x in (c.get("procs") or {}).items():
+                p = procs.get(pid)
+                e = {"pid": pid, "name": p["name"] if p else None}
+                if x.get("mb") is not None:
+                    e["mb"] = round(x["mb"])
+                if x.get("sm") is not None:
+                    e["util"] = round(x["sm"], 1)
+                    u = use.setdefault(pid, {})
+                    u["gpu"] = min(100.0, u.get("gpu", 0.0) + x["sm"])
+                rows.append({k: v for k, v in e.items() if v is not None})
+            if rows:
+                g["procs"] = rows
+            out["gpu"].append(g)
 
     GPU_APART, GPU_APART_S = 25.0, 300.0
 
@@ -879,10 +930,23 @@ class LedgerWorker:
         self.event("daemon_error", where="ledger", error=str(msg)[:300], **extra)
 
 
+def ledger_kept_to_group():
+    """Linux: the machine's ledger kept to a group (doctor's way: no access for others). Its purposes and
+    projects then stay out of the samples, which every local account can read."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        return not os.stat(oomph.LEDGER_DIR).st_mode & 0o007
+    except OSError:
+        return False
+
+
 class Daemon:
     def __init__(self):
         os.umask(0o022)
         os.makedirs(os.path.join(LOG_DIR, "incidents"), exist_ok=True)
+        if getattr(oomph.plat(), "ALERTS", False):  # made by the logger, not by the installer: root touches nothing in
+            os.makedirs(os.path.join(LOG_DIR, "alerts"), exist_ok=True)  # a folder of the logger's (oomph-alert.path watches it)
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.pending_triggers = []
@@ -902,7 +966,7 @@ class Daemon:
         self.unowned_flagged = False
         self.swap_hist = []
         self.incident = None
-        self.rolled = None  # (id, t, top rank, escalated) of an incident just closed at INCIDENT_MAX_S
+        self.rolled = None  # (id, t, top rank, escalated, it if the hooks heard of it) of an incident just closed at INCIDENT_MAX_S
         self.last_notify = 0
         self.last_disk_notify = 0
         self.last_maint = 0
@@ -928,6 +992,10 @@ class Daemon:
         self.prev_pools = None     # pool id -> (watched, mount, name), for the volume events
         self.cpu_others = None     # the smoothed load on the cores that holds no reservation (pools.cpu.others)
         self.vol_at, self.vol_held = {}, {}   # pool id -> its last volume event; -> [state told, changes held]
+        self.kills = None          # Linux: the kill watcher (oomph_linux.KillWatcher), started by run()
+        self.storms = []           # cgroups whose OOMs repeat (name, ooms, cgroup), from the watcher's thread
+        self.quiet = None          # the open quiet incident (03 §5.6): containers at their own limit
+        self.alert_t = 0.0         # when the newest alert record was written
 
     # -- events
     def event(self, kind, **kw):
@@ -936,6 +1004,18 @@ class Daemon:
         with self.lock:
             append_json(os.path.join(LOG_DIR, "events.jsonl"), ev)
         return ev
+
+    def trigger(self, kind, msg):
+        """An incident trigger from another thread (the kill watcher): the next evaluation takes it, now."""
+        with self.lock:
+            self.pending_triggers.append({"kind": kind, "msg": msg[:300], "t": time.time()})
+        self.wake.set()
+
+    def cgroup_storm(self, name, ooms, cg):
+        """A cgroup that hit its own limit `ooms` times in ten minutes (from the kill watcher's thread)."""
+        with self.lock:
+            self.storms.append((oomph.notify_text(name, 64), ooms, cg[:200], time.time()))
+            del self.storms[:-64]
 
     # -- log stream (jetsam kills are logged by launchd and ReportSystemMemory,
     #    not by the kernel; a low-swap storm is ~1000 lines/min -> aggregate)
@@ -1117,6 +1197,9 @@ class Daemon:
         not reached is announced, once, as it would have been there."""
         reasons = oomph.sort_reasons(reasons)
         iid = datetime.datetime.fromtimestamp(t).strftime("%Y%m%d-%H%M%S")
+        while self.quiet_id(iid):  # Linux: a quiet incident opened in this second keeps its folder
+            iid = datetime.datetime.fromtimestamp(datetime.datetime.strptime(iid, "%Y%m%d-%H%M%S").timestamp() + 1).strftime(
+                "%Y%m%d-%H%M%S")
         d = os.path.join(LOG_DIR, "incidents", iid)
         os.makedirs(d, exist_ok=True)
         rolled, self.rolled = self.rolled, None
@@ -1135,9 +1218,16 @@ class Daemon:
         if escalate:
             self.last_notify = time.time()
             self.notify("Memory incident", "%s — papertrail: oomph incident %s" % (reasons[0]["desc"], iid), event="kill")
+            self.alert("kill", self.incident, reasons[0]["desc"])
         elif not cont and time.time() - self.last_notify > NOTIFY_COOLDOWN:
             self.last_notify = time.time()
             self.notify("Memory incident", "%s — papertrail: oomph incident %s" % (reasons[0]["desc"], iid))
+            self.alert("open", self.incident, reasons[0]["desc"])
+        elif not cont:  # within the cool-down: no notification, no hook, but the journal line at critical, always
+            self.journal(2, "Memory incident: %s — papertrail: oomph incident %s"
+                         % (oomph.notify_text(reasons[0]["desc"], 300), iid))
+        if cont and len(cont) > 4 and cont[4]:
+            self.incident["alerted"] = True  # the hooks heard of the incident it continues: they hear of its close
 
     def join_incident(self, t, reasons):
         """Add the reasons the open incident doesn't have yet, keeping the most severe first.
@@ -1161,6 +1251,7 @@ class Daemon:
                 self.last_notify = time.time()
                 self.notify("Memory incident", "%s — papertrail: oomph incident %s" % (r["desc"], inc["id"]),
                             event="kill")
+                self.alert("kill", inc, r["desc"])
             elif r["kind"] in ("dialog", "lowmem", "jetsam_storm", "jetsam_report", "unowned", "stall") and \
                     time.time() - self.last_notify > NOTIFY_COOLDOWN:
                 self.last_notify = time.time()
@@ -1197,6 +1288,137 @@ class Daemon:
             write_atomic(os.path.join(d, "incident.json"), json.dumps(inc, indent=1))
             self.event("daemon_error", where="close_incident", error=repr(e))
         self.event("incident_close", id=inc["id"], duration_s=round(t - inc["start"]), **({"rolled": True} if rolled else {}))
+        if not rolled and inc.get("alerted"):
+            self.close_alert(t, inc)
+
+    def close_alert(self, t, inc):
+        """The close record and journal line of an incident the hooks heard of (or of the one it continued)."""
+        self.alert("close", inc, (inc.get("reasons") or [{}])[0].get("desc", ""))
+        self.journal(5, "memory incident %s closed after %d min" % (inc["id"], round((t - inc["start"]) / 60)))
+
+    # -- alert records and journal lines (Linux, 03 §5.13)
+    def journal(self, level, text):
+        P = oomph.plat()
+        if hasattr(P, "journal"):
+            P.journal(level, text)
+
+    def alert(self, ev, inc, desc):
+        """An alert record alerts/<incident>.<event>.json (open, kill, close) for the scripts in
+        /etc/oomph/alert.d, which oomph-alert.service runs; the logger itself runs nothing. Only where the
+        backend says so (Linux), never for a quiet incident or a roll-over (03 §5.13)."""
+        if not getattr(oomph.plat(), "ALERTS", False) or inc.get("quiet"):
+            return
+        try:
+            d = os.path.join(LOG_DIR, "alerts")
+            os.makedirs(d, exist_ok=True)
+            host = oomph.notify_text(((self.machine or {}).get("name") or os.uname()[1]), 64)
+            rec = {"v": 1, "event": ev, "incident": inc["id"], "t": round(time.time(), 3), "iso": now_iso(), "host": host,
+                   "level": "notice" if ev == "close" else "critical", "title": "Memory incident on %s" % host,
+                   "message": oomph.notify_text(desc, 300),
+                   "report": os.path.join(LOG_DIR, "incidents", inc["id"], "report.html" if ev == "close" else "")}
+            if inc.get("continues"):  # a roll-over's next part: its close ends what the first part opened
+                rec["continues"] = inc["continues"]
+            write_atomic(os.path.join(d, "%s.%s.json" % (inc["id"], ev)), json.dumps(rec))
+            inc["alerted"] = True
+            self.alert_t = time.time()
+            self.beat()
+        except OSError as e:
+            self.event("daemon_error", where="alert", error=str(e)[:300])
+
+    def beat(self):
+        """alerts/.beat rewritten while an alert record is young: each rewrite starts oomph-alert.path again, so
+        a record written while the runner was finishing is not left until the next one (03 Appendix A)."""
+        if self.alert_t and time.time() - self.alert_t < ALERT_BEAT_S:
+            try:
+                write_atomic(os.path.join(LOG_DIR, "alerts", ".beat"), "%.1f\n" % time.time())
+            except OSError:
+                pass
+
+    # -- quiet incidents (Linux, 03 §5.6): containers at their own limit
+    def quiet_storms(self, t):
+        """Cgroups that hit their own limit five times in ten minutes share one quiet incident per machine and
+        day: no notification, no alert, a journal line at notice. While it is open each further cgroup joins
+        it; after it closed, the day's later storms are folded into it (`repeats`) and it is written again at
+        its next close."""
+        with self.lock:
+            storms, self.storms = self.storms, []
+        q = self.quiet
+        if storms:
+            if q is None:
+                day = datetime.date.fromtimestamp(t).strftime("%Y%m%d")
+                q = self.quiet_of_day(day)
+                if q is None:
+                    iid = datetime.datetime.fromtimestamp(t).strftime("%Y%m%d-%H%M%S")
+                    while os.path.exists(os.path.join(LOG_DIR, "incidents", iid)) or \
+                            (self.incident and self.incident["id"] == iid):
+                        t += 1
+                        iid = datetime.datetime.fromtimestamp(t).strftime("%Y%m%d-%H%M%S")
+                    q = {"id": iid, "start": t, "start_iso": now_iso(t), "quiet": True, "open": True, "cgroups": [],
+                         "opened_by": "cgroup_oom_storm", "reasons": []}
+                    self.event("incident_open", id=iid, quiet=True, reasons=[{"kind": "cgroup_oom_storm", "t": t}])
+                else:
+                    q.update(open=True, repeats=q.get("repeats", 0) + 1)
+                    q.pop("end", None)
+                    q.pop("end_iso", None)
+                self.quiet = q
+            for name, ooms, cg, at in storms:
+                row = next((c for c in q["cgroups"] if c["name"] == name), None)
+                if row is None:
+                    row = {"name": name, "ooms": 0, "first": round(at, 1)}
+                    q["cgroups"].append(row)
+                row.update(ooms=max(row["ooms"], ooms), last=round(at, 1))
+            q["cgroups"].sort(key=lambda c: -c["ooms"])
+            q["more"] = max(0, len(q["cgroups"]) - 20)
+            del q["cgroups"][20:]
+            q["last_trigger"] = t
+            top = q["cgroups"][0]
+            desc = oomph.notify_text("%s: %d OOMs at its limit" % (top["name"], top["ooms"]), 44) \
+                if len(q["cgroups"]) == 1 else "%d containers hit their limit repeatedly" % (len(q["cgroups"]) + q["more"])
+            new = not q["reasons"]
+            q["reasons"] = [{"kind": "cgroup_oom_storm", "t": q["start"], "desc": desc}]
+            try:
+                d = os.path.join(LOG_DIR, "incidents", q["id"])
+                os.makedirs(d, exist_ok=True)
+                write_atomic(os.path.join(d, "incident.json"), json.dumps(q, indent=1))
+            except OSError as e:
+                self.event("daemon_error", where="quiet_incident", error=str(e)[:300])
+            if new:
+                self.journal(5, "containers at their own memory limit: %s (quiet incident %s)" % (desc, q["id"]))
+        elif q is not None and t - q.get("last_trigger", t) > INCIDENT_CLOSE_AFTER:
+            self.quiet = None
+            q.update(open=False, end=t, end_iso=now_iso(t))
+            d = os.path.join(LOG_DIR, "incidents", q["id"])
+            try:
+                q["summary"] = oomph.summarize(oomph.iter_samples(q["start"] - INCIDENT_LOOKBACK, t),
+                                               oomph.load_events(q["start"] - INCIDENT_LOOKBACK, t))
+                write_atomic(os.path.join(d, "incident.json"), json.dumps(q, indent=1))
+                write_atomic(os.path.join(d, "report.html"), oomph.incident_html(q))
+            except Exception as e:
+                write_atomic(os.path.join(d, "incident.json"), json.dumps(q, indent=1))
+                self.event("daemon_error", where="close_incident", error=repr(e)[:300])
+            self.event("incident_close", id=q["id"], quiet=True, duration_s=round(t - q["start"]))
+
+    def quiet_id(self, iid):
+        """Is `iid` the folder of a quiet incident (open, or written today)?"""
+        if self.quiet and self.quiet["id"] == iid:
+            return True
+        try:
+            with open(os.path.join(LOG_DIR, "incidents", iid, "incident.json")) as f:
+                return json.load(f).get("quiet") is True
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def quiet_of_day(self, day):
+        """Today's quiet incident, closed, to fold a later storm into; None if there is none."""
+        for f in sorted(glob.glob(os.path.join(LOG_DIR, "incidents", day + "-*", "incident.json")), reverse=True):
+            try:
+                with open(f) as h:
+                    inc = json.load(h)
+            except (OSError, ValueError):
+                continue
+            if isinstance(inc, dict) and inc.get("quiet") and isinstance(inc.get("cgroups"), list):
+                return inc
+        return None
 
     # -- maintenance
     def maintenance(self):
@@ -1217,9 +1439,24 @@ class Daemon:
         if os.path.exists(ev) and os.path.getsize(ev) > 20 * MB:
             os.replace(ev, ev + ".1")
         cutoff = time.time() - INCIDENT_RETAIN_DAYS * 86400
+        quiet = time.time() - QUIET_RETAIN_DAYS * 86400
         for d in glob.glob(os.path.join(LOG_DIR, "incidents", "*")):
-            if os.path.getmtime(d) < cutoff:
+            m = os.path.getmtime(d)
+            if m < cutoff:
                 shutil.rmtree(d, ignore_errors=True)
+            elif m < quiet and (not self.quiet or self.quiet["id"] != os.path.basename(d)):
+                try:
+                    with open(os.path.join(d, "incident.json")) as f:
+                        if json.load(f).get("quiet"):
+                            shutil.rmtree(d, ignore_errors=True)
+                except (OSError, ValueError, AttributeError):
+                    pass
+        for f in glob.glob(os.path.join(LOG_DIR, "alerts", "*.json")):
+            try:
+                if os.path.getmtime(f) < time.time() - ALERT_KEEP_S:
+                    os.remove(f)
+            except OSError:
+                pass
 
     # -- main loop
     def sample(self):
@@ -1231,7 +1468,15 @@ class Daemon:
             self.console = {"uid": away["uid"], "user": away["user"]}
         procs = P.collect_procs()
         up = P.uptime_s()  # here, not later: the Meter's interval must be the process table's
-        jetsam_kills = self.flush_jetsam()
+        killed = None
+        if self.kills is not None:  # Linux: from the journal (or the kernel's counter), one event per sample
+            killed = self.kills.flush(max(self.prev_pressure or 1, sysm.get("pressure") or 1), procs)
+            jetsam_kills = killed["kills"]
+            if killed["victims"] or killed["by"]:
+                self.event("oom_kill", kills=killed["kills"], cgroup=killed["cgroup"], ooms=killed["ooms"],
+                           by=killed["by"], top=killed["top"], victims=killed["victims"])  # (machine-wide, at a limit)
+        else:
+            jetsam_kills = self.flush_jetsam()
 
         big = {(p["pid"], p["start"]): (p["name"], round(p["fp"] / MB)) for p in procs.values()
                if p["fp"] >= GONE_MIN_MB * MB}
@@ -1253,7 +1498,8 @@ class Daemon:
                 if gap >= STALL_TRIGGER_S:
                     with self.lock:
                         self.pending_triggers.append({"kind": "stall", "t": t,
-                            "msg": "oomph couldn't run for %d s while the Mac was awake — the system is starved for memory" % gap})
+                            "msg": "oomph couldn't run for %d s while the %s was awake — the system is starved for memory"
+                            % (gap, "Mac" if P.OS == "macos" else "machine")})
         self.prev_t, self.prev_up = t, up
         blocks, use = self.resources(P, procs, sysm.get("ram_gb"), bool(gap), up)
         top, groups, sessions, session_of = _summarize(procs, use)
@@ -1266,6 +1512,11 @@ class Daemon:
         s.update(sysm)
         s.update(P.ownership(sysm, procs))
         s["jetsam_kills"] = jetsam_kills
+        if killed is not None:
+            s["cgroup_kills"] = killed["cgroup"]
+            big = [{"name": v["name"], "mb": v.get("mb"), "by": v["by"]} for v in killed["victims"] if v["by"] != "cgroup"]
+            if big:
+                s["killed"] = big[:3]
         s.update(blocks)  # cpu, gpu, disks, io (02 §5.1): each where it could be read
         s["away"] = {k: away[k] for k in ("idle_s", "display_on", "locked", "sleep_preventers")}
         s["top"] = top
@@ -1291,8 +1542,8 @@ class Daemon:
         self.ledger.offer(dict({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
                                 and k not in TOP_RATES}, **({"pools": pools} if pools else {})),
                           procs, rates or None, writes or None)
-        if leases:
-            s["leases"] = leases  # memory sessions have reserved through oomph's ledger
+        if leases:  # memory sessions have reserved through oomph's ledger (purposes left out where it is a group's)
+            s["leases"] = [dict(x, purpose="?", project=None) for x in leases] if ledger_kept_to_group() else leases
         if gone:
             s["gone"] = gone
         if self.incident:
@@ -1310,10 +1561,17 @@ class Daemon:
             except Exception as e:  # who this machine is matters less than the sample
                 self.machine = {"os": P.OS}
                 self.event("daemon_error", where="machine", error=repr(e)[:300])
+        if self.kills is not None and isinstance(self.machine.get("measures"), dict):
+            self.machine["measures"]["kills"] = self.kills.mode  # journal, or count where it cannot be read
         cur["daemon"] = {"pid": os.getpid(), "version": VERSION, "started": self.started,
                          "interval": HOT_INTERVAL if self.hot else INTERVAL,
                          "incident": self.incident["id"] if self.incident else None,
                          "root": os.geteuid() == 0, "machine": self.machine}
+        if P.OS != "macos":
+            cur["daemon"].update(user=oomph._whoami(), all_procs=bool((self.machine.get("measures") or {}).get("all_procs")))
+            if self.quiet:
+                cur["daemon"]["quiet"] = self.quiet["id"]
+        self.beat()
         if self.full is not None or self.full_off:
             cur["daemon"]["ioreport"] = self.full.status() if self.full is not None else self.full_off
         write_atomic(os.path.join(LOG_DIR, "current.json"), json.dumps(cur))
@@ -1368,19 +1626,34 @@ class Daemon:
             if self.unowned_flagged and (u is None or u < 0.75 * lim):
                 self.unowned_flagged = False
                 self.event("unowned_memory_cleared", gb=u)
-        if pr >= 4:
+        if pr >= 4 and s.get("os") == "linux":
+            psi = s.get("psi") if isinstance(s.get("psi"), dict) else {}
+            reasons.append({"kind": "pressure", "t": t, "desc": "pressure CRITICAL (stalled %d%%, fully %d%%)" % (
+                round(psi.get("mem_some") or 0), round(psi.get("mem_full") or 0)) if psi else
+                "pressure CRITICAL (%.1f GB available)" % ((s.get("linux") or {}).get("avail_gb") or 0)})
+        elif pr >= 4:
             reasons.append({"kind": "pressure", "desc": "Memory pressure CRITICAL (swap %.1f GB, disk %.0f GB free)"
                             % (s["swap_used_gb"], s["disk_free_gb"]), "t": t})
+        if self.kills is not None:
+            try:
+                self.quiet_storms(t)
+            except Exception as e:  # a quiet incident lost costs no sample
+                self.soft_error("quiet_incident", repr(e))
         inc = self.incident
         if inc and t - inc.get("start", t) >= INCIDENT_MAX_S:
             if t - inc.get("last_trigger", t) <= INCIDENT_CLOSE_AFTER:  # still going: continued below
                 top = max([oomph.reason_rank(r) for r in inc.get("reasons", [])] + [0])
                 # a kill it opened with was announced then: the continuation doesn't announce it again
                 done = inc.get("escalated") or (inc.get("start") if top >= oomph.ESCALATE_RANK else None)
-                self.rolled = (inc["id"], t, top, done)
+                self.rolled = (inc["id"], t, top, done, inc if inc.get("alerted") else None)
                 self.close_incident(t, rolled=True)
             else:  # left open across a sleep or a restart: it ended, a trigger now opens a new one
                 self.close_incident(t)
+        r = self.rolled
+        if r and t - r[1] > INCIDENT_CLOSE_AFTER:  # rolled over, then nothing went on: it ended
+            self.rolled = None
+            if r[4]:
+                self.close_alert(t, r[4])
         if reasons:
             if self.incident:
                 self.join_incident(t, reasons)
@@ -1457,11 +1730,13 @@ class Daemon:
             pid, free = p["id"], p["free_gb"]
             what = dict(pool=pid, mount=p.get("mount"), name=p.get("name"), free_gb=free)
             crit = p["crit_gb"] if isinstance(p.get("crit_gb"), (int, float)) else 5
-            if pid == "data" and not mac:
-                pass                                    # Linux: no swap on it, no memory problem (03 §5.4)
-            elif p.get("level") in ("low", "critical") and t - self.disk_low_at.get(pid, -1e18) > DISK_COOLDOWN:
+            if p.get("level") in ("low", "critical") and t - self.disk_low_at.get(pid, -1e18) > DISK_COOLDOWN:
                 self.disk_low_at[pid] = t
-                if pid == "data":
+                if pid == "data" and not mac:           # Linux: no swap on it, so no memory wording (03 §5.4)
+                    self.event("disk_low", disk_free_gb=free, level=p["level"], **what)
+                    self.notify("Disk space low", "Only %.0f GB free on %s." % (
+                        free, oomph.notify_text(p.get("mount") or "/", 40)))
+                elif pid == "data":
                     self.last_disk_notify = time.time()
                     self.event("disk_low", disk_free_gb=s.get("disk_free_gb", free), level=p["level"], **what)
                     self.notify("Disk space low", "Only %.0f GB free — swap can't grow, risk of memory kills." % free)
@@ -1525,18 +1800,30 @@ class Daemon:
     def run(self):
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
-        self.event("daemon_start", version=VERSION, pid=os.getpid(), root=os.geteuid() == 0)
+        self.event("daemon_start", version=VERSION, pid=os.getpid(), root=os.geteuid() == 0,
+                   **({"os": oomph.plat().OS, "user": oomph._whoami()} if oomph.plat().OS != "macos" else {}))
         # resume a still-open incident after restart
         for f in sorted(glob.glob(os.path.join(LOG_DIR, "incidents", "*", "incident.json")))[-3:]:
             try:
                 inc = json.load(open(f))
-                if inc.get("open"):
+                if inc.get("open") and inc.get("quiet"):
+                    self.quiet = inc
+                elif inc.get("open"):
                     self.incident = inc
             except Exception:
                 pass
-        if oomph.plat().OS == "macos":  # kills are read from the unified log
+        P = oomph.plat()
+        if P.OS == "macos":  # kills are read from the unified log
             threading.Thread(target=self.stream_loop, daemon=True).start()
             threading.Thread(target=self.poll_loop, daemon=True).start()
+        if hasattr(P, "KillWatcher"):  # Linux: from the journal, or the kernel's counter (03 §5.5)
+            try:
+                os.makedirs(STATE_DIR, exist_ok=True)
+            except OSError:
+                pass
+            self.kills = P.KillWatcher(STATE_DIR, trigger=self.trigger, storm=self.cgroup_storm, event=self.event).start()
+        if hasattr(P, "PressureWatch"):
+            P.PressureWatch(self.wake.set, lambda: self.hot).start()
         self.ledger.start()
         while not self.stopping:
             t0 = time.time()
@@ -1554,6 +1841,8 @@ class Daemon:
 
     def stop(self, *_):
         self.stopping = True
+        if self.kills is not None:
+            self.kills.stop()
         if self.full is not None:  # a reading this signal interrupts is not a crash of the helper
             self.full.close(final=True)
         if self.stream_proc:

@@ -654,6 +654,59 @@ def test_arrays():
     test_series()
 
 
+HOSTILE_CHILD = r"""
+import json, os, resource, sys
+sys.path.insert(0, sys.argv[1])
+import oomph_top as T
+d, now = sys.argv[2], float(sys.argv[3])
+pts, _ = T.load_points(d, now, now - 10 * 86400)
+h = T.History(d)
+h.refresh()
+h.refresh()
+rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+print(json.dumps({"points": sorted(p["t"] for p in pts), "days": {k: len(v.t) for k, v in h.days.items()},
+                  "rss_mb": rss / (1 << 20 if sys.platform == "darwin" else 1 << 10)}))
+"""
+
+
+def test_hostile_days():
+    """A day file the logger's account planted (on Linux /var/log/oomph is oomphd's, which `sudo oomph top`
+    must not trust; 03 §12.3): a link out of the folder, a FIFO, a link to /dev/zero, a .gz that unpacks to
+    one endless line and a line over LINE_MAX. load_points and History.refresh read none of them (only the
+    good line after the long one), never hang and stay small."""
+    now = NOW
+    d = tempfile.mkdtemp(prefix="oomph-toptest-hostile-")
+    try:
+        day = [time.strftime("%Y-%m-%d", time.localtime(now - k * 86400)) for k in range(6)]
+        outside = os.path.join(d, "outside.json")
+        with open(outside, "w") as f:
+            f.write(json.dumps({"t": now - 5 * 86400, "app_gb": 1.0}) + "\n")
+        os.symlink(outside, os.path.join(d, "samples-%s.jsonl" % day[5]))
+        os.mkfifo(os.path.join(d, "samples-%s.jsonl" % day[4]))
+        os.symlink("/dev/zero", os.path.join(d, "samples-%s.jsonl" % day[3]))
+        with gzip.open(os.path.join(d, "samples-%s.jsonl.gz" % day[2]), "wb", compresslevel=9) as f:
+            chunk = b"a" * (1 << 20)
+            for _ in range(T.DAY_CAP // len(chunk) + 64):       # past DAY_CAP, without a newline
+                f.write(chunk)
+        good = json.dumps({"t": now - 3600, "app_gb": 2.0, "wired_gb": 1.0}) + "\n"
+        with open(os.path.join(d, "samples-%s.jsonl" % day[0]), "w") as f:
+            f.write('{"t": %d, "pad": "%s"}\n' % (now - 7200, "x" * (T.LINE_MAX + 10)) + good)
+        try:
+            r = subprocess.run([sys.executable, "-I", "-c", HOSTILE_CHILD, os.path.join(ROOT, "daemon"), d, str(now)],
+                               capture_output=True, text=True, timeout=60)
+            o = json.loads(r.stdout or "{}")
+        except (subprocess.TimeoutExpired, ValueError) as e:
+            o = {"error": repr(e)}
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    days = o.get("days") or {}
+    check(o.get("points") == [now - 3600] and days.get(day[0]) == 1 and not any(days.get(x) for x in day[1:])
+          and o.get("rss_mb", 1e9) < 120,
+          "history: a planted day file (a link out, a FIFO, /dev/zero, a .gz of one endless line, an overlong line) "
+          "is not read, nothing hangs, and the reader stays small (%s)" % (o if "error" in o else
+                                                                         "%.0f MB" % o.get("rss_mb", -1)))
+
+
 def test_series():
     """History.series is load_points column by column: days in order, a day out of order, days that
     overlap and a sample in the future (the slow path raised on every typed array up to 1.11.0)."""
@@ -2365,6 +2418,7 @@ def main():
     test_selection()
     test_inspect_mouse()
     test_arrays()
+    test_hostile_days()
     test_resource_arrays()
     test_tab_ladder()
     test_link_rows()

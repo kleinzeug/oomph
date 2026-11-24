@@ -8,8 +8,10 @@
   oomph top --ssh [USER@]HOST       the same on another Mac or Linux machine, over ssh
   oomph top --once [--size 80x24]   one frame of it, as text
   oomph top --machine NAME          starts on another machine's tab [--no-connect: no links]
-  oomph incidents
+  oomph incidents [--all]           --all: with the quiet ones (Linux: containers at their own limit)
   oomph incident <id|latest> [--html]
+  oomph alert --test | --run-hooks  Linux: run the scripts in /etc/oomph/alert.d with a test record; what
+                                    oomph-alert.service runs for each incident the logger opens, kills in, closes
   oomph html [--last 24h | --since ISO [--until ISO]] [-o FILE] [--open]
   oomph upgrade tools|check|log|build [--json]   upgrade from GitHub (each commit on main is a release)
   oomph ai-report [--provider claude|openai|ollama] [--model M] [--base-url URL] [--last 24h] [--open]
@@ -66,11 +68,11 @@ other machines (read-only, Mac to Mac over TLS, or anything with `oomph` over ss
 import datetime
 import errno
 import functools
-import glob
 import grp
 import gzip
 import heapq
 import html as _html
+import io
 import json
 import math
 import os
@@ -83,6 +85,7 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
 
 VERSION = "dev"  # stamped by build-app.sh / install.sh from `git describe` (tools/version.sh)
 COMMIT = ""      # the git commit the stamped copy was built from
@@ -122,9 +125,10 @@ def usage(doc):
 
 # Where things live, per system: one table instead of constants scattered over the modules.
 # OOMPH_DIR, OOMPH_LEDGER_DIR and OOMPH_STATE_DIR still win. Reading it imports no backend, so
-# the hook and the readers never load the code that measures. On Linux the ledger is per user
-# (and per machine, for a home folder shared between machines) until a logger there keeps one
-# for everybody (roadmap 03 §8.1); `ledger_mode` is what a new ledger folder is created with.
+# the hook and the readers never load the code that measures. On Linux the ledger is the
+# machine's, /var/lib/oomph/ledger, once `linux/install.sh --system` made it (1.13.0: open to every
+# local account, as on a Mac, D16); without it, one per user (and per machine, for a home folder
+# shared between machines; roadmap 03 §7.1, §8.1). `ledger_mode` is what a new per-user folder gets.
 PATHS = {
     "darwin": {"log": "/Library/Logs/oomph",
                "ledger": "/Users/Shared/oomph", "ledger_mode": 0o777,
@@ -133,6 +137,8 @@ PATHS = {
                "libexec": "/usr/local/libexec/oomph", "service": "/Library/LaunchDaemons/local.oomph.daemon.plist"},
     "linux": {"log": "/var/log/oomph",
               "ledger": "{state}/ledger/{machine}", "ledger_mode": 0o700,
+              "shared_ledger": "/var/lib/oomph/ledger", "daemon_state": "/var/lib/oomph/daemon",
+              "alert_d": "/etc/oomph/alert.d", "bin": "/usr/local/bin/oomph",
               "state": "{xdg_state}/oomph",
               "config": "/etc/oomph/config.json",
               "libexec": "/usr/local/libexec/oomph", "service": "/etc/systemd/system/oomphd.service",
@@ -220,8 +226,8 @@ AWAY_IDLE_S = 300
 # What an incident is headlined by: its highest-ranked reason, ties to the earlier one. The
 # logger keeps `reasons` in this order, so reasons[0] is the headline for every reader;
 # incidents written before 1.8.6 keep arrival order and are shown as they are.
-REASON_RANK = {"jetsam_report": 90, "dialog": 85, "lowmem": 80, "jetsam_storm": 70,
-               "unowned": 60, "stall": 50, "pressure": 40}
+REASON_RANK = {"jetsam_report": 90, "oom": 90, "oomd": 90, "dialog": 85, "lowmem": 80, "jetsam_storm": 70,
+               "unowned": 60, "stall": 50, "pressure": 40, "cgroup_oom_storm": 10}  # oom, oomd, cgroup_oom_storm: Linux
 ESCALATE_RANK = 80  # a reason this severe that takes over the headline is announced once more
 
 
@@ -284,13 +290,50 @@ def _day_range(since, until):
         d += datetime.timedelta(days=1)
 
 
-def _read_lines(path):
-    opener = gzip.open if path.endswith(".gz") else open
+def open_log(path, cap=None, binary=False):
+    """A file of the logger's, opened for reading as text (.gz unpacked; `binary`: as bytes): a regular file only,
+    never through a link, never blocking on a FIFO, and with `cap` no bigger than that. On Linux the log folder
+    belongs to the logger's account (oomphd), whose files a root reader must not trust (03 §12.3): what it unpacks
+    to is the reader's to bound (_read_lines, load_log_json). Raises OSError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
     try:
-        with opener(path, "rt") as f:
-            for line in f:
-                yield line
-    except (OSError, EOFError):
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (cap is not None and st.st_size > cap):
+            raise OSError(errno.EINVAL, "not a log file: %s" % path)
+        f = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    raw = gzip.GzipFile(fileobj=f) if path.endswith(".gz") else f
+    return raw if binary else io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
+
+
+def load_log_json(path, cap=16 << 20):
+    """A JSON file of the logger's (open_log), parsed: at most `cap` bytes, unpacked too."""
+    with open_log(path, cap, binary=True) as f:
+        b = f.read(cap + 1)
+    if len(b) > cap:
+        raise ValueError("%s: larger than %d bytes" % (path, cap))
+    return json.loads(b.decode("utf-8", "replace"))
+
+
+def _read_lines(path):
+    """The lines of a log file of the logger's (open_log), as text: each at most LIMITS["log_line"] bytes (a
+    longer one is skipped whole), at most LIMITS["log_file"] bytes in all, unpacked (a .gz that unpacks to more,
+    or a file without newlines, costs a root reader nothing but the time to read that much)."""
+    line_max, left, skip = LIMITS["log_line"], LIMITS["log_file"], False
+    try:
+        with open_log(path, binary=True) as f:
+            while left > 0:
+                b = f.readline(min(line_max + 1, left))
+                if not b:
+                    return
+                left -= len(b)
+                if skip or len(b) > line_max:
+                    skip = not b.endswith(b"\n")
+                    continue
+                yield b.decode("utf-8", "replace")
+    except (OSError, EOFError, ValueError, zlib.error):
         return
 
 
@@ -642,6 +685,7 @@ class _Summary:
 
     def __init__(self):
         self.n = self.kills = self.away = 0
+        self.cg_kills = None  # Linux: victims at a cgroup's own limit (03 §6.3)
         self.first = self.last = self.peak = self.onset = None
         self.swap = self.swap_total = self.disk = self.used = self.unowned = self.stall = None
         self.groups, self.top = _Risers("groups"), _Risers("top")
@@ -660,6 +704,8 @@ class _Summary:
         if self.onset is None and (s.get("pressure", 0) >= 2 or s.get("jetsam_kills")):
             self.onset = s
         self.kills += s.get("jetsam_kills", 0)
+        if isinstance(s.get("cgroup_kills"), int):
+            self.cg_kills = (self.cg_kills or 0) + s["cgroup_kills"]
         self.away += is_away(s)
         self.swap = _more(self.swap, s.get("swap_used_gb", 0))
         self.swap_total = _more(self.swap_total, s.get("swap_total_gb", 0))
@@ -701,12 +747,20 @@ class _Summary:
         peak, onset, stall = self.peak, self.onset, self.stall
         reasons = {}
         killed = {}
+        victims = []
         for e in events:
             if e.get("kind") == "jetsam":
                 for r, n in (e.get("reasons") or {}).items():
                     reasons[r] = reasons.get(r, 0) + n
                 for k, n in (e.get("top") or {}).items():
                     killed[k] = killed.get(k, 0) + n
+            elif e.get("kind") == "oom_kill":  # Linux (03 §5.5): who the kernel or a killer took, by name
+                for k, n in (e.get("top") or {}).items() if isinstance(e.get("top"), dict) else ():
+                    if isinstance(n, int):
+                        killed[str(k)[:64]] = killed.get(str(k)[:64], 0) + n
+                for v in e.get("victims") or () if isinstance(e.get("victims"), list) else ():
+                    if isinstance(v, dict) and len(victims) < 10:
+                        victims.append({k: v[k] for k in ("name", "pid", "mb", "by") if k in v})
             elif e.get("kind") == "stall":
                 stall = _more(stall, e.get("seconds", 0))
         return {
@@ -731,6 +785,7 @@ class _Summary:
             "claude_at_peak": peak.get("claude") or [],
             "group_risers": self.groups.result(),
             "process_risers": self.top.result(),
+            **({"cgroup_kills": self.cg_kills, "oom_victims": victims} if self.cg_kills is not None else {}),
             **self._resources()
         }
 
@@ -833,7 +888,15 @@ input[type=datetime-local]:disabled{opacity:.45}
 td.kind{white-space:nowrap}td.time{white-space:nowrap;color:var(--muted)}
 """
 
-BAD_KINDS = ("incident_open", "stall", "unowned_memory", "jetsam", "disk_low", "disk_filling", "daemon_error", "log")
+BAD_KINDS = ("incident_open", "stall", "unowned_memory", "jetsam", "oom_kill", "disk_low", "disk_filling", "daemon_error", "log")
+
+
+def calm_event(e):
+    """An event of a bad kind that is no news (Linux, 03 §5.6): an OOM kill only at a cgroup's own limit (none of
+    the machine's: `kills` 0 beside a `cgroup` count), a quiet incident's open or close."""
+    if e.get("kind") == "oom_kill":
+        return "cgroup" in e and not (_num(e.get("kills")) and e["kills"] > 0)
+    return e.get("kind") in ("incident_open", "incident_close") and e.get("quiet") is True
 
 
 def _e(x):
@@ -1233,7 +1296,7 @@ def _view_html(view, events, meta, key, t0, t1):
         return (sub + '<div class="card %s"><p class=sub>No samples in this window.</p></div>' % cls, "")
     summ = view.summ.result(events)
     marks = [{"t": e["t"], "label": "%s %s %s" % (e.get("iso", "")[11:19], e["kind"].replace("_", " "), e.get("id", ""))}
-             for e in events if e.get("kind") in ("incident_open", "incident_close")]
+             for e in events if e.get("kind") in ("incident_open", "incident_close") and not e.get("quiet")]
     bands = view.bands
     draw = view.draw
     mem_series = [("wired", lambda s: s.get("wired_gb"), "var(--c-wired)"),
@@ -1251,7 +1314,7 @@ def _view_html(view, events, meta, key, t0, t1):
     k = [("Peak pressure", summ["peak_pressure"], summ["peak_pressure"] in ("WARN", "CRITICAL")),
          ("Max swap used", "%.1f GB" % summ["max_swap_used_gb"], False),
          ("Min free disk", "%.0f GB" % summ["min_disk_free_gb"], summ["min_disk_free_gb"] < 20),
-         ("Jetsam kills", summ["jetsam_kills"], summ["jetsam_kills"] > 0),
+         ("OOM kills" if "cgroup_kills" in summ else "Jetsam kills", summ["jetsam_kills"], summ["jetsam_kills"] > 0),
          ("Max unowned memory", "%.0f GB" % summ["max_unowned_gb"] if summ.get("max_unowned_gb") is not None else "–",
           (summ.get("max_unowned_gb") or 0) >= unowned_limit_gb(summ.get("ram_gb"))),
          ("Away during window", "%d%%" % round(100 * summ["away_fraction"]), False),
@@ -1298,10 +1361,17 @@ def _view_html(view, events, meta, key, t0, t1):
         "<h2>Top processes at peak</h2><div class=card>%s</div>" % _table(summ.get("top_at_peak", []), [
             ("pid", lambda r: r["pid"], True, "pid"), ("name", lambda r: r["name"], False), ("MB", lambda r: r["mb"], True)],
             attrs=lambda r: _row_attrs("p:%s" % r["pid"], [r["pid"]], (meta.get(r["pid"]) or {}).get("g"))),
-        "<h2>Most-killed by jetsam</h2><div class=card>%s<p class=sub>reasons: %s</p></div>" % (
+        ("<h2>Most-killed by jetsam</h2><div class=card>%s<p class=sub>reasons: %s</p></div>" % (
             _table([{"n": k2, "c": v2} for k2, v2 in (summ.get("most_killed") or {}).items()],
                    [("service", lambda r: r["n"], False), ("kills", lambda r: r["c"], True)]),
-            _e(", ".join("%s × %d" % kv for kv in (summ.get("jetsam_reasons") or {}).items()) or "–")),
+            _e(", ".join("%s × %d" % kv for kv in (summ.get("jetsam_reasons") or {}).items()) or "–"))
+         if "cgroup_kills" not in summ else  # Linux: the kernel's OOM killer, systemd-oomd, earlyoom (03 §6.3)
+         "<h2>Killed for memory</h2><div class=card>%s<p class=sub>%d more at a cgroup's own limit</p></div>" % (
+            _table(summ.get("oom_victims") or [], [("process", lambda r: r.get("name", "?"), False),
+                                                   ("pid", lambda r: r.get("pid", ""), True),
+                                                   ("MB", lambda r: r.get("mb", ""), True),
+                                                   ("by", lambda r: r.get("by", ""), False)]),
+            summ.get("cgroup_kills") or 0)),
         _busiest_html(summ, meta),
         "</div>",
     ])
@@ -1407,8 +1477,9 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
         procs, apps = _risers_data(v)
         vdata[v.key] = {"procs": procs, "apps": apps, "range": [v.a, v.b]}
     evs = [{"t": e["t"], "iso": e.get("iso", ""), "kind": e.get("kind", ""), "d": _event_detail(e),
-            "bad": e.get("kind") in BAD_KINDS}
-           for e in reversed(collapse_pressure_events([e for e in events if e.get("kind") != "notified"]))]
+            "bad": e.get("kind") in BAD_KINDS and not calm_event(e)}
+           for e in reversed(collapse_pressure_events([e for e in events if e.get("kind") != "notified"
+                                                       and not (e.get("quiet") and e.get("kind") in ("incident_open", "incident_close"))]))]
     data = {"meta": meta, "users": users, "sessions": sessions, "events": evs, "views": vdata}
     first = views[0][0]
     view_css = "".join('body:not([data-view="%s"]) .v-%s{display:none!important}' % (k, k) for k, *_ in views)
@@ -1847,7 +1918,7 @@ def cmd_status():
     if not os.path.exists(p):
         print("oomph: no data in %s — daemon not installed or not running" % LOG_DIR)
         return 1
-    c = json.load(open(p))
+    c = load_log_json(p)
     age = time.time() - c["t"]
     d = c.get("daemon", {})
     alive = age < 3 * (d.get("interval") or 30) + 10
@@ -1856,6 +1927,8 @@ def cmd_status():
 
     def line(label, text):
         print(wrap(text, w, "%-11s" % label, 11))
+    if c.get("os") == "linux":  # the Linux logger (1.13.0): never root, the words of 03 §3.3
+        return _status_linux(c, d, age, alive, line, w)
     line("daemon", "%s (pid %s, v%s, sample %ds ago, interval %ss%s)" % (
         "running" if alive else "NOT RUNNING", d.get("pid"), d.get("version"), age, d.get("interval"),
         ", root" if d.get("root") else ", NOT root"))
@@ -1892,6 +1965,52 @@ def cmd_status():
         print("\nclaude sessions:")
         for s in c["claude"]:
             print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], cut_left(s.get("cwd"), w - 24)))
+    try:
+        leases = ledger_snapshot()
+    except LedgerError:
+        leases = []
+    if leases:
+        print("\nreservations (oomph reservations for details):")
+        for b in leases:
+            print("  " + _fmt_brief(b))
+    return 0
+
+
+def _status_linux(c, d, age, alive, line, w):
+    """`oomph status` from the Linux logger's current sample: who it runs as and how it learns of kills,
+    the lines of status_lines_linux, the other resources, the open incident, groups and sessions."""
+    ms = (d.get("machine") or {}).get("measures") or {}
+    kills = {"journal": "kills from the journal", "count": "kills counted (no journal)"}.get(ms.get("kills"), "")
+    line("logger", "%s (pid %s, v%s, sample %ds ago, every %ss%s%s)" % (
+        "running" if alive else "NOT RUNNING", d.get("pid"), d.get("version"), age, d.get("interval"),
+        ", as %s" % term_text(d["user"])[:32] if isinstance(d.get("user"), str) else "", ", " + kills if kills else ""))
+    for label, text in status_lines_linux(c):
+        if label != "disk" or not c.get("disks"):
+            line(label, text)
+    for label, text in resource_lines(c, *volume_prefs(), io=True):
+        line(label, text)
+    if c.get("jetsam_kills") or c.get("cgroup_kills"):
+        names = ", ".join(term_text(k.get("name"))[:30] for k in c.get("killed") or () if isinstance(k, dict))
+        line("killed", "%d by the OOM killer or a killer of memory%s, %d at a cgroup's own limit (last sample)" % (
+            c.get("jetsam_kills") or 0, " (%s)" % names if names else "", c.get("cgroup_kills") or 0))
+    if d.get("incident"):
+        line("INCIDENT", "open: %s" % d["incident"])
+    if d.get("quiet"):
+        line("quiet", "containers keep hitting their own limit: incident %s (%s incidents --all)" % (d["quiet"], CMD))
+    print("\ntop groups:")
+    for g in (c.get("groups") or [])[:8]:
+        print("  %6.1f GB  %s (%d)" % (g["mb"] / 1024, fit_group(term_text(g["name"]), w - 19), g["n"]))
+    for title, key, field, fmt in (("busiest (cores)", "top_cpu", "cpu", "%7.2f   "), ("GPU (%)", "top_gpu", "gpu", "%7.1f   ")):
+        rows = [r for r in (c.get(key) or [])[:5] if isinstance(r, dict) and _n(r.get(field)) is not None]
+        if rows:
+            print("\n%s:" % title)
+            for r in rows:
+                print(fmt % r[field] + "%s (%s)" % (cut_middle(term_text(str(r.get("name"))), 30),
+                                                   fit_group(term_text(str(r.get("g") or "")), w - 46)))
+    if c.get("claude"):
+        print("\nclaude sessions:")
+        for s in c["claude"]:
+            print("  %6.1f GB  pid %-6s %s" % (s["mb"] / 1024, s["pid"], cut_left(s.get("cwd") or "(another user's)", w - 24)))
     try:
         leases = ledger_snapshot()
     except LedgerError:
@@ -2011,8 +2130,13 @@ def cmd_report(args):
         print("\nother resources:")
         for line in res:
             print("  " + cut_end(term_text(line), w - 2))
-    notable = [e for e in events if e.get("kind") not in ("jetsam", "notified")]
-    if summ["jetsam_kills"]:
+    notable = [e for e in events if e.get("kind") not in ("jetsam", "oom_kill", "notified")]
+    if summ.get("cgroup_kills") is not None:  # Linux: by the kernel's OOM killer and the user-space killers
+        if summ["jetsam_kills"] or summ["cgroup_kills"]:
+            print("\nOOM kills: %d of the machine, %d at a cgroup's own limit   most: %s" % (
+                summ["jetsam_kills"], summ["cgroup_kills"], term_text(", ".join(
+                    "%s ×%d" % kv for kv in list((summ.get("most_killed") or {}).items())[:5]) or "–")))
+    elif summ["jetsam_kills"]:
         print("\njetsam kills: %d   reasons: %s" % (summ["jetsam_kills"], summ["jetsam_reasons"]))
     if notable:
         print("\nevents:")
@@ -2052,12 +2176,23 @@ def resource_summary_lines(summ, names=None):
     return out
 
 
-def list_incidents():
-    out = []
-    for f in sorted(glob.glob(os.path.join(LOG_DIR, "incidents", "*", "incident.json"))):
-        try:
-            inc = json.load(open(f))
+def list_incidents(quiet=True):
+    """Every incident, oldest first; with quiet=False without the quiet ones (Linux: containers at their own
+    limit, 03 §5.6), which never count as news."""
+    out, d = [], os.path.join(LOG_DIR, "incidents")
+    try:
+        ids = sorted(n for n in os.listdir(d) if not n.startswith("."))
+    except OSError:
+        ids = []
+    for iid in ids:
+        f = os.path.join(d, iid, "incident.json")
+        try:  # only a real folder: the logger's account could have put a link to anywhere there (03 §12.3)
+            if not stat.S_ISDIR(os.lstat(os.path.join(d, iid)).st_mode):
+                continue
+            inc = load_log_json(f)
         except Exception:
+            continue
+        if not isinstance(inc, dict) or (not quiet and inc.get("quiet")):
             continue
         inc["dir"] = os.path.dirname(f)
         out.append(inc)
@@ -2067,21 +2202,281 @@ def list_incidents():
 INCIDENT_ROW = "%-15s %5s  %-5s %5s  %s"  # a 36-column prefix, then the headline (44 at 80 columns)
 
 
-def cmd_incidents():
+def cmd_incidents(args=()):
     """One row per incident: when, how long, open or not, kills, and its headline. A headline
-    longer than the line continues on the next, indented to its column."""
+    longer than the line continues on the next, indented to its column. Quiet incidents (Linux:
+    containers at their own limit, 03 §5.6) are left out and counted in a last line; --all lists
+    them, with `quiet` in the state column."""
+    every = "--all" in args
     incs = list_incidents()
-    if not incs:
-        print("no incidents recorded")
+    shown = [i for i in incs if every or not i.get("quiet")]
+    nquiet = sum(1 for i in incs if i.get("quiet"))
+    if not shown:
+        print("no incidents recorded" + ("" if not nquiet else " (+ %d quiet one%s, containers at their own limit: %s "
+                                         "incidents --all)" % (nquiet, "" if nquiet == 1 else "s", CMD)))
         return 0
     w = max(80, term_width())
     print(INCIDENT_ROW % ("incident", "took", "state", "kills", "headline"))
-    for i in incs:
+    for i in shown:
         dur = ("%dm" % ((i.get("end", time.time()) - i["start"]) // 60))
         kills = (i.get("summary") or {}).get("jetsam_kills")
-        head = (i.get("reasons") or [{}])[0].get("desc", "")
-        print(wrap(head, w, INCIDENT_ROW % (i["id"], dur, "OPEN" if i.get("open") else "",
-                                           "–" if kills is None else kills, ""), 36))
+        head = term_text((i.get("reasons") or [{}])[0].get("desc", ""))
+        state = "quiet" if i.get("quiet") else "OPEN" if i.get("open") else ""
+        print(wrap(head, w, INCIDENT_ROW % (i["id"], dur, state, "–" if kills is None else kills, ""), 36))
+    if nquiet and not every:
+        print("+ %d quiet one%s (containers at their own limit): %s incidents --all" % (nquiet, "" if nquiet == 1 else "s", CMD))
+    return 0
+
+
+# ----- alert hooks (Linux, roadmap 03 §5.13): the logger writes a record per open, kill and close into
+# LOG_DIR/alerts; oomph-alert.path notices it and oomph-alert.service (a DynamicUser that may reach the
+# network, which the logger may not) runs this, which runs the administrator's scripts.
+ALERT_SAFE = re.compile(r"[^A-Za-z0-9 .,:;()/%+@_-]")
+ALERT_NAME = re.compile(r"(\d{8}-\d{6})\.(open|kill|close)\.json")
+ALERT_HOOK_S = 30            # each script gets this long per record
+ALERT_RUN_S = 270            # one start of the runner (the unit allows 300)
+ALERT_FIRST_S = 600          # without a cursor (the first start), records younger than this are run
+ALERT_VARS = ("event", "incident", "level", "host", "title", "message", "report")
+
+
+def alert_dir():
+    return PATHS_HERE.get("alert_d") or "/etc/oomph/alert.d"
+
+
+def alert_hooks(d=None, unrunnable=None):
+    """The scripts of `d` (/etc/oomph/alert.d) that may run, by name: executable regular files owned by root
+    (or by the account that runs them: itself, a test), writable by neither group nor others, in a folder of
+    the same kind. A dot file, a backup (~, .dpkg-*, .rpm*), a .md or .example is skipped. The runner is a
+    throwaway account, not root: a script others may not read and run (0700, 0750) would fail at every real
+    alert, so it is left out too, and named in `unrunnable` (a list) for doctor and `alert --test`."""
+    d = d or os.environ.get("OOMPH_ALERT_D") or alert_dir()
+    ok = (0, os.geteuid())
+    try:
+        st = os.lstat(d)
+        names = sorted(os.listdir(d))
+    except OSError:
+        return []
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid not in ok or st.st_mode & 0o022:
+        return []
+    out, open_dir = [], st.st_mode & 0o005 == 0o005
+    for n in names:
+        if n.startswith(".") or n.endswith(("~", ".md", ".example", ".txt")) or ".dpkg-" in n or ".rpm" in n:
+            continue
+        f = os.path.join(d, n)
+        try:
+            st = os.lstat(f)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode) and st.st_uid in ok and not st.st_mode & 0o022 and st.st_mode & 0o111:
+            if open_dir and st.st_mode & 0o005 == 0o005:
+                out.append(f)
+            elif unrunnable is not None:
+                unrunnable.append(f)
+    return out
+
+
+ALERT_CRED = re.compile(r"/[A-Za-z0-9/._@:-]{1,200}")
+
+
+def alert_env(rec):
+    """The variables a hook gets: each field cut to 200 characters of [A-Za-z0-9 .,:;()/%+@_-], anything else
+    a '?' (process names and purposes are text any local user chooses); the JSON on stdin has the original.
+    Under oomph-alert.service also CREDENTIALS_DIRECTORY: where the unit put /etc/oomph/alert.secret."""
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "HOME": "/"}
+    cred = os.environ.get("CREDENTIALS_DIRECTORY") or ""
+    if ALERT_CRED.fullmatch(cred) and ".." not in cred:
+        env["CREDENTIALS_DIRECTORY"] = cred
+    for k in ALERT_VARS:
+        env["OOMPH_" + k.upper()] = ALERT_SAFE.sub("?", str(rec.get(k) if rec.get(k) is not None else ""))[:200]
+    return env
+
+
+def run_alert_hooks(rec, hooks, out=None, deadline=None):
+    """Every hook once for one record, each at most ALERT_HOOK_S; returns [(hook, exit status or why)]. With a
+    `deadline` (epoch), a hook that could run past it is not started: the list then ends before it."""
+    res, data = [], json.dumps(rec).encode()
+    for h in hooks:
+        if deadline is not None and time.time() + ALERT_HOOK_S > deadline:
+            break
+        try:
+            r = subprocess.run([h], input=data, env=alert_env(rec), cwd="/", stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, timeout=ALERT_HOOK_S)
+            res.append((h, r.returncode, r.stdout[-300:].decode("utf-8", "replace")))
+        except subprocess.TimeoutExpired:
+            res.append((h, "timed out after %d s" % ALERT_HOOK_S, ""))
+        except OSError as e:
+            res.append((h, e.strerror or str(e), ""))
+        if out:
+            out("%s %s: %s" % (rec.get("event"), os.path.basename(h), res[-1][1]))
+    return res
+
+
+def _alert_records(d, after):
+    """The alert records in `d` after the cursor (t, name), oldest first: [(t, name, record)]."""
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    got = []
+    for n in names:
+        if not ALERT_NAME.fullmatch(n):
+            continue
+        rec = loads_untrusted(read_bounded(os.path.join(d, n), 64 << 10) or b"")
+        if not isinstance(rec, dict) or not _num(rec.get("t"), 0, 1e11):
+            continue
+        k = (float(rec["t"]), n)
+        if after is None or k > after:
+            got.append((k[0], n, {x: rec.get(x) for x in ALERT_VARS + ("t", "iso", "v") if x in rec}))
+    return sorted(got)
+
+
+ALERT_SECRET = "/etc/oomph/alert.secret"   # the hooks' secrets: root's, 0600; the unit's LoadCredential=alert:
+
+
+# oomph-alert.service's sandbox, for `alert --test` where `systemctl cat` cannot say what it is (as shipped)
+ALERT_SANDBOX = ("DynamicUser=yes", "CapabilityBoundingSet=", "AmbientCapabilities=", "NoNewPrivileges=yes", "UMask=0077",
+                 "ProtectSystem=strict", "ProtectHome=yes", "PrivateTmp=yes", "PrivateDevices=yes", "PrivateUsers=yes",
+                 "ProtectControlGroups=yes", "ProtectKernelModules=yes", "ProtectKernelTunables=yes",
+                 "ProtectKernelLogs=yes", "ProtectClock=yes", "ProtectHostname=yes", "ProtectProc=invisible",
+                 "ProcSubset=pid", "KeyringMode=private", "RemoveIPC=yes",
+                 "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6", "RestrictNamespaces=yes", "RestrictRealtime=yes",
+                 "RestrictSUIDSGID=yes", "LockPersonality=yes", "MemoryDenyWriteExecute=yes",
+                 "SystemCallArchitectures=native", "SystemCallFilter=@system-service",
+                 "SystemCallFilter=~@privileged @resources", "SystemCallErrorNumber=EPERM", "MemoryMax=256M", "TasksMax=64")
+ALERT_UNIT_SKIP = ("ExecStart", "ExecStartPre", "ExecStartPost", "ExecStop", "ExecStopPost", "Type", "StateDirectory",
+                   "LoadCredential", "SetCredential", "TimeoutStartSec", "TimeoutSec", "RuntimeMaxSec", "Restart",
+                   "RemainAfterExit")
+
+
+def _alert_unit_sandbox():
+    """oomph-alert.service's [Service] settings as the machine has them (with an administrator's drop-ins, from
+    `systemctl cat`), less how it starts, its cursor and its credential: what `alert --test` runs the hooks in.
+    The shipped ones where systemctl cannot tell."""
+    import shutil
+    try:
+        r = subprocess.run([shutil.which("systemctl", path="/usr/bin:/bin") or "/usr/bin/systemctl", "cat", "--no-pager", "oomph-alert.service"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10)
+        text = r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        text = ""
+    props, section = [], None
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line
+        elif section == "[Service]" and "=" in line and not line.startswith(("#", ";")) and not line.endswith("\\"):
+            if line.split("=", 1)[0].strip() not in ALERT_UNIT_SKIP:
+                props.append(line)
+    return props or list(ALERT_SANDBOX)
+
+
+def _alert_test_as_runner(hooks):
+    """`sudo oomph alert --test` on a machine with systemd: the test run as oomph-alert.service runs the hooks, in
+    its sandbox (a throwaway account, its system call filter, no JIT, no devices: _alert_unit_sandbox) with the
+    secrets as a credential, so that a hook that passes here also works at a real alert (one only root may read,
+    or one that needs a JIT, would not). None where systemd cannot do that."""
+    import shutil
+    run = shutil.which("systemd-run", path="/usr/bin:/bin")
+    if os.geteuid() != 0 or os.environ.get("OOMPH_ALERT_INNER") == "1" or not run or not os.path.isdir("/run/systemd/system"):
+        return None
+    me = os.path.join(PATHS_HERE["libexec"], "oomph.py")
+    me = me if os.path.isfile(me) else os.path.realpath(__file__)
+    cmd = [run, "--quiet", "--wait", "--pipe", "--collect"]
+    for prop in _alert_unit_sandbox():
+        cmd += ["-p", prop]
+    cmd += ["-p", "RuntimeMaxSec=%d" % (ALERT_HOOK_S * len(hooks) + 60), "--setenv=OOMPH_ALERT_INNER=1"]
+    if os.environ.get("OOMPH_ALERT_D"):
+        cmd.append("--setenv=OOMPH_ALERT_D=%s" % os.environ["OOMPH_ALERT_D"])
+    if os.path.isfile(ALERT_SECRET):
+        cmd += ["-p", "LoadCredential=alert:%s" % ALERT_SECRET]
+    print("(run as oomph-alert.service runs them: a throwaway account in its sandbox, the secrets of %s as "
+          "$CREDENTIALS_DIRECTORY/alert)" % ALERT_SECRET)
+    sys.stdout.flush()
+    try:
+        return subprocess.run(cmd + [PY, "-I", "-B", me, "alert", "--test"], stdin=subprocess.DEVNULL,
+                              timeout=ALERT_HOOK_S * len(hooks) + 90).returncode
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print("%s: systemd-run failed: %s" % (CMD, e), file=sys.stderr)
+        return 1
+
+
+def cmd_alert(args):
+    """`oomph alert --test`: every hook once with a test record, and what each said (as root: the way the unit runs
+    them, _alert_test_as_runner). `oomph alert --run-hooks`: the runner oomph-alert.service starts when the logger
+    writes a record, and only it (its STATE_DIRECTORY holds the cursor): every record after its cursor, each to
+    every hook; then it looks again until nothing newer is left, waits 2 s, looks a last time and exits (a record
+    written while hooks ran is not left behind; the logger's alerts/.beat starts it again anyway)."""
+    if sys.platform == "darwin":
+        print("%s alert: Linux only (on a Mac the logger notifies by itself)" % CMD, file=sys.stderr)
+        return 2
+    bad = []
+    hooks = alert_hooks(unrunnable=bad)
+    if args == ["--test"]:
+        rc = _alert_test_as_runner(hooks) if hooks else None
+        if rc is not None:
+            return rc
+        for h in bad:
+            print("%-40s not run: others may not read and run it, and the unit runs hooks as a throwaway account "
+                  "(chmod 755 it; secrets go into %s)" % (h, ALERT_SECRET))
+        if not hooks:
+            print("%s: no hooks to run in %s (executable, root's, writable by root only, readable by all)"
+                  % (CMD, alert_dir()))
+            return 1
+        if os.geteuid() != 0 and os.environ.get("OOMPH_ALERT_INNER") != "1":
+            print("(run as %s: oomph-alert.service runs them as a throwaway account, with %s; sudo %s alert --test "
+                  "runs them that way)" % (_whoami(), ALERT_SECRET, CMD))
+        host = os.uname()[1].split(".")[0]
+        rec = {"v": 1, "event": "test", "incident": "00000000-000000", "level": "notice", "host": host,
+               "title": "Test from %s on %s" % (BRAND, host), "message": "%s alert --test: your hook works" % CMD,
+               "report": "", "t": round(time.time(), 3), "iso": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+        res = run_alert_hooks(rec, hooks)
+        for h, rc, said in res:
+            print("%-40s %s%s" % (h, "ok" if rc == 0 else "exit %s" % rc if isinstance(rc, int) else rc,
+                                  (": " + term_text(said.strip().splitlines()[-1])[:120]) if said.strip() else ""))
+        return 0 if all(r[1] == 0 for r in res) and not bad else 1
+    if args != ["--run-hooks"]:
+        print("usage: %s alert --test | --run-hooks" % CMD, file=sys.stderr)
+        return 2
+    state = os.environ.get("STATE_DIRECTORY", "").split(":")[0]
+    if not os.path.isabs(state):  # anyone else would replay a day of records through root's hooks
+        print("%s alert --run-hooks: only oomph-alert.service runs this (it sets STATE_DIRECTORY); to try the hooks: "
+              "sudo %s alert --test" % (CMD, CMD), file=sys.stderr)
+        return 2
+    os.makedirs(state, mode=0o700, exist_ok=True)
+    cur_f = os.path.join(state, "cursor.json")
+    c = loads_untrusted(read_bounded(cur_f, 16 << 10) or b"")
+    after = (float(c["t"]), str(c["name"])) if isinstance(c, dict) and _num(c.get("t"), 0, 1e11) and \
+        isinstance(c.get("name"), str) else (time.time() - ALERT_FIRST_S, "")
+    part = c.get("part") if isinstance(c, dict) and isinstance(c.get("part"), dict) else None  # a record half done:
+    # the hooks that ran for it (a start stops before a hook that could outlast the unit's TimeoutStartSec)
+    d, looked_last = os.path.join(LOG_DIR, "alerts"), False
+    deadline = time.time() + ALERT_RUN_S
+    while time.time() < deadline:
+        recs = _alert_records(d, after)
+        if not recs:
+            if looked_last:
+                break
+            time.sleep(2)
+            looked_last = True
+            continue
+        looked_last = False
+        for t, n, rec in recs:
+            done = set(x for x in part.get("done") or () if isinstance(x, str)) \
+                if part and part.get("name") == n and isinstance(part.get("done"), list) else set()
+            todo = [h for h in hooks if os.path.basename(h) not in done]
+            res = run_alert_hooks(rec, todo, out=lambda x: sys.stderr.write("%s\n" % term_text(x)[:300]), deadline=deadline)
+            done.update(os.path.basename(r[0]) for r in res)
+            if len(res) == len(todo):
+                after, part = (t, n), None
+            else:
+                part = {"name": n, "done": sorted(done)[:256]}
+            tmp = "%s.%d.tmp" % (cur_f, os.getpid())
+            with open(tmp, "w") as f:
+                f.write(json.dumps(dict({"t": after[0], "name": after[1]}, **({"part": part} if part else {}))))
+            os.replace(tmp, cur_f)
+            if part:  # out of time: the next start (the logger's .beat) goes on with the hooks not yet run
+                sys.stderr.write("%s alert: out of time; the next start runs the rest of %s\n" % (CMD, n))
+                return 0
     return 0
 
 
@@ -2090,21 +2485,97 @@ def cmd_incident(args):
     if not incs:
         print("no incidents recorded")
         return 1
-    ident = args[0] if args else "latest"
-    inc = incs[-1] if ident == "latest" else next((i for i in incs if i["id"] == ident), None)
+    ident = args[0] if args and not args[0].startswith("-") else "latest"
+    loud = [i for i in incs if not i.get("quiet")]
+    inc = (loud or incs)[-1] if ident == "latest" else next((i for i in incs if i["id"] == ident), None)
     if not inc:
         print("no such incident: %s" % ident)
         return 1
     if "--html" in args:
         # Render fresh rather than opening the report.html saved at close: that one is a
         # snapshot in whatever report design the daemon had back then.
-        p = os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-%s.html" % inc["id"])
-        open(p, "w").write(incident_html(inc))
-        subprocess.run(["/usr/bin/open", p])
+        p = _report_write("%s-%s" % (CMD, inc["id"]), incident_html(inc))
+        if p is None:
+            return 1
         print(p)
+        _open_report(p)
         return 0
     print(json.dumps(inc, indent=1))
     return 0
+
+
+def _own_dir(d, uid):
+    """Is `d` a folder of `uid`'s own that no one else may enter (lstat: never through a link)?"""
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return False
+    return stat.S_ISDIR(st.st_mode) and st.st_uid == uid and not st.st_mode & 0o077
+
+
+def _report_dir():
+    """Where a report goes without -o (03 §12.4): never a shared folder like /tmp, which `sudo oomph html` would
+    write into as root. $TMPDIR where it is this account's own (a Mac's per-user one), else $XDG_RUNTIME_DIR/oomph
+    (in a runtime folder of this account's), else `reports` in this account's state folder (root's own home, by
+    its account, not $HOME, under sudo); each 0700. None if none can be had."""
+    uid = os.geteuid()
+    t = os.environ.get("TMPDIR") or ""
+    if os.path.isabs(t) and _own_dir(t, uid):
+        return t
+    x = os.environ.get("XDG_RUNTIME_DIR") or ""
+    home = pwd.getpwuid(uid).pw_dir if uid == 0 else None
+    cands = [os.path.join(x, CMD)] if os.path.isabs(x) and _own_dir(x, uid) else []
+    cands.append(os.path.join(home, ".local", "state", CMD, "reports") if home else os.path.join(STATE_DIR, "reports"))
+    for d in cands:
+        try:
+            os.makedirs(d, 0o700, exist_ok=True)
+        except OSError:
+            continue
+        if _own_dir(d, uid):
+            return d
+    return None
+
+
+def _report_write(stem, text, out=None):
+    """Write a report: to `out` (-o: the caller's choice), else as <stem>-<random>.html, created new (O_EXCL,
+    never through a link) in _report_dir(), where those older than a week are removed. Its path, or None."""
+    if out:
+        with open(out, "w") as f:
+            f.write(text)
+        return out
+    d = _report_dir()
+    if d is None:
+        print("%s: no folder of your own to write the report into: name one with -o FILE" % CMD, file=sys.stderr)
+        return None
+    try:
+        for n in os.listdir(d):
+            f = os.path.join(d, n)
+            if n.startswith(CMD + "-") and n.endswith(".html") and time.time() - os.lstat(f).st_mtime > 7 * 86400:
+                os.unlink(f)
+    except OSError:
+        pass
+    p = os.path.join(d, "%s-%s.html" % (stem, secrets.token_hex(4)))
+    fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    return p
+
+
+def _open_report(p):
+    """Show a written report: `open` on a Mac; on Linux xdg-open where there is one and a desktop to show it on
+    (never as root); otherwise the printed path is all."""
+    import shutil
+    if sys.platform == "darwin":
+        cmd = ["/usr/bin/open", p]
+    else:
+        xo = shutil.which("xdg-open")
+        if not xo or os.geteuid() == 0 or not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return
+        cmd = [xo, p]
+    try:
+        subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def cmd_html(args):
@@ -2112,13 +2583,14 @@ def cmd_html(args):
     out = None
     if "-o" in args:
         out = args[args.index("-o") + 1]
-    out = out or os.path.join(os.environ.get("TMPDIR", "/tmp"), "oomph-report.html")
     s = load_samples(since, until)
     e = load_events(since, until)
-    open(out, "w").write(render_html(s, e, "Memory report"))
+    out = _report_write("%s-report" % CMD, render_html(s, e, "Memory report"), out)
+    if out is None:
+        return 1
     print(out)
     if "--open" in args:
-        subprocess.run(["/usr/bin/open", out])
+        _open_report(out)
     return 0
 
 
@@ -2164,7 +2636,7 @@ def _daemon_module():
 def _daemon_sample(max_age=45):
     """The daemon's latest sample if it is fresh, else None."""
     try:
-        c = json.load(open(os.path.join(LOG_DIR, "current.json")))
+        c = load_log_json(os.path.join(LOG_DIR, "current.json"))
         if time.time() - c["t"] <= max_age:
             c["source"] = "daemon"
             return c
@@ -2312,7 +2784,13 @@ def _verdict_parts(s):
     if lx.get("overcommit") == 2 and _num(lx.get("commit_pct")) and lx["commit_pct"] >= 95:
         out.append((1, "memory", "strict overcommit is at %d%% of its limit: allocations are about to fail"
                     % lx["commit_pct"]))
-    if s.get("jetsam_kills"):
+    if s.get("jetsam_kills") and lin:  # 03 §6.1: `killed` names them where the logger read the journal
+        k = [x for x in s.get("killed") or () if isinstance(x, dict) and isinstance(x.get("name"), str)][:1]
+        out.append((1, "memory", "the system just killed %d process%s for memory%s" % (
+            s["jetsam_kills"], "" if s["jetsam_kills"] == 1 else "es", " (%s%s)" % (
+                term_text(k[0]["name"])[:40], ", %.1f GB" % (k[0]["mb"] / 1024.0) if _num(k[0].get("mb"), 0, 1e9) else "")
+            if k else "")))
+    elif s.get("jetsam_kills"):
         out.append((1, "memory", "macOS just killed %d processes for memory" % s["jetsam_kills"]))
     u = s.get("unowned_gb")
     if u is not None and ram and u >= unowned_limit_gb(ram):
@@ -2691,11 +3169,13 @@ def _gpu_text(g):
     mem = ""
     if _n(g.get("mem_gb")) is not None:
         mem = " · %.1f%s GB GPU memory" % (g["mem_gb"], " of %.0f" % g["mem_limit_gb"] if _n(g.get("mem_limit_gb")) else "")
-    name = " (%s)" % str(g.get("name"))[:40] if g.get("name") else ""
+    name = " (%s)" % term_text(str(g.get("name")))[:40] if g.get("name") else ""
     if _n(g.get("util")) is None:
         return "not measured yet%s%s" % (mem, name)
     if g.get("src") == "ioreport":
         return "%.0f %% of full speed%s%s" % (g["util"], mem, name)
+    if g.get("src") == "nvidia-smi":  # the driver's own figure: the share of time a kernel ran
+        return "busy %.0f %% of the time%s%s" % (g["util"], mem, name)
     return "busy %.0f %% of the time (speed not reported)%s%s" % (g["util"], mem, name)
 
 
@@ -2719,8 +3199,6 @@ def resource_lines(s, pinned=frozenset(), hidden=frozenset(), io=False):
     out = []
     off = NOT_MEASURED if s.get("source") == "live" else NOT_READ if logger_measures(s) else NOT_LOGGED
     cpu = s.get("cpu") if isinstance(s.get("cpu"), dict) else None
-    if s.get("os") == "linux" and s.get("source") == "live":  # no CPU, GPU or disk sources on Linux yet (L2)
-        return out
     if cpu is None:
         out.append(("cpu", off))
     else:
@@ -2823,7 +3301,7 @@ def _resources(s, c=None):
     gpus = s.get("gpu") if isinstance(s.get("gpu"), list) else None
     out["gpu"] = None if gpus is None else [dict({k: g[k] for k in ("id", "name", "util", "active", "src", "mem_gb",
                                                                     "mem_alloc_gb", "mem_limit_gb", "mem_limit_est",
-                                                                    "unified") if k in g}, reservable=False)
+                                                                    "unified", "procs") if k in g}, reservable=False)
                                              for g in gpus if isinstance(g, dict)]
     pools = (c or {}).get("disk") if isinstance((c or {}).get("disk"), dict) else {}
     out["disks"] = [dict({k: d[k] for k in ("id", "name", "mount", "free_gb", "total_gb", "kind", "roles", "level",
@@ -2955,8 +3433,8 @@ def cmd_volumes(args):
         main = p is not None and p["mount"] == r["mount"]
         if not main and "--all" not in opts:
             continue
-        e = {"mount": r["mount"], "name": r["name"], "fs": r["fs"], "free_gb": r["free_gb"], "total_gb": r["total_gb"],
-             "class": r["cls"], "why": r["why"]}
+        e = {"mount": r["mount"], "name": r["name"], "fs": r["fs"], "free_gb": r.get("free_gb"), "total_gb": r.get("total_gb"),
+             "class": r["cls"], "why": r["why"]}  # (Linux leaves a network mount's size unread: it could block)
         if p is not None:
             e.update(id=p["id"], pinned=p["id"] in pinned, hidden=p["id"] in hidden)
             if not main:
@@ -2979,8 +3457,9 @@ def cmd_volumes(args):
             what += " · pinned"
         if e.get("hidden"):
             what += " · hidden by you"
-        size = "%s free of %s GB" % (_gb(e["free_gb"]), _gb(e["total_gb"])) if e["total_gb"] else ""
-        print(wrap("%s · %s" % (what, e["mount"]), w, "  %-14s %-20s " % (cut_middle(e["name"], 14), size), 38))
+        size = "%s free of %s GB" % (_gb(e["free_gb"]), _gb(e["total_gb"])) if e["total_gb"] and e["free_gb"] is not None else ""
+        print(wrap("%s · %s" % (what, term_text(e["mount"])), w, "  %-14s %-20s " % (cut_middle(term_text(e["name"]), 14),
+                                                                                     size), 38))
     if "--all" not in opts:
         print("(`oomph volumes --all` also lists the volumes the logger ignores, and why)")
     return 0
@@ -2992,7 +3471,14 @@ def cmd_volumes(args):
 # fits into free memory minus what earlier grants have not yet used, minus a safety margin.
 # So concurrent heavy steps from different sessions run side by side when there's room, and
 # one after another when there isn't. Advisory: oomph never stops or kills anything.
-LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR") or _path("ledger")
+def _ledger_default():
+    """The ledger of this machine: on Linux /var/lib/oomph/ledger whenever it exists (also when this
+    caller may not use it: two ledgers would grant the same memory twice, 03 §7.1), else the per-user one."""
+    shared = PATHS_HERE.get("shared_ledger")
+    return shared if shared and os.path.lexists(shared) else _path("ledger")
+
+
+LEDGER_DIR = os.environ.get("OOMPH_LEDGER_DIR") or _ledger_default()
 QUEUE_STALE_S = 180          # a queued request lapses if its owner hasn't polled for this long
 DEFAULT_TTL_S = 30 * 60      # session-held grants expire unless released or extended
 MAX_TTL_S = 8 * 3600
@@ -3349,6 +3835,8 @@ def _whoami():
 # the invoking user (or nobody), and the root daemon only ever sees what such a child
 # printed, rebuilt from typed, capped fields.
 LIMITS = {                   # the one table of limits for what is read from the directory
+    "log_line": 1 << 20,     # a line of the logger's samples or events (a real one: under 10 KB) ...
+    "log_file": 256 << 20,   # ... and one of its files, unpacked (a real day: about 30 MB)
     "ledger": 4 << 20,       # ledger.json: bytes; a bigger one is treated as absent
     "history": 8 << 20,      # reservations.jsonl: readers take its newest 8 MB, writers keep it below
     "child": 1 << 20,        # a root caller's unprivileged child: bytes of answer
@@ -3366,7 +3854,8 @@ LOCK_WAIT_S = 5.0            # interactive callers: a holder keeps the lock for 
 LOCK_WAIT_TICK_S = 1.0       # the daemon's child: it runs again next sample anyway
 CHILD_TIMEOUT_S = 20         # a root caller's child (lock wait included)
 TICK_TIMEOUT_S = 5           # the daemon's child
-PY = "/usr/bin/python3"
+PY = "/usr/bin/python3" if sys.platform == "darwin" or not os.path.isabs(sys.executable or "") else sys.executable
+# (on Linux the Python this runs on, which linux/install.sh chose: /usr/bin/python3 can be too old there)
 _lock_wait = LOCK_WAIT_S
 _held = None                 # the Ledger whose lock this process holds (the history log is written under it)
 _given = None                # (sample, procs) a root parent measured for its unprivileged child
@@ -5108,16 +5597,39 @@ def _dec(x):
     return x
 
 
+def _kept_to_group(d):
+    """The gid a folder is kept to (no access for others), else None."""
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return None
+    return st.st_gid if stat.S_ISDIR(st.st_mode) and not st.st_mode & 0o007 else None
+
+
+def _in_group(user, gid):
+    try:
+        return pwd.getpwnam(user).pw_gid == gid or user in grp.getgrgid(gid).gr_mem
+    except (KeyError, OverflowError):
+        return False
+
+
 def _call_as_user(name, args, kw, inputs):
     d = {"args": [_enc(a) for a in args], "kw": {k: _enc(v) for k, v in kw.items()}}
     if inputs:
         s, procs, _ = _decide_inputs()
         d["s"], d["procs"] = s, list(procs.values())
     user, group = _child_user()
-    if user == "nobody" and sys.platform.startswith("linux") and not os.environ.get("OOMPH_LEDGER_DIR"):
+    if user == "nobody" and sys.platform.startswith("linux") and not os.environ.get("OOMPH_LEDGER_DIR") and \
+            LEDGER_DIR == _path("ledger"):  # root's per-user ledger; the machine's (/var/lib/oomph/ledger) is nobody's too
         raise LedgerError("root's own ledger %s is used only where nobody else can reach it: every folder "
                           "above it root's and not writable by group or others, the folder itself 0700"
                           % LEDGER_DIR)  # nobody could not open it in root's home anyway
+    if user == "nobody" and sys.platform.startswith("linux") and LEDGER_DIR == PATHS_HERE.get("shared_ledger"):
+        g = _kept_to_group(LEDGER_DIR)
+        if g is not None and not _in_group("nobody", g):
+            raise LedgerError("the machine's ledger %s is kept to group %s, and root without sudo reaches it as "
+                              "nobody, who is not in it: reserve with sudo from the account of a member (sudo %s ...)"
+                              % (LEDGER_DIR, _group_name(g), CMD))
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-call", name],
                                json.dumps(d, default=str).encode(), LIMITS["child"], CHILD_TIMEOUT_S,
                                **_drop_to(user, group))
@@ -6663,7 +7175,7 @@ def _mcp_call(name, a):
         ok, v, waited = wait_for_memory(min(int(a.get("timeout_s", 120)), 300), float(a.get("min_free_gb", 0)), quiet=True)
         return {"recovered": ok, "waited_s": waited, "verdict": v}
     if name == "incidents":
-        incs = list_incidents()[-int(a.get("limit", 10)):]
+        incs = list_incidents(quiet=False)[-int(a.get("limit", 10)):]
         return [{"id": i["id"], "start": i.get("start_iso"), "end": i.get("end_iso"), "open": i.get("open"),
                  "triggers": [r["desc"] for r in i.get("reasons", [])][:5],
                  "max_swap_used_gb": (i.get("summary") or {}).get("max_swap_used_gb"),
@@ -7040,8 +7552,11 @@ def doctor():
             "%s; the reason is in %s/daemon.err" % (kick, LOG_DIR) if mac else kick)
     else:
         add("logger", "note", "not installed: nothing is logged, every reading is live%s" % (
-            "" if mac else "; history and incidents need the Linux logger, which comes in a later release"),
-            "Activate in the menu-bar app, or sudo ./install.sh from a checkout" if mac else None)
+            "" if mac else "; history, incidents and kills by name need the logger"),
+            "Activate in the menu-bar app, or sudo ./install.sh from a checkout" if mac else
+            "sudo linux/install.sh --system, from a checkout (git clone https://github.com/kleinzeug/oomph.git)")
+    if not mac:
+        _doctor_linux_logger(add, d if fresh else None, installed)
 
     inst = _version_in(os.path.join(PATHS_HERE["libexec"], "oomph.py"))
     if inst is None and not mac:  # linux/install.sh: the user's own copy
@@ -7102,7 +7617,6 @@ def _doctor_linux(add, m, s, procs):
                                 "alone, and stops at warning (memory never reads critical here)",
             "turn it on with psi=1 on the kernel command line and a restart; on the RHEL family: "
             "sudo grubby --update-kernel=ALL --args=psi=1")
-    add("kills", "note", "not recorded: kernel OOM kills by name need the Linux logger (a later release)")
     mine = sum(1 for p in procs.values() if p.get("uid") == os.getuid())
     if ms.get("all_procs") is False:
         add("processes", "note", "%d visible: /proc is mounted with hidepid, so only your own (%d) count" % (len(procs), mine))
@@ -7124,6 +7638,113 @@ def _doctor_linux(add, m, s, procs):
                              "its own and the host's" % (sc.get("limit_gb") or 0))
     else:
         add("scope", "note", "not in a limited cgroup: %s measures the whole machine" % BRAND)
+
+
+def _secret_bad(path=None):
+    """What is wrong with the hooks' secrets file (ALERT_SECRET), which must be root's alone (a regular file of
+    uid 0, mode 0600 or less): "is a link", "belongs to uid N", "may be read by others (0644)"; None when it is
+    right or missing (missing has its own line)."""
+    try:
+        st = os.lstat(path or ALERT_SECRET)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return "is not a regular file (a link?)"
+    if st.st_uid != 0:
+        return "belongs to uid %d, not root" % st.st_uid
+    if st.st_mode & 0o077:
+        return "may be read or written by others (%04o)" % stat.S_IMODE(st.st_mode)
+    return None
+
+
+def _doctor_linux_logger(add, d, installed):
+    """doctor's lines for the Linux logger (1.13.0, 03 §3.2): how kills are recorded, the alert hooks, and
+    who may use the machine's ledger (open to every local account, D16) with how to restrict it."""
+    ms = ((d or {}).get("machine") or {}).get("measures") or {}
+    mode = ms.get("kills")
+    if d is None:
+        add("kills", "note", "not recorded: the logger names kernel OOM kills (it is not running)")
+    elif mode == "journal":
+        add("kills", "ok", "named from the journal: the kernel's OOM killer, systemd-oomd and earlyoom")
+    else:
+        add("kills", "note", "counted, not named: the logger cannot read the journal (no systemd, or installed "
+                             "with --no-journal)", "sudo linux/install.sh --system (without --no-journal)")
+    if installed or d is not None:
+        bad = []
+        hooks = alert_hooks(unrunnable=bad)
+        wants = "/etc/systemd/system/multi-user.target.wants/oomph-alert.path"
+        if bad:
+            add("alerts", "warn", "%d script(s) in %s cannot run: the unit runs hooks as a throwaway account, which "
+                                  "may not read %s" % (len(bad), alert_dir(), ", ".join(os.path.basename(b) for b in bad[:3])),
+                "sudo chmod 755 %s (secrets go into %s, which the unit hands to them)" % (" ".join(bad[:3]), ALERT_SECRET))
+        elif hooks and not os.path.lexists(ALERT_SECRET):
+            add("alerts", "warn", "%s is missing: oomph-alert.service cannot start without it" % ALERT_SECRET,
+                "sudo install -m 600 /dev/null %s (then its KEY=value lines for the hooks)" % ALERT_SECRET)
+        elif hooks and _secret_bad():
+            add("alerts", "warn", "%s %s: the hooks' secrets must be root's alone" % (ALERT_SECRET, _secret_bad()),
+                "sudo chown root:root %s && sudo chmod 600 %s (if it is a link: remove it and run sudo install -m "
+                "600 /dev/null %s)" % (ALERT_SECRET, ALERT_SECRET, ALERT_SECRET))
+        elif hooks and not os.path.lexists(wants):
+            add("alerts", "warn", "%d script(s) in %s, but oomph-alert.path is not enabled" % (len(hooks), alert_dir()),
+                "sudo systemctl enable --now oomph-alert.path")
+        elif hooks:
+            add("alerts", "ok", "%d script(s) in %s run when an incident opens, kills or closes (test: sudo %s alert "
+                                "--test)" % (len(hooks), alert_dir(), CMD))
+        else:
+            add("alerts", "note", "incidents reach the journal only (journalctl -p crit -u oomphd); a script in %s "
+                                  "hears of each" % alert_dir(),
+                "examples in %s/alert.d.examples (ntfy, a Slack webhook, mail)" % PATHS_HERE["libexec"])
+    shared = PATHS_HERE.get("shared_ledger")
+    if shared and LEDGER_DIR == shared:
+        try:
+            st = os.lstat(shared)
+        except OSError:
+            return
+        if stat.S_ISDIR(st.st_mode) and st.st_mode & 0o002:
+            add("access", "note", "the machine's ledger %s is open to every local account, as on a Mac: any of them "
+                                  "may reserve, and see the others' purposes" % shared,
+                "to keep it to a group: sudo groupadd %(g)s; sudo usermod -aG %(g)s oomphd (and each member); "
+                "sudo chgrp %(g)s %(d)s; sudo chmod 2770 %(d)s; sudo systemctl restart oomphd (the logger then "
+                "keeps purposes out of %(l)s, whose process names and figures every account still reads). Root "
+                "without sudo (su -, a root agent) reaches the ledger as nobody, who is not in the group: root then "
+                "reserves only with sudo from a member's account" % {"g": CMD, "d": shared, "l": LOG_DIR})
+        elif stat.S_ISDIR(st.st_mode):
+            add("access", "note", "the machine's ledger %s is kept to group %s (mode %03o); purposes stay out of the "
+                                  "logs%s" % (shared, _group_name(st.st_gid), stat.S_IMODE(st.st_mode),
+                                              "" if _in_group("nobody", st.st_gid) else "; root without sudo cannot "
+                                              "reserve (it would as nobody): sudo from a member's account"))
+    _doctor_linux_skew(add, shared)
+
+
+def _doctor_linux_skew(add, shared):
+    """Copies that do not take turns with the others (03 review #16): once the machine's ledger exists, a copy of
+    oomph older than 1.13 (a ~/.local/bin/oomph first on the PATH, a long-running MCP server) still uses its own
+    per-user ledger. Said when that ledger is still there (with its live reservations) or the own copy is older."""
+    if not shared or LEDGER_DIR != shared:
+        return
+    own = _path("ledger")
+    if os.geteuid() != 0 and own != shared and os.path.isdir(own):
+        L = _valid_ledger(loads_untrusted(read_bounded(os.path.join(own, "ledger.json"), LIMITS["ledger"]) or b""))
+        now = time.time()
+        n = sum(1 for r in (L or {}).get("leases") or () if _live(r, now))
+        add("own ledger", "warn" if n else "note",
+            "your ledger from before the machine's, %s, is still there%s: a copy of %s older than 1.13 (an MCP server "
+            "started before the update, ~/.local/bin/oomph) keeps using it and does not take turns with the others"
+            % (own, " with %d live reservation%s" % (n, "" if n == 1 else "s") if n else "", BRAND),
+            "restart the sessions; linux/uninstall.sh (as yourself) removes your own copy; then rm -r %s" % own)
+    mine = _version_in(os.path.join(os.path.expanduser(PATHS_HERE["user_lib"]), "oomph.py"))
+    machine = _version_in(os.path.join(PATHS_HERE["libexec"], "oomph.py"))
+    if os.geteuid() != 0 and mine and machine and mine != machine:
+        add("own copy", "warn", "your own copy in ~/.local (%s) is not the machine's (%s), and it comes first on your "
+                                "PATH" % (mine, machine),
+            "linux/uninstall.sh (as yourself), or linux/install.sh again from the machine's version")
+
+
+def _group_name(gid):
+    try:
+        return grp.getgrgid(gid).gr_name
+    except KeyError:
+        return str(gid)
 
 
 IOREPORT_OFF = {"crashes": "the IOReport helper crashed four times since the Mac started and stays off until the next "
@@ -7441,7 +8062,9 @@ def _main(argv):
     if c == "report":
         return cmd_report(rest)
     if c == "incidents":
-        return cmd_incidents()
+        return cmd_incidents(rest)
+    if c == "alert":
+        return cmd_alert(rest)
     if c == "incident":
         return cmd_incident(rest)
     if c == "html":

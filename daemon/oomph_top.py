@@ -37,6 +37,7 @@ import oomph_view as view
 view.BRAND = oomph.BRAND
 
 DAY_CAP = 128 << 20         # bytes of one day's samples, inflated (a day at a 5 s interval is about 60 MB)
+LINE_MAX = oomph.LIMITS["log_line"]   # a sample line (a real one: under 10 KB); a longer one is skipped
 CURRENT_CAP = 256 << 10
 INCIDENT_CAP = 256 << 10
 EVENTS_CAP = 1 << 20        # the newest MB of events.jsonl is plenty for one frame
@@ -56,7 +57,8 @@ USAGE = ("usage: oomph top [--span inf|24h|6h|1h] [--color auto|truecolor|256|16
 
 # ------------------------------------------------------------------ reading
 def _read(path, cap, tail=False):
-    """A regular file of the log directory (root's, readable by all), at most `cap` bytes; None for
+    """A regular file of the log directory (readable by all; on Linux the logger's account's, whose
+    files root does not trust), at most `cap` bytes, never through a link; None for
     anything else. With `tail` a bigger file gives its newest whole lines within `cap`."""
     d = oomph.read_bounded(path, cap, tail=tail)
     if d is None:
@@ -85,7 +87,7 @@ def _no_constant(c):
 
 
 def _loads(line):
-    """A line of the log (root's, written by the daemon): json.loads without NaN and Infinity."""
+    """A line of the log (written by the logger, untrusted): json.loads without NaN and Infinity."""
     return json.loads(line, parse_constant=_no_constant)
 
 
@@ -115,26 +117,51 @@ def _day_files(log_dir):
     return out
 
 
-def _lines(path):
-    """The lines of a day's file: of a plain file (today's) bigger than DAY_CAP its newest DAY_CAP
-    bytes, of a .gz at most DAY_CAP bytes inflated."""
-    try:
-        if path.endswith(".gz"):
-            n = 0
-            with gzip.open(path, "rb") as f:
-                for line in f:
-                    n += len(line)
-                    if n > DAY_CAP:
-                        return
-                    yield line
+def _pieces(f, left, skip=False):
+    """What a day's file holds from where `f` stands, read at most LINE_MAX + 1 bytes at a time and at
+    most `left` bytes in all (inflated, for a .gz: so one that unpacks to a single endless line costs
+    a reader nothing but the time): (bytes, usable) pairs. Not usable is every piece of a line longer
+    than LINE_MAX, which is skipped whole, and with `skip` the rest of the line `f` stands in. The
+    log folder is the logger's account's on Linux (oomphd), which a root reader must not trust."""
+    while left > 0:
+        b = f.readline(min(LINE_MAX + 1, left))
+        if not b:
             return
-        with open(path, "rb") as f:
-            size = os.fstat(f.fileno()).st_size
-            if size > DAY_CAP:
-                f.seek(size - DAY_CAP)
-                f.readline()                    # a piece of a line
-            for line in f:
-                yield line
+        left -= len(b)
+        bad = skip or len(b) > LINE_MAX
+        skip = bad and not b.endswith(b"\n")
+        yield b, not bad
+
+
+def _open_day(path):
+    """A day's file opened as oomph.open_log opens the logger's files (a regular file only, never
+    through a link, never blocking on a FIFO; a .gz unpacked) and its os.fstat; None for anything else."""
+    try:
+        f = oomph.open_log(path, binary=True)
+    except OSError:
+        return None, None
+    try:
+        return f, os.fstat(f.fileno())
+    except OSError:
+        f.close()
+        return None, None
+
+
+def _lines(path):
+    """The lines of a day's file (_open_day): of a plain file (today's) bigger than DAY_CAP its newest
+    DAY_CAP bytes, of a .gz at most DAY_CAP bytes inflated; a line over LINE_MAX is skipped."""
+    f, st = _open_day(path)
+    if f is None:
+        return
+    try:
+        with f:
+            skip = False
+            if not path.endswith(".gz") and st.st_size > DAY_CAP:
+                f.seek(st.st_size - DAY_CAP)
+                skip = True                     # a piece of a line
+            for b, ok in _pieces(f, DAY_CAP, skip):
+                if ok:
+                    yield b
     except (OSError, EOFError, ValueError, zlib.error):
         return
 
@@ -302,7 +329,7 @@ def incident_of(inc, iid, d=None):
                 open=inc.get("open") is True, kills=int(_num(summ.get("jetsam_kills"), 0)),
                 desc=reasons[0] if reasons else "", reasons=[r for r in reasons if r][:3], nreasons=len(reasons),
                 summary=_card_summary(summ), dir=os.path.join(d, iid) if d else None,
-                report=report if report and os.path.isfile(report) else None)
+                report=report if report and os.path.isfile(report) else None, quiet=inc.get("quiet") is True)
 
 
 def _incident(d, iid, cache=None):
@@ -335,7 +362,7 @@ def load_incidents(log_dir, now, cache=None):
     out, n90 = [], 0
     for iid in ids[:INCIDENTS_SHOWN]:
         inc = _incident(d, iid, cache)
-        if inc is None:
+        if inc is None or inc.get("quiet"):  # Linux: containers at their own limit are never news (03 §5.6)
             continue
         out.append(inc)
         if inc["start"] >= now - 90 * 86400:
@@ -353,7 +380,7 @@ def load_incidents(log_dir, now, cache=None):
 
 
 PRESSURE_WORD = {1: "normal", 2: "warning", 4: "critical"}
-ALARMING = ("jetsam", "stall", "unowned_memory", "disk_low", "disk_filling", "pressure_flapping", "daemon_error")
+ALARMING = ("jetsam", "oom_kill", "stall", "unowned_memory", "disk_low", "disk_filling", "pressure_flapping", "daemon_error")
 VOLUME_WORD = {"mounted": "mounted", "unmounted": "unmounted", "watched": "watched", "unwatched": "no longer watched"}
 
 
@@ -380,6 +407,11 @@ def event_text(e):
         return "pressure flapping, %d flips" % num("flips")
     if k == "jetsam":
         return "%d killed by jetsam" % num("kills") if num("kills") > 0 else "jetsam report"
+    if k == "oom_kill":  # Linux (03 §5.5): the victims of the kernel's OOM killer, systemd-oomd or earlyoom
+        names = ", ".join(str(n)[:24] for n in list((e.get("top") or {}) if isinstance(e.get("top"), dict) else {})[:2])
+        n = num("kills") + num("cgroup")    # (since 1.13.0 `kills` is the machine's, `cgroup` those at a limit)
+        return "%d OOM-killed%s%s" % (n, " at a container's limit" if n and not num("kills") else "",
+                                       " · " + names if names else "")
     if k == "sleep_gap":
         return "asleep " + view.duration(num("seconds"))
     if k == "stall":
@@ -434,7 +466,7 @@ def chart_event(e, memo=None):
         kind, text = memo.setdefault(kind, kind), memo.setdefault(text, text)
     top = e.get("top") if kind == "jetsam" and isinstance(e.get("top"), dict) else {}   # (only jetsam's is added up)
     top = {str(k)[:64]: v for k, v in list(top.items())[:32] if isinstance(v, int) and not isinstance(v, bool)}
-    return view.ChartEv(float(e["t"]), kind, text, kind in ALARMING, int(_num(e.get("kills"))), top or None,
+    return view.ChartEv(float(e["t"]), kind, text, kind in ALARMING and not oomph.calm_event(e), int(_num(e.get("kills"))), top or None,
                         _num(e.get("seconds")) or 0)
 
 
@@ -578,45 +610,42 @@ class Day:
 
 
 def _read_day(path, old, res=False):
-    """A day's file into a Day: on from `old`'s offset when it is the same plain file grown, else
-    whole. A .gz that ends early is not kept (the logger may be writing it: tried again later)."""
-    try:
-        st = os.stat(path)
-    except OSError:
+    """A day's file (_open_day) into a Day: on from `old`'s offset when it is the same plain file
+    grown, else whole. A .gz that ends early is not kept (the logger may be writing it: tried again
+    later). At most DAY_CAP bytes (inflated) are read per call; a line over LINE_MAX is skipped."""
+    f, st = _open_day(path)
+    if f is None:
         return None
-    sig = (path, st.st_ino, st.st_size, st.st_mtime)
-    if old is not None and old.sig == sig:
-        return old
-    if path.endswith(".gz"):
-        d = Day(path, st.st_ino, res)
-        n = 0
+    with f:
+        sig = (path, st.st_ino, st.st_size, st.st_mtime)
+        if old is not None and old.sig == sig:
+            return old
+        if path.endswith(".gz"):
+            d = Day(path, st.st_ino, res)
+            try:
+                for b, ok in _pieces(f, DAY_CAP):
+                    if ok:
+                        d.add(b)
+            except (OSError, EOFError, ValueError, zlib.error):
+                return None
+            d.sig = sig
+            return d
+        d = old if old is not None and old.path == path and old.ino == st.st_ino and st.st_size >= old.off else None
+        if d is None:
+            d = Day(path, st.st_ino, res)
         try:
-            with gzip.open(path, "rb") as f:
-                for line in f:
-                    n += len(line)
-                    if n > DAY_CAP:
-                        break
-                    d.add(line)
-        except (OSError, EOFError, ValueError, zlib.error):
-            return None
-        d.sig = sig
-        return d
-    d = old if old is not None and old.path == path and old.ino == st.st_ino and st.st_size >= old.off else None
-    if d is None:
-        d = Day(path, st.st_ino, res)
-    try:
-        with open(path, "rb") as f:
+            skip = False
             if d.off == 0 and st.st_size > DAY_CAP:
-                f.seek(st.st_size - DAY_CAP)
-                d.off = st.st_size - DAY_CAP + len(f.readline())
+                d.off, skip = st.st_size - DAY_CAP, True        # a piece of a line first
             f.seek(d.off)
-            for line in f:
-                if not line.endswith(b"\n"):
+            for b, ok in _pieces(f, DAY_CAP, skip):
+                if ok and not b.endswith(b"\n"):
                     break                       # a line still being written: read it whole next time
-                d.off += len(line)
-                d.add(line)
-    except OSError:
-        return old
+                d.off += len(b)
+                if ok:
+                    d.add(b)
+        except (OSError, ValueError):
+            return old
     d.sig = sig
     return d
 
@@ -741,8 +770,8 @@ def install_hint():
     here = os.path.dirname(os.path.realpath(oomph.__file__))
     if "/Contents/Resources" in here:
         return "Logging is off: click Activate in the app"
-    if sys.platform.startswith("linux"):  # no logger on Linux yet (1.9.4): the readings of this run only.
-        return "Logging is off: live readings only"  # short: at 80 columns a longer status would give way to the keys
+    if sys.platform.startswith("linux"):  # the Linux logger is installed from a checkout (1.13.0): doctor says how
+        return "Logging is off: see oomph doctor"  # short: at 80 columns a longer status would give way to the keys
     for cand in (os.path.join(here, "install.sh"), os.path.join(os.path.dirname(here), "install.sh")):
         if os.path.isfile(cand):
             home = os.path.expanduser("~")

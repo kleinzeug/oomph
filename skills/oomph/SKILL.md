@@ -78,7 +78,7 @@ fix. Pass its fix lines on to the user; don't run them yourself (most need `sudo
 | `OOMPH session` | This Claude session's memory: its whole process tree, total, biggest children (pid, name, MB). |
 | `OOMPH wait --timeout 10m [--free 4G]` | Blocks until memory is ok again. Exit 1 on timeout. |
 | `OOMPH status --json` | Full sample: memory breakdown, swap, disk, top processes and apps, all Claude sessions. |
-| `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger: a Mac's, for now) and their summaries; `--html` opens the report. Summaries also carry the CPU, GPU and disk peaks where recorded (`max_cpu_busy`, `max_gpu_*`, `min_free_gb`). |
+| `OOMPH incidents` / `OOMPH incident latest` | Recorded incidents (needs the logger: a Mac's, or Linux with `sudo linux/install.sh --system`) and their summaries; `--html` writes the report into a folder of your own and prints its path (and opens it where there is a desktop). `incidents --all` adds Linux's quiet ones (containers at their own limit). Summaries also carry the CPU, GPU and disk peaks where recorded (`max_cpu_busy`, `max_gpu_*`, `min_free_gb`). |
 
 The MCP tools map one-to-one: `reserve_memory` (gb, purpose, wait_s ≤ 300, ttl_min,
 ticket), `update_reservation` (id, gb?, ttl_min?, purpose?), `release_memory` (id or
@@ -238,7 +238,7 @@ session's own work.
   figure is also `grantable_gb` ("left to grant").
 - **ledger** (`ledger.kind` in `check --json`, `reservations --json` and the MCP answers):
   `shared` means you coordinate with every session on the machine (a Mac: all accounts);
-  `user` means only with your own user's sessions (Linux until a machine-wide install exists).
+  `user` means only with your own user's sessions (Linux without the machine's logger install).
 - **disks** (`resources.disks` in `check --json`, `resources --json` and `memory_check`): each
   disk says whether the user `pinned` it (`OOMPH volumes watch PATH`); a pinned disk carries
   its floors `low_gb` and `crit_gb` and its `level`, and a low or critical one raises your
@@ -260,6 +260,9 @@ session's own work.
 - The safety margin is 15% of RAM, at most 8 GB, so that work used as reserved never makes
   the machine tight by itself. A request that cannot fit even alone (more than RAM and swap
   can hold) is `refused` with the most you can ask for.
-- There is no jetsam and no unowned-memory figure on Linux, and no incidents yet: the
-  kernel's OOM killer is what kills. A process that died with exit 137 / SIGKILL under
-  pressure was most likely killed by it.
+- There is no jetsam and no unowned-memory figure on Linux: the kernel's OOM killer (or
+  systemd-oomd, earlyoom) is what kills. A process that died with exit 137 / SIGKILL under
+  pressure was most likely killed by it. Where the machine's logger is installed
+  (`oomph doctor` says "logger running"), `oomph incidents` and `oomph incident latest`
+  name what was killed and when; kills of a container at its own memory limit are quiet
+  incidents (`oomph incidents --all`).

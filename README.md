@@ -187,9 +187,10 @@ ad-hoc signed; no Apple account is needed.
 On Ubuntu 22.04 and newer, Debian 12 and the RHEL 9 family (Python 3.9+, cgroup v2),
 `oomph` gives agents the same commands, MCP tools, skill and exit codes as on a Mac:
 `check`, `reserve`, `run`, `mcp`, `hook`, `doctor` and `oomph top`. No root, nothing
-system-wide: it installs into your `~/.local`, every reading is live (there is no Linux
-logger yet, so no history or incidents), and the reservation ledger is your own, shared
-by your own sessions. Inside a container or a limited cgroup it speaks about that cgroup.
+system-wide: it installs into your `~/.local`, every reading is live, and the reservation
+ledger is your own, shared by your own sessions. Inside a container or a limited cgroup it
+speaks about that cgroup. The logger, with history, incidents and kills by name, is the
+machine's install below.
 
 ```sh
 git clone https://github.com/kleinzeug/oomph.git
@@ -203,6 +204,38 @@ its own ledger, as any user does (under `sudo` they refuse: install as yourself)
 `sudo oomph run …` reserves in the ledger of the user who ran sudo; if your sessions set
 `XDG_STATE_HOME`, keep it for sudo (`sudo --preserve-env=XDG_STATE_HOME`), or it uses the
 default `~/.local/state` and does not meet them.
+
+### On Linux, for the machine: the logger (root once)
+
+```sh
+sudo oomph/linux/install.sh --system     # the service oomphd, /usr/local/bin/oomph, the machine's ledger
+oomph doctor                             # logger, kills, alerts, who may use the ledger
+journalctl -u oomphd -p crit             # incidents as they open, and kills in them
+```
+
+The logger runs as the systemd service `oomphd`, as the system user `oomphd`, with **no
+capability, no network and no devices** (`systemd-analyze security oomphd` rates it 0.8, 1.0 with the NVIDIA drop-in). It
+samples every 30 s (5 s under pressure) into `/var/log/oomph`, readable by every local
+account as on a Mac, and keeps 14 days, with incidents (90 days) and their reports. It learns
+of kills from the journal (the service is in group `systemd-journal`): the kernel's OOM killer,
+systemd-oomd and earlyoom, each victim counted once and named (`--no-journal` counts them
+without names). A machine-wide kill opens an incident at once, headlined by it; a container
+that keeps hitting its own memory limit makes one quiet incident a day, which `oomph
+incidents` leaves out (`--all` lists it). It also records CPU, disks, I/O and NVIDIA cards
+(utilisation and memory per card and per process, through `nvidia-smi`, a program of its own:
+no GPU library is loaded into the logger; the installer lets the service open the cards).
+
+The reservation ledger becomes the machine's, `/var/lib/oomph/ledger`, open to every local
+account as `/Users/Shared/oomph` is on a Mac; `oomph doctor` says how to keep it to a group.
+To hear of incidents elsewhere, put a script into `/etc/oomph/alert.d` (examples for ntfy, a
+Slack webhook and mail in `/usr/local/libexec/oomph/alert.d.examples`), then
+`sudo systemctl enable --now oomph-alert.path`; `sudo oomph alert --test` tries it the way the
+unit runs it. Scripts run as a throwaway account that may reach the network, which the logger
+may not, with variables cut to a safe alphabet. They stay readable by every account (mode 755),
+so secrets (a topic, a webhook's URL, a password) go into `/etc/oomph/alert.secret` (root's,
+0600), which the unit hands to them as `$CREDENTIALS_DIRECTORY/alert`. `sudo linux/install.sh --system` again updates it;
+`sudo linux/uninstall.sh --system` removes it (`--purge` also the logs, the ledger and the
+account).
 
 ### Activating the logger
 
@@ -279,6 +312,10 @@ oomph ps --cpu                  # the busiest processes now (--gpu, --io: writin
 oomph volumes --all             # the disks oomph records, and the ones it ignores and why
 oomph resources                 # memory, cores, GPU and disks of this Mac, and which can be reserved
 ```
+
+An HTML report (`html`, `incident … --html`, `ai-report`) goes to the file named with `-o`, else, from
+1.13.0, to a new file of your own each time (`oomph-report-<random>.html` in `$TMPDIR`, mode 0600, removed
+after a week), whose path it prints.
 
 From 1.9.1 the logger also records the CPU (cores busy, per process too), the thermal level, the
 GPU (how busy, from the IO registry, and its memory), reads and writes to disk, and the free space
@@ -680,7 +717,8 @@ provider only if its owner allowed it there (`sudo oomph share ai on`; off by de
 daemon/oomphd.py                  the sampler daemon (root)
 daemon/oomph.py                   CLI, summaries and HTML reports (shared with the daemon), the path table
 daemon/oomph_darwin.py            everything that measures a Mac (the backend the daemon and CLI call)
-daemon/oomph_linux.py             everything that measures a Linux machine, from /proc and /sys (no root)
+daemon/oomph_linux.py             everything that measures a Linux machine, from /proc and /sys (no root); kills
+                                  from the journal, NVIDIA cards through nvidia-smi
 daemon/oomph_ioreport.py          the IOReport helper: the GPU's performance states, as nobody (never root)
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
@@ -691,7 +729,10 @@ app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Cha
 app/Info.plist
 build-app.sh                      builds oomph.app and bundles the daemon + scripts into it
 install.sh / uninstall.sh         install or remove the daemon (run as root)
-linux/install.sh, uninstall.sh    install or remove oomph for one Linux user, in ~/.local (no root)
+linux/install.sh, uninstall.sh    install or remove oomph for one Linux user, in ~/.local (no root), or with
+                                  --system the machine's logger (root once; linux/system.sh)
+linux/oomphd.service              the logger's unit: no capability, no network, no devices
+linux/oomph-alert.path, .service  the alert hooks of /etc/oomph/alert.d (examples: linux/alert.d.examples)
 skills/oomph/SKILL.md             the Claude skill (raw link above)
 tools/selftest.py                 unprivileged end-to-end check of daemon + CLI (also run by CI)
 tools/linuxtest.py                Linux: the backend on recorded machines, the CLI's exit codes, the installer

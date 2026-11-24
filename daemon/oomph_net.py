@@ -290,7 +290,8 @@ FINISHED_FIELDS = ("key", "id", "purpose", "project", "gb", "holder", "peak_gb",
                    "ended", "waited_s", "held_s")
 RECORD_FIELDS = ("event", "t", "key", "id", "purpose", "project", "holder", "gb", "requested", "granted", "ended",
                  "outcome", "peak_gb", "used_gb", "expires", "change", "backfilled", "waited_s", "held_s")
-INCIDENT_FIELDS = ("id", "start", "start_iso", "last_trigger", "open", "end", "end_iso", "opened_by", "continues")
+INCIDENT_FIELDS = ("id", "start", "start_iso", "last_trigger", "open", "end", "end_iso", "opened_by", "continues",
+                   "quiet", "repeats", "more")
 
 
 def _segments(x):
@@ -324,8 +325,12 @@ def record_out(rec):
 
 def incident_out(inc):
     """An incident.json as it may leave the machine: its named fields, reasons as kind, desc and
-    t, the summary scrubbed."""
+    t, a quiet incident's cgroups (Linux, 03 §5.6: `quiet` keeps it out of every viewer's news), the
+    summary scrubbed."""
     out = oomph._fields(inc, INCIDENT_FIELDS, 200)
+    if isinstance(inc.get("cgroups"), list):
+        out["cgroups"] = [oomph._fields(c, ("name", "ooms", "first", "last"), 200) for c in inc["cgroups"][:20]
+                          if isinstance(c, dict)]
     out["reasons"] = [oomph._fields(r, ("kind", "desc", "t"), 200)
                       for r in (inc.get("reasons") if isinstance(inc.get("reasons"), list) else [])[:64]
                       if isinstance(r, dict)]
@@ -611,7 +616,8 @@ class Server:
             lines.append(b)
             size += len(b) + 1
             nxt = iid
-        open_now = [i for i in ids[-30:] if (self.incident(i) or {}).get("open") is True]
+        open_now = [i for i in ids[-30:] if (self.incident(i) or {}).get("open") is True]  # quiet ones too: a mirror
+        # fetches an open incident again until it closes, and a quiet one grows (viewers leave it out by its flag)
         return {"enc": "zlib+b64", "data": pack(lines), "n": len(lines), "next": nxt, "more": more,
                 "skipped": skipped, "open": open_now}
 
@@ -651,12 +657,28 @@ class Server:
             if k in m:
                 out[k] = m[k]
         off = time.localtime(self.now()).tm_gmtoff
+        out["logs"] = self.logs(cur)
         out.update(ram_gb=(cur or {}).get("ram_gb"), version=oomph.VERSION, logger=d.get("version"),
                    interval=d.get("interval") if oomph._num(d.get("interval"), 1, 3600) else 30,
                    tz="%s%02d:%02d" % ("-" if off < 0 else "+", abs(off) // 3600, abs(off) % 3600 // 60),
                    retention_days=RETENTION_DAYS, oldest=self.oldest(), now=self.now(),
                    caps=self.caps())
         return out
+
+    def logs(self, cur):
+        """Whether this machine's logs can be served (roadmap §4.3, from 03): `ok` (a logger's current
+        sample), `denied` (its folder is there, but this account may not read it), `absent` (no logger has
+        written here: a Linux machine with oomph for agents only)."""
+        if cur is not None:
+            return "ok"
+        try:
+            os.listdir(self.log_dir)
+        except PermissionError:
+            return "denied"
+        except OSError:
+            return "absent"
+        return "denied" if os.path.exists(self.path("current.json")) and not os.access(self.path("current.json"), os.R_OK) \
+            else "absent"
 
     def caps(self):
         return list(CAPS) + ([AI_CAP] if self.ai else [])
@@ -733,7 +755,13 @@ class Server:
             return []
 
     def incident(self, iid):
-        f = _open_regular(os.path.join(self.log_dir, "incidents", iid, "incident.json"))
+        d = os.path.join(self.log_dir, "incidents", iid)
+        try:  # a real folder only: the logger's account could have put a link there (03 §12.3)
+            if not stat.S_ISDIR(os.lstat(d).st_mode):
+                return None
+        except OSError:
+            return None
+        f = _open_regular(os.path.join(d, "incident.json"))
         if f is None:
             return None
         with f:

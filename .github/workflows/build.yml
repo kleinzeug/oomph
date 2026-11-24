@@ -33,7 +33,7 @@ jobs:
       - name: Lint scripts and plists
         run: |
           bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
-          sh -n linux/install.sh linux/uninstall.sh
+          sh -n linux/install.sh linux/uninstall.sh linux/system.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
           /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py tools/selftest.py tools/nettest.py tools/sharetest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/connectvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/renderfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
@@ -279,9 +279,9 @@ jobs:
 
       - name: Lint
         run: |
-          sh -n linux/install.sh linux/uninstall.sh
+          sh -n linux/install.sh linux/uninstall.sh linux/system.sh
           bash -n install.sh uninstall.sh
-          shellcheck -S error linux/install.sh linux/uninstall.sh
+          shellcheck -S error linux/install.sh linux/uninstall.sh linux/system.sh linux/alert.d.examples/10-ntfy linux/alert.d.examples/20-slack-webhook linux/alert.d.examples/30-mail
           python3 -I -m py_compile daemon/*.py tools/*.py
 
       - name: Import without macOS, doctor
@@ -312,10 +312,34 @@ jobs:
             runuser -u tester -- env HOME=/home/tester OOMPH_LINUXTEST_STRICT=1 sh -c "cd /tmp && python3 -I -B /src/tools/linuxtest.py live linux"
             cd /tmp && HOME=/root python3 -I -B /src/tools/linuxtest.py root'
 
+  linux-logger:
+    # The Linux logger for real (1.13.0, roadmap 03 §15.5): as root on the runner, which is thrown away
+    # afterwards. linux/install.sh --system installs and starts the service oomphd; the test reads its
+    # process status (no capability, NoNewPrivs, seccomp), rates both units with systemd-analyze security
+    # (at most 2.5), OOM-kills a scope at its 64 MB limit and finds the victim named in events.jsonl within two
+    # samples, makes a slice OOM five times (one quiet incident), runs a hook from /etc/oomph/alert.d through
+    # oomph-alert.path, lets two accounts reserve in the one ledger /var/lib/oomph/ledger, asks serve --stdio
+    # and doctor, and uninstalls with --purge (nothing left, the account gone).
+    name: Linux logger as root (ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the version derives from `git describe`
+
+      - name: Install the service, provoke kills, run a hook, uninstall
+        run: |
+          systemctl --version | head -1
+          sudo OOMPH_LINUXTEST_STRICT=1 python3 -I -B tools/linuxtest.py service
+
   linux-container:
     # The same on Debian 12 and Rocky 9 user space (Python 3.11 and 3.9), in containers on an Ubuntu
-    # runner: the runner's kernel, no systemd; the self-test as an unprivileged user, then the
-    # root part (the job's own user is root: root's own ledger in place, install.sh as root).
+    # runner: the runner's kernel, no running systemd; the self-test as an unprivileged user (its logger
+    # part rates oomphd.service, with and without the NVIDIA drop-in, and oomph-alert.service with these
+    # systems' own `systemd-analyze security --offline`), then the root part (the job's own user is root:
+    # root's own ledger in place, install.sh as root). The service itself is installed for real on Ubuntu only.
     name: Linux (${{ matrix.image }})
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
@@ -332,10 +356,11 @@ jobs:
       - name: Python, git, tmux
         run: |
           if command -v apt-get >/dev/null; then
-            apt-get update -q && apt-get install -y -q python3 git tmux procps util-linux ca-certificates openssl
+            apt-get update -q && apt-get install -y -q python3 git tmux procps util-linux ca-certificates openssl systemd
           else
-            dnf install -y -q python3 git tmux procps-ng diffutils findutils util-linux shadow-utils openssl
+            dnf install -y -q python3 git tmux procps-ng diffutils findutils util-linux shadow-utils openssl systemd
           fi
+          systemd-analyze --version | head -1   # (systemd 252: the logger part rates both units offline)
           python3 --version
           useradd -m tester
 

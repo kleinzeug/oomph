@@ -1,0 +1,16 @@
+#!/bin/sh
+# oomph alert hook: a mail through an SMTP server (curl speaks SMTP; sendmail's set-group-id drop is not
+# available to the hook's account). Copy to /etc/oomph/alert.d/ (root's, mode 755: the unit runs it as a
+# throwaway account, which must read it), set the three lines, and put the login into /etc/oomph/alert.secret
+# (root's, 0600; the unit hands it to the hook as $CREDENTIALS_DIRECTORY/alert):  SMTP_LOGIN=alerts@example.com:password
+# The login goes to curl in a config on fd 3, never on its command line (which other accounts can read in /proc).
+SMTP="smtps://smtp.example.com:465"
+FROM="alerts@example.com"
+TO="you@example.com"
+secret() { sed -n "s/^$1=//p" "${CREDENTIALS_DIRECTORY:-/nonexistent}/alert" 2>/dev/null | head -n 1 | sed 's/[\\"]/\\&/g'; }
+LOGIN=$(secret SMTP_LOGIN)
+[ -n "$LOGIN" ] || { echo "no SMTP_LOGIN= line in /etc/oomph/alert.secret" >&2; exit 1; }
+printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s\r\n%s\r\n' "$FROM" "$TO" "$OOMPH_TITLE" "$OOMPH_MESSAGE" "$OOMPH_REPORT" |
+  exec curl -fsS -m 25 --url "$SMTP" --ssl-reqd --mail-from "$FROM" --mail-rcpt "$TO" --upload-file - -K /dev/fd/3 3<<END
+user = "$LOGIN"
+END

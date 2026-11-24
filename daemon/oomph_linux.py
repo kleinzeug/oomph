@@ -1,12 +1,15 @@
 """oomph's backend for Linux: what measures a Linux machine, behind the backend contract of
-oomph_darwin.py (roadmap 03 §4.3). Text files under /proc and /sys only: no ctypes, no
-subprocess, no privilege. Every path goes through OOMPH_SYSROOT (default empty), so that a
-recorded tree stands in for a machine in the tests (tools/linuxfixture.py), on a Mac too.
-Nothing happens at import.
+oomph_darwin.py (roadmap 03 §4.3). Text files under /proc and /sys, and two programs of the system
+(journalctl for kills, nvidia-smi for NVIDIA cards), each in a child process: no ctypes, no GPU
+library, no privilege. Every path goes through OOMPH_SYSROOT (default empty), so that a recorded
+tree stands in for a machine in the tests (tools/linuxfixture.py), on a Mac too. Nothing happens
+at import.
 
-1.9.4 is Linux for agents (step L1): checks, reservations, `oomph run`, the MCP server, the hook
-and `oomph top` measure live; there is no logger yet, so no kills by name, no presence, no
-notifications. What the design settled from the fact spike (03 Appendix C.3) and applies here:
+1.9.4 was Linux for agents (step L1): checks, reservations, `oomph run`, the MCP server, the hook
+and `oomph top` measure live. 1.13.0 adds the logger (step L2): oomphd.py runs as the systemd
+service oomphd, without capabilities or network, and this backend gives it kills from the journal,
+CPU, disks, I/O and NVIDIA cards. What the design settled from the fact spike (03 Appendix C.3)
+and applies here:
 
   memory     /proc/meminfo; MemAvailable is "available" (03 §5.2). Compressed is zswap plus the RAM
              of zram devices that are swap; swap is what lies on disk.
@@ -20,6 +23,9 @@ notifications. What the design settled from the fact spike (03 Appendix C.3) and
   scope      inside a cgroup with a memory limit (a container, a systemd-run scope) the limit is the
              machine: figures, stall time and the margin are the cgroup's, and the level is the worse
              of the cgroup's and the host's (03 §5.14).
+  kills      the journal, one victim counted once however often a group kill names it, the cursor
+             always one this watcher read (C.3 rows 9, 13); without a readable journal, the kernel's
+             counter (KillWatcher).
 
 The thresholds live in P; `level`, `margin` and `oversize_limit` are pure functions of numbers,
 so oomph.py judges a Linux sample with them on any system.
@@ -38,6 +44,10 @@ MB = 1024 * KB
 GB = 1024 * MB
 ROOT = os.environ.get("OOMPH_SYSROOT", "")
 CAP = 1 << 20              # bytes read of any one file
+try:
+    CLK_TCK = os.sysconf("SC_CLK_TCK") or 100
+except (AttributeError, ValueError, OSError):
+    CLK_TCK = 100
 CG_ROOT = "/sys/fs/cgroup"
 PF_KTHREAD = 0x00200000
 
@@ -475,8 +485,9 @@ _AGENT_ARG = re.compile(r"(^|/)(claude|claude-code/cli\.js)$")
 
 
 def _stat(pid):
-    """(comm, ppid, flags, starttime) from /proc/<pid>/stat: the name is what lies between the
-    first "(" and the LAST ")" (names hold spaces and parentheses)."""
+    """(comm, ppid, flags, starttime, (utime, stime, cutime, cstime)) from /proc/<pid>/stat, times in
+    clock ticks: the name is what lies between the first "(" and the LAST ")" (names hold spaces and
+    parentheses)."""
     t = read("/proc/%d/stat" % pid, 4096)
     if not t:
         return None
@@ -486,7 +497,18 @@ def _stat(pid):
     f = t[b + 2:].split()
     if len(f) < 20:
         return None
-    return t[a + 1:b], _int(f[1], 0), _int(f[6], 0), _int(f[19], 0)
+    return t[a + 1:b], _int(f[1], 0), _int(f[6], 0), _int(f[19], 0), tuple(_int(x, 0) for x in f[11:15])
+
+
+def _io(pid):
+    """(read_bytes, write_bytes) of /proc/<pid>/io: what reached storage. None where it cannot be read."""
+    out = {}
+    for line in (read("/proc/%d/io" % pid, 4096) or "").splitlines():
+        k, _, v = line.partition(":")
+        if k in ("read_bytes", "write_bytes"):
+            out[k] = _int(v.strip())
+    r, w = out.get("read_bytes"), out.get("write_bytes")
+    return (r, w) if isinstance(r, int) and isinstance(w, int) else None
 
 
 def _status(pid):
@@ -556,18 +578,22 @@ def _ancestors(pids):
 
 
 def collect_procs(only=None):
-    """{pid: {pid ppid uid name start fp rss path cg nspid}} of every process this caller may see
-    (kernel threads own no memory and are left out). `start` is the start time in clock ticks since
-    boot: compared for equality only. With `only` (pids), those processes and their ancestors,
-    without a full scan (03 §4.4): what finding one's own session needs."""
+    """{pid: {pid ppid uid name start fp rss path cg nspid cpu_s child_s t0}} of every process this
+    caller may see (kernel threads own no memory and are left out). `start` is the start time in clock
+    ticks since boot: compared for equality only; `t0` is that time as a date. `cpu_s` and `child_s`
+    are CPU seconds of the process and of the children it reaped, from the world-readable stat file;
+    `rd` and `wr`, bytes read from and written to storage, only where /proc/<pid>/io may be read (the
+    caller's own processes; root's: all) and only in a full scan (03 §11.2). With `only` (pids), those
+    processes and their ancestors, without a full scan (03 §4.4): what finding one's own session needs."""
     procs = {}
     pids = _ancestors(only) if only is not None else list_pids()
     live = set()
+    bt, me = boot_time(), os.geteuid()
     for pid in pids:
         st = _stat(pid)
         if not st:
             continue
-        comm, ppid, flags, start = st
+        comm, ppid, flags, start, ticks = st
         if flags & PF_KTHREAD:
             continue
         s = _status(pid)
@@ -579,7 +605,14 @@ def collect_procs(only=None):
         name, path, cg, agent, con = _static_of(pid, start, comm)
         live.add((pid, start))
         p = procs[pid] = {"pid": pid, "ppid": ppid, "uid": uid, "name": name, "start": start,
-                          "fp": kb("RssAnon") + kb("VmSwap"), "rss": kb("VmRSS"), "path": path}
+                          "fp": kb("RssAnon") + kb("VmSwap"), "rss": kb("VmRSS"), "path": path,
+                          "cpu_s": (ticks[0] + ticks[1]) / CLK_TCK, "child_s": (ticks[2] + ticks[3]) / CLK_TCK}
+        if bt is not None:
+            p["t0"] = bt + start / CLK_TCK  # when it started (epoch): the Meter's "new since the last reading"
+        if only is None and (me == 0 or uid == me):  # /proc/<pid>/io: one's own processes, or as root
+            io = _io(pid)
+            if io:
+                p["rd"], p["wr"] = io
         if cg:
             p["cg"] = cg
         ns = s.get("NSpid")
@@ -718,6 +751,19 @@ def uptime_s():
     return time.clock_gettime(time.CLOCK_MONOTONIC)
 
 
+@functools.lru_cache(maxsize=4)
+def _btime(root):
+    for line in (read("/proc/stat") or "").splitlines():
+        if line.startswith("btime "):
+            return _int(line.split()[1])
+    return None
+
+
+def boot_time():
+    """When this machine booted (epoch seconds, the btime line of /proc/stat), read once."""
+    return _btime(ROOT)
+
+
 def boot_id():
     """Changes at every boot (/proc/sys/kernel/random/boot_id)."""
     v = (read("/proc/sys/kernel/random/boot_id", 128) or "").strip()
@@ -816,21 +862,1018 @@ def machine(all_procs=None):
     m["measures"] = {"memory": True, "psi": os.path.exists(_p("/proc/pressure/memory")), "kills": "count",
                      "cgroup": cgroup_version(), "zram": z["n"] > 0, "zswap": _zswap(),
                      "presence": "none", "footprint": "anon+swap", "names": "argv", "containers": "main-program",
-                     "unowned": False, "scope": sc["kind"],
+                     "unowned": False, "scope": sc["kind"], "cpu": "proc-stat", "io": "diskstats", "disks": "mountinfo",
+                     "gpu": "nvidia-smi" if gpu_available() else "none",
                      "all_procs": (os.geteuid() == 0 or hp == "0") if all_procs is None else bool(all_procs)}
     return m
 
 
-# ------------------------------------------------------------------ telling somebody
+# ------------------------------------------------------------------ CPU, disks, I/O (03 §11.2)
+# What the logger's Meter and Volumes turn into the sample's cpu, io and disks blocks, the same
+# readings the Mac's backend gives (oomph_darwin.py lists the contract). World-readable files only.
+@functools.lru_cache(maxsize=1)
+def cpu_topology():
+    """{"n", "p", "e", "e_ids"}: the logical cores /proc/stat counts (no performance and efficiency
+    clusters on Linux in this version). Read once."""
+    return {"n": len(cpu_ticks() or ()) or os.cpu_count() or 1, "p": None, "e": None, "e_ids": None}
+
+
+def cpu_ticks():
+    """Per core [user, system, idle, nice] ticks since boot, as the Mac's backend gives them: system
+    holds irq and softirq, idle holds iowait and steal (time this machine did not have). None where
+    /proc/stat cannot be read."""
+    rows = []
+    for line in (read("/proc/stat") or "").splitlines():
+        if line.startswith("cpu") and line[3:4].isdigit():
+            f = [_int(x, 0) for x in line.split()[1:9]] + [0] * 8
+            user, nice, system, idle, iowait, irq, softirq, steal = f[:8]
+            rows.append([user, system + irq + softirq, idle + iowait + steal, nice])
+    return rows or None
+
+
+_VIRTUAL_DISK = re.compile(r"(loop|ram|zram|dm-|md|nbd|sr|fd)\d")
+
+
+def _phys_disks():
+    """The names of /sys/block that are disks of their own: not a loop, RAM, zram, device-mapper, md
+    or optical device (their bytes are a real disk's bytes once more, or no disk's)."""
+    try:
+        names = os.listdir(_p("/sys/block"))
+    except OSError:
+        return set()
+    out = set()
+    for n in names:
+        try:
+            virt = "/devices/virtual/" in os.path.realpath(_p("/sys/block/" + n))
+        except OSError:
+            virt = True
+        if not virt and not _VIRTUAL_DISK.match(n):
+            out.add(n)
+    return out
+
+
+def disk_bytes():
+    """(read, written) bytes of every physical disk since boot, from /proc/diskstats (sectors of 512
+    bytes, whatever the disk's own size): the sample's `io` block counts all processes, other users'
+    included, which /proc/<pid>/io cannot. None where it cannot be read."""
+    text = read("/proc/diskstats")
+    if text is None:
+        return None
+    disks, r, w = _phys_disks(), 0, 0
+    for line in text.splitlines():
+        f = line.split()
+        if len(f) >= 10 and f[2] in disks:
+            r, w = r + _int(f[5], 0) * 512, w + _int(f[9], 0) * 512
+    return r, w
+
+
+LOCAL_FS = frozenset(("ext2", "ext3", "ext4", "xfs", "btrfs", "f2fs", "zfs", "bcachefs", "jfs", "reiserfs", "nilfs2",
+                      "vfat", "exfat", "ntfs", "ntfs3", "fuseblk", "hfsplus"))
+NETWORK_FS = frozenset(("nfs", "nfs4", "cifs", "smb3", "smbfs", "ceph", "glusterfs", "9p", "afs", "lustre", "davfs",
+                        "virtiofs", "sshfs"))
+SYSTEM_MOUNTS = ("/boot", "/efi", "/snap", "/var/lib/snapd", "/var/lib/docker", "/var/lib/containers", "/run", "/proc",
+                 "/sys", "/dev")
+MNT_RDONLY = 0x1
+_OCTAL = re.compile(r"\\([0-7]{3})")
+
+
+def _unoctal(s):
+    """A path as mountinfo writes it: space, tab, newline and backslash as \\040, \\011, \\012, \\134."""
+    return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), s)
+
+
+def mounts():
+    """Every mount of /proc/self/mountinfo, the last one per mount point (what a path there reaches),
+    as the Mac's records: mount, from, fs, flags (MNT_RDONLY when the file system itself is read-only:
+    a sandbox's read-only view of a writable disk is not), dev (st_dev of files on it), majmin, and
+    total_gb, free_gb (what df shows). statvfs is asked only for / and local disk file systems: a
+    network mount whose server is gone would block it. None when the table cannot be read or has no /."""
+    text = read("/proc/self/mountinfo")
+    if not text:
+        return None
+    by = {}
+    for line in text.splitlines():
+        a, sep, b = line.partition(" - ")
+        f, g = a.split(), b.split()
+        if not sep or len(f) < 5 or len(g) < 2:
+            continue
+        mm = f[2].split(":")
+        if len(mm) != 2 or not (mm[0].isdigit() and mm[1].isdigit()):
+            continue
+        mnt, src = _printable(_unoctal(f[4])), _printable(_unoctal(g[1]))
+        by[mnt] = {"mount": mnt, "from": src, "fs": g[0][:32],
+                   "flags": MNT_RDONLY if "ro" in (g[2].split(",") if len(g) > 2 else ()) else 0,
+                   "dev": os.makedev(int(mm[0]), int(mm[1])) & 0xFFFFFFFF, "majmin": "%d:%d" % (int(mm[0]), int(mm[1]))}
+    out = []
+    for r in by.values():
+        if r["mount"] == "/" or (r["fs"] in LOCAL_FS and (r["from"].startswith("/dev/") or r["fs"] in ("zfs", "btrfs"))):
+            try:
+                v = os.statvfs(_p(r["mount"]) if ROOT else r["mount"])
+            except OSError:
+                continue
+            size, free = v.f_blocks * v.f_frsize, v.f_bavail * v.f_frsize
+            if size > 1 << 60 or free > size:
+                if r["mount"] == "/":
+                    return None
+                continue
+            r.update(total_gb=round(size / GB, 1), free_gb=round(free / GB, 1))
+        out.append(r)
+    return out if any(r["mount"] == "/" and "total_gb" in r for r in out) else None
+
+
+def mount_key(rec):
+    return "%s|%s|%s" % (rec.get("from"), rec.get("mount"), rec.get("dev"))
+
+
+def _rawread(path, cap=4096):
+    try:
+        with open(path, "rb") as f:
+            return f.read(cap).decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
+def _udev(majmin):
+    """The file system's UUID and label as udev recorded them (/run/udev/data/b<maj>:<min>,
+    world-readable; /dev/disk/by-uuid is not there inside the logger's sandbox)."""
+    out = {}
+    for line in (read("/run/udev/data/b" + majmin, 64 << 10) or "").splitlines():
+        k, _, v = line.partition("=")
+        if k in ("E:ID_FS_UUID", "E:ID_FS_LABEL"):
+            out[k[2:]] = v.strip()
+    return out
+
+
+def _block_facts(majmin):
+    """What sysfs says about a block device: removable (the disk's own flag), on USB. None for no device."""
+    try:
+        real = os.path.realpath(_p("/sys/dev/block/" + majmin))
+    except OSError:
+        return None
+    if not os.path.isdir(real):
+        return None
+    disk = os.path.dirname(real) if os.path.exists(os.path.join(real, "partition")) else real
+    return {"removable": (_rawread(os.path.join(disk, "removable")) or "").strip() == "1", "usb": "/usb" in real}
+
+
+def volume_facts(dev):
+    """The Mac's slow question (diskutil) has no counterpart: disk_pools reads sysfs and udev itself."""
+    return None
+
+
+def linux_floors(total):
+    """(low, critical) GB of the system's pool on Linux: 5 % and 1 % of it, within 2..20 and 1..5 GB.
+    Swap does not grow there (its size is fixed), so a small server's disk is not red at 19 GB (03 §11.2)."""
+    t = total if isinstance(total, (int, float)) and total > 0 else 0.0
+    return round(max(2.0, min(20.0, 0.05 * t)), 1), round(max(1.0, min(5.0, 0.01 * t)), 1)
+
+
+def _pool(rec):
+    """The device a mount's free space belongs to ("maj:min"): mountinfo's own, or for a file system
+    with an anonymous device (btrfs, zfs: major 0) the device it is mounted from."""
+    if not rec["majmin"].startswith("0:"):
+        return rec["majmin"]
+    base = os.path.basename(rec["from"]) if rec["from"].startswith("/dev/") else ""
+    mm = (read("/sys/class/block/%s/dev" % base, 64) or "").strip() if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", base) else ""
+    return mm if re.fullmatch(r"\d+:\d+", mm) else rec["majmin"]
+
+
+def _classify(r, pool, data_pool):
+    fs, mnt = r.get("fs") or "", r["mount"]
+    if mnt == "/" or (pool == data_pool and not r["flags"] & MNT_RDONLY):
+        return "watched", "the system's pool", "internal"
+    if any(mnt == p or mnt.startswith(p + "/") for p in SYSTEM_MOUNTS):
+        return "ignored", "part of the system", None
+    if fs in NETWORK_FS or (fs.startswith("fuse.") and fs != "fuseblk"):
+        return "ignored", "network file system", None
+    if fs not in LOCAL_FS or "total_gb" not in r:
+        return "ignored", "not a disk", None
+    if r["flags"] & MNT_RDONLY:
+        return "ignored", "read-only", None
+    if r["from"].startswith("/dev/loop"):
+        return "ignored", "disk image", None
+    f = _block_facts(pool)
+    if f and f["removable"]:
+        return "ignored", "removable media", None
+    if f and f["usb"]:
+        return "listed", "external disk", "external"
+    return "listed", "second internal disk", "internal"
+
+
+def disk_pools(recs, facts=None):
+    """(pools, rows) for `mounts()` records, as on the Mac (oomph_darwin.disk_pools): rows are every
+    mount with its class; pools the system's pool (`data`: the file system of /, watched, with the floors
+    of linux_floors) and every listed disk by its file system's UUID (`vol:<UUID>`), else `mnt:` and a
+    hash of the mount point and `weak`. No mount waits for an answer here (no class `pending`)."""
+    root = next((r for r in recs if r["mount"] == "/"), None)
+    data_pool = _pool(root) if root else None
+    rows, listed = [], {}
+    for r in sorted(recs, key=lambda r: r["mount"]):
+        pool = _pool(r)
+        cls, why, kind = _classify(r, pool, data_pool)
+        u = _udev(pool) if cls == "listed" else {}
+        rows.append(dict(r, pool=pool, cls=cls, why=why,
+                         name=_printable(u.get("ID_FS_LABEL") or "")[:64] or os.path.basename(r["mount"]) or r["mount"]))
+        if cls == "listed" and pool not in listed:
+            uuid = u.get("ID_FS_UUID")
+            uuid = uuid if isinstance(uuid, str) and re.fullmatch(r"[0-9A-Za-z-]{1,64}", uuid) else None
+            p = {"id": "vol:" + uuid if uuid else _mount_id(r["mount"]), "name": rows[-1]["name"][:64],
+                 "mount": r["mount"], "dev": pool, "fs": r["fs"], "total_gb": r["total_gb"], "free_gb": r["free_gb"],
+                 "roles": [], "kind": kind, "watch": False}
+            if not uuid:
+                p["weak"] = True
+            listed[pool] = p
+    pools = []
+    if root and "total_gb" in root:
+        low, crit = linux_floors(root["total_gb"])
+        free = root["free_gb"]
+        roles = ["home"] if not any(r["mount"] == "/home" for r in recs) else []
+        pools.append({"id": "data", "name": "System", "mount": "/", "dev": data_pool, "fs": root["fs"],
+                      "total_gb": root["total_gb"], "free_gb": free, "roles": roles + ["tmp"], "watch": True,
+                      "low_gb": low, "crit_gb": crit, "level": "critical" if free < crit else "low" if free < low else "ok"})
+    return pools + list(listed.values()), rows
+
+
+def _mount_id(mount):
+    return "mnt:" + hashlib.sha256(mount.encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+# ------------------------------------------------------------------ NVIDIA cards (roadmap §11: utilisation and memory per card and per process)
+# Read with nvidia-smi, a program of its own: no GPU library is ever loaded into an oomph process,
+# and when the caller is root the program runs as nobody (the device files are 0666; nothing else is
+# needed). The logger itself is never root on Linux. A machine without nvidia-smi has no `gpu` block.
+NVIDIA_SMI = "/usr/bin/nvidia-smi"
+NV_QUERY = ["--query-gpu=index,uuid,name,utilization.gpu,memory.total,memory.used", "--format=csv,noheader,nounits"]
+NV_PMON = ["pmon", "-c", "1", "-s", "um"]
+NV_APPS = ["--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"]
+NV_RETRY_S = 600         # nvidia-smi missing or failing: asked again after this long
+NV_PROCS = 16            # processes kept per card
+_nv = {"off_until": 0.0}
+
+
+def _nobody():
+    """subprocess arguments that make a child of root nobody, with no other groups (03 §12.3: nothing runs
+    as root that does not have to); none for anyone else. Resolved here, in the parent: a lookup in the
+    forked child of a threaded process can deadlock on a lock another thread held."""
+    if os.geteuid() != 0:
+        return {}
+    import pwd
+    try:
+        pw = pwd.getpwnam("nobody")
+        uid, gid = pw.pw_uid, pw.pw_gid
+    except KeyError:
+        uid = gid = 65534
+    return {"user": uid, "group": gid, "extra_groups": []}
+
+
+def run_capped(cmd, cap, timeout, tail=False):
+    """stdout of `cmd` (bytes), at most `cap` of them within `timeout` seconds, else None; as nobody
+    when this process is root. With `tail`, more than `cap` (or the deadline) keeps the last whole lines
+    within `cap` instead. The child is always reaped."""
+    import collections
+    import select
+    import subprocess
+    try:
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/",
+                             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}, **_nobody())
+    except OSError:
+        return None
+    out, n, cut, deadline = collections.deque(), 0, False, time.monotonic() + timeout
+    fd = p.stdout.fileno()
+
+    def kept():
+        b = b"".join(out)
+        return b[b.find(b"\n") + 1:] if cut else b   # a line cut at its front is dropped whole
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([fd], [], [], left)[0]:
+                return kept() if tail else None
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            n += len(b)
+            out.append(b)
+            while n > cap:
+                if not tail:
+                    return None
+                cut, drop = True, out.popleft()
+                n -= len(drop)
+                if n < cap:                           # keep what of it still fits
+                    out.appendleft(drop[n - cap:])
+                    n = cap
+        p.wait(max(0.01, deadline - time.monotonic()))
+        return kept() if p.returncode == 0 or (tail and out) else None
+    except (OSError, subprocess.TimeoutExpired):
+        return kept() if tail and out else None
+    finally:
+        if p.returncode is None:
+            p.kill()
+            try:
+                p.wait(2)
+            except subprocess.TimeoutExpired:
+                pass
+        p.stdout.close()
+
+
+def _num_or_none(x):
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and 0 <= v < 1e9 else None
+
+
+_NV_UUID = re.compile(r"GPU-[0-9a-fA-F-]{8,60}")
+
+
+def parse_nvidia_gpus(text):
+    """The cards of `nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.total,memory.used
+    --format=csv,noheader,nounits`: [{index, uuid, name, util (%), total_mb, used_mb}], a figure None
+    where the driver says "[N/A]" or "[Not Supported]". The name is the driver's, cut and cleaned."""
+    out = []
+    for line in (text or "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) < 6 or not f[0].isdigit():
+            continue
+        num = f[-3:]
+        out.append({"index": int(f[0]), "uuid": f[1] if _NV_UUID.fullmatch(f[1]) else None,
+                    "name": _printable(",".join(f[2:-3]).strip())[:64] or "NVIDIA GPU", "util": _num_or_none(num[0]),
+                    "total_mb": _num_or_none(num[1]), "used_mb": _num_or_none(num[2])})
+    return out[:16]
+
+
+def parse_nvidia_pmon(text):
+    """{card index: {pid: {"sm": %, "mb": MB}}} from `nvidia-smi pmon -c 1 -s um`, by the column names
+    of its header line (they differ between drivers); "-" is a figure nobody measured. A process that
+    uses a card for compute and graphics has two rows: they add up. None when there is no header."""
+    cols, out = None, {}
+    for line in (text or "").splitlines():
+        if line.startswith("#"):
+            h = line[1:].split()
+            if "gpu" in h and "pid" in h and cols is None:
+                cols = h
+            continue
+        f = line.split()
+        if not cols or len(f) < cols.index("pid") + 1:
+            continue
+        row = dict(zip(cols, f))
+        gi, pid = _int(row.get("gpu")), _int(row.get("pid"))
+        if gi is None or pid is None or pid <= 0:
+            continue
+        e = out.setdefault(gi, {}).setdefault(pid, {})
+        for k, col in (("sm", "sm"), ("mb", "fb")):
+            v = _num_or_none(row.get(col))
+            if v is not None:
+                e[k] = e.get(k, 0.0) + v
+    return out if cols else None
+
+
+def parse_nvidia_apps(text):
+    """{card uuid: {pid: MB}} from `nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory
+    --format=csv,noheader,nounits`: the fallback for memory per process where pmon gives none."""
+    out = {}
+    for line in (text or "").splitlines():
+        f = [x.strip() for x in line.split(",")]
+        if len(f) >= 3 and _NV_UUID.fullmatch(f[0]) and f[1].isdigit():
+            mb = _num_or_none(f[2])
+            if mb is not None:
+                d = out.setdefault(f[0], {})
+                d[int(f[1])] = d.get(int(f[1]), 0.0) + mb
+    return out
+
+
+def _nvsmi(args):
+    raw = run_capped([_p(NVIDIA_SMI)] + args, 256 << 10, 4)
+    return raw.decode("utf-8", "replace") if raw is not None else None
+
+
+def gpu_cards():
+    """The NVIDIA cards with what each process uses of them: [{index, uuid, name, util, total_mb,
+    used_mb, procs {pid: {"sm", "mb"}}}], two short runs of nvidia-smi (30 and 100 ms on the Epyc's two
+    RTX 4090). None where there is no nvidia-smi or it lists no card (asked again after NV_RETRY_S)."""
+    now = time.monotonic()
+    if now < _nv["off_until"]:
+        return None
+    if not os.access(_p(NVIDIA_SMI), os.X_OK):
+        _nv["off_until"] = now + NV_RETRY_S
+        return None
+    cards = parse_nvidia_gpus(_nvsmi(NV_QUERY))
+    if not cards:
+        _nv["off_until"] = now + NV_RETRY_S
+        return None
+    per = parse_nvidia_pmon(_nvsmi(NV_PMON))
+    if per is None:  # a driver without pmon: memory per process from the compute apps, no utilisation
+        apps = parse_nvidia_apps(_nvsmi(NV_APPS))
+        per = {c["index"]: {pid: {"mb": mb} for pid, mb in apps.get(c["uuid"], {}).items()} for c in cards}
+    for c in cards:
+        c["procs"] = dict(sorted((per.get(c["index"]) or {}).items(), key=lambda kv: -kv[1].get("mb", 0))[:NV_PROCS])
+    return cards
+
+
+def gpu_available():
+    """Is there an nvidia-smi to ask (for `measures`): no run, just the file."""
+    return os.access(_p(NVIDIA_SMI), os.X_OK)
+
+
+# ------------------------------------------------------------------ kills (03 §5.5, Appendix B, C.3 rows 8 to 13, 32, 33)
+# The kernel's OOM lines, systemd-oomd's and earlyoom's, from one `journalctl -f -o json` child: the
+# logger is in group systemd-journal and holds no capability. Patterns from the kernel's format
+# strings, checked against the lines the fact spike captured on 4.18 to 7.0. Names in them are
+# chosen by whoever named the process: cut and cleaned before they are stored.
+JOURNALCTL = "/usr/bin/journalctl"
+JOURNAL_MATCH = ["_TRANSPORT=kernel", "+", "_SYSTEMD_UNIT=systemd-oomd.service", "+", "_SYSTEMD_UNIT=earlyoom.service"]
+INVOKED = re.compile(r"^(?P<who>.+) invoked oom-killer: gfp_mask=(?P<gfp>0x[0-9a-f]+)\(.*?\), "
+                     r"(?:nodemask=\S+, )?order=(?P<order>-?\d+), oom_score_adj=(?P<adj>-?\d+)")
+SUMMARY = re.compile(r"^oom-kill:constraint=(?P<constraint>CONSTRAINT_\w+),nodemask=[^,]*(?:,[^,=]+=[^,]*)*?"
+                     r",(?:oom_memcg=(?P<memcg>.+?)|global_oom),task_memcg=(?P<task_cg>.+?)"
+                     r",task=(?P<name>.+),pid=(?P<pid>\d+),uid=(?P<uid>\d+)$")
+KILLED = re.compile(r"^(?:(?P<what>Memory cgroup out of memory|Out of memory(?: \(oom_kill_allocating_task\))?): )?"
+                    r"Killed process (?P<pid>\d+) \((?P<name>.+)\),? total-vm:(?P<vm>\d+)kB, anon-rss:(?P<anon>\d+)kB, "
+                    r"file-rss:(?P<file>\d+)kB(?:, shmem-rss:(?P<shmem>\d+)kB)?(?:, UID:(?P<uid>\d+))?")
+KILL_OLD = re.compile(r"^(?P<what>Memory cgroup out of memory|Out of memory(?: \(oom_kill_allocating_task\))?): "
+                      r"Kill process (?P<pid>\d+) \((?P<name>.+)\) score \d+ or sacrifice child")
+OOMD_P = re.compile(r"^Killed (?P<cg>\S+) due to memory pressure for (?P<mon>\S+) being (?P<pct>[\d.]+)% > (?P<lim>[\d.]+)%")
+OOMD_S = re.compile(r"^Killed (?P<cg>\S+) due to memory used \((?P<used>\d+)\) / total \((?P<total>\d+)\) and swap used ")
+EARLY = re.compile(r'^sending (?P<sig>SIGTERM|SIGKILL) to process (?P<pid>\d+) uid (?P<uid>\d+) "(?P<name>.*?)": ')
+REAPED = re.compile(r"^oom_reaper: reaped process \d+|^Tasks in \S+ are going to be killed due to memory\.oom\.group set")
+OTHER_MEM = re.compile(r"page allocation failure|blocked for more than \d+ seconds")
+_CURSOR = re.compile(r"[A-Za-z0-9=;_-]{1,512}")
+LINE_MAX = 64 << 10      # a journal entry longer than this is not one of ours: skipped
+MACHINE_WIDE = ("kernel", "systemd-oomd", "earlyoom")
+
+
+def journal_message(e):
+    """The MESSAGE of a journal entry as text: `journalctl -o json` writes a string, or a list of byte
+    values where the text is not UTF-8; None for anything else."""
+    m = e.get("MESSAGE") if isinstance(e, dict) else None
+    if isinstance(m, str):
+        return m
+    if isinstance(m, list) and len(m) <= LINE_MAX and all(isinstance(x, int) and 0 <= x < 256 for x in m):
+        return bytes(m).decode("utf-8", "replace")
+    return None
+
+
+def _clean(name, n=64):
+    return _printable(str(name).strip())[:n]
+
+
+def headline(fmt, name, *rest, width=44):
+    """An incident headline of at most `width` characters (03 §3.12): the name is what gives way."""
+    whole = fmt % ((name,) + rest)
+    if len(whole) <= width:
+        return whole
+    room = max(1, len(name) - (len(whole) - width) - 1)
+    return fmt % ((name[:room] + "…",) + rest)
+
+
+def kill_headline(v):
+    """The headline of a machine-wide kill, at most 44 characters (03 §6.3): "OOM killer killed node (pid
+    48211, 2.1 GB)", "systemd-oomd killed firefox (3.4 GB)"; the pid goes first, then the name is cut."""
+    size = _gb_text(v["mb"]) if v.get("mb") else None
+    who = "OOM killer" if v["by"] == "kernel" else v["by"]
+    tails = ([" (pid %d, %s)" % (v["pid"], size)] if size and v.get("pid") and v["by"] == "kernel" else []) + \
+        [" (%s)" % size if size else " (pid %d)" % v["pid"] if v.get("pid") else ""]
+    for tail in tails:
+        if len("%s killed %s%s" % (who, v["name"], tail)) <= 44:
+            return "%s killed %s%s" % (who, v["name"], tail)
+    return headline("%s killed %%s%s" % (who, tails[-1].replace("%", "%%")), v["name"])
+
+
+def _gb_text(mb):
+    return "%.1f GB" % (mb / 1024.0) if mb >= 102.4 else "%d MB" % round(mb)
+
+
+class KillWatcher:
+    """The kill watcher of the Linux logger (03 §5.5). One thread follows the journal; the sampler
+    calls flush() once per sample and gets what was killed since the last one.
+
+    Rules, from the fact spike (03 Appendix C.3):
+      one victim, one count   a group kill reports its chosen victim twice (row 9), earlyoom may send
+                              SIGTERM and then SIGKILL: a (killer, pid) seen in the last 30 s is the
+                              same victim, updated, not counted again.
+      the class               from the prefix of the kill line ("Memory cgroup out of memory" or "Out of
+                              memory") on every kernel: summaries are rate-limited, kill lines are not.
+      OOM events              a summary line, or a run of kill lines of one class and cgroup within a
+                              second that no summary preceded; a cgroup with 5 in 10 minutes is a storm.
+      the cursor              only that of an entry this watcher read with its own filter, so the next
+                              start resumes exactly after it (row 13: systemd 249 drops the first match
+                              after a foreign cursor). The first start ever reads this boot from its
+                              beginning, without counting what happened before the logger started: told
+                              by the entry's monotonic time of this boot (a wall clock stepped back after
+                              the start, as NTP does at boot, would hide every kill until it caught up),
+                              and only until the first entry from after the start.
+      lost records            the kernel's own counter (/proc/vmstat oom_kill) against the kill lines read,
+                              before de-duplication (it counts a group's repeated victim too); a difference
+                              that stays LOST_S (30 s: journald lags under memory pressure, and a sample may be
+                              5 s apart) is recorded as `unknown`, and only that much of it.
+      hidepid                 where /proc hides other accounts' processes from the logger, it does not name them
+                              either (03 §5.6): another account's victim is "?", with no pid, account or
+                              cgroup, and so is a storm in another account's slice; sizes and counts stay.
+    Without a journal it can read (no systemd, not in group systemd-journal) it counts: the counter's
+    delta, classified by the level (`count` mode). State (cursor, counter, boot) is kept in state.json
+    in the logger's state folder, written at most once per sample."""
+    VICTIM_S = 30.0
+    LOST_S = 30.0
+    EVENT_S = 1.0
+    STORM_N, STORM_S = 5, 600
+    VICTIMS_MAX = 15
+    HISTORY_S = 60.0
+    RETRY_S = 5.0
+    COUNT_RETRY_S = 600.0
+
+    def __init__(self, state_dir=None, trigger=None, storm=None, event=None, journalctl=None, now=time.time,
+                 mono=time.monotonic):
+        import threading
+        self.state_path = os.path.join(state_dir, "state.json") if state_dir else None
+        self.trigger = trigger or (lambda kind, msg: None)
+        self.storm = storm or (lambda name, ooms, cg: None)
+        self.event = event or (lambda kind, **kw: None)
+        self.journalctl = journalctl or _p(JOURNALCTL)
+        self.now, self.mono = now, mono       # mono: CLOCK_MONOTONIC, the journal's __MONOTONIC_TIMESTAMP
+        self.lock = threading.Lock()
+        self.started, self.last_t = now(), None
+        self.started_m, self.last_m = mono(), None
+        self.procs = {}
+        st = self._load()
+        self.boot = boot_id()
+        cnt = _vmstat().get("oom_kill")
+        self.cursor = st.get("cursor") if st.get("cursor") and _CURSOR.fullmatch(str(st.get("cursor"))) else None
+        self.fresh = self.cursor is None
+        if st.get("boot") == self.boot and isinstance(st.get("oom_kill"), int) and cnt is not None and st["oom_kill"] <= cnt:
+            self.base = st["oom_kill"]            # a restart: what happened meanwhile is counted, once
+        elif st.get("boot") and st.get("boot") != self.boot and self.cursor:
+            self.base = 0                         # a new boot: its kills are in the journal after the cursor
+        else:
+            self.base = cnt                       # the first start: nothing before it is counted
+        self.acc, self.pending = 0, None          # kernel kill lines read since `base`; (a difference, since when)
+        self.victims, self.seen, self.storms = [], {}, {}
+        self.ooms, self.ev, self.summ, self.old = 0, None, None, {}
+        self.mode = "journal" if self._can_journal() else "count"
+        self.proc, self.stopping, self.saved, self.thread = None, False, None, None
+        self.hide = os.geteuid() != 0 and hidepid() != "0"
+
+    def _hidden(self, v):
+        """A victim as this machine lets the logger see it: under hidepid another account's is only a size."""
+        if not self.hide or (v.get("uid") is not None and v.get("uid") == os.getuid()):
+            return v
+        return dict({k: x for k, x in v.items() if k in ("mb", "rss_mb", "constraint", "sig")}, name="?")
+
+    def _own_slice(self, cg):
+        """Is cgroup `cg` none of another account's (user-<uid>.slice)?"""
+        m = re.search(r"/user-(\d+)\.slice(?:/|$)", cg or "")
+        return not m or int(m.group(1)) == os.getuid()
+
+    def _load(self):
+        if not self.state_path:
+            return {}
+        try:
+            with open(self.state_path, "rb") as f:
+                d = __import__("json").loads(f.read(64 << 10).decode("utf-8"))
+            return d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _can_journal(self):
+        return os.access(self.journalctl, os.X_OK) and os.path.isdir(_p("/run/systemd/system"))
+
+    # -- the thread
+    def start(self):
+        import threading
+        if self.mode == "journal":
+            self.thread = threading.Thread(target=self.loop, name="kills", daemon=True)
+            self.thread.start()
+        return self
+
+    def stop(self):
+        self.stopping = True
+        p = self.proc
+        if p is not None and p.poll() is None:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+    def command(self):
+        """The journalctl command line: after the stored cursor, else this boot from its start."""
+        with self.lock:
+            c = self.cursor
+        return [self.journalctl, "-f", "-q", "--no-pager", "-o", "json"] + \
+            (["--after-cursor=" + c] if c else ["-b", "--no-tail"]) + JOURNAL_MATCH
+
+    def loop(self):
+        import subprocess
+        fails = 0
+        while not self.stopping:
+            t0, n = time.monotonic(), 0
+            try:
+                p = self.proc = subprocess.Popen(self.command(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.DEVNULL, cwd="/",
+                                                 env={"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SYSTEMD_COLORS": "0"})
+            except OSError as e:
+                self.mode = "count"
+                self.event("daemon_error", where="kills", error="journalctl: %s" % e)
+                time.sleep(self.COUNT_RETRY_S)
+                continue
+            for line in _lines(p.stdout, LINE_MAX):
+                n += 1
+                try:
+                    self.feed(line)
+                except Exception as e:  # one entry that breaks the parser costs that entry
+                    self.event("daemon_error", where="kills", error=repr(e)[:300])
+            rc = p.wait()
+            p.stdout.close()
+            if self.stopping:
+                break
+            if n == 0 and rc != 0 and time.monotonic() - t0 < 10:
+                with self.lock:
+                    stale = self.cursor is not None
+                    if stale and fails == 0:  # a cursor the journal no longer has (vacuumed), or journald was away:
+                        # this boot from its start, nothing up to the last line handled counted again (what the
+                        # journal lost meanwhile the kernel's counter still finds)
+                        self.cursor, self.fresh = None, True
+                        self.started = self.last_t + self.HISTORY_S + 1e-3 if self.last_t else self.now()
+                        self.started_m = self.last_m + self.HISTORY_S + 1e-3 if self.last_m else \
+                            None if self.last_t else self.mono()    # (None: told by the wall clock, as last_t)
+                fails += 1
+                if fails >= 3:
+                    self.mode = "count"
+                    self.event("daemon_error", where="kills", error="journalctl exits with %s: kills are counted, "
+                               "not named (is the logger in group systemd-journal?)" % rc)
+                    time.sleep(self.COUNT_RETRY_S)
+                    fails = 0
+                    continue
+            else:
+                fails = 0
+                if n:
+                    self.mode = "journal"
+            time.sleep(self.RETRY_S)
+
+    def feed(self, line):
+        """One line of `journalctl -o json`."""
+        e = __import__("json").loads(line)
+        if not isinstance(e, dict):
+            return
+        msg = journal_message(e)
+        try:
+            t = int(e.get("__REALTIME_TIMESTAMP")) / 1e6
+        except (TypeError, ValueError):
+            t = self.now()
+        m = None                          # its monotonic time, when it is of this boot
+        if self.boot and e.get("_BOOT_ID") == self.boot.replace("-", ""):
+            try:
+                m = int(e.get("__MONOTONIC_TIMESTAMP")) / 1e6
+            except (TypeError, ValueError):
+                m = None
+        cur = e.get("__CURSOR")
+        before = False
+        if self.fresh:                    # the first start (or a lost cursor): this boot's past is not counted
+            x, ref = (m, self.started_m) if m is not None and self.started_m is not None else (t, self.started)
+            before = x < ref - self.HISTORY_S
+            if x >= ref:
+                self.fresh = False        # the past is read: from here on every entry counts
+        if msg is not None and not before:
+            unit = e.get("_SYSTEMD_UNIT") if isinstance(e.get("_SYSTEMD_UNIT"), str) else ""
+            self.handle(msg, unit, t)
+        if isinstance(cur, str) and _CURSOR.fullmatch(cur):
+            with self.lock:
+                self.cursor, self.last_t, self.last_m = cur, t, m
+
+    # -- the lines
+    def handle(self, msg, unit, t):
+        """One journal line: a victim, a summary, or nothing of ours."""
+        msg = msg.strip()
+        if unit == "systemd-oomd.service":
+            m = OOMD_P.match(msg) or OOMD_S.match(msg)
+            if m:
+                cg = _clean(m.group("cg"), 200)
+                name = group_of_cgroup(cg) or os.path.basename(cg) or cg
+                mb = sum(p["fp"] for p in self.procs.values() if p.get("cg") == cg or (p.get("cg") or "").startswith(cg + "/")) / MB
+                self._victim(t, "systemd-oomd", cg, {"name": _clean(name), "cg": cg, "mb": round(mb)})
+            return
+        if unit == "earlyoom.service":
+            m = EARLY.match(msg)
+            if m:
+                pid = int(m.group("pid"))
+                p = self.procs.get(pid) or {}
+                rss = re.search(r"VmRSS (\d+) MiB", msg)
+                self._victim(t, "earlyoom", pid, {"name": _clean(m.group("name")), "pid": pid, "uid": int(m.group("uid")),
+                                                  "mb": int(rss.group(1)) if rss else round(p.get("fp", 0) / MB),
+                                                  "sig": m.group("sig"), "cg": p.get("cg")})
+            return
+        m = SUMMARY.match(msg)
+        if m:
+            cls = "cgroup" if m.group("constraint") == "CONSTRAINT_MEMCG" else "kernel"
+            cg = _clean(m.group("memcg") if cls == "cgroup" and m.group("memcg") else m.group("task_cg"), 200)
+            with self.lock:
+                self.summ = (t, cls, cg, m.group("constraint"))
+            self._oom_event(t, cls, cg, summary=True)
+            return
+        m = KILL_OLD.match(msg)
+        if m:
+            with self.lock:   # waits a second for its "Killed process" line; one that never comes is dropped
+                self.old = {k: v for k, v in self.old.items() if 0 <= t - v[0] <= self.EVENT_S}
+                self.old[int(m.group("pid"))] = (t, m.group("what"))
+            return
+        m = KILLED.match(msg)
+        if not m:
+            return
+        pid = int(m.group("pid"))
+        with self.lock:
+            self.acc += 1                         # a kernel kill line, before de-duplication (the counter's unit)
+            what = m.group("what")
+            old = self.old.pop(pid, None)
+            summ = self.summ if self.summ and 0 <= t - self.summ[0] <= self.EVENT_S else None
+        if what is None and old and t - old[0] <= self.EVENT_S:
+            what = old[1]
+        if what is not None:
+            cls = "cgroup" if what.startswith("Memory cgroup") else "kernel"
+        else:
+            cls = summ[1] if summ else "kernel"
+        p = self.procs.get(pid) or {}
+        cg = summ[2] if summ and summ[1] == cls else p.get("cg") or ""
+        if not summ or summ[1] != cls:
+            self._oom_event(t, cls, cg)
+        else:
+            with self.lock:
+                if self.ev:
+                    self.ev[2] = t
+        anon, shmem, filerss = int(m.group("anon")), int(m.group("shmem") or 0), int(m.group("file"))
+        self._victim(t, "cgroup" if cls == "cgroup" else "kernel", pid, {
+            "name": _clean(m.group("name")), "pid": pid, "uid": int(m.group("uid")) if m.group("uid") else p.get("uid"),
+            "mb": round((anon + shmem) / 1024.0), "rss_mb": round((anon + shmem + filerss) / 1024.0),
+            "constraint": "memcg" if cls == "cgroup" else "none", "cg": cg or None})
+
+    def _oom_event(self, t, cls, cg, summary=False):
+        """Count an invocation of the killer: a summary is one; kill lines of one class and cgroup within a
+        second of each other, with no summary, are one."""
+        with self.lock:
+            ev = self.ev
+            if not summary and ev and ev[0] == cls and ev[1] == cg and 0 <= t - ev[2] <= self.EVENT_S:
+                ev[2] = t
+                return
+            self.ev = [cls, cg, t]
+            self.ooms += 1
+            if cls != "cgroup" or not cg:
+                return
+            times = [x for x in self.storms.get(cg, ()) if t - x <= self.STORM_S] + [t]
+            self.storms[cg] = times[-64:]
+            for k in [k for k, v in self.storms.items() if t - v[-1] > self.STORM_S]:
+                del self.storms[k]
+            n = len(times)
+        if n >= self.STORM_N:
+            if self.hide and not self._own_slice(cg):
+                self.storm("?", n, "?")
+            else:
+                self.storm(group_of_cgroup(cg) or cg.rsplit("/", 1)[-1] or cg, n, cg)
+
+    def _victim(self, t, by, key, v):
+        v = self._hidden(v)
+        with self.lock:
+            k = (by, key)
+            old = self.seen.get(k)
+            if old and 0 <= t - old[0] <= self.VICTIM_S:
+                old[0] = t
+                if v.get("sig"):
+                    old[1]["sig"] = v["sig"]
+                return
+            if len(self.seen) > 4096:
+                self.seen = {a: b for a, b in self.seen.items() if t - b[0] <= self.VICTIM_S}
+            v = {a: b for a, b in v.items() if b is not None}
+            v.update(by=by, t=round(t, 1))
+            self.seen[k] = [t, v]
+            self.victims.append(v)
+            del self.victims[:-256]
+        if by in MACHINE_WIDE:
+            self.trigger("oom" if by == "kernel" else "oomd", kill_headline(v))
+
+    # -- once per sample
+    def flush(self, level=1, procs=None):
+        """What was killed since the last flush: {"kills": machine-wide victims, "cgroup": victims at a
+        cgroup's limit, "ooms", "by": {killer: n}, "top": {name: n}, "victims": [...] (biggest first, at
+        most 15)}. `level`: the machine's level in this or the last sample (unexplained kills count as
+        machine-wide at warning or above); `procs`: this sample's processes, for the next lines."""
+        if procs is not None:
+            self.procs = procs
+        cnt = _vmstat().get("oom_kill")
+        with self.lock:
+            victims, self.victims = self.victims, []
+            ooms, self.ooms = self.ooms, 0
+            unknown = 0
+            if cnt is not None:
+                if self.base is None or cnt < self.base:
+                    self.base, self.acc, self.pending = cnt, 0, None
+                gap, now = cnt - self.base - self.acc, self.now()
+                if self.mode == "count":  # (less what lines were read before the journal stopped answering)
+                    unknown, self.base, self.acc, self.pending = max(0, gap), cnt, 0, None
+                elif gap > 0 and self.pending and now - self.pending[1] >= self.LOST_S:
+                    unknown = min(gap, self.pending[0])  # what stayed missing that long; the rest waits its turn
+                    self.base += unknown
+                    self.pending = (gap - unknown, now) if gap > unknown else None
+                elif gap > 0:
+                    self.pending = (min(gap, self.pending[0]), self.pending[1]) if self.pending else (gap, now)
+                else:
+                    self.base, self.acc, self.pending = cnt, 0, None
+            state = {"boot": self.boot, "cursor": self.cursor,
+                     "oom_kill": (self.base + self.acc) if self.base is not None else None}
+        by, top = {}, {}
+        for v in victims:
+            by[v["by"]] = by.get(v["by"], 0) + 1
+            top[v["name"]] = top.get(v["name"], 0) + 1
+        machine = sum(n for k, n in by.items() if k in MACHINE_WIDE)
+        cgroup = by.get("cgroup", 0)
+        if unknown:
+            by["unknown"] = unknown
+            if (level or 0) >= 2:
+                machine += unknown
+            else:
+                cgroup += unknown
+        self._save(state)
+        victims.sort(key=lambda v: -(v.get("mb") or 0))
+        return {"kills": machine, "cgroup": cgroup, "ooms": max(ooms, 1 if unknown else 0) if (victims or unknown) else 0,
+                "by": by, "top": dict(sorted(top.items(), key=lambda kv: -kv[1])[:15]), "victims": victims[:self.VICTIMS_MAX]}
+
+    def _save(self, state):
+        if not self.state_path or state == self.saved:
+            return
+        try:
+            tmp = "%s.%d.tmp" % (self.state_path, os.getpid())
+            with open(tmp, "w") as f:
+                f.write(__import__("json").dumps(state))
+            os.replace(tmp, self.state_path)
+            self.saved = state
+        except OSError as e:
+            self.event("daemon_error", where="kills", error="state: %s" % e)
+
+    def status(self):
+        return self.mode
+
+
+def _lines(f, cap):
+    """The lines of a binary pipe, each at most `cap` bytes (a longer one is skipped whole)."""
+    skip = False
+    while True:
+        b = f.readline(cap + 1)
+        if not b:
+            return
+        if len(b) > cap and not b.endswith(b"\n"):
+            skip = True
+            continue
+        if skip:
+            skip = not b.endswith(b"\n")
+            continue
+        yield b
+
+
+# ------------------------------------------------------------------ the pressure watch (03 §5.3)
+class PressureWatch:
+    """Asks the logger for an early sample when memory turns tight between two samples: every 2 s it
+    reads the machine's memory stall time (where PSI is on) and what is available, and wakes the
+    sampler once the stall time or the headroom crosses warning while it samples slowly. A 2 s read
+    works on every kernel (C.3 row 5: the unprivileged trigger exists on some 6.1 kernels and not on
+    others, and RHEL 9 has no PSI at all); waking is all it does."""
+    EVERY_S, QUIET_S = 2.0, 30.0
+
+    def __init__(self, wake, hot):
+        self.wake, self.hot, self.stopping, self.last = wake, hot, False, -1e18
+
+    def start(self):
+        import threading
+        threading.Thread(target=self.loop, name="pressure", daemon=True).start()
+        return self
+
+    def tight(self):
+        pr = psi_file("/proc/pressure/memory")
+        some, full = _avg(pr, "some"), _avg(pr, "full")
+        if some is not None and (some >= P["some_warn"] or (full or 0) >= P["full_warn"]):
+            return True
+        m = meminfo()
+        total = m.get("MemTotal", 0)
+        return bool(total) and m.get("MemAvailable", total) / GB < bounds(total / GB)[1]
+
+    def loop(self):
+        while not self.stopping:
+            time.sleep(self.EVERY_S)
+            try:
+                if not self.hot() and time.monotonic() - self.last >= self.QUIET_S and self.tight():
+                    self.last = time.monotonic()
+                    self.wake()
+            except Exception:  # a reading that fails costs this early sample only
+                pass
+
+
+# ------------------------------------------------------------------ telling somebody (03 §5.13)
+def journal(level, text):
+    """One line in the journal at a syslog priority (2 critical, 4 warning, 5 notice): systemd reads
+    the <N> prefix of what the logger writes to stderr."""
+    import sys
+    sys.stderr.write("<%d>oomph: %s\n" % (level, _printable(text.replace("\n", " "))[:500]))
+    sys.stderr.flush()
+
+
 def notify(title, msg, console):
-    """No notifications without the Linux logger (it comes with its alert hooks)."""
-    return False
+    """A notification on Linux is a journal line at *critical* (`journalctl -p crit` sees it); scripts in
+    /etc/oomph/alert.d hear of it through the logger's alert records."""
+    journal(4 if title.startswith("Disk") else 2, "%s: %s" % (title, msg))  # a full disk is a warning (03 §5.13)
+    return True
+
+
+def _journal_since(since, cap=8 << 20, timeout=20):
+    """The entries of our filter since `since` (epoch), as dicts; [] where the journal cannot be read. Only the
+    fields read here (systemd 236 and later), and the last `cap` bytes of them: a storm of OOM reports keeps
+    its latest, not nothing."""
+    import json
+    exe = _p(JOURNALCTL)
+    if not os.access(exe, os.X_OK):
+        return []
+    raw = run_capped([exe, "-q", "--no-pager", "-o", "json", "--output-fields=MESSAGE,_SYSTEMD_UNIT,__REALTIME_TIMESTAMP",
+                      "--since=@%d" % int(since)] + JOURNAL_MATCH, cap, timeout, tail=True)
+    out = []
+    for line in (raw or b"").splitlines():
+        if len(line) > LINE_MAX:
+            continue
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict):
+            out.append(e)
+    return out
+
+
+# The lines of an OOM report syslog.txt keeps besides its header, its summary and its kill line: the memory
+# summary (Mem-Info, per node and zone, swap, pages; a cgroup's usage and its memory.stat). Not the table of
+# every task (pid, uid, size and name of each process: what hidepid hides from other accounts), no stack,
+# no registers, nothing else the kernel printed meanwhile.
+OOM_MEM = re.compile(r"^(?:Mem-Info:|Node \d+ |lowmem_reserve\[\]:|\d+ (?:total pagecache pages|pages in swap cache|"
+                     r"pages RAM|pages HighMem/MovableOnly|pages reserved|pages cma reserved|pages hwpoisoned)$|"
+                     r"Free swap +=|Total swap +=|Swap cache stats:|(?:memory|swap|memory\+swap|kmem): usage \d+kB|"
+                     r"Memory cgroup stats for |(?:[a-z_]+:\d+(?:kB)?\s*)+$|[a-z_]+ \d+$)")
+
+
+def oom_excerpt(entries, cap=256 << 10, per_report=400):
+    """syslog.txt for an incident (03 §5.6): the OOM evidence and nothing else of the kernel log. Each
+    OOM report's "invoked oom-killer" line, its memory summary (OOM_MEM, at most `per_report` lines) and
+    its kill lines, a kill line whose header was rate-limited away, the lines of systemd-oomd and earlyoom,
+    and kernel lines about memory from a short list. Every local account reads it: no task table. At most
+    `cap` bytes."""
+    out, size, inside, n, killed = [], 0, False, 0, False
+    for e in entries:
+        msg = journal_message(e)
+        if msg is None:
+            continue
+        msg = _printable(msg.strip())[:500]
+        unit = e.get("_SYSTEMD_UNIT") if isinstance(e.get("_SYSTEMD_UNIT"), str) else ""
+        try:
+            t = int(e.get("__REALTIME_TIMESTAMP")) / 1e6
+        except (TypeError, ValueError):
+            t = 0
+        who = unit[:-len(".service")] if unit.endswith(".service") else "kernel"
+        keep = False
+        if unit in ("systemd-oomd.service", "earlyoom.service"):
+            keep = True
+        elif INVOKED.match(msg):
+            inside, n, killed, keep = True, 0, False, True
+        elif KILLED.match(msg) or KILL_OLD.match(msg) or REAPED.match(msg):
+            keep, killed = True, True
+        elif inside and not killed:
+            keep = n < per_report and (bool(OOM_MEM.match(msg)) or bool(SUMMARY.match(msg)))
+        elif OTHER_MEM.search(msg):
+            keep = True
+        if inside and killed and not (KILLED.match(msg) or KILL_OLD.match(msg) or REAPED.match(msg) or INVOKED.match(msg)):
+            inside = False
+            keep = bool(OTHER_MEM.search(msg)) or unit in ("systemd-oomd.service", "earlyoom.service")
+        if not keep:
+            continue
+        n += 1
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t)) if t else "?"
+        row = "%s %s: %s\n" % (stamp, who, msg)
+        if size + len(row) > cap:
+            out.append("(cut at %d KB)\n" % (cap >> 10))
+            break
+        out.append(row)
+        size += len(row)
+    return "".join(out)
 
 
 def dump_syslog(d, predicate):
-    """The kernel's OOM lines come with the Linux logger; until then there is nothing to copy."""
-    with open(os.path.join(d, "syslog.txt"), "w") as f:
-        f.write("(no system log excerpt: the journal is not read on Linux yet)\n")
+    """The OOM evidence of the last 15 minutes into d/syslog.txt (oom_excerpt), nothing else of the
+    kernel log: the logs are readable by every local user, and kernel.dmesg_restrict exists for a reason."""
+    text = oom_excerpt(_journal_since(time.time() - 15 * 60)) or \
+        "(no OOM lines in the journal in the 15 minutes before this incident)\n"
+    # where /proc hides other accounts' processes (hidepid), so does this file, which names them: the logger's
+    # own group only (0640), as the kernel's lines are root's (dmesg_restrict) and the journal's group's (03 §5.6)
+    hide = os.geteuid() != 0 and hidepid() != "0"
+    try:
+        fd = os.open(os.path.join(d, "syslog.txt"), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o640 if hide else 0o644)
+    except FileExistsError:  # (an incident's folder written again: its first excerpt stays)
+        return
+    if hide:
+        os.fchmod(fd, 0o640)  # (whatever the umask)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
 
 
+ALERTS = True    # the logger writes alert records for /etc/oomph/alert.d (03 §5.13)
 WORDS = {"machine": "machine", "system": "Linux", "killer": "the OOM killer", "available": "available"}
