@@ -4288,34 +4288,59 @@ struct PopoverView: View {
         let n = CGFloat(avail.count)
         let width: CGFloat = (popupWidth - 28 - 6 * (n - 1)) / n
         return HStack(spacing: 6) {
-            ForEach(avail, id: \.self) { r in
-                let role: ResourceTile.Role = sel.focus == r ? .focus : sel.shown.contains(r) ? .shown : .plain
-                ResourceTile(resource: r, tile: facts[r] ?? Tile(), role: role, chevron: role == .focus && sel.shown.count == 1,
-                             open: showTopApps && role == .focus, compact: store.compactLevel >= 3, shake: shakes[r] ?? 0,
-                             help: tileHelp(r, role: role, alone: sel.shown.count == 1, tile: facts[r]))
-                    .contentShape(Rectangle())
-                    .onTapGesture { tapTile(r) }
-                    .contextMenu {
-                        Button("Show \(r.name) alone") { gesture(.click, r, alone: true) }
-                        if role == .plain { Button("Add to view") { gesture(.cmd, r) } } else if !(role == .focus && sel.shown.count == 1) {
-                            Button("Remove from view") { gesture(.cmd, r) }
-                        }
-                        Button("Biggest apps…") { gesture(.click, r, alone: true); openCallout() }
-                    }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(r.name + ", " + (facts[r]?.reading ?? "no reading") + (facts[r]?.flagText.isEmpty == false ? ", " + facts[r]!.flagText : ""))
-                    .accessibilityValue(role == .focus ? "shown with the big chart" : role == .shown ? "shown" : "not shown")
-                    .accessibilityAddTraits(role == .plain ? [.isButton] : [.isButton, .isSelected])
-                    .accessibilityHint("Shows \(r.name) alone. Command-click \(role == .plain ? "adds" : "removes") it.")
-                    .accessibilityAction(named: "Show alone") { gesture(.click, r, alone: true) }
-                    .accessibilityAction(named: role == .plain ? "Add to view" : "Remove from view") { gesture(.cmd, r) }
-                    .accessibilityAction(named: "Biggest apps") { gesture(.click, r, alone: true); openCallout() }
-                    .frame(width: width)
-                    .anchorPreference(key: TopAppAnchorKey.self, value: .bounds) { role == .focus ? $0 : nil }
-            }
+            ForEach(avail, id: \.self) { r in tile(r, sel: sel, facts: facts, width: width) }
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Resources")
+    }
+
+    /// One tile of the row, apart from it, its parts typed one by one: as one expression with the row
+    /// the older Swift of CI (6.1) could not type-check it in time.
+    func tile(_ r: Resource, sel: Selection, facts: [Resource: Tile], width: CGFloat) -> some View {
+        let role: ResourceTile.Role = sel.focus == r ? .focus : sel.shown.contains(r) ? .shown : .plain
+        let focus: Bool = role == .focus, plain: Bool = role == .plain
+        let alone: Bool = sel.shown.count == 1
+        let removable: Bool = !plain && !(focus && alone)
+        let help: String = tileHelp(r, role: role, alone: alone, tile: facts[r])
+        let base: ResourceTile = ResourceTile(resource: r, tile: facts[r] ?? Tile(), role: role, chevron: focus && alone,
+                                              open: showTopApps && focus, compact: store.compactLevel >= 3,
+                                              shake: shakes[r] ?? 0, help: help)
+        let value: String = focus ? "shown with the big chart" : role == .shown ? "shown" : "not shown"
+        let traits: AccessibilityTraits = plain ? [.isButton] : [.isButton, .isSelected]
+        let hint: String = "Shows \(r.name) alone. Command-click \(plain ? "adds" : "removes") it."
+        let toggle: String = plain ? "Add to view" : "Remove from view"
+        let anchor: (Anchor<CGRect>) -> Anchor<CGRect>? = { focus ? $0 : nil }
+        let clickable = base.contentShape(Rectangle()).onTapGesture { tapTile(r) }
+        let menu = clickable.contextMenu { tileMenu(r, plain: plain, removable: removable) }
+        let spoken = menu.accessibilityElement(children: .ignore).accessibilityLabel(tileLabel(r, tile: facts[r]))
+            .accessibilityValue(value).accessibilityAddTraits(traits).accessibilityHint(hint)
+        return spoken
+            .accessibilityAction(named: "Show alone") { gesture(.click, r, alone: true) }
+            .accessibilityAction(named: toggle) { gesture(.cmd, r) }
+            .accessibilityAction(named: "Biggest apps") { biggestApps(r) }
+            .frame(width: width)
+            .anchorPreference(key: TopAppAnchorKey.self, value: .bounds, transform: anchor)
+    }
+
+    /// A tile's menu: show it alone, add it or remove it (not the focus shown alone), its biggest apps.
+    @ViewBuilder func tileMenu(_ r: Resource, plain: Bool, removable: Bool) -> some View {
+        Button("Show \(r.name) alone") { gesture(.click, r, alone: true) }
+        if plain { Button("Add to view") { gesture(.cmd, r) } }
+        if removable { Button("Remove from view") { gesture(.cmd, r) } }
+        Button("Biggest apps…") { biggestApps(r) }
+    }
+
+    /// Shows a resource alone and opens its biggest consumers.
+    func biggestApps(_ r: Resource) {
+        gesture(.click, r, alone: true)
+        openCallout()
+    }
+
+    /// A tile's spoken name: the resource, its reading and its flag.
+    func tileLabel(_ r: Resource, tile: Tile?) -> String {
+        let reading: String = tile?.reading ?? "no reading"
+        let flag: String = tile?.flagText ?? ""
+        return r.name + ", " + reading + (flag.isEmpty ? "" : ", " + flag)
     }
 
     /// A tile's tooltip (§3.7.2): its reading in words, then what the clicks do.
