@@ -583,10 +583,19 @@ def gb_at(r, t):
     return ([g for s, g in r["segments"] if s <= t] or [r["segments"][0][1]])[-1]
 
 
-def stack_reservations(rs, now):
+def amount_at(r, k, t):
+    """Reservation.amount(_:at:): its amount of resource k at time t."""
+    if k == "memory":
+        return gb_at(r, t)
+    segs = amount_segs(r, k)
+    return ([x for s, x in segs if s <= t] or [segs[0][1]])[-1]
+
+
+def stack_reservations(rs, now, kind="memory"):
     """ResBlock.stack: lanes first-fit by request time; steps [a, b) with the stacked GB below (lo) and
     at the top (hi) of each block. An unchanged step is extended instead of repeated, except at the
-    moment of the grant."""
+    moment of the grant. `kind`: the band's resource (its amounts over time, amount_segs); the caller passes
+    the reservations that hold it."""
     blocks = [dict(res=r, end=max(r["ended"] if r.get("ended") is not None else now, r["requested"] + 1), lane=0,
                    steps=[]) for r in sorted(rs, key=lambda r: r["requested"])]
     lane_end = []
@@ -604,18 +613,18 @@ def stack_reservations(rs, now):
         bps.update((r["requested"], b["end"]))
         if r.get("granted") is not None and r["requested"] < r["granted"] < b["end"]:
             bps.add(r["granted"])
-        bps.update(t for t, _ in r["segments"] if r["requested"] < t < b["end"])
+        bps.update(t for t, _ in amount_segs(r, kind) if r["requested"] < t < b["end"])
     ts = sorted(bps)
     active, nxt = [], 0
     for a, bb in zip(ts, ts[1:]):
         while nxt < len(blocks) and blocks[nxt]["res"]["requested"] <= a:
             active.append(nxt)
             nxt += 1
-        active = [k for k in active if blocks[k]["end"] > a]
+        active = [j for j in active if blocks[j]["end"] > a]
         acc = 0.0
-        for k in sorted(active, key=lambda k: blocks[k]["lane"]):
-            r = blocks[k]["res"]
-            steps, hi = blocks[k]["steps"], acc + gb_at(r, a)
+        for j in sorted(active, key=lambda j: blocks[j]["lane"]):
+            r = blocks[j]["res"]
+            steps, hi = blocks[j]["steps"], acc + amount_at(r, kind, a)
             if steps and steps[-1][1] == a and steps[-1][2] == acc and steps[-1][3] == hi and r.get("granted") != a:
                 steps[-1] = (steps[-1][0], bb, acc, hi)
             else:
@@ -640,12 +649,141 @@ def _norm(o):
     segs = [(s["t"], s["gb"]) for s in (o.get("segments") or [])
             if isinstance(s, dict) and isinstance(s.get("t"), (int, float)) and isinstance(s.get("gb"), (int, float))]
     h = o.get("holder")
-    return dict(key=_key(o), id=_s(o["id"]), purpose=_s(o.get("purpose"), "?"),
-                project=_s(o.get("project")), holder=_s(h.get("kind") if isinstance(h, dict) else h),
-                pid=h.get("pid") if isinstance(h, dict) and isinstance(h.get("pid"), int) else None,
-                requested=o["requested"], granted=o.get("granted"), ended=o.get("ended"), outcome=_s(o.get("outcome")),
-                peak=o.get("peak_gb") or 0, used=o.get("used_gb"), expires=o.get("expires"),
-                segments=segs or [(o["requested"], o["gb"])], agent=agent_index(o.get("agent")))
+    r = dict(key=_key(o), id=_s(o["id"]), purpose=_s(o.get("purpose"), "?"),
+             project=_s(o.get("project")), holder=_s(h.get("kind") if isinstance(h, dict) else h),
+             pid=h.get("pid") if isinstance(h, dict) and isinstance(h.get("pid"), int) else None,
+             requested=o["requested"], granted=o.get("granted"), ended=o.get("ended"), outcome=_s(o.get("outcome")),
+             peak=o.get("peak_gb") or 0, used=o.get("used_gb"), expires=o.get("expires"),
+             segments=segs or [(o["requested"], o["gb"])], agent=agent_index(o.get("agent")))
+    r.update(res_vector(o))
+    return r
+
+
+# ------------------------------------------------------------------ a reservation's resources (B3, T4b: 02 §3.4.5, §3.4.6)
+BAND_RES = ("memory", "cpu", "disk")     # what agents reserve, in tile order (the GPU from 1.14)
+RES_WORD = {"memory": "memory", "cpu": "CPU", "gpu": "GPU", "disk": "disk"}   # in "waiting for CPU", "over on disk"
+
+
+def _amt(x):
+    """An amount of the shared ledger: a finite number 0 … 1e6, else None (any user can write the ledger)."""
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and 0 <= x <= 1e6 else None
+
+
+def _since(x):
+    return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) and 0 < x < 1e11 else None
+
+
+def res_vector(o):
+    """Reservation(_:)'s resources (Reservation.vector): what a lease (`res` of parts) or a record (`res` of amounts,
+    02 §6.2) holds besides its gb mirror. `mem`: does it hold memory (a vector without `ram` whose gb is the 0.01
+    mirror does not); `cpu` cores and `disk` GB (granted, or asked while queued; None: not held), `pool` and
+    `pool_name` of the disk; `cpu_used`, `disk_w` (written since the grant); `flags` {resource: [over|idle, since]}
+    (a grant's advice, 02 §6.3); `waiting` the resources a queued lease waits for, in tile order; `rsegs` the
+    amounts over time {cpu: [(t, cores)], disk: [...]} from its segments. Only what differs from "memory alone,
+    nothing else" is returned (readers use .get with those defaults): 14 days of records stay small in oomph top."""
+    res = o.get("res") if isinstance(o.get("res"), dict) else None
+    out = {}
+    if res is None:
+        if o.get("granted") is None and o.get("ended") is None:
+            w = [k for k in RESOURCES if k in {waited_resource(i) for i in _waiting_ids(o, ["ram"])}]
+            if w:
+                out["waiting"] = w
+        return out
+    lease = any(isinstance(x, dict) for x in res.values())
+    mem = "ram" in res or (_amt(o.get("gb")) or 0.0) > 0.015
+    if not mem:
+        out["mem"] = False
+    granted = o.get("granted") is not None
+    if lease:
+        flags = {}
+        for k in ("cpu", "disk"):
+            part = res.get(k) if isinstance(res.get(k), dict) else {}
+            amt = (_amt(part.get("got")) if granted else None)
+            amt = amt if amt is not None else _amt(part.get("ask"))
+            if amt is None:
+                continue
+            out[k] = amt
+            if granted and part.get("flag") in ("over", "idle"):
+                flags[k] = [part["flag"], _since(part.get("over_t" if part["flag"] == "over" else "low_t"))]
+        if flags:
+            out["flags"] = flags
+        d = res.get("disk") if isinstance(res.get("disk"), dict) else {}
+        if "disk" in out:
+            for f, x in (("pool", _s(d.get("pool"))), ("pool_name", _s(d.get("name")))):
+                if x is not None:
+                    out[f] = x
+        x = _amt((res.get("cpu") or {}).get("used")) if isinstance(res.get("cpu"), dict) else None
+        if x is not None:
+            out["cpu_used"] = x
+        x = _amt(d.get("w"))
+        if x is not None:
+            out["disk_w"] = x
+    else:
+        for k in ("cpu", "disk"):
+            x = _amt(res.get(k))
+            if x is not None:
+                out[k] = x
+        x = _s(res.get("disk_pool")) if "disk" in out else None
+        if x is not None:
+            out["pool"] = x
+    rsegs = {}
+    for k in ("cpu", "disk"):
+        if k not in out:
+            continue
+        seq = [(sg["t"], _amt(sg["res"].get(k))) for sg in (o.get("segments") or [])
+               if isinstance(sg, dict) and isinstance(sg.get("t"), (int, float)) and isinstance(sg.get("res"), dict)]
+        seq = [(t, x) for t, x in seq if x is not None]
+        if seq:
+            rsegs[k] = seq
+    if rsegs:
+        out["rsegs"] = rsegs
+    if not granted and o.get("ended") is None:
+        got = {waited_resource(i) for i in _waiting_ids(o, (["ram"] if mem else []) +
+                                                        [k for k in ("cpu", "disk") if k in out])}
+        w = [k for k in RESOURCES if k in got]
+        if w:
+            out["waiting"] = w
+    return out
+
+
+def _waiting_ids(o, default):
+    """A queued lease's `waiting_on` (pool ids, 02 §6.4); `default` where it has none (written by older code, or not
+    evaluated yet: what it asks for)."""
+    w = o.get("waiting_on")
+    return [x for x in w[:16] if isinstance(x, str)] if isinstance(w, list) and w else default
+
+
+def waited_resource(pool_id):
+    """The resource of a pool id in `waiting_on` (02 §6.4): ram and mem, and "critical" (memory is critical), are
+    memory; cpu; gpu and vram; disk:<id> is disk."""
+    i = str(pool_id)
+    return "memory" if i in ("ram", "mem", "critical") else "cpu" if i == "cpu" else \
+        "gpu" if i.startswith(("gpu", "vram")) else "disk"
+
+
+def holds(r, k, pool=None):
+    """Does reservation r hold resource k (for disk: on `pool`, when one is named)?"""
+    if k == "memory":
+        return r.get("mem", True)
+    if k == "disk":
+        return r.get("disk") is not None and (pool is None or r.get("pool") == pool)
+    return r.get(k) is not None
+
+
+def amount_segs(r, k):
+    """r's amount of k over time: [(t, amount)], the first from its request."""
+    if k == "memory":
+        return r["segments"]
+    return (r.get("rsegs") or {}).get(k) or [(r["requested"], r.get(k) or 0.0)]
+
+
+def bands(res, shown, focus, pool=None):
+    """The strip's bands (02 §3.4.5, §3.7.6; Reservation.bands): of the resources shown, those with a reservation in
+    the 14 days kept (a slow fact: the strip changes height when a resource is reserved for the first time, and 14
+    days after the last), the focus's first (the tall one), then the others in tile order. The Disk band is the
+    tile's pool's."""
+    have = [k for k in BAND_RES if k in shown and any(holds(r, k, pool) for r in res)]
+    return ([focus] if focus in have else []) + [k for k in have if k != focus]
 
 
 def merge_reservations(records, ledger, now, holder_alive=None, own_ns=None):
@@ -1035,6 +1173,22 @@ def _n(x):
     return x if isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x) else None
 
 
+def fit_mid(text, n, g=None):
+    """fit() that keeps the start and the end and gives way in the middle (02 §3.4.6: purposes of one project
+    differ at the end, "harbor playwright…mium) shard 12"); never splits a two-cell character. Under 8 cells, or
+    for a text longer than the 200 characters a purpose is cut to, it is fit()."""
+    cells = cells_of(text[:400])
+    if len(cells) <= n or n < 8 or len(text) > 400:
+        return fit(text, n, g)
+    a = n // 2
+    head, tail = cells[:a], cells[len(cells) - (n - 1 - a):]
+    if head and len(cells) > a and cells[a] == "":         # the cut fell inside a pair
+        head[-1] = " "
+    if tail and tail[0] == "":
+        tail[0] = " "
+    return "".join(head) + (g or GLYPHS["unicode"])["ell"][:1] + "".join(tail)
+
+
 def mid_fit(text, n):
     """A name shortened in its middle to n characters, keeping its start and its end (02 §3.4.2)."""
     text = str(text)
@@ -1078,11 +1232,7 @@ def waiting_on(leases):
         if not isinstance(r, dict) or r.get("state") != "queued":
             continue
         ids = r.get("waiting_on") if isinstance(r.get("waiting_on"), list) and r.get("waiting_on") else ["ram"]
-        got = set()
-        for i in ids:
-            i = str(i)
-            got.add("memory" if i in ("ram", "mem") else "cpu" if i == "cpu" else
-                    "gpu" if i.startswith(("gpu", "vram")) else "disk")
+        got = {waited_resource(i) for i in ids}     # "critical" (memory is critical) is memory's
         for k in got:
             out[k] = out.get(k, 0) + 1
     return out
@@ -2116,15 +2266,73 @@ def _draw_plot(fr, x0, y0, W, H, model, ui, caps, g):
     return gridcols
 
 
-def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=()):
+_RBLOCKS = {"res": None, "bands": {}}   # the reservations the blocks are of, and (resource, pool, 10 s) → blocks
+
+
+def band_blocks(model, k):
+    """The blocks of band k (stack_reservations over what holds k; the Disk band: the tile's pool), kept while the
+    model's reservations are the same list (they are reloaded as a new one) and for at most 10 s of its clock,
+    as the memory blocks are kept between reloads. The cache holds the list itself and compares by identity: a
+    reloaded list can never be taken for the one before it (an id alone can be reused once that one is freed)."""
+    res, pool = model["res"], rv_pool(model) if k == "disk" else None
+    c = _RBLOCKS
+    if c["res"] is not res or len(c["bands"]) > 16:
+        c["res"], c["bands"] = res, {}
+    key = (k, pool, int(model["now"] // 10))
+    if key not in c["bands"]:
+        c["bands"][key] = stack_reservations([r for r in res if holds(r, k, pool)], model["now"], k)
+    return c["bands"][key]
+
+
+def band_top(tallest, k):
+    """Reservation.bandTop: a band's scale, the first round figure at or above its tallest stack in view; GB of
+    disk go on in steps up to 64 TB."""
+    if k == "disk" and tallest > 256:
+        return next((t for t in (384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768, 65536)
+                     if t >= tallest), tallest)
+    return strip_top(tallest)
+
+
+def band_scale(top, k):
+    """The scale of a tall band in the gutter: "24G", "12c", "320G"."""
+    return ("%dc" if k == "cpu" else "%dG") % top
+
+
+def strip_plan(model, S):
+    """[(resource, first row, rows)] of a strip of S rows with the resources on (02 §3.7.6; 04 §3.14): a band per
+    shown resource that has one, the first (the focus's) takes what the others leave, each other one a row; with
+    more bands than rows the last ones are left out (the list still has them)."""
+    shown, focus = rv_shown(model)
+    bs = bands(model["res"], shown, focus, rv_pool(model))[:max(S, 0)]
+    if not bs:
+        return []
+    out, y = [(bs[0], 0, S - (len(bs) - 1))], S - (len(bs) - 1)
+    for k in bs[1:]:
+        out.append((k, y, 1))
+        y += 1
+    return out
+
+
+def draw_bands(fr, x0, y0, W, H, model, ui, caps, g, gridcols=()):
+    """The strip with the resources on: a band per reserved resource shown (strip_plan), each on its own scale, the
+    first tall with its scale in the gutter, the others a row with their name there. The memory alone is today's
+    strip."""
+    plan_ = strip_plan(model, H)
+    for k, dy, h in plan_:
+        draw_strip(fr, x0, y0 + dy, W, h, model, ui, caps, g, gridcols, kind=k, label=None if dy == 0 else
+                   {"memory": "Mem", "cpu": "CPU", "disk": "Disk"}[k])
+
+
+def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=(), kind=None, label=None):
     """The reservation blocks on the plot's time axis: height ∝ GB, stacked in lanes; queued
-    stretches in a shade. A column shows the instant inside it with the tallest stack."""
+    stretches in a shade. A column shows the instant inside it with the tallest stack. `kind`: one band of
+    the resources (draw_bands), with its own scale or, a row high, its `label` in the gutter."""
     mono = caps.color == "none"
     now = model["now"]
     first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
     f, finv = mapper(now, first, SPANS[ui["span"]])
-    blocks = [b for b in model["blocks"] if f(b["end"]) >= 0]
-    top = strip_top(max([st[3] for b in blocks for st in b["steps"] if f(st[1]) >= 0] or [0]))
+    blocks = [b for b in (model["blocks"] if kind is None else band_blocks(model, kind)) if f(b["end"]) >= 0]
+    top = band_top(max([st[3] for b in blocks for st in b["steps"] if f(st[1]) >= 0] or [0]), kind or "memory")
     L = 8 * H
     for c in range(W):
         ta, tb = finv(c / float(W)), finv((c + 1) / float(W))
@@ -2171,7 +2379,12 @@ def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=()):
             if ch == " " and c in gridcols:
                 ch, fg = g["grid"], "grid"
             fr.put(x0 + c, y0 + H - 1 - r_, ch, fg, bg)
-    fr.rput(x0 + W + 4, y0, "%dG" % top, "faint")
+    if label:
+        fr.rput(x0 + W + 4, y0, label, "faint")
+    elif kind is None or kind == "memory":
+        fr.rput(x0 + W + 4, y0, "%dG" % top, "faint")
+    else:
+        fr.rput(x0 + W + 4, y0, band_scale(top, kind), "faint")
 
 
 # ------------------------------------------------------------------ the lists
@@ -2182,25 +2395,163 @@ def _queue_key(r):
     return (q is None, q if isinstance(q, int) else 0, r["requested"], r["key"])
 
 
-def ordered_res(res):
+def ordered_res(res, flags_first=False):
     """Waiting first (the queue, head on top), then grants by time left, soonest first (a grant
     without a ttl last), then finished ones newest first: whatever a short list cuts off is never
-    the reservation that explains why an agent waits. The live part is the app's order too
+    the reservation that explains why an agent waits. With `flags_first` (the resources on, 02 §3.4.6)
+    a grant with an `over` or `idle` flag comes before them all. The live part is the app's order too
     (Reservation.listOrder; roadmap C13), held to it by tools/vectors/chart.json."""
     live = [r for r in res if r.get("ended") is None]
     waiting = sorted([r for r in live if r.get("granted") is None], key=_queue_key)
     granted = sorted([r for r in live if r.get("granted") is not None],
                      key=lambda r: (r.get("expires") is None, r.get("expires") or 0, r["requested"], r["key"]))
+    if flags_first:
+        flagged = [r for r in granted if r.get("flags")]
+        waiting = flagged + waiting
+        granted = [r for r in granted if not r.get("flags")]
     done = sorted([r for r in res if r.get("ended") is not None], key=lambda r: (-r["ended"], r["key"]))
     return waiting, granted, done
 
 
+def short_duration(sec):
+    """MemoryChart.shortDuration: '17m', '1h05', '2h' (a time left, in the strip and the list)."""
+    m = max(int(math.floor(sec / 60.0 + 0.5)), 0)
+    return "%dm" % m if m < 60 else "%dh" % (m // 60) if m % 60 == 0 or m >= 600 else "%dh%02d" % (m // 60, m % 60)
+
+
+def amt_g(x):
+    """'6G', '2.5G': GB in a row (no ".0")."""
+    return "%dG" % int(round(x)) if abs(x - round(x)) < 0.05 else "%.1fG" % x
+
+
+def cores_words(x):
+    """'1 core', '6 cores', '2.5 cores' (one decimal, as printf rounds it; no ".0")."""
+    t = "%.1f" % x
+    t = t[:-2] if t.endswith(".0") else t
+    return t + (" core" if t == "1" else " cores")
+
+
+def amounts_text(r, pool=None):
+    """Reservation.amountsText (02 §3.8.5): every amount of a row as text, "5G · 6 cores · 20G disk"; disk space on
+    another pool than the tile's is named ("300G Scratch")."""
+    parts = []
+    if r.get("mem", True):
+        parts.append(amt_g(r["segments"][-1][1]))
+    if r.get("cpu") is not None:
+        parts.append(cores_words(r["cpu"]))
+    if r.get("disk") is not None:
+        other = pool is not None and r.get("pool") not in (None, pool)
+        parts.append(amt_g(r["disk"]) + " " + (mid_fit(r.get("pool_name") or r.get("pool"), 12) if other else "disk"))
+    return " · ".join(parts) or "–"
+
+
+def _and(words):
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def use_figure(r, k):
+    """One use figure of a grant (02 §3.4.6): "using 2.1G", "using 5.2 cores", "wrote 11G of 20G"; None unmeasured."""
+    if k == "memory":
+        return "using %.1fG" % _gb(r.get("used"))
+    if k == "cpu" and r.get("cpu_used") is not None:
+        return "using " + cores_words(r["cpu_used"])
+    if k == "disk" and r.get("disk_w") is not None and r.get("disk") is not None:
+        return "wrote %s of %s" % (amt_g(r["disk_w"]), amt_g(r["disk"]))
+    return None
+
+
+def status_text(r, shown, focus, now):
+    """Reservation.statusText (02 §3.4.6, §3.7.7): a waiting row says for how long and what it waits for ("waiting
+    40 s · for CPU"); a grant its flag ("over", "idle 12 min", "over on CPU" when it is not about the focus), one use
+    figure (of the focus if it holds it, else of the first shown resource it holds; none after `idle`), then the
+    time left."""
+    if r.get("granted") is None:
+        w = [RES_WORD[k] for k in r.get("waiting") or []]
+        return "waiting " + duration(now - r["requested"]) + (" · for " + _and(w) if w else "")
+    parts, idle = [], False
+    fl = r.get("flags") or {}
+    fk = next((k for k in [focus] + list(RESOURCES) if k in fl), None)
+    if fk:
+        f, since = fl[fk][0], fl[fk][1]
+        parts.append(f + ("" if fk == focus else " on " + RES_WORD[fk]) +
+                     (" " + duration(now - since) if f == "idle" and since is not None else ""))
+        idle = f == "idle"
+    held = [k for k in RESOURCES if holds(r, k)]
+    if not idle and held:
+        fig = use_figure(r, focus if focus in held else next((k for k in held if k in shown), held[0]))
+        if fig:
+            parts.append(fig)
+    if r.get("expires") is not None:
+        parts.append(short_duration(r["expires"] - now) + " left")
+    return " · ".join(parts)
+
+
+def rv_split(live, shown):
+    """(the live reservations that hold a shown resource, the rest) (02 §3.7.7)."""
+    rows = [r for r in live if any(holds(r, k) for k in shown)]
+    return rows, [r for r in live if not any(holds(r, k) for k in shown)]
+
+
+def _totals(rs, which):
+    """The granted totals of `which` over rs, as words: "14.0 GB", "6 cores", "20 GB disk"."""
+    out = []
+    g = [r for r in rs if r.get("granted") is not None]
+    if "memory" in which and any(r.get("mem", True) for r in g):
+        out.append("%.1f GB" % sum(r["segments"][-1][1] for r in g if r.get("mem", True)))
+    if "cpu" in which and any(r.get("cpu") is not None for r in g):
+        out.append(cores_words(sum(r["cpu"] for r in g if r.get("cpu") is not None)))
+    if "disk" in which and any(r.get("disk") is not None for r in g):
+        out.append("%s GB disk" % amt_g(sum(r["disk"] for r in g if r.get("disk") is not None))[:-1])
+    return out
+
+
+def caption_text(live, shown, n24):
+    """Reservation.captionText (02 §3.7.7): the live grants of the shown resources summed, as text, and how many
+    reservations the last 24 h saw: "14.0 GB · 6 cores · 46 in the last 24 h"."""
+    return " · ".join(_totals(live, shown) + ["%d in the last 24 h" % n24])
+
+
+def other_text(rest, short=False):
+    """Reservation.otherText (02 §3.7.7): the line for what holds no shown resource: its granted totals and how many
+    of it wait, for what. "On other resources: 6 cores and 20 GB disk reserved · 1 waiting for CPU"; short "Other: 6
+    cores, 20 GB disk · 1 waiting". None when there is nothing."""
+    if not rest:
+        return None
+    tot = _totals(rest, RESOURCES)
+    waiting = [r for r in rest if r.get("granted") is None]
+    what = [RES_WORD[k] for k in RESOURCES if any(k in (r.get("waiting") or ()) for r in waiting)]
+    if short:
+        return "Other: " + ", ".join(tot) + (" · " if tot and waiting else "") + \
+            ("%d waiting" % len(waiting) if waiting else "")
+    return "On other resources: " + (_and(tot) + " reserved" if tot else "") + (" · " if tot and waiting else "") + \
+        ("%d waiting%s" % (len(waiting), " for " + _and(what) if what else "") if waiting else "")
+
+
 def res_seq(model):
     """The reservation list as one sequence: waiting, granted, then the finished ones of the last 24 h.
-    Returns (sequence, live count, waiting count)."""
-    waiting, granted, done = ordered_res(model["res"])
+    With the resources on, only what holds a shown resource, flagged grants first (02 §3.7.7; the rest is
+    counted by rv_other). Returns (sequence, live count, waiting count)."""
+    res = model["res"]
+    if model.get("rv"):
+        shown = rv_shown(model)[0]
+        res = [r for r in res if any(holds(r, k) for k in shown)]
+    waiting, granted, done = ordered_res(res, flags_first=bool(model.get("rv")))
+    n_wait = sum(1 for r in waiting if r.get("granted") is None)
     return waiting + granted + [r for r in done if r["ended"] >= model["now"] - 86400], len(waiting) + len(granted), \
-        len(waiting)
+        n_wait
+
+
+def rv_other(model, short=False):
+    """With the resources on, the line for the live reservations that hold no shown resource (other_text)."""
+    if not model.get("rv"):
+        return None
+    live = [r for r in model["res"] if r.get("ended") is None]
+    return other_text(rv_split(live, rv_shown(model)[0])[1], short)
+
+
+def res_room(model, R):
+    """How many of the list's R rows are for reservations: one less while the "other" line needs one."""
+    return R - 1 if R >= 2 and rv_other(model) else R
 
 
 def res_visible(R, n_live, off):
@@ -2219,14 +2570,16 @@ def list_rows(model, R, ui=None):
     off = min((ui or {}).get("res_off", 0), max(len(seq) - 1, 0))
     if R <= 0:
         return [], n_live, n_wait
+    other = [("other",)] if res_room(model, R) < R else []     # the resources on: "On other resources: …"
+    R = res_room(model, R)
     if (R < 2 and (ui or {}).get("focus") == "res") or (n_live <= R and off == 0):
-        return [("res", r, off + i) for i, r in enumerate(seq[off:off + R])], n_live, n_wait
+        return [("res", r, off + i) for i, r in enumerate(seq[off:off + R])] + other, n_live, n_wait
     shown = seq[off:off + R - 1]
     below = [r for r in seq[off + R - 1:] if r.get("ended") is None]
     rows = [("res", r, off + i) for i, r in enumerate(shown)]
     rows.append(("more", off, len(below), sum(1 for r in below if r.get("granted") is None),
                  len(seq) - off - len(shown)))
-    return rows, n_live, n_wait
+    return rows + other, n_live, n_wait
 
 
 def panel_area(P):
@@ -2261,7 +2614,7 @@ def press(ui, key, model, P):
     With a panel open (a s e) the panel is the one focus stop. Changes `ui`; returns it."""
     if ui.get("panel"):
         return _press_panel(ui, key, model, P)
-    R, I = P["R"], P["I"]
+    R, I = res_room(model, P["R"]), P["I"]
     seq, n_live, _ = res_seq(model)
     incs = model["incidents"]
     has = {"res": bool(R and seq), "inc": bool(I and incs)}
@@ -2363,14 +2716,36 @@ def highlight(fr, x, y, w, caps, g, focus):
         fr.put(x, y, g["sel"], "faint", KEEP)
 
 
+def amounts_width(model):
+    """The amounts column of the list with the resources on: as wide as the widest row of the 14 days (a slow
+    fact, so rows that come and go do not push the purposes sideways), 6 to 20 cells."""
+    pool = rv_pool(model)
+    return max(6, min(20, max([tw(amounts_text(r, pool)) + 1 for r in model["res"]] or [6])))
+
+
+def rv_pool(model):
+    """The id of the disk pool the Disk tile shows (its band's), None where the sample names none."""
+    return (model.get("rfacts") or {}).get("pool_id")
+
+
 def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
     ui = ui or {}
     mono = caps.color == "none"
     now = model["now"]
-    pw, px = res_columns(w)
+    rv = model.get("rv")
+    aw = max(6, min(amounts_width(model), w // 3)) if rv else 6
+    pw, px = res_columns(w - (aw - 6))
+    px += aw - 6
     focus, sel = ui.get("focus") == "res", ui.get("res_sel")
+    if rv:
+        shown, rfocus = rv_shown(model)
+        pool = rv_pool(model)
     for i, row in enumerate(rows):
         yy = y + i
+        if row[0] == "other":
+            text = rv_other(model, short=w < 64) or ""
+            fr.put(x + 2, yy, fit(asc(text, fr), w - 4, g), "dim")
+            continue
         if row[0] == "more":
             _, above, below, waiting, rest = row
             parts = []
@@ -2381,6 +2756,12 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
                     parts.append(("%d granted" % (below - waiting), "fg"))
                 if waiting:
                     parts.append(("%d waiting" % waiting, "warntx"))
+            elif below and rv and not above:    # the app's words (02 §3.4.6): "▾ 3 more: 2 granted, 1 waiting"
+                parts.append(("%s %d more" % (g["down"], below), "dim"))
+                if below - waiting:
+                    parts.append(("%d granted" % (below - waiting), "dim"))
+                if waiting:
+                    parts.append(("%d waiting" % waiting, "warntx"))
             elif below:
                 parts.append(("%s %d more" % (g["down"], below), "dim"))
                 if waiting:
@@ -2388,9 +2769,10 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
             elif rest:
                 parts.append(("%s %d finished" % (g["down"], rest), "dim"))
             xx = x + 2
+            listed = rv and below and not above and len(parts) > 1 and parts[0][0].startswith(g["down"])
             for k, (text, role) in enumerate(parts):
                 if k:
-                    xx = fr.put(xx, yy, " %s " % g["mid"], "faint")
+                    xx = fr.put(xx, yy, (": " if k == 1 else ", ") if listed else " %s " % g["mid"], "faint")
                 xx = fr.put(xx, yy, text, role)
             if not focus and w >= 44 and len(rows) > 1 and (below or rest):
                 fr.rput(x + w - 2, yy, "%s scrolls" % g["updown"][1], "faint")
@@ -2399,13 +2781,22 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
         live = r.get("ended") is None
         granted = r.get("granted") is not None
         fr.put(x + 2, yy, g["sw"] if granted else g["swq"], None if mono else res_role(model, r), KEEP)
-        fr.put(x + 4, yy, "%4.1fG" % r["segments"][-1][1], "fg" if live else "dim", KEEP, BOLD if live else 0)
+        raw = aw                  # this row's amounts column: wider than the list's where its amounts need it
+        if rv:                    # (02 §3.4.6: the amounts and the status are never cut; the project goes first,
+            amounts = asc(amounts_text(r, pool), fr)        # then the purpose is shortened in its middle)
+            raw = max(aw, min(tw(amounts) + 1, w - 2 - 5 - 4))
+            fr.put(x + 4, yy, fit(amounts, raw - 1, g), "fg" if live else "dim", KEEP, BOLD if live else 0)
+        else:
+            fr.put(x + 4, yy, "%4.1fG" % r["segments"][-1][1], "fg" if live else "dim", KEEP, BOLD if live else 0)
         if not live:
             tail = "peak %.1fG %s %s %s" % (_gb(r.get("peak")), g["mid"], (r.get("outcome") or "ended").replace("_", " "),
                                             hhmm(r["ended"]))
             trole = "faint"
         elif granted and model.get("stale"):
             tail, trole = "was using %.1fG" % _gb(r.get("used")), "dim"
+        elif rv:
+            tail = status_text(r, shown, rfocus, now)
+            trole = "warntx" if not granted else "fg" if r.get("flags") else "dim"
         elif granted:
             used = "using %.1fG" % _gb(r.get("used"))
             tail = used + (" %s %s left" % (g["mid"], left_of(r["expires"] - now)) if r.get("expires") is not None else "")
@@ -2413,13 +2804,20 @@ def draw_res_rows(fr, x, y, w, rows, model, caps, g, ui=None):
         else:
             tail = "waiting %s" % ago(now - r["requested"])
             trole = "warntx"
-        if w < 44:                           # a narrow pane keeps the state, shortened
-            tail = tail.replace("using ", "").replace(" left", "").replace("waiting ", "wait ")
-        fr.rput(x + w - 2, yy, tail, trole, KEEP)
+        if w < 44 or (rv and tw(tail) > w - 4 - raw - 14):     # a narrow pane keeps the state, shortened
+            tail = tail.replace("using ", "").replace(" left", "").replace("waiting ", "wait ").replace(" cores", "c")
+        if rv:                    # still too long beside a 4-cell purpose: the middle gives way, then all but the first
+            parts = tail.split(" · ")
+            room = w - 2 - (5 + raw) - 5
+            while tw(" · ".join(parts)) > room and len(parts) > 1:
+                parts.pop(1 if len(parts) > 2 else -1)
+            tail = asc(" · ".join(parts), fr)
+        fr.rput(x + w - 2, yy, tail, trole, KEEP, BOLD if rv and r.get("flags") and live else 0)
         end = w - 2 - tw(tail) - 1
-        fr.put(x + 11, yy, fit(r["purpose"], max(4, min(pw, end - 11)), g), "fg" if live else "dim", KEEP)
+        pwid = max(4, min(pw - (raw - aw), end - 5 - raw))
+        fr.put(x + 5 + raw, yy, (fit_mid if rv else fit)(r["purpose"], pwid, g), "fg" if live else "dim", KEEP)
         project = r.get("project")
-        if isinstance(project, str) and project and end - px >= 3:
+        if isinstance(project, str) and project and end - px >= 3 and px > 5 + raw + pwid:
             fr.put(x + px, yy, fit(project.rstrip("/").rsplit("/", 1)[-1], end - px, g), "dim", KEEP)
         if live and model.get("stale"):      # what claims to be now, of a machine not connected: grey
             fr.restyle(x, yy, w, 1, "off")
@@ -3256,45 +3654,59 @@ def card_res(fr, caps, g, model, r):
     mono = caps.color == "none"
     gb = r["segments"][-1][1]
 
+    rv = model.get("rv")
+    amounts = asc(amounts_text(r, rv_pool(model)), fr) if rv else "%.1f GB" % gb
+    mem = not rv or r.get("mem", True)      # with the resources on, memory facts only where it holds memory
+
     def head(fr, x, y, w, bg):
         fr.put(x, y, g["sw"] if r.get("granted") is not None else g["swq"], None if mono else res_role(model, r), bg)
-        fr.put(x + 2, y, fit("%.1f GB  %s" % (gb, r["purpose"]), w - 2, g), "fg", bg, BOLD)
+        fr.put(x + 2, y, fit("%s  %s" % (amounts, r["purpose"]), w - 2, g), "fg", bg, BOLD)
     project = r.get("project") if isinstance(r.get("project"), str) else None
     lines = [(9, None), (0, head), (8, None)]
     if project:
         lines.append((1, _kv("Project", project)))
     lines.append((2, _kv("Holder", _holder_text(r))))
+    if rv:                      # the vector card (02 §3.4.5): each resource it holds besides memory, and its advice
+        lines += res_card_lines(r, now, fr, g)
     if len(r["segments"]) > 1:
         lines.append((3, _kv("Sizes", (" %s " % g["arrow"]).join(
             "%s %s" % (gfmt(s_gb), hhmm(t)) for t, s_gb in r["segments"][-4:]))))
     if r.get("ended") is not None:
-        lines += [(0, _kv("Ended", "%s at %s" % ((r.get("outcome") or "ended").replace("_", " "), hhmm(r["ended"])))),
-                  (1, _kv("Peak", "%.1f GB" % _gb(r.get("peak"))))]
+        lines.append((0, _kv("Ended", "%s at %s" % ((r.get("outcome") or "ended").replace("_", " "), hhmm(r["ended"])))))
+        if mem:
+            lines.append((1, _kv("Peak", "%.1f GB" % _gb(r.get("peak")))))
         if r.get("granted") is not None:
             lines.append((2, _kv("Ran", "%s, after waiting %s" % (ago(r["ended"] - r["granted"]),
                                                                      ago(r["granted"] - r["requested"])))))
     elif r.get("granted") is None:
         ahead = [w_ for w_ in waiting if _queue_key(w_) < _queue_key(r)]
+        if rv:                  # ahead of it: those that wait for a resource it asks for too (02 §6.4)
+            ahead = [w_ for w_ in ahead if any(holds(w_, k) and holds(r, k) for k in BAND_RES)]
         st = model.get("ledger_state") or {}
         owed = sum(max(0.0, x_["segments"][-1][1] - _gb(x_.get("used"))) for x_ in granted)
         lines.append((0, _kv("Waiting", "%s, %s" % (ago(now - r["requested"]), "first in the queue" if not ahead else
                                                     "behind %d in the queue" % len(ahead)), "warntx")))
-        if isinstance(st.get("free_gb"), (int, float)) and isinstance(st.get("margin_gb"), (int, float)):
+        if rv and r.get("waiting"):     # what it waits for (02 §3.4.6): "Waits for  CPU and disk"
+            lines.append((0, _kv("Waits for", _and([RES_WORD[k] for k in r["waiting"]]), "warntx")))
+        if mem and isinstance(st.get("free_gb"), (int, float)) and isinstance(st.get("margin_gb"), (int, float)):
             avail = st["free_gb"] - owed - st["margin_gb"]
             lines += [(1, _kv("Needs", "%.1f GB; %.1f GB can be granted now" % (gb, max(0.0, avail)))),
                       (2, _kv("", "%.1f GB free, %.1f GB still owed to grants, %.1f GB margin"
                               % (st["free_gb"], owed, st["margin_gb"]), "dim"))]
-        else:
+        elif mem:
             lines.append((1, _kv("Needs", "%.1f GB" % gb)))
         lines.append((3, _kv("Ahead", "nobody: it is granted as soon as it fits" if not ahead else
-                             ", ".join("%s %s" % (a["purpose"], gfmt(a["segments"][-1][1])) for a in ahead[:3]) +
+                             ", ".join("%s %s" % (a["purpose"], asc(amounts_text(a), fr) if rv else
+                                                  gfmt(a["segments"][-1][1])) for a in ahead[:3]) +
                              (" %s" % g["ell"] if len(ahead) > 3 else ""))))
-        if granted:
+        if granted and mem:
             big = sorted(granted, key=lambda x_: -x_["segments"][-1][1])
             lines.append((2, _kv("Holding", ", ".join("%s %s" % (x_["purpose"], gfmt(x_["segments"][-1][1]))
                                                       for x_ in big[:3]) + (" %s" % g["ell"] if len(big) > 3 else ""))))
     else:
-        lines.append((0, _kv("Using", "%.1f GB now %s peak %.1f GB" % (_gb(r.get("used")), g["mid"], _gb(r.get("peak"))))))
+        if mem:
+            lines.append((0, _kv("Using", "%.1f GB now %s peak %.1f GB" % (_gb(r.get("used")), g["mid"],
+                                                                         _gb(r.get("peak"))))))
         lines.append((1, _kv("Granted", "%s, after waiting %s" % (hhmm(r["granted"]), ago(r["granted"] - r["requested"])))))
         if r.get("expires") is not None:
             lines.append((1, _kv("Expires", "in %s, unless its holder renews it" % left_of(r["expires"] - now))))
@@ -3302,6 +3714,32 @@ def card_res(fr, caps, g, model, r):
               (9, None)]
     return dialog(fr, g, caps, "Reservation", 76, len(lines) + 3, lines,
                   [("esc", "close"), (g["updown"], "previous %s next" % g["mid"])])
+
+
+def res_card_lines(r, now, fr, g):
+    """A reservation card's lines for its cores, its disk space and its advice (the app's ReservationCard)."""
+    out = []
+    live = r.get("ended") is None and r.get("granted") is not None
+    if r.get("cpu") is not None:
+        out.append((1, _kv("Cores", cores_words(r["cpu"]) + (" %s using %s" % (g["mid"], cores_words(r["cpu_used"]))
+                                                            if live and r.get("cpu_used") is not None else ""))))
+    if r.get("disk") is not None:
+        out.append((1, _kv("Disk", "%s on %s" % (amt_g(r["disk"]), mid_fit(asc(r.get("pool_name") or r.get("pool") or "?", fr),
+                                                                          24)) +
+                           (" %s wrote %s" % (g["mid"], amt_g(r["disk_w"])) if live and r.get("disk_w") is not None else ""))))
+    for k, (f, since) in sorted((r.get("flags") or {}).items()) if live else ():
+        out.append((0, _kv("Advice", advice_words(k, f, since, now), "warntx")))
+    return out
+
+
+def advice_words(k, f, since, now):
+    """Reservation.adviceWords: "over on CPU since 13:26: its processes use more than it got", "idle on CPU for
+    12 min: it could be released"."""
+    if f == "idle":
+        return "idle on %s%s: it could be released or made smaller" % (RES_WORD[k], " for " + duration(now - since)
+                                                                      if since is not None else "")
+    return "over on %s%s: %s" % (RES_WORD[k], " since " + hhmm(since) if since is not None else "",
+                                 "it wrote more than it reserved" if k == "disk" else "it uses more than it got")
 
 
 def card_inc(fr, caps, g, model, inc):
@@ -3772,8 +4210,10 @@ def mouse(ui, model, P, g, button, x, y):
                 again = ui.get("focus") == "res" and ui.get("res_sel") == row[2]
                 ui.update(focus="res", res_sel=row[2])
                 return ("card",) if again else None
+            if row[0] == "other":                     # "On other resources": its words are all there is
+                return None
             ui["focus"] = "res"                       # "n more": into the list, at the first not shown
-            ui["res_sel"] = row[1] + len(rows) - 1
+            ui["res_sel"] = row[1] + k
             press(ui, "noop", model, P)
         return None
     if P["I"] and P["inc_y"] <= y < P["inc_y"] + P["I"]:
@@ -4039,16 +4479,27 @@ def draw_body(fr, P, model, ui, caps, g):
         reserved = sum(r["segments"][-1][1] for r in live if r.get("granted") is not None)
         n24 = sum(1 for r in model["res"] if (r["ended"] if r.get("ended") is not None else now) >= now - 86400)
         summary = "%.1f GB reserved %s %d in the last 24 h" % (reserved, g["mid"], n24)
+        if model.get("rv"):         # the shown resources' grants, summed (02 §3.7.7)
+            shown = rv_shown(model)[0]
+            summary = asc(caption_text(rv_split(live, shown)[0], shown, n24), fr).replace(" · ", " %s " % g["mid"])
         if model.get("stale"):           # another machine's, not connected: said once, as of when (01 §3.5)
             summary = "as of %s: %.1f GB reserved" % (hhmm(model.get("known") or now), reserved)
-        if tw(summary) + 4 > lw - 2 - (24 if lw >= 64 else 14):      # too long beside the title: the count gives way
+        room = lw - 2 - (24 if lw >= 64 else 14)
+        if model.get("rv") and not model.get("stale"):     # too long beside the title: the last parts give way
+            parts = summary.split(" %s " % g["mid"])
+            while len(parts) > 1 and tw((" %s " % g["mid"]).join(parts)) + 4 > room:
+                parts.pop()
+            summary = (" %s " % g["mid"]).join(parts)
+        elif tw(summary) + 4 > room:      # too long beside the title: the count gives way
             summary = summary.split(" %s " % g["mid"])[0]
         hidden = n_live - sum(1 for r in rows if r[0] == "res" and r[1].get("ended") is None)
         if hidden and not any(r[0] == "more" for r in rows):         # no list at all: the caption counts
             summary = "%d granted%s %s %s" % (n_live - n_wait, " %s %d waiting" % (g["mid"], n_wait) if n_wait else "",
                                              g["mid"], summary.split(" %s " % g["mid"])[0])
         section(fr, 0, P["cap_y"], lw, g, "Reserved by agents" if lw >= 64 else "Reserved", summary)
-        if P["S"]:
+        if P["S"] and model.get("rv"):
+            draw_bands(fr, x0, P["strip_y"], pw, P["S"], model, ui, caps, g, gridcols)
+        elif P["S"]:
             draw_strip(fr, x0, P["strip_y"], pw, P["S"], model, ui, caps, g, gridcols)
     if P["R"]:
         draw_res_rows(fr, 1, P["list_y"], lw - 2, rows, model, caps, g, ui)

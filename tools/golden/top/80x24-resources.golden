@@ -1,7 +1,7 @@
 # oomph top golden frame v2 · 80x24 · scenario=resources · span=24h glyphs=unicode color=256 · keys=C
 --- text
  oomph  studio                                         3.3G free  Normal  13:27 
-  Memory  1 waiting CPU                GPU                Disk                  
+  Memory  1 waiting CPU      1 waiting GPU                Disk                  
  32.7 / 36 GB       8.2 / 14 cores     23 % · 16.7 GB     45 GB free · Data     
 ╭─ ∞  24h  6h  1h ──── ■ Wired 7.2 ■ App 15.2 ■ Compressed 10.3 ■ Swap 0.0 GB ─╮
 │  ┃▆▁         ┊    ╱╱╱╱         ┊  ╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱           ┃     ┊     48G│
@@ -12,13 +12,13 @@
 │██┃████████████████╱╱╱╱████████████╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱██████▁████┃██▁▁▁▁█▁█     │
 │▇▇┃▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇╱╱╱╱▇███████████╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱╱███████████┃█████████     │
 │            18:00            Fri 20             06:00              12:00      │
-├─ Reserved by agents ──────────────── 12.0 GB reserved · 39 in the last 24 h ─┤
-│           ▄  ┊                 ┊                 ┊               ▃ ▁┊  ▒  24G│
-│▃▄ ▃▂▁▁  ▁▆▄▃▃▅▁▁               ┊                 ┊             ▁▁▅▃▄▄ ▄▅     │
-│  □  8.0G  docker build api        atlas                         waiting 40 s │
-│  ■  6.0G  gradle assembleDebug    atlas                using 4.1G · 18m left │
-│  ■  4.0G  pytest -n 8             ml-eval              using 1.3G · 26m left │
-│  ■  2.0G  pnpm check              webshop              using 0.3G · 29m left │
+├─ Reserved by agents ────────────── 13.0 GB · 14 cores · 42 in the last 24 h ─┤
+│▁▁ ▂▁▁▁  ▁▄▄▃▂▂▁▁               ┊                 ┊             ▁▁▃▂▃▂ ▂▄  24G│
+│▃  ▃▃      ▄▄ ┊                 ┊                 ┊               ▃▂ ┊ ▃▅  CPU│
+│  ■ 6G · 6 cores     gradle a…bleDebug    over on CPU · using 4.1G · 18m left │
+│  ■ 4G · 8 cores     pytest -n 8        ml-ev…  idle on CPU 12 min · 35m left │
+│  ▾ 4 more: 2 granted, 2 waiting                                    ↓ scrolls │
+│  On other resources: 40 GB disk reserved                                     │
 ├─ Incidents ────────────────────────────────────────── 1–2 of 3 in 90 days ▾ ─┤
 │  ○ Fri 20 10:29  memory pressure critical                              7 min │
 │  ○ Thu 19 14:22  14 processes killed for memory in 60 s    14 kills · 28 min │
@@ -26,7 +26,7 @@
  q quit  ? help  a apps  ←→ span  ↑↓ select  s sessions      Logging every 30 s 
 --- fg
 .......ssssssss........................................ddddddddd.kkkkkkkk.ddddd.
-.ssssssss.ddddddddd....................ddd................dddd..................
+.ssssssss.ddddddddd..........ddddddddd.ddd................dddd..................
 ................................................................................
 lldddsssssddddddddllll.wdddddddddd.addddddddd.cdddddddddddddddd.pddddddddd.dd.ll
 l..ipp.........g....hhhh.........g..hhhhhhhhhhhhhhhhh...........i.....g.....dddl
@@ -37,13 +37,13 @@ laaiaaaaaaaaaaaaaaaahhhhaaaaaaaaaaaahhhhhhhhhhhhhhhhhaaaaaaaaaaaiaaaaaaaaa.....l
 laaiaaaaaaaaaaaaaaaahhhhaaaaaaaaaaaahhhhhhhhhhhhhhhhhaaaaaawaaaaiaawwwwawa.....l
 lwwiwwwwwwwwwwwwwwwwhhhhwwwwwwwwwwwwhhhhhhhhhhhhhhhhhwwwwwwwwwwwiwwwwwwwww.....l
 l............ddddd............dddddd.............ddddd..............ddddd......l
-ll....................llllllllllllllllddddddddddddddddddddddddddddddddddddddddll
-l...........u..g.................g.................g...............u.vg..u..fffl
-lzv.qqzz..zuuqzvzz...............g.................g.............zzuvvv.uu.....l
-l..u................................ddddd.........................xxxxxxxxxxxx.l
-l..u................................ddddd................ddddddddddddddddddddd.l
-l..v................................ddddddd..............ddddddddddddddddddddd.l
-l..z................................ddddddd..............ddddddddddddddddddddd.l
+ll....................llllllllllllllddddddddddddddddddddddddddddddddddddddddddll
+lzz.qqzz..zuuqzvzz...............g.................g.............zzuuvv.uu..fffl
+lq..qq......uq.g.................g.................g...............uu.g.vv..fffl
+l..u...........................................................................l
+l..v.....................................dddddd................................l
+l..ddddddddffdddddddddffxxxxxxxxx....................................fffffffff.l
+l..ddddddddddddddddddddddddddddddddddddddd.....................................l
 ll...........lllllllllllllllllllllllllllllllllllllllllldddddddddddddddddddddddll
 l..f...............dddddddddddddddddddddddd..............................ddddd.l
 l..f...............dddddddddddddddddddddddddddddddddddddd....iiiiiiiiiiidddddd.l
@@ -63,8 +63,8 @@ BBBBBBBSSSSSSSSBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBooooooooBBBBBBB
 .aawaaaaaaaaaaaaaaaa....a...........yyyyyyyyyyyyyyyyy...........w...............
 ................................................................................
 ................................................................................
-............u...................................................................
-.qv........zuuvz...................................................vuv...v......
+............u............................................................u......
+............u............................................................u......
 ................................................................................
 ................................................................................
 ................................................................................
@@ -90,10 +90,10 @@ BBBBBBBSSSSSSSSBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBooooooooBBBBBBB
 ..11111111111111111111..........................................................
 ................................................................................
 ................................................................................
-.....11111......................................................................
-.....11111......................................................................
-.....11111......................................................................
-.....11111......................................................................
+.....111111111111..........................11111111111111111111111111111111111..
+.....111111111111................................11111111111111111111111111111..
+................................................................................
+................................................................................
 ..11111111111...................................................................
 ................................................................................
 ................................................................................

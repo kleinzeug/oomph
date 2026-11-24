@@ -10,7 +10,8 @@ table whether a lease's holder lives; `--now T` and `--no-liveness` take both fr
                                         later must differ (the clock is honoured), and so must one without
                                         --no-liveness (the fixture's holders are not alive)
     tools/renderfixture.py --app EXE --resources DIR
-                                        the four-resource popup (1.11.0, behind resourcesUI) forced on, in every
+                                        the four-resource popup (1.11.0, and its bands of 1.12.3, behind
+                                        resourcesUI) forced on, in every
                                         state of RESOURCES below, light and dark, into DIR as NAME-light.png and
                                         NAME-dark.png, and the menu-bar chip (--render-chip) as chip-light.png and
                                         chip-dark.png: what the owner looks at before switching it on
@@ -104,6 +105,10 @@ RESOURCES = ([("memory-alone", "fxr", "", sel("memory")), ("memory-cpu", "fxr", 
               ("memory-callout", "fxr", "top", sel("memory")), ("cpu-callout", "fxr", "top", sel("cpu")),
               ("gpu-callout", "fxr", "top", sel("gpu")), ("disk-callout", "fxr", "top", sel("disk")),
               ("cpu-only-list", "fxr", "", sel("cpu", "cpu", "gpu")),
+              # B3 (1.12.3): a band per reserved resource; the pointer on a row, on a block of the CPU band; every row
+              ("bands-row-hover", "fxr", "rowhover:0", sel("memory", *ALL4)),
+              ("bands-cpu-card", "fxr", "rhover:428:56", sel("memory", *ALL4)),
+              ("bands-all-rows", "fxr", "resmore", sel("memory", *ALL4)),
               ("tour-1", "fxr", "tour:1", sel("memory", "memory", "cpu")), ("tour-2", "fxr", "tour:2", sel("memory", "memory", "cpu"))]
              + [("all-memory-level-%d" % n, "fxr", "lvl:%d" % n, sel("memory", *ALL4)) for n in range(1, 6)]
              + [("memory-tight", "fxr-tight", "", sel("cpu")), ("memory-critical", "fxr-crit", "", sel("cpu", "cpu", "gpu")),

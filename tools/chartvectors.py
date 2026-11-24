@@ -6,7 +6,10 @@ share: the mapper and its inversion (the app's TimeAxis, which every chart row i
 thinning, gap finding, band merging, lane stacking, the strip's top, the colour index, the
 reservation merge and the hover card over a column (which `oomph top`'s inspect readout shows);
 from 1.11.0 the four resources (02 §3.7, §3.8): the selection's gestures, the capsule's words, what
-each tile says, and an agent's palette slot.
+each tile says, and an agent's palette slot; from 1.12.3 a band per reserved resource (B3, 02 §3.4.5,
+§3.4.6, §3.7.7): which bands a selection draws, their lanes and scales, and the list's words (the rows
+of what holds a shown resource in their order, with their amounts and status, the caption, the line
+for the rest).
 The expected answers are the app's: `oomph --chart-vectors FILE` runs its own functions over the
 inputs and prints what they return. A change on either side that is not made on the other fails here.
 
@@ -37,7 +40,7 @@ import oomph_top  # noqa: E402
 import oomph_view as V  # noqa: E402
 
 GROUPS = ("mapper", "invert", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order",
-          "hover", "selection", "capsule", "tiles", "agent")
+          "hover", "selection", "capsule", "tiles", "agent", "rows", "band_stack", "band_top")
 
 
 def cases():
@@ -281,11 +284,82 @@ def resource_cases(v):
         v["capsule"].append({"sample": smp})
         waiting = [{}, {"memory": 1}, {"memory": 2, "cpu": 1}][i % 3]
         v["tiles"].append({"sample": smp, "waiting": waiting})
+    band_cases(v)
     for a in ({"key": "3f9a0c21", "slot": 0}, {"key": "3f9a0c21", "slot": 5}, {"key": "3f9a0c21"},
               {"key": "3f9a0c21", "slot": 6}, {"key": "3f9a0c21", "slot": -1}, {"key": "3F9A0C21", "slot": 1},
               {"key": "3f9a0c2", "slot": 1}, {"key": 12345678, "slot": 1}, {"key": "3f9a0c21", "slot": True},
               {"key": "3f9a0c21", "slot": 2.0}, None, "3f9a0c21", {}):
         v["agent"].append({"agent": a})
+
+
+def band_cases(v):
+    """B3's inputs: the resources fixture's ledger and records (tools/topfixture.py: cores over and idle, disk space on
+    Data and over on Scratch, a request waiting for cores), seen through several selections; and hand-made leases
+    with odd and hostile fields."""
+    import topfixture
+    now = topfixture.NOW
+    recs, ledger = topfixture.reservations(topfixture.LIVE_RES, agents=True)
+    recs = recs[-12:]                       # Friday's: some of them held cores or disk space too
+    sels = [(["memory"], "memory", "data"), (["memory", "cpu"], "memory", "data"), (["cpu"], "cpu", "data"),
+            (["memory", "cpu", "gpu", "disk"], "disk", "data"), (["disk"], "disk", "vol:4F632FD2"),
+            (["gpu"], "gpu", None), (["cpu", "disk"], "cpu", None), (["memory", "cpu", "gpu", "disk"], "gpu", "data")]
+    for shown, focus, pool in sels:
+        v["rows"].append({"now": now, "records": recs, "ledger": ledger, "shown": shown, "focus": focus, "pool": pool,
+                          "day": 42})
+    t0 = now - 4000
+
+    def lease(i, req, gb, **more):
+        return dict({"id": i, "key": "%s@%d" % (i, int(req)), "state": "granted" if more.get("granted") else "queued",
+                     "gb": gb, "purpose": "p " + i, "requested": req, "seen": now - 2,
+                     "holder": {"pid": 1, "start": 1, "kind": "session"}}, **more)
+    odd = {"seq": 30, "v": 2, "history": [], "leases": [
+        lease("x1", t0, 2.5, granted=t0, expires=now + 600, used_gb=1.04, v=2,
+              res={"ram": {"ask": 2.5, "got": 2.5}, "cpu": {"ask": 1, "got": 1, "used": 1.05, "flag": "idle", "low_t": now - 61},
+                   "disk": {"ask": 0.5, "got": 0.5, "pool": "data", "w": 0.96, "flag": "over", "over_t": now - 5}},
+              segments=[{"t": t0, "gb": 2.5, "res": {"ram": 2.5, "cpu": 1, "disk": 0.5}},
+                        {"t": t0 + 1200, "gb": 2.5, "res": {"ram": 2.5, "cpu": 2.25, "disk": 0.5}}]),
+        lease("x2", t0 + 100, 0.01, granted=t0 + 100, v=2,
+              res={"cpu": {"ask": 12, "min": 6, "got": 6.5, "used": "lots", "flag": "on fire"},
+                   "disk": {"ask": True, "got": -3, "pool": 7}}),
+        lease("x3", t0 + 200, 3.0, v=2, waiting_on=["critical"], res={"ram": {"ask": 3.0}}),
+        lease("x4", t0 + 300, 0.01, v=2, waiting_on=["cpu", "disk:vol:AB", "gpu0"],
+              res={"cpu": {"ask": 4, "min": 4}, "disk": {"ask": 1500, "pool": "vol:AB", "name": "Footage Archive SSD"}}),
+        lease("x5", t0 + 400, 1.0, granted=t0 + 400, expires=now + 30, v=2,
+              res={"ram": {"ask": 1.0, "got": 1.0}, "cpu": {"ask": 1e9, "got": 3, "used": 0.04, "flag": "over",
+                                                           "over_t": "x"}}),
+        lease("x6", t0 + 500, 4.0, waiting_on="ram")]}
+    odd_recs = [{"event": "end", "key": "y1@%d" % int(t0 - 3000), "id": "y1", "purpose": "p y1", "gb": 0.01,
+                 "requested": t0 - 3000, "granted": t0 - 3000, "ended": t0 - 100, "outcome": "released", "v": 2,
+                 "res": {"cpu": 8, "disk": 300.0, "disk_pool": "vol:AB"}}]
+    for shown, focus, pool in ((["memory", "cpu", "disk"], "cpu", "data"), (["disk"], "disk", "vol:AB"),
+                               (["memory"], "memory", None)):
+        v["rows"].append({"now": now, "records": odd_recs, "ledger": odd, "shown": shown, "focus": focus, "pool": pool,
+                          "day": 7})
+    for kind, pool in (("memory", None), ("cpu", None), ("disk", "data"), ("disk", "vol:4F632FD2"), ("disk", None)):
+        v["band_stack"].append({"now": now, "records": recs, "ledger": ledger, "kind": kind, "pool": pool})
+    for kind, pool in (("cpu", None), ("disk", "vol:AB"), ("memory", None)):
+        v["band_stack"].append({"now": now, "records": odd_recs, "ledger": odd, "kind": kind, "pool": pool})
+    for kind in ("memory", "cpu", "disk"):
+        for tallest in (0, 3, 12, 255, 300, 1500, 70000):
+            v["band_top"].append({"tallest": tallest, "kind": kind})
+
+
+def band_answers(v, out):
+    """What oomph_view answers for B3's inputs (band_cases)."""
+    for c in v["rows"]:
+        all_ = V.merge_reservations(c["records"], c["ledger"], c["now"])
+        waiting, granted, _ = V.ordered_res(all_, flags_first=True)
+        rows, rest = V.rv_split(waiting + granted, c["shown"])
+        out["rows"].append({"bands": V.bands(all_, c["shown"], c["focus"], c["pool"]),
+                            "rows": [[r["key"], V.amounts_text(r, c["pool"]), V.status_text(r, c["shown"], c["focus"], c["now"])]
+                                     for r in rows],
+                            "rest": [r["key"] for r in rest], "caption": V.caption_text(rows, c["shown"], c["day"]),
+                            "other": V.other_text(rest), "other_short": V.other_text(rest, short=True)})
+    for c in v["band_stack"]:
+        rs = [r for r in V.merge_reservations(c["records"], c["ledger"], c["now"]) if V.holds(r, c["kind"], c["pool"])]
+        out["band_stack"].append([{"key": b["res"]["key"], "lane": b["lane"], "steps": [list(st) for st in b["steps"]]}
+                                  for b in V.stack_reservations(rs, c["now"], c["kind"])])
+    out["band_top"] = [V.band_top(c["tallest"], c["kind"]) for c in v["band_top"]]
 
 
 def tile_answer(t):
@@ -394,6 +468,7 @@ def python_answers(v):
         t = V.tiles(c["sample"], oomph.capsule(c["sample"]), c["waiting"])
         out["tiles"].append([tile_answer(t[r]) for r in V.RESOURCES])
     out["agent"] = [V.agent_index(c["agent"]) for c in v["agent"]]
+    band_answers(v, out)
     return out
 
 

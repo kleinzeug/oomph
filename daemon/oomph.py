@@ -3077,6 +3077,15 @@ VOLUME_GONE_S = 120          # a reserved pool missing this long from a list of 
 DISK_STATE_MAX = 32          # disk pools in the ledger's state
 WRITE_DT_MAX_S = 120         # the longest interval one evaluation charges a tree's writes for (a sleep, a stall)
 
+# ----- advice on a grant (B3, 1.12.3; 02 §6.3): `over` and `idle`, shown and returned to the holder, never enforced
+OVER_X = 1.25                # a rate grant used at more than this × what it got …
+OVER_N = 2                   # … for this many evaluations in a row is `over`; a disk grant is over once it wrote more
+IDLE_X = 0.1                 # a rate grant used at under this × what it got …
+IDLE_S = 600                 # … for this long is `idle`
+ADVICE_FLAGS = ("over", "idle")
+ADVICE_FIELDS = ("flag", "over_n", "over_t", "low_t", "rate_t")  # in res.cpu and res.disk: the advice, its counters
+ADVICE_STALE_S = 300         # and when the logger last rated them: advice older than this is dropped (_advice_stale)
+
 
 def disk_reservable():
     """Can disk space be reserved here? Only where this machine lists its volumes by pool id (`mounts`, the
@@ -3664,7 +3673,8 @@ def _segments(x):
 #     last write, Linux), `sessions` {"<pid>@<start>": {cwd, uid, seen}} (what each agent session
 #     says about itself);
 #   lease: `v` (2 when a vector-aware writer created it: set once, never added later), `res` {ram,
-#     cpu, gpu, vram, disk, mem: {ask, min, got, used, peak, tree, w, dev, pool, unified}} (gb and
+#     cpu, gpu, vram, disk, mem: {ask, min, got, used, peak, tree, w, dev, pool, unified, and from 1.12.3 the
+#     advice `flag` "over" | "idle" with its counters over_n, over_t, low_t}} (gb and
 #     used_gb / peak_gb / baseline_gb stay as the memory mirrors 1.8 readers read; gb is 0 for a
 #     lease without memory), `res_granted` (the time a vector-aware evaluator granted it: a v2
 #     lease granted without it was granted by old code), `waiting_on` and `hold` (pool ids),
@@ -3730,6 +3740,10 @@ def _res(x):
             del o["pool"]
         if "unified" in o and not isinstance(o["unified"], bool):
             del o["unified"]
+        for f, ok in (("flag", lambda v: v in ADVICE_FLAGS), ("over_n", lambda v: _int(v, 0, 10 ** 6)),
+                      ("over_t", _t), ("low_t", _t), ("rate_t", _t)):  # the advice of 1.12.3 (_rate_flag)
+            if f in o and not ok(o[f]):
+                del o[f]
         out[k] = o
     return out or None
 
@@ -4497,8 +4511,8 @@ def _normalize(L):
             for k in ("granted", "expires", "baseline_gb", "used_gb", "peak_gb", "note"):
                 r.pop(k, None)
             for k, x in res.items():
-                for f in (("used", "peak") if k == "mem" else ("got", "used", "peak", "w", "wt") if k == "disk"
-                          else ("got", "used", "peak")):
+                for f in (("used", "peak") if k == "mem" else ("got", "used", "peak", "w", "wt") + ADVICE_FIELDS
+                          if k == "disk" else ("got", "used", "peak") + ADVICE_FIELDS):
                     x.pop(f, None)
         mem = res.get("mem")
         if isinstance(mem, dict) and _num(mem.get("got")) and abs(mem["got"] - r["gb"]) > 0.005:
@@ -4506,12 +4520,97 @@ def _normalize(L):
             res.update((k, fixed[k]) for k in ("ram", "vram", "mem") if k in fixed)
 
 
-def _charge_cpu(L, procs, children):
+def _rate_flag(c, used, now):
+    """`over` / `idle` of a rate grant (02 §6.3): used at more than OVER_X × got for OVER_N evaluations in a row
+    (`over_n`, since `over_t`), or at under IDLE_X × got for IDLE_S (since `low_t`). `flag` is what readers
+    show; the counters are this function's. Advice only: nothing is revoked or charged differently."""
+    got = c.get("got")
+    if not _num(got) or got <= 0:
+        return
+    if used > OVER_X * got:
+        n = c["over_n"] + 1 if _int(c.get("over_n"), 0, 10 ** 6 - 1) else 1
+        c["over_n"] = n
+        if n == 1 or not _t(c.get("over_t")):
+            c["over_t"] = round(now, 1)
+    else:
+        c.pop("over_n", None)
+        c.pop("over_t", None)
+    if used < IDLE_X * got:
+        if not (_t(c.get("low_t")) and c["low_t"] <= now):
+            c["low_t"] = round(now, 1)
+    else:
+        c.pop("low_t", None)
+    flag = "over" if c.get("over_n", 0) >= OVER_N else "idle" if "low_t" in c and now - c["low_t"] >= IDLE_S else None
+    if flag:
+        c["flag"] = flag
+    else:
+        c.pop("flag", None)
+    _rated(c, now)
+
+
+def _rated(part, now):
+    """Stamps a grant's part with the time the logger last rated its advice (`rate_t`), while it has any."""
+    if any(f in part for f in ADVICE_FIELDS[:-1]):
+        part["rate_t"] = round(now, 1)
+    else:
+        part.pop("rate_t", None)
+
+
+def _advice_stale(L, now):
+    """Drops advice the logger no longer rates (02 §6.3): its `rate_t` older than ADVICE_STALE_S, or none. Only
+    the logger's rated evaluation keeps a flag current; when the logger stops, or a disk pool leaves the sample
+    (_charge_disk rates only pools listed), a lease must not keep saying "over on CPU since …" as if it were
+    now. Every evaluation runs this, so the next `oomph` call or status poll clears it for every reader."""
+    for r in L["leases"]:
+        res = r.get("res") if isinstance(r.get("res"), dict) else {}
+        for k in ("cpu", "disk"):
+            part = res.get(k)
+            if isinstance(part, dict) and any(f in part for f in ADVICE_FIELDS) and not (
+                    _t(part.get("rate_t")) and -60 <= now - part["rate_t"] <= ADVICE_STALE_S):
+                for f in ADVICE_FIELDS:
+                    part.pop(f, None)
+
+
+def advice_flags(r):
+    """{resource: (flag, since)} of a lease (02 §6.3; oomph_view.res_vector and the app read the same): `over`
+    or `idle` on its cores (since its run of over or low use began), `over` on its disk space (since it first
+    wrote more than it got). A queued lease has none."""
+    out = {}
+    if r.get("state") not in (None, "granted") or (r.get("state") is None and r.get("granted") is None):
+        return out
+    for k, part in (("cpu", _cpu_of(r)), ("disk", _disk_of(r))):
+        if part and part.get("flag") in ADVICE_FLAGS:
+            t = part.get("over_t") if part["flag"] == "over" else part.get("low_t")
+            out[k] = (part["flag"], t if _t(t) else None)
+    return out
+
+
+def flag_advice(r, flags, now):
+    """The words for a holder about its grant's `over` / `idle` (advice_flags), each a sentence ending in a space."""
+    out = []
+    c, d = _cpu_of(r), _disk_of(r)
+    f, t = flags.get("cpu", (None, None))
+    if f == "over" and c and _num(c.get("got")):
+        out.append("Your processes keep %s cores busy, more than the %s granted: run with fewer jobs (-j%d), or "
+                   "amend the reservation (`oomph amend %s --cpu N`). " % (
+                       cores_text(_cn(c["used"])) if _num(c.get("used")) else "more", cores_text(_cn(c["got"])),
+                       max(1, int(c["got"])), r["id"]))
+    elif f == "idle" and c and _num(c.get("got")):
+        out.append("Your %s cores have been nearly idle%s: release them, or amend the reservation (`oomph amend %s "
+                   "--cpu 0` drops them) if the heavy part is over. " % (
+                       cores_text(_cn(c["got"])), " for %d min" % round((now - t) / 60) if _t(t) else "", r["id"]))
+    if flags.get("disk", (None,))[0] == "over" and d and _num(d.get("got")):
+        out.append("%s GB written to %s, more than the %s GB reserved: grow it (`oomph amend %s --disk NG`) before "
+                   "writing more. " % (_gb(d["w"]) if _num(d.get("w")) else "More", _disk_name(d), _gb(d["got"]), r["id"]))
+    return "".join(out)
+
+
+def _charge_cpu(L, procs, children, now=None):
     """Cores each grant's process tree keeps busy (`res.cpu.used`, and its `peak`), from the logger's rates
     per process: only the logger's child has them (02 §6.3, who measures); every other evaluation leaves the
     figures as they are. Grants watching the same tree share its load in grant order, as memory does, and
     the last takes the rest: what a holder burns beyond its grant shows in its own `used`, while admission
-    charges a grant no more than it got (cpu_pool)."""
+    charges a grant no more than it got (cpu_pool). With `now`, each grant's `over` / `idle` advice too."""
     groups = {}
     for r in L["leases"]:
         c = _cpu_of(r)
@@ -4526,6 +4625,8 @@ def _charge_cpu(L, procs, children):
             load -= share
             c["used"] = round(share, 2)
             c["peak"] = round(max(c.get("peak", 0), share), 2)
+            if now is not None:
+                _rate_flag(c, share, now)
 
 
 def _tree_w(procs, children, root):
@@ -4573,6 +4674,14 @@ def _charge_disk(L, s, procs, children, now):
             left -= u
             d["used"] = round(u, 2)
             d["peak"] = round(max(d["peak"] if _num(d.get("peak")) else 0.0, u), 2)
+            if d["w"] > d["got"] + 0.005:  # wrote more than it reserved: `over` (02 §6.3), since it first did
+                if d.get("flag") != "over" or not _t(d.get("over_t")):
+                    d["over_t"] = round(now, 1)
+                d["flag"] = "over"
+            else:
+                d.pop("flag", None)
+                d.pop("over_t", None)
+            _rated(d, now)
 
 
 def _volumes_gone(L, s, now):
@@ -4727,8 +4836,9 @@ def _evaluate(L, s, procs, now, rated=False):
             r["used_gb"] = round(min(r["gb"], share), 2)
             r["peak_gb"] = round(max(r.get("peak_gb", 0), share), 2)
     if rated:
-        _charge_cpu(L, procs, children)
+        _charge_cpu(L, procs, children, now)
         _charge_disk(L, s, procs, children, now)
+    _advice_stale(L, now)
 
     v = verdict(s)
     free = free_physical_gb(s)
@@ -4821,7 +4931,7 @@ def _evaluate(L, s, procs, now, rated=False):
                         notes.append("other reservations hold %s of the %d cores that can be reserved: granted %s of "
                                      "the %s asked" % (cores_text(cpu["reserved"]), cpu["cap"] - cpu["margin"],
                                                        cores_text(got), cores_text(hi)))
-                res["cpu"] = dict(res["cpu"], got=got)
+                res["cpu"] = dict({k: x for k, x in res["cpu"].items() if k not in ADVICE_FIELDS}, got=got)
                 cpu["room"] -= got
                 cpu["reserved"] += got
                 if cpu["idle"] is not None:
@@ -4829,7 +4939,7 @@ def _evaluate(L, s, procs, now, rated=False):
             dk = _disk_of(r)
             if dk:  # in full; what it has used is charged from here on (its writes, the pool's drop: 02 §6.3)
                 d = disks[dk["pool"]]
-                res["disk"] = dict({k: x for k, x in dk.items() if k not in ("w", "wt", "used", "peak")},
+                res["disk"] = dict({k: x for k, x in dk.items() if k not in ("w", "wt", "used", "peak") + ADVICE_FIELDS},
                                    got=dk["ask"], w=0.0, wt=round(now, 1))  # used and peak: once measured
                 r["base"] = dict(r.get("base") or {}, free_gb=d["free"])
                 d["left"] -= dk["ask"]
@@ -5087,6 +5197,9 @@ def _brief(r, now):
             b["disk_used"] = d["used"]
         if r.get("expires"):
             b["expires_in_min"] = round((r["expires"] - now) / 60, 1)
+        fl = advice_flags(r)
+        if fl:  # over / idle on a resource (02 §6.3): advice, shown to everyone
+            b["flags"] = {k: f for k, (f, _) in fl.items()}
     else:
         b["waiting_min"] = round((now - r["requested"]) / 60, 1)
     return b
@@ -5148,6 +5261,10 @@ def _status(L, rid, now):
         out["advice"] = ("%sGranted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
                          "%s part is over%s." % (run, r["id"], heavy, "" if not r.get("expires") else
                                                  "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
+        fl = advice_flags(r)
+        if fl:  # over / idle (02 §6.3): what the grant's own processes do, said first; nothing is revoked
+            out["flags"] = {k: f for k, (f, _) in fl.items()}
+            out["advice"] = flag_advice(r, fl, now) + out["advice"]
     else:
         queued = [x for x in L["leases"] if x["state"] == "queued"]
         before = [x for x in queued[:queued.index(r)] if set(lease_need(x)) & set(need)]
@@ -5713,14 +5830,25 @@ def reservation_history(since_s=24 * 3600, limit=50):
 
 
 VIEW_FIELDS = ("event", "key", "id", "purpose", "project", "holder", "gb", "requested", "granted", "ended",
-               "outcome", "peak_gb", "used_gb", "expires", "segments", "agent")
+               "outcome", "peak_gb", "used_gb", "expires", "segments", "agent", "res")  # res: the bands (1.12.3)
 
 
 def _view_records(recs, since):
     """The history log's records as a viewer merges them (merge_history, as oomph_view.merge_reservations
     and the app do), those that end at or after `since`, with only the fields the viewers read. One
-    record per reservation keeps a root caller's answer far below LIMITS["child"]."""
-    return [{f: r[f] for f in VIEW_FIELDS if f in r} for r in merge_history(recs) if _rec_time(r) >= since]
+    record per reservation keeps a root caller's answer far below LIMITS["child"]; `res` only where it
+    holds more than memory (oomph top keeps 14 days of these within its 40 MB)."""
+    out = []
+    for r in merge_history(recs):
+        if _rec_time(r) >= since:
+            x = {f: r[f] for f in VIEW_FIELDS if f in r}
+            if isinstance(x.get("res"), dict) and x["res"] and set(x["res"]) <= {"ram"}:
+                del x["res"]  # memory alone: the gb mirror says the same (and its segments' res too)
+                if isinstance(x.get("segments"), list) and any(isinstance(g, dict) and "res" in g for g in x["segments"]):
+                    x["segments"] = [{k: v for k, v in g.items() if k != "res"} if isinstance(g, dict) else g
+                                     for g in x["segments"]]
+            out.append(x)
+    return out
 
 
 @_unprivileged()
@@ -5898,6 +6026,9 @@ def _fmt_brief(b, purpose_w=22):
                                     " (%sG used)" % _gb(b["disk_used"]) if _num(b.get("disk_used")) else "")
     tail = cores + ((("using %.1fG, " % b.get("used_gb", 0)) if b["gb"] > 0 else "") + "%.0f min" % max(0.0, b["for_min"])
                     if b["state"] == "granted" else "waiting %.0f min" % max(0.0, b["waiting_min"]))
+    flags = b.get("flags") if isinstance(b.get("flags"), dict) else {}
+    if flags:  # over / idle (02 §6.3), said first: "over on CPU, …"
+        tail = ", ".join("%s on %s" % (f, "CPU" if k == "cpu" else k) for k, f in sorted(flags.items())) + ", " + tail
     size = "%5.1fG" % b["gb"] if b["gb"] > 0 or not cores else "%6s" % "-"
     return "%-5s %-7s %s  %-*s %-10s %s" % (b["id"], b["state"], size, purpose_w, cut_end(b["purpose"], purpose_w),
                                            cut_middle(b.get("project") or "", 10), tail)

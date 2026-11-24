@@ -77,8 +77,14 @@ critical*; the chip is yellow while memory is tight and red while it is critical
 critical asks for more: a red disc on the chip when the disk is critical, and the popup opening
 on the resource that is critical. A disk that is merely low, or memory that stays tight, shows
 on the capsule and the tile and does not move the popup. Every reservation wears its agent's colour: all reservations of one Claude session have
-one colour (the ledger gives each agent a palette slot since 1.11.0). The header reads "oomph:
-resource monitor". It is off by default while its design is reviewed; to switch it on:
+one colour (the ledger gives each agent a palette slot since 1.11.0). Under the charts the strip
+has a band per resource shown that agents reserve (memory, cores, disk space; 1.12.3), each on its
+own scale, the big chart's first and tall, the others thin; hovering a block or a row outlines that
+reservation in every band. The list under it gives every amount of a reservation ("6G · 6 cores",
+"40G Scratch"), what a waiting one waits for ("waiting 40 s · for CPU"), and puts first a grant
+that uses more than it got (*over*) or has sat idle for ten minutes (*idle*); what holds nothing
+shown is summed up in one line ("On other resources: 40 GB disk reserved · 1 waiting for CPU").
+The header reads "oomph: resource monitor". It is off by default while its design is reviewed; to switch it on:
 `defaults write local.oomph.menubar resourcesUI -bool YES`, then quit and reopen
 oomph (`-bool NO` switches it off again).
 
@@ -331,6 +337,9 @@ The four resources (1.11.0) are in `oomph top` too, switched off like the app's:
 CPU, GPU and Disk; `m` `c` `g` `d` show one alone with the plot (again: its biggest apps), `M`
 `C` `G` `D` add or remove one, and from 30 rows each other one shown gets a row of its own under
 the plot. The capsule says oomph's verdict and the reservations wear their agents' colours. The
+strip has a band per reserved resource shown (the plot's first; the others a row each, named at
+the right), and the list the same words as the app's: every amount, *over* and *idle*, what a
+request waits for, and a line for what holds nothing shown. The
 selection is remembered in `top.json` (`"selection"`, `"focus"`), apart from the app's.
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
@@ -483,6 +492,12 @@ session B  → granted r8, tests start
   image, a memory card, a network volume). A request waiting for one disk holds up only that disk.
   With the logger (1.12.1 or later) installed, what a holder's processes write counts against its
   reservation, shared out so that a disk never counts as filled twice.
+- **Advice on a grant** (1.12.3, with the logger): a grant whose processes keep more cores busy
+  than 1.25 × what it got, two samples in a row, or that wrote more than the disk space it
+  reserved, is *over*; one that has used less than a tenth of its cores for ten minutes is
+  *idle*. The holder's next answer leads with it (`flags`, and the advice to lower its
+  parallelism, amend or release), `oomph reservations` names it, and both front ends show it.
+  It is advice: nothing is taken away.
 - **No double counting:** as a granted job's processes grow, the growth is taken off its
   reservation, so memory is never counted once as used and again as reserved. That
   growth is also how the real peak gets measured, and `oomph reservations` shows it next

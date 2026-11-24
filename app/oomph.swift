@@ -51,6 +51,7 @@ var renderHoverX: CGFloat?  // --ai hover:X / hoverlog:X renders the hover toolt
 var renderBlend: Double?  // --ai blend:0.5 renders the 24h → ∞ morph halfway
 var renderMode = false  // --render-popup: static renders don't draw scroll-view contents
 var renderStripHover: CGPoint?  // --ai rhover:X:Y renders the reservation strip's tooltip at (X, Y) pt
+var renderResRowHover: Int?     // --ai rowhover:N renders the pointer on row N of "Reserved by agents" (with the resources on)
 let skillURL = "https://raw.githubusercontent.com/kleinzeug/oomph/main/skills/oomph/SKILL.md"
 
 // MARK: - AI analysis settings
@@ -423,6 +424,18 @@ struct Reservation: Identifiable {
     var queue: Int?                      // its place in ledger.json's list of leases: the queue's order
     var agentSlot = -1                   // its agent's place in the palette (D11), -1 "agent not known"
     var agentKey: String?                // its agent's key, whose first four digits the card names
+    // What it holds besides memory (02 §6.2; B3, 1.12.3; drawn with the resources on): Reservation.vector,
+    // oomph_view.res_vector. Cores and GB of disk granted (asked while queued), nil where not held.
+    var holdsMemory = true               // a vector without `ram` whose gb is the 0.01 mirror holds none
+    var cpu: Double?
+    var disk: Double?
+    var diskPool: String?
+    var diskName: String?
+    var cpuUsed: Double?
+    var diskWrote: Double?               // what its trees wrote since the grant (res.disk.w)
+    var flags: [Resource: (flag: String, since: Double?)] = [:]  // a grant's advice: over, idle (02 §6.3)
+    var waitingFor: [Resource] = []      // a queued one: what it waits for (waiting_on), in tile order
+    var resSegs: [Resource: [(t: Double, v: Double)]] = [:]     // cores and disk over time (segments[].res)
 
     var live: Bool { ended == nil }
     var gb: Double { segments.last?.gb ?? 0 }
@@ -468,7 +481,8 @@ struct Reservation: Identifiable {
     /// grows moves to the back; by request time where the place is unknown); then grants by time left,
     /// the one that ends soonest first, a grant without a ttl last. With a cap, the rows that explain
     /// why an agent waits are the ones that stay.
-    static func listOrder(_ live: [Reservation]) -> [Reservation] {
+    /// With `flagsFirst` (the resources on, 02 §3.4.6) a grant with an `over` or `idle` flag comes before them all.
+    static func listOrder(_ live: [Reservation], flagsFirst: Bool = false) -> [Reservation] {
         let waiting = live.filter { $0.granted == nil }.sorted { a, b in
             let ka: (Int, Int, Double, String) = (a.queue == nil ? 1 : 0, a.queue ?? 0, a.requested, a.id)
             let kb: (Int, Int, Double, String) = (b.queue == nil ? 1 : 0, b.queue ?? 0, b.requested, b.id)
@@ -479,6 +493,7 @@ struct Reservation: Identifiable {
             let kb: (Int, Double, Double, String) = (b.expires == nil ? 1 : 0, b.expires ?? 0, b.requested, b.id)
             return ka < kb
         }
+        if flagsFirst { return granted.filter { !$0.flags.isEmpty } + waiting + granted.filter { $0.flags.isEmpty } }
         return waiting + granted
     }
 
@@ -505,6 +520,209 @@ struct Reservation: Identifiable {
         segments = segs.isEmpty ? [(req, gb)] : segs
         agentSlot = Reservation.agentIndex(o["agent"])
         agentKey = ((o["agent"] as? [String: Any])?["key"] as? String).flatMap { $0.count == 8 ? $0 : nil }
+        readVector(o)
+    }
+
+    // MARK: its resources (B3, 1.12.3; 02 §3.4.5, §3.4.6, §3.7.7; held to oomph_view by tools/vectors/chart.json)
+
+    /// An amount of the shared ledger, which any user can write: a finite number 0 … 1e6, else nil.
+    static func amt(_ x: Any?) -> Double? {
+        guard let n = x as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        let d = n.doubleValue
+        return d.isFinite && d >= 0 && d <= 1e6 ? d : nil
+    }
+    static func since(_ x: Any?) -> Double? {
+        guard let n = x as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() else { return nil }
+        let d = n.doubleValue
+        return d.isFinite && d > 0 && d < 1e11 ? d : nil
+    }
+    /// The resource of a pool id in `waiting_on` (02 §6.4): ram, mem and "critical" are memory's; cpu; gpu, vram; disk:<id>.
+    static func waited(_ id: String) -> Resource {
+        id == "ram" || id == "mem" || id == "critical" ? .memory : id == "cpu" ? .cpu
+            : id.hasPrefix("gpu") || id.hasPrefix("vram") ? .gpu : .disk
+    }
+
+    /// oomph_view.res_vector: what a lease (`res` of parts) or a record (`res` of amounts) holds besides its gb.
+    mutating func readVector(_ o: [String: Any]) {
+        let isGranted = granted != nil
+        let open = ended == nil
+        func waits(_ deflt: [String]) {
+            guard !isGranted && open else { return }
+            let w = ((o["waiting_on"] as? [Any]) ?? []).prefix(16).compactMap { $0 as? String }
+            let got = Set((w.isEmpty ? deflt : w).map(Reservation.waited))
+            waitingFor = Resource.allCases.filter { got.contains($0) }
+        }
+        guard let res = o["res"] as? [String: Any] else { waits(["ram"]); return }
+        let lease = res.values.contains { $0 is [String: Any] }
+        holdsMemory = res["ram"] != nil || (Reservation.amt(o["gb"]) ?? 0) > 0.015
+        func s(_ x: Any?) -> String? { (x as? String).map { String($0.prefix(200)) } }
+        if lease {
+            for (k, r) in [("cpu", Resource.cpu), ("disk", Resource.disk)] {
+                let part = (res[k] as? [String: Any]) ?? [:]
+                let a = (isGranted ? Reservation.amt(part["got"]) : nil) ?? Reservation.amt(part["ask"])
+                if r == .cpu { cpu = a } else { disk = a }
+                if a != nil, isGranted, let f = part["flag"] as? String, f == "over" || f == "idle" {
+                    flags[r] = (f, Reservation.since(part[f == "over" ? "over_t" : "low_t"]))
+                }
+            }
+            let d = (res["disk"] as? [String: Any]) ?? [:]
+            if disk != nil { diskPool = s(d["pool"]); diskName = s(d["name"]) }
+            cpuUsed = Reservation.amt((res["cpu"] as? [String: Any])?["used"])
+            diskWrote = Reservation.amt(d["w"])
+        } else {
+            cpu = Reservation.amt(res["cpu"]); disk = Reservation.amt(res["disk"])
+            if disk != nil { diskPool = s(res["disk_pool"]) }
+        }
+        for (k, r) in [("cpu", Resource.cpu), ("disk", Resource.disk)] where (r == .cpu ? cpu : disk) != nil {
+            let seq = ((o["segments"] as? [[String: Any]]) ?? []).compactMap { sg -> (t: Double, v: Double)? in
+                guard let t = (sg["t"] as? NSNumber)?.doubleValue, let x = Reservation.amt((sg["res"] as? [String: Any])?[k])
+                else { return nil }
+                return (t, x)
+            }
+            if !seq.isEmpty { resSegs[r] = seq }
+        }
+        var asked: [String] = holdsMemory ? ["ram"] : []
+        if cpu != nil { asked.append("cpu") }
+        if disk != nil { asked.append("disk") }
+        waits(asked)
+    }
+
+    /// Does it hold resource k (the disk: on `pool`, when one is named)?
+    func holds(_ k: Resource, pool: String? = nil) -> Bool {
+        switch k {
+        case .memory: return holdsMemory
+        case .cpu: return cpu != nil
+        case .gpu: return false
+        case .disk: return disk != nil && (pool == nil || diskPool == pool)
+        }
+    }
+    /// Its amount of k over time, the first from its request.
+    func amountSegs(_ k: Resource) -> [(t: Double, v: Double)] {
+        if k == .memory { return segments.map { ($0.t, $0.gb) } }
+        return resSegs[k] ?? [(requested, (k == .cpu ? cpu : disk) ?? 0)]
+    }
+    func amount(_ k: Resource, at t: Double) -> Double {
+        if k == .memory { return gb(at: t) }
+        let s = amountSegs(k)
+        return (s.last { $0.t <= t } ?? s.first)?.v ?? 0
+    }
+
+    /// The strip's bands (02 §3.4.5, §3.7.6): of the resources shown, those reserved in the 14 days kept, the focus's
+    /// first (the tall one), then the others in tile order. The Disk band is the tile's pool's.
+    static let bandResources: [Resource] = [.memory, .cpu, .disk]
+    static func bands(_ rs: [Reservation], shown: [Resource], focus: Resource, pool: String?) -> [Resource] {
+        let have = bandResources.filter { k in shown.contains(k) && rs.contains { $0.holds(k, pool: pool) } }
+        return (have.contains(focus) ? [focus] : []) + have.filter { $0 != focus }
+    }
+    /// A band's scale: the strip's round figures; GB of disk go on up to 64 TB.
+    static func bandTop(_ vis: Double, _ k: Resource) -> Double {
+        if k == .disk && vis > 256 {
+            return [384.0, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768, 65536].first { $0 >= vis } ?? vis
+        }
+        return MemoryChart.stripTop(vis)
+    }
+
+    static let word: [Resource: String] = [.memory: "memory", .cpu: "CPU", .gpu: "GPU", .disk: "disk"]
+    static func amtG(_ x: Double) -> String { abs(x - x.rounded()) < 0.05 ? "\(Int(x.rounded()))G" : String(format: "%.1fG", x) }
+    static func coresWords(_ x: Double) -> String {
+        var t = String(format: "%.1f", x)
+        if t.hasSuffix(".0") { t.removeLast(2) }
+        return t + (t == "1" ? " core" : " cores")
+    }
+    static func and(_ w: [String]) -> String { w.count <= 1 ? (w.first ?? "") : w.dropLast().joined(separator: ", ") + " and " + w.last! }
+
+    /// Every amount of a row as text (02 §3.8.5): "5G · 6 cores · 20G disk"; disk on another pool is named.
+    func amountsText(pool: String?) -> String {
+        var parts: [String] = []
+        if holdsMemory { parts.append(Reservation.amtG(gb)) }
+        if let c = cpu { parts.append(Reservation.coresWords(c)) }
+        if let d = disk {
+            let other = pool != nil && diskPool != nil && diskPool != pool
+            parts.append(Reservation.amtG(d) + " " + (other ? Tile.midFit(diskName ?? diskPool ?? "?", 12) : "disk"))
+        }
+        return parts.isEmpty ? "–" : parts.joined(separator: " · ")
+    }
+    /// One use figure of a grant: "using 2.1G", "using 5.2 cores", "wrote 11G of 20G"; nil where not measured.
+    func useFigure(_ k: Resource) -> String? {
+        switch k {
+        case .memory: return String(format: "using %.1fG", used ?? 0)
+        case .cpu: return cpuUsed.map { "using " + Reservation.coresWords($0) }
+        case .disk:
+            guard let w = diskWrote, let d = disk else { return nil }
+            let text: String = "wrote " + Reservation.amtG(w)
+            return text + " of " + Reservation.amtG(d)
+        case .gpu: return nil
+        }
+    }
+    /// The status column (02 §3.4.6, §3.7.7): "waiting 40 s · for CPU"; a grant's flag ("over", "idle 12 min", "over on
+    /// CPU" when not about the focus), one use figure (the focus's, else the first shown one's; none after idle), the time left.
+    func statusText(shown: [Resource], focus: Resource, now: Double) -> String {
+        if granted == nil {
+            let w = waitingFor.compactMap { Reservation.word[$0] }
+            return "waiting " + MemoryChart.duration(now - requested) + (w.isEmpty ? "" : " · for " + Reservation.and(w))
+        }
+        var parts: [String] = []
+        var idle = false
+        let order: [Resource] = [focus] + Resource.allCases
+        if let fk = order.first(where: { flags[$0] != nil }), let f = flags[fk] {
+            var word: String = f.flag
+            if fk != focus { word += " on " + (Reservation.word[fk] ?? "") }
+            if f.flag == "idle", let t = f.since { word += " " + MemoryChart.duration(now - t) }
+            parts.append(word)
+            idle = f.flag == "idle"
+        }
+        let held: [Resource] = Resource.allCases.filter { holds($0) }
+        if !idle, let first = held.first {
+            let u: Resource = held.contains(focus) ? focus : (held.first { shown.contains($0) } ?? first)
+            if let fig = useFigure(u) { parts.append(fig) }
+        }
+        if let e = expires { parts.append(MemoryChart.shortDuration(e - now) + " left") }
+        return parts.joined(separator: " · ")
+    }
+    /// The granted totals of `which` over rs, as words: "14.0 GB", "6 cores", "20 GB disk".
+    static func totals(_ rs: [Reservation], _ which: [Resource]) -> [String] {
+        let g = rs.filter { $0.granted != nil }
+        var out: [String] = []
+        if which.contains(.memory), g.contains(where: \.holdsMemory) {
+            out.append(String(format: "%.1f GB", g.filter(\.holdsMemory).reduce(0) { $0 + $1.gb }))
+        }
+        if which.contains(.cpu), g.contains(where: { $0.cpu != nil }) {
+            let n: Double = g.reduce(0.0) { (a: Double, r: Reservation) in a + (r.cpu ?? 0) }
+            out.append(coresWords(n))
+        }
+        if which.contains(.disk), g.contains(where: { $0.disk != nil }) {
+            let n: Double = g.reduce(0.0) { (a: Double, r: Reservation) in a + (r.disk ?? 0) }
+            out.append(String(amtG(n).dropLast()) + " GB disk")
+        }
+        return out
+    }
+    /// The caption (02 §3.7.7): the shown resources' live grants summed, and the last 24 h: "14.0 GB · 6 cores · 46 in the last 24 h".
+    static func captionText(_ live: [Reservation], shown: [Resource], day: Int) -> String {
+        (totals(live, shown) + ["\(day) in the last 24 h"]).joined(separator: " · ")
+    }
+    /// The line for what holds no shown resource: "On other resources: 6 cores and 20 GB disk reserved · 1 waiting for CPU";
+    /// short "Other: 6 cores, 20 GB disk · 1 waiting". nil when there is nothing.
+    static func otherText(_ rest: [Reservation], short: Bool) -> String? {
+        guard !rest.isEmpty else { return nil }
+        let tot = totals(rest, Resource.allCases)
+        let waiting = rest.filter { $0.granted == nil }
+        let what = Resource.allCases.filter { k in waiting.contains { $0.waitingFor.contains(k) } }.compactMap { word[$0] }
+        let sep: String = !tot.isEmpty && !waiting.isEmpty ? " · " : ""
+        let count: String = waiting.isEmpty ? "" : "\(waiting.count) waiting"
+        if short { return "Other: " + tot.joined(separator: ", ") + sep + count }
+        let reserved: String = tot.isEmpty ? "" : and(tot) + " reserved"
+        let forWhat: String = waiting.isEmpty || what.isEmpty ? "" : " for " + and(what)
+        return "On other resources: " + reserved + sep + count + forWhat
+    }
+    /// The words of a grant's advice on resource k (the card): "over on CPU since 13:26: it uses more than it got".
+    static func adviceWords(_ k: Resource, _ f: (flag: String, since: Double?), now: Double, clock: (Double) -> String) -> String {
+        var text: String = f.flag + " on " + (word[k] ?? "")
+        if f.flag == "idle" {
+            if let t = f.since { text += " for " + MemoryChart.duration(now - t) }
+            return text + ": it could be released or made smaller"
+        }
+        if let t = f.since { text += " since " + clock(t) }
+        return text + ": " + (k == .disk ? "it wrote more than it reserved" : "it uses more than it got")
     }
 }
 
@@ -518,7 +736,8 @@ struct ResBlock: Identifiable {
     var steps: [(a: Double, b: Double, lo: Double, hi: Double)] = []
     var id: String { res.id }
 
-    static func stack(_ rs: [Reservation], now: Double) -> [ResBlock] {
+    /// `kind`: the band's resource (its amounts over time); the caller passes the reservations that hold it.
+    static func stack(_ rs: [Reservation], now: Double, kind: Resource = .memory) -> [ResBlock] {
         // by request, then id: `rs` comes out of a Dictionary, whose order changes with every launch
         var blocks = rs.sorted { a, b in
             let ka: (Double, String) = (a.requested, a.id), kb: (Double, String) = (b.requested, b.id)
@@ -537,7 +756,11 @@ struct ResBlock: Identifiable {
         for b in blocks {
             bps.insert(b.res.requested); bps.insert(b.end)
             if let g = b.res.granted, g > b.res.requested, g < b.end { bps.insert(g) }
-            for s in b.res.segments where s.t > b.res.requested && s.t < b.end { bps.insert(s.t) }
+            if kind == .memory {
+                for s in b.res.segments where s.t > b.res.requested && s.t < b.end { bps.insert(s.t) }
+            } else {
+                for s in b.res.amountSegs(kind) where s.t > b.res.requested && s.t < b.end { bps.insert(s.t) }
+            }
         }
         let ts = bps.sorted()
         var active: [Int] = []
@@ -548,7 +771,7 @@ struct ResBlock: Identifiable {
             active.removeAll { blocks[$0].end <= a }
             var acc = 0.0
             for j in active.sorted(by: { blocks[$0].lane < blocks[$1].lane }) {
-                let hi = acc + blocks[j].res.gb(at: a)
+                let hi = acc + (kind == .memory ? blocks[j].res.gb(at: a) : blocks[j].res.amount(kind, at: a))
                 if let last = blocks[j].steps.last, last.b == a, last.lo == acc, last.hi == hi,
                    (blocks[j].res.granted ?? .infinity) != a {
                     blocks[j].steps[blocks[j].steps.count - 1].b = b
@@ -781,11 +1004,7 @@ struct Tile {
         var out: [Resource: Int] = [:]
         for l in leases where (l["state"] as? String) == "queued" {
             let ids = ((l["waiting_on"] as? [Any]) ?? []).map { "\($0)" }
-            var got = Set<Resource>()
-            for i in ids.isEmpty ? ["ram"] : ids {
-                got.insert(i == "ram" || i == "mem" ? .memory : i == "cpu" ? .cpu
-                           : i.hasPrefix("gpu") || i.hasPrefix("vram") ? .gpu : .disk)
-            }
+            let got = Set((ids.isEmpty ? ["ram"] : ids).map(Reservation.waited))  // "critical": memory's
             for r in got { out[r, default: 0] += 1 }
         }
         return out
@@ -915,7 +1134,7 @@ final class MachineStore: ObservableObject {
     @Published var events: [ChartEvent] = []
     /// The agents' reservations, live and of the last 14 days, stacked for the strip under the chart.
     @Published var reservations: [ResBlock] = []
-    var liveReservations: [Reservation] { Reservation.listOrder(reservations.map(\.res).filter(\.live)) }
+    var liveReservations: [Reservation] { Reservation.listOrder(reservations.map(\.res).filter(\.live), flagsFirst: resourcesUIOn) }
     private var eventsStamp = ""
     @Published var incidents: [Incident] = []
     /// A mirror's link, coverage and machine (nil for this Mac).
@@ -1124,7 +1343,8 @@ final class MachineStore: ObservableObject {
     }
 
     private struct Loaded { let history: [Point]; let gaps: [Gap]; let now: Double; let events: [ChartEvent]?
-                            let reservations: [ResBlock]; var waiting: [Resource: Int] = [:] }
+                            let reservations: [ResBlock]; var waiting: [Resource: Int] = [:]
+                            var bands: [String: [ResBlock]] = [:] }
 
     private func apply(_ r: Loaded) {
         history = r.history
@@ -1132,7 +1352,27 @@ final class MachineStore: ObservableObject {
         historyNow = r.now
         if let e = r.events { events = e }
         reservations = r.reservations
-        if resourcesUIOn { waiting = r.waiting }
+        if resourcesUIOn { waiting = r.waiting; bandBlocks = r.bands }
+    }
+
+    /// With the resources on, the blocks of each band the strip can draw (B3, 02 §3.4.5), stacked at the load:
+    /// "memory" (what holds memory), "cpu", and "disk:<pool id>" per disk pool reserved (the band shows the tile's).
+    @Published var bandBlocks: [String: [ResBlock]] = [:]
+    private var bandsLoaded: [String: [ResBlock]] = [:]
+    func blocks(for k: Resource, pool: String?) -> [ResBlock] {
+        bandBlocks[k == .disk ? pool.map { "disk:" + $0 } ?? "disk" : k.rawValue] ?? []
+    }
+    static func bandBlocks(_ rs: [Reservation], now: Double) -> [String: [ResBlock]] {
+        var out: [String: [ResBlock]] = [:]
+        out["memory"] = ResBlock.stack(rs.filter(\.holdsMemory), now: now)
+        let cpu = rs.filter { $0.cpu != nil }
+        if !cpu.isEmpty { out["cpu"] = ResBlock.stack(cpu, now: now, kind: .cpu) }
+        let disk = rs.filter { $0.disk != nil }
+        if !disk.isEmpty { out["disk"] = ResBlock.stack(disk, now: now, kind: .disk) }   // a sample that names no pool
+        for p in Set(disk.compactMap(\.diskPool)) {
+            out["disk:" + p] = ResBlock.stack(disk.filter { $0.diskPool == p }, now: now, kind: .disk)
+        }
+        return out
     }
 
     /// Queued requests by the resource they wait for (the tiles' "n waiting"), as of the last load.
@@ -1150,7 +1390,10 @@ final class MachineStore: ObservableObject {
         let local = isLocal
         let rs = Store.mergeReservations(records: records, ledger: ledger, now: now,
                                          holderGone: { pid in local && !noLiveness && kill(pid, 0) != 0 && errno == ESRCH })
-        if resourcesUIOn { waitingLoaded = Tile.waiting((ledger["leases"] as? [[String: Any]]) ?? []) }
+        if resourcesUIOn {
+            waitingLoaded = Tile.waiting((ledger["leases"] as? [[String: Any]]) ?? [])
+            bandsLoaded = MachineStore.bandBlocks(rs, now: now)
+        }
         return ResBlock.stack(rs, now: now)
     }
 
@@ -1181,7 +1424,7 @@ final class MachineStore: ObservableObject {
         for k in cache.keys where !present.contains(k) { cache[k] = nil }
         let res = loadReservations(now: known)
         return Loaded(history: Store.multires(all, now: now), gaps: gaps, now: now, events: loadEvents(),
-                      reservations: res, waiting: waitingLoaded)
+                      reservations: res, waiting: waitingLoaded, bands: bandsLoaded)
     }
 
     /// A mirror's gaps (roadmap 01 §3.5, §5.7): inside the coverage map, the stretches without
@@ -2817,6 +3060,11 @@ struct MemoryChart: View, Animatable {
     /// The agents' reservations, drawn as a strip of blocks under the chart on the same time axis.
     var reservations: [ResBlock] = []
     var stripHeight: CGFloat = 0 // 0 = no strip
+    /// With the resources on: the strip's bands, each with its blocks, the first tall (02 §3.7.6); none: the one
+    /// memory strip of `reservations`. A small band's height; the reservation a row of the list points at.
+    var bands: [(kind: Resource, blocks: [ResBlock])] = []
+    var smallBand: CGFloat = 12
+    var highlight: String? = nil
     // With the resources on (roadmap 02 §3.7): the resource with the big chart, the small charts under it (in
     // tile order) and their height, and the scales the charts need from the current sample.
     var focus: Resource = .memory
@@ -3148,12 +3396,14 @@ struct MemoryChart: View, Animatable {
     /// Every reservation as blocks on the chart's time axis: height ∝ GB, stacked where they
     /// overlap, solid while granted, hatched while queued. The scale's top is a round figure above
     /// the highest stack in view.
-    func stripRects(_ f: (Double) -> Double, W: CGFloat, H: CGFloat) -> (rects: [(i: Int, r: CGRect, queued: Bool)], top: Double) {
+    func stripRects(_ f: (Double) -> Double, W: CGFloat, H: CGFloat, blocks: [ResBlock]? = nil,
+                    kind: Resource = .memory) -> (rects: [(i: Int, r: CGRect, queued: Bool)], top: Double) {
+        let reservations = blocks ?? self.reservations
         var vis = 0.0
         for b in reservations where f(b.end) >= 0 {
             for st in b.steps where f(st.b) >= 0 { vis = max(vis, st.hi) }
         }
-        let top = MemoryChart.stripTop(vis)
+        let top = Reservation.bandTop(vis, kind)
         let usable = H - 4
         var out: [(i: Int, r: CGRect, queued: Bool)] = []
         for (i, b) in reservations.enumerated() {
@@ -3178,21 +3428,65 @@ struct MemoryChart: View, Animatable {
         [2.0, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256].first { $0 >= vis } ?? vis
     }
 
+    // With the resources on (B3, 02 §3.4.5, §3.7.6): a band per reserved resource shown, each on its own scale.
+    static let bandGap: CGFloat = 4
+    /// The strip's bands as drawn: (resource, its blocks, top, height); the first is tall and takes what the others
+    /// leave of stripHeight. Without bands: the one memory strip of every reservation.
+    var bandRects: [(kind: Resource, blocks: [ResBlock], y: CGFloat, h: CGFloat)] {
+        guard !bands.isEmpty else { return [(.memory, reservations, 0, stripHeight)] }
+        let tall: CGFloat = stripHeight - CGFloat(bands.count - 1) * (smallBand + MemoryChart.bandGap)
+        var out: [(kind: Resource, blocks: [ResBlock], y: CGFloat, h: CGFloat)] = [(bands[0].kind, bands[0].blocks, 0, tall)]
+        var y: CGFloat = tall
+        for b in bands.dropFirst() {
+            y += MemoryChart.bandGap
+            out.append((b.kind, b.blocks, y, smallBand))
+            y += smallBand
+        }
+        return out
+    }
+
     func stripLayer(plot: CGRect, top: CGFloat, mapper f: @escaping (Double) -> Double, grid: [TimeAxis.GridLine],
                     missing: [TimeAxis.Band] = []) -> some View {
-        let W = plot.width, H = stripHeight
-        let (rects, scaleTop) = stripRects(f, W: W, H: H)
-        let blocks = reservations, now = now, dark = scheme == .dark
+        let W = plot.width
+        let rects = bandRects
         return ZStack(alignment: .topLeading) {
-            Canvas { ctx, size in
+            ForEach(Array(rects.enumerated()), id: \.offset) { i, b in
+                bandCanvas(b.blocks, kind: b.kind, tall: i == 0, W: W, H: b.h, mapper: f, grid: grid, missing: missing)
+                    .offset(y: b.y)
+            }
+            Rectangle().fill(Color.clear).contentShape(Rectangle())
+                .frame(width: W, height: stripHeight)
+                .onContinuousHover { phase in
+                    switch phase {
+                    case .active(let p): stripHover = p
+                    case .ended: stripHover = nil
+                    }
+                }
+                .help(stripHover.flatMap { stripHit($0, f, W: W) } != nil ? "" : bands.isEmpty
+                      ? "Memory reserved by agents (Claude sessions, oomph run), one block per reservation: height = GB reserved, hatched while queued, stacked where they overlap. Hover a block for details."
+                      : "What agents reserve (Claude sessions, oomph run), a band per resource shown, each on its own scale: one block per reservation in its agent's colour, height = the amount, hatched while queued, stacked where they overlap. Hover a block for details.")
+        }
+        .offset(x: plot.minX, y: top)
+    }
+
+    /// One band: its blocks on the chart's time axis. The tall one has its scale, the time left of live grants and
+    /// purpose labels; a small one is a baseline, its blocks and its name in the gutter (02 §3.4.5).
+    func bandCanvas(_ blocks: [ResBlock], kind: Resource, tall: Bool, W: CGFloat, H: CGFloat, mapper f: (Double) -> Double,
+                    grid: [TimeAxis.GridLine], missing: [TimeAxis.Band]) -> some View {
+        let (rects, scaleTop) = stripRects(f, W: W, H: H, blocks: blocks, kind: kind)
+        let now = now, dark = scheme == .dark
+        let lit = highlight
+        return Canvas { ctx, size in
                 let usable = H - 4
-                for l in grid {
+                for l in grid where tall {
                     ctx.fill(Path(CGRect(x: l.x * W - 0.25, y: 0, width: 0.5, height: H)), with: .color(.primary.opacity(l.alpha)))
                 }
                 ctx.fill(Path(CGRect(x: 0, y: H - 0.5, width: W, height: 0.5)), with: .color(.primary.opacity(0.25)))
-                var topLine = Path()
-                topLine.move(to: CGPoint(x: 0, y: H - usable)); topLine.addLine(to: CGPoint(x: W, y: H - usable))
-                ctx.stroke(topLine, with: .color(.primary.opacity(0.12)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
+                if tall {
+                    var topLine = Path()
+                    topLine.move(to: CGPoint(x: 0, y: H - usable)); topLine.addLine(to: CGPoint(x: W, y: H - usable))
+                    ctx.stroke(topLine, with: .color(.primary.opacity(0.12)), style: StrokeStyle(lineWidth: 0.5, dash: [2, 2]))
+                }
                 var plotCtx = ctx
                 plotCtx.clip(to: Path(CGRect(x: 0, y: 0, width: W, height: H)))
                 if !missing.isEmpty {
@@ -3203,19 +3497,26 @@ struct MemoryChart: View, Animatable {
                 for x in rects {
                     if x.queued { waiting[x.i, default: Path()].addRect(x.r) } else { solid[x.i, default: Path()].addRect(x.r) }
                 }
+                // a row of the list or a block under the pointer: its blocks stay, the rest dims (linked highlighting)
+                func dim(_ i: Int) -> Double { lit == nil || blocks[i].res.id == lit ? 1 : 0.3 }
                 // in the blocks' order: a Dictionary's changes with every launch, and so would the edges
-                for (i, p) in solid.sorted(by: { $0.key < $1.key }) { plotCtx.fill(p, with: .color(blocks[i].res.tint(dark: dark).opacity(0.8))) }
+                for (i, p) in solid.sorted(by: { $0.key < $1.key }) { plotCtx.fill(p, with: .color(blocks[i].res.tint(dark: dark).opacity(0.8 * dim(i)))) }
                 for (i, p) in waiting.sorted(by: { $0.key < $1.key }) {
                     let c = blocks[i].res.tint(dark: dark)
-                    plotCtx.fill(p, with: .color(c.opacity(0.12)))
+                    plotCtx.fill(p, with: .color(c.opacity(0.12 * dim(i))))
                     var h = plotCtx
                     h.clip(to: p)
-                    h.stroke(TimeAxis.hatchLines(in: p.boundingRect, spacing: 4), with: .color(c.opacity(0.75)), lineWidth: 1)
+                    h.stroke(TimeAxis.hatchLines(in: p.boundingRect, spacing: 4), with: .color(c.opacity(0.75 * dim(i))), lineWidth: 1)
+                }
+                if let lit {
+                    for x in rects where blocks[x.i].res.id == lit {
+                        plotCtx.stroke(Path(x.r.insetBy(dx: -0.5, dy: -0.5)), with: .color(.primary.opacity(0.7)), lineWidth: 1)
+                    }
                 }
                 // purpose labels on the widest granted part of each block, when it fits
                 var best: [Int: CGRect] = [:]
                 for x in rects where !x.queued && x.r.height >= 9 && x.r.width > (best[x.i]?.width ?? 0) { best[x.i] = x.r }
-                for (i, r) in best.sorted(by: { $0.key < $1.key }) where r.width >= 24 {
+                for (i, r) in best.sorted(by: { $0.key < $1.key }) where r.width >= 24 && tall {
                     let purpose = blocks[i].res.purpose
                     var n = purpose.count
                     while n >= 4 {
@@ -3228,6 +3529,11 @@ struct MemoryChart: View, Animatable {
                         n = n > 24 ? 24 : n - 3
                     }
                 }
+                guard tall else {  // a small band: its name in the gutter, nothing else
+                    ctx.draw(Text(kind.name).font(.system(size: 8.5)).foregroundColor(.secondary),
+                             at: CGPoint(x: W + 4, y: H / 2), anchor: .leading)
+                    return
+                }
                 // right of the plot: the scale, and how long each live grant has left
                 var used: [CGFloat] = []
                 for x in rects where blocks[x.i].res.live && !x.queued && x.r.maxX >= W - 0.5 {
@@ -3237,41 +3543,42 @@ struct MemoryChart: View, Animatable {
                              at: CGPoint(x: W + 4, y: x.r.midY), anchor: .leading)
                 }
                 if !used.contains(where: { abs($0 - (H - usable)) < 9 }) {
-                    ctx.draw(Text(String(format: "%.0fG", scaleTop)).font(.system(size: 8.5)).foregroundColor(.secondary),
+                    let scale = String(format: kind == .cpu ? "%.0fc" : "%.0fG", scaleTop)  // "24c": the gutter is 30 pt
+                    ctx.draw(Text(scale).font(.system(size: 8.5)).foregroundColor(.secondary),
                              at: CGPoint(x: W + 4, y: H - usable), anchor: .leading)
                 }
                 if rects.isEmpty {
-                    ctx.draw(Text("No reservations in this range").font(.system(size: 9)).foregroundColor(.secondary),
+                    let none = kind == .memory ? "No reservations in this range" : "No \(kind.name) reservations in this range"
+                    ctx.draw(Text(none).font(.system(size: 9)).foregroundColor(.secondary),
                              at: CGPoint(x: W / 2, y: H / 2), anchor: .center)
                 }
             }
             .frame(width: W + 40, height: H)
             .allowsHitTesting(false)
-            Rectangle().fill(Color.clear).contentShape(Rectangle())
-                .frame(width: W, height: H)
-                .onContinuousHover { phase in
-                    switch phase {
-                    case .active(let p): stripHover = p
-                    case .ended: stripHover = nil
-                    }
-                }
-                .help(stripHover.flatMap { stripHit($0, f, W: W) } != nil ? "" : "Memory reserved by agents (Claude sessions, oomph run), one block per reservation: height = GB reserved, hatched while queued, stacked where they overlap. Hover a block for details.")
-        }
-        .offset(x: plot.minX, y: top)
     }
 
-    /// The reservation under the pointer on the strip, if any.
+    /// The reservation under the pointer on the strip, if any, and its rect in strip coordinates (in its band).
     func stripHit(_ p: CGPoint, _ f: (Double) -> Double, W: CGFloat) -> (block: ResBlock, rect: CGRect)? {
-        let (rects, _) = stripRects(f, W: W, H: stripHeight)
-        let hit = rects.last { $0.r.insetBy(dx: -2, dy: -1).contains(p) }
-            ?? rects.filter { p.x >= $0.r.minX - 2 && p.x <= $0.r.maxX + 2 }.min { abs($0.r.midY - p.y) < abs($1.r.midY - p.y) }
-        return hit.map { (reservations[$0.i], $0.r) }
+        guard let band = bandRects.first(where: { p.y >= $0.y - 2 && p.y <= $0.y + $0.h + 2 }) else { return nil }
+        let q = CGPoint(x: p.x, y: p.y - band.y)
+        let (rects, _) = stripRects(f, W: W, H: band.h, blocks: band.blocks, kind: band.kind)
+        let hit = rects.last { $0.r.insetBy(dx: -2, dy: -1).contains(q) }
+            ?? rects.filter { q.x >= $0.r.minX - 2 && q.x <= $0.r.maxX + 2 }.min { abs($0.r.midY - q.y) < abs($1.r.midY - q.y) }
+        return hit.map { (band.blocks[$0.i], $0.r.offsetBy(dx: 0, dy: band.y)) }
     }
 
     @ViewBuilder func stripCard(plot: CGRect, top: CGFloat, width: CGFloat, mapper f: (Double) -> Double) -> some View {
         if let p = stripHover, let (b, r) = stripHit(p, f, W: plot.width) {
             let x = plot.minX + p.x
             let w = MemoryChart.cardWidth
+            if bands.count > 1 {  // the same reservation in every other band (linked highlighting)
+                ForEach(Array(otherRects(of: b.res.id, besides: r, f, W: plot.width).enumerated()), id: \.offset) { _, o in
+                    Rectangle().strokeBorder(Color.primary.opacity(0.7), lineWidth: 1)
+                        .frame(width: max(o.width, 1.5) + 2, height: o.height + 2)
+                        .offset(x: plot.minX + o.minX - 1, y: top + o.minY - 1)
+                        .allowsHitTesting(false)
+                }
+            }
             Rectangle().strokeBorder(Color.primary.opacity(0.7), lineWidth: 1)
                 .frame(width: max(r.width, 1.5) + 2, height: r.height + 2)
                 .offset(x: plot.minX + r.minX - 1, y: top + r.minY - 1)
@@ -3283,6 +3590,16 @@ struct MemoryChart: View, Animatable {
                 .offset(x: min(max(x - w / 2, 0), width - w))
                 .allowsHitTesting(false)
         }
+    }
+
+    /// The rects of reservation `id` in every band but the one hovered, in strip coordinates.
+    func otherRects(of id: String, besides hit: CGRect, _ f: (Double) -> Double, W: CGFloat) -> [CGRect] {
+        var out: [CGRect] = []
+        for band in bandRects where !(hit.minY >= band.y - 1 && hit.maxY <= band.y + band.h + 1) {
+            let (rects, _) = stripRects(f, W: W, H: band.h, blocks: band.blocks, kind: band.kind)
+            out += rects.filter { band.blocks[$0.i].res.id == id }.map { $0.r.offsetBy(dx: 0, dy: band.y) }
+        }
+        return out
     }
 
     static func shortDuration(_ s: Double) -> String {
@@ -3663,6 +3980,23 @@ struct ReservationCard: View {
         }
     }
 
+    func cardCores(_ c: Double, on: Bool) -> String {
+        var t: String = Reservation.coresWords(c)
+        if on, let u = res.cpuUsed { t += " · using " + Reservation.coresWords(u) }
+        return t
+    }
+    func cardDisk(_ d: Double, on: Bool) -> String {
+        var t: String = Reservation.amtG(d) + " on " + Tile.midFit(res.diskName ?? res.diskPool ?? "?", 24)
+        if on, let w = res.diskWrote { t += " · wrote " + Reservation.amtG(w) }
+        return t
+    }
+
+    /// A queued one's "Now": with the resources on, what it waits for (02 §3.4.6), "queued, waiting for CPU".
+    var queuedText: String {
+        let w: [String] = resourcesUIOn ? res.waitingFor.compactMap { Reservation.word[$0] } : []
+        return w.isEmpty ? "queued, waiting for room" : "queued, waiting for " + Reservation.and(w)
+    }
+
     var body: some View {
         let gbs = res.segments.map { String(format: "%.1f", $0.gb) }.joined(separator: " → ") + " GB"
         let edits = res.segments.count > 1 ? " (changed " + res.segments.dropFirst().map { at($0.t) }.joined(separator: ", ") + ")" : ""
@@ -3681,10 +4015,23 @@ struct ReservationCard: View {
                     .font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
             }
             Divider().padding(.vertical, 1)
+            if !resourcesUIOn || res.holdsMemory {
             row("Reserved", gbs + edits)
             row("Peak used", res.live && res.granted != nil
                 ? String(format: "%.1f GB so far (%.1f GB now)", res.peak, res.used ?? 0)
                 : String(format: "%.1f GB", res.peak))
+            }
+            if resourcesUIOn {  // the vector card (02 §3.4.5): its cores and disk space, and the advice on them
+                let on = res.live && res.granted != nil
+                if let c = res.cpu { row("Cores", cardCores(c, on: on)) }
+                if let d = res.disk { row("Disk", cardDisk(d, on: on)) }
+                if on {
+                    ForEach(Resource.allCases.filter { res.flags[$0] != nil }, id: \.self) { (k: Resource) in
+                        row("Advice", Reservation.adviceWords(k, res.flags[k]!, now: now, clock: { at($0) }))
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
             if let g = res.granted {
                 row("Granted", at(g) + (g - res.requested >= 60 ? " · waited " + MemoryChart.duration(g - res.requested) : ""))
             } else {
@@ -3694,7 +4041,7 @@ struct ReservationCard: View {
                 row("Ended", at(e) + " · " + (ReservationCard.outcomes[res.outcome ?? ""] ?? (res.outcome ?? "")))
                 if let g = res.granted { row("Held", MemoryChart.duration(e - g)) }
             } else if res.granted == nil {
-                row("Now", "queued, waiting for room")
+                row("Now", queuedText)
             } else {
                 row("Now", "active for " + MemoryChart.duration(now - (res.granted ?? now))
                     + (res.expires.map { " · expires in " + MemoryChart.duration(max($0 - now, 0)) } ?? ""))
@@ -3888,6 +4235,8 @@ struct PopoverView: View {
     @State private var draftURL = ""
     @State private var ollamaModels: [String] = []
     @State var showAllReservations = false  // the callout behind "+N more"
+    /// The reservation whose row the pointer is on: its blocks are outlined in every band (02 §3.4.5, resources on).
+    @State var hoveredRow: String? = nil
     @State private var shakes: [Resource: Int] = [:]  // a refused ⌘-click shakes its tile (§3.7.2)
     @Environment(\.colorScheme) private var scheme
     private let series = ["Wired", "App", "Compressed", "Swap"]
@@ -3996,12 +4345,12 @@ struct PopoverView: View {
             GeometryReader { geo in
                 if showAllReservations, let anchor {
                     let r = geo[anchor]
-                    let w: CGFloat = 360
+                    let w: CGFloat = resourcesUIOn ? min(geo.size.width - 16, 470) : 360  // the amounts need room (B3)
                     let left = min(max(8, r.minX + 40 - w / 2), geo.size.width - w - 8)
                     ZStack(alignment: .topLeading) {
                         Color.black.opacity(0.001)
                             .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { showAllReservations = false } }
-                        allReservationsCallout(arrowX: r.minX + 40 - left)
+                        allReservationsCallout(arrowX: r.minX + 40 - left, width: w)
                             .frame(width: w)
                             .padding(.leading, left)
                             .padding(.bottom, geo.size.height - r.minY + 2)
@@ -4384,15 +4733,15 @@ struct PopoverView: View {
         // with the resources on (§3.7.7): the rows of what holds a shown resource (every reservation holds
         // memory until 1.12), the list's cap by the compact level, and one line for the rest
         let sel = resourcesUIOn ? store.selection(for: m) : nil
-        let live = sel.map { $0.shown.contains(.memory) ? all : [] } ?? all
-        let other = sel != nil && live.isEmpty ? all : []
+        let (live, other) = PopoverView.split(all, sel?.shown)
         let lines = !resourcesUIOn ? PopoverView.reservationLines : store.compactLevel >= 3 ? 3 : store.compactLevel >= 1 ? 4 : PopoverView.reservationLines
         let capped = live.count > lines
         let shown = capped ? Array(live.prefix(lines - 1)) : live
         let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
         var summary = live.isEmpty ? "\(day) in the last 24 h" : String(format: "%.1f GB reserved · %d in the last 24 h", reserved, day)
-        if sel != nil && !live.isEmpty { summary = String(format: "%.1f GB · %d in the last 24 h", reserved, day) }
+        if let s = sel, !live.isEmpty { summary = Reservation.captionText(live, shown: s.shown, day: day) }
         if m.stale && !live.isEmpty { summary = "as of " + MemoryChart.when(now) + String(format: ": %.1f GB reserved", reserved) }
+        let amountsWidth: CGFloat = sel == nil ? 40 : min(150, max(40, 6.3 * CGFloat(shown.map { $0.amountsText(pool: tilePool).count }.max() ?? 0)))
         let nothing = sel.map { s in "Nothing reserved right now on " + ListFormatter.localizedString(byJoining: s.shown.map {
             $0 == .memory ? "memory" : $0.name }) } ?? "Nothing reserved right now"
         return VStack(alignment: .leading, spacing: 3) {
@@ -4410,22 +4759,35 @@ struct PopoverView: View {
                 Text(nothing).font(.caption).foregroundStyle(.tertiary)
             }
             ForEach(shown) { (r: Reservation) in
-                if m.stale { reservationRow(r, now: now).grayscale(1).opacity(0.6) } else { reservationRow(r, now: now) }
+                if m.stale { reservationRow(r, now: now, amountsWidth: amountsWidth).grayscale(1).opacity(0.6) }
+                else { reservationRow(r, now: now, amountsWidth: amountsWidth) }
             }
             if capped { moreLine(Array(live.dropFirst(shown.count))) }
             if !other.isEmpty && !m.fetchingLedger { otherLine(other) }
         }
     }
 
+    /// (the live reservations that hold a shown resource, the rest) (02 §3.7.7); everything without a selection.
+    static func split(_ all: [Reservation], _ shown: [Resource]?) -> (rows: [Reservation], rest: [Reservation]) {
+        guard let shown else { return (all, []) }
+        return (all.filter { r in shown.contains { r.holds($0) } }, all.filter { r in !shown.contains { r.holds($0) } })
+    }
+    /// The id of the disk pool the Disk tile shows (its band's).
+    var tilePool: String? { Tile.pool(m.current?.disks?.v).pool?.id }
+    /// The reservation a row points at: the one under the pointer, or in a render (`--ai rowhover:N`) row N.
+    var rowHighlight: String? {
+        guard resourcesUIOn else { return nil }
+        if let h = hoveredRow { return h }
+        guard let n = renderResRowHover else { return nil }
+        let rows = PopoverView.split(m.liveReservations, store.selection(for: m).shown).rows
+        return n >= 0 && n < rows.count ? rows[n].id : nil
+    }
+
     /// "On other resources: 14.0 GB reserved · 1 waiting for memory ›" (§3.7.7): the live totals of the
     /// resources not shown and how many of the hidden requests wait; a click lists them all. Shorter from
     /// level 1, never without the count of waiting requests.
     func otherLine(_ rest: [Reservation]) -> some View {
-        let gb = rest.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
-        let waiting = rest.filter { $0.granted == nil }.count
-        var text = store.compactLevel >= 1 ? "Other: " + String(format: "%.1f GB", gb)
-                                           : "On other resources: " + String(format: "%.1f GB reserved", gb)
-        if waiting > 0 { text += " · \(waiting) waiting" + (store.compactLevel >= 1 ? "" : " for memory") }
+        let text = Reservation.otherText(rest, short: store.compactLevel >= 1) ?? ""
         return Button {
             NSApp.keyWindow?.makeFirstResponder(nil)
             withAnimation(.easeOut(duration: 0.15)) { showAllReservations.toggle(); showTopApps = false; showAI = false }
@@ -4442,8 +4804,9 @@ struct PopoverView: View {
         .anchorPreference(key: MoreAnchorKey.self, value: .bounds) { $0 }
     }
 
-    func reservationRow(_ r: Reservation, now: Double) -> some View {
+    func reservationRow(_ r: Reservation, now: Double, amountsWidth: CGFloat = 40) -> some View {
         let c = resourcesUIOn ? r.agentColor(dark: scheme == .dark) : r.color
+        let flagged = resourcesUIOn && !r.flags.isEmpty && !m.stale
         return HStack(spacing: 6) {
             ZStack {
                 RoundedRectangle(cornerRadius: 2).fill(c.opacity(r.granted == nil ? 0.15 : 0.8))
@@ -4452,16 +4815,35 @@ struct PopoverView: View {
                 }
             }
             .frame(width: 8, height: 8)
+            if resourcesUIOn {  // every amount as text (02 §3.8.5)
+                // never cut (02 §3.4.6): a row whose amounts outgrow the column widens it for itself
+                Text(r.amountsText(pool: tilePool)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                    .lineLimit(1).fixedSize().frame(minWidth: amountsWidth, alignment: .leading)
+            } else {
             Text(String(format: "%.1fG", r.gb)).font(.system(size: 11, weight: .semibold)).monospacedDigit()
                 .frame(width: 40, alignment: .trailing)
+            }
+            // with the resources on, the project gives way first, then the purpose in its middle (02 §3.4.6)
             Text(r.purpose).font(.system(size: 11)).lineLimit(1)
+                .truncationMode(resourcesUIOn ? .middle : .tail).layoutPriority(resourcesUIOn ? 1 : 0)
             if let p = r.projectName { Text(p).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1) }
             Spacer(minLength: 4)
-            Text(reservationTail(r, now: now)).font(.system(size: 10)).foregroundStyle(.secondary).monospacedDigit()
+            Text(reservationTail(r, now: now)).font(.system(size: 10, weight: flagged ? .semibold : .regular))
+                .foregroundStyle(flagged ? .primary : .secondary).monospacedDigit()
                 .lineLimit(1).fixedSize()
         }
-        .help("\(r.rid): \(r.purpose)" + (r.project.map { " — " + $0 } ?? "")
-              + String(format: " · reserved %.1f GB, peak %.1f GB so far", r.gb, r.peak))
+        .contentShape(Rectangle())
+        .onHover { inside in
+            guard resourcesUIOn else { return }
+            if inside { hoveredRow = r.id } else if hoveredRow == r.id { hoveredRow = nil }
+        }
+        .help(rowHelp(r))
+    }
+
+    func rowHelp(_ r: Reservation) -> String {
+        let head: String = "\(r.rid): \(r.purpose)" + (r.project.map { " — " + $0 } ?? "")
+        if resourcesUIOn { return head + " · " + r.amountsText(pool: tilePool) + String(format: " · peak %.1f GB so far", r.peak) }
+        return head + String(format: " · reserved %.1f GB, peak %.1f GB so far", r.gb, r.peak)
     }
 
     /// The fifth line when there are more: "+3 more · 5.0 GB reserved · 1 waiting" (of the ones
@@ -4470,8 +4852,15 @@ struct PopoverView: View {
         let gb = rest.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
         let waiting = rest.filter { $0.granted == nil }.count
         var text = "+\(rest.count) more"
+        if resourcesUIOn {  // amounts of several kinds do not add up: how many are granted, how many wait (02 §3.4.6)
+            var counts: [String] = []
+            if rest.count - waiting > 0 && store.compactLevel < 1 { counts.append("\(rest.count - waiting) granted") }
+            if waiting > 0 { counts.append("\(waiting) waiting") }
+            if !counts.isEmpty { text += (store.compactLevel >= 1 ? " · " : ": ") + counts.joined(separator: ", ") }
+        } else {
         if gb > 0 { text += String(format: " · %.1f GB reserved", gb) }
         if waiting > 0 { text += " · \(waiting) waiting" }
+        }
         return Button {
             NSApp.keyWindow?.makeFirstResponder(nil)
             withAnimation(.easeOut(duration: 0.15)) { showAllReservations.toggle(); showTopApps = false; showAI = false }
@@ -4492,11 +4881,12 @@ struct PopoverView: View {
     }
 
     /// Every live reservation, above the "+N more" line.
-    func allReservationsCallout(arrowX: CGFloat) -> some View {
+    func allReservationsCallout(arrowX: CGFloat, width: CGFloat = 360) -> some View {
         let live = m.liveReservations
         let now = m.isLocal ? wallNow() : m.stale || m.inGrace ? (m.knownUntil ?? m.now) : m.now
         let reserved = live.filter { $0.granted != nil }.reduce(0) { $0 + $1.gb }
         let rows = renderMode ? Array(live.prefix(14)) : live
+        let aw: CGFloat = !resourcesUIOn ? 40 : min(120, max(40, 6.3 * CGFloat(rows.map { $0.amountsText(pool: tilePool).count }.max() ?? 0)))
         return VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline) {
@@ -4506,10 +4896,10 @@ struct PopoverView: View {
                 }
                 .padding(.bottom, 3)
                 if rows.count > 14 {
-                    ScrollView { VStack(alignment: .leading, spacing: 3) { ForEach(rows) { reservationRow($0, now: now) } } }
+                    ScrollView { VStack(alignment: .leading, spacing: 3) { ForEach(rows) { reservationRow($0, now: now, amountsWidth: aw) } } }
                         .frame(maxHeight: 14 * 17)
                 } else {
-                    ForEach(rows) { reservationRow($0, now: now) }
+                    ForEach(rows) { reservationRow($0, now: now, amountsWidth: aw) }
                 }
             }
             .padding(12)
@@ -4519,13 +4909,17 @@ struct PopoverView: View {
                 .fill(.regularMaterial)
                 .overlay(CalloutArrow().stroke(Color.primary.opacity(0.12), lineWidth: 0.5))
                 .frame(width: 16, height: 8)
-                .offset(x: arrowX - 180)  // centre of a 360-wide bubble
+                .offset(x: arrowX - width / 2)  // centre of the bubble
         }
         .shadow(color: .black.opacity(0.22), radius: 12, y: 4)
     }
 
     func reservationTail(_ r: Reservation, now: Double) -> String {
         if m.stale { return r.granted == nil ? "was waiting" : String(format: "was using %.1fG", r.used ?? 0) }
+        if resourcesUIOn {  // its flag, what it waits for, one use figure (02 §3.4.6)
+            let sel = store.selection(for: m)
+            return r.statusText(shown: sel.shown, focus: sel.focus, now: now)
+        }
         guard r.granted != nil else { return "waiting " + MemoryChart.duration(now - r.requested) }
         return String(format: "using %.1fG", r.used ?? 0) + (r.expires.map { " · " + MemoryChart.shortDuration($0 - now) + " left" } ?? "")
     }
@@ -4744,6 +5138,7 @@ struct PopoverView: View {
                     MemoryChart(points: m.history, gaps: m.gaps, incidents: m.incidents, events: m.events,
                                 ram: m.current?.ram_gb, axis: axis,
                                 reservations: m.reservations, stripHeight: stripHeight,
+                                bands: stripBands, smallBand: smallBandHeight, highlight: rowHighlight,
                                 focus: sel.focus, rows: smallRows, rowHeight: smallRowHeight, cores: m.current?.cpu?.v?.n,
                                 floors: pool?.watch == true ? pool.flatMap { p in p.low_gb.map { (low: $0, crit: p.crit_gb ?? 0) } } : nil)
                         .id(sel.focus)  // a plain click cross-fades the chart area (§3.7.4)
@@ -4773,8 +5168,21 @@ struct PopoverView: View {
     /// The reservation strip under the chart: there once any agent reserved memory (14 days kept). With the
     /// resources on, the memory band is drawn while memory is shown (§3.7.6: no other resource has a band yet).
     var stripHeight: CGFloat {
-        m.historyLoaded && (!m.history.isEmpty || !m.isLocal) && !m.reservations.isEmpty
-            && (!resourcesUIOn || store.selection(for: m).shown.contains(.memory)) ? 46 : 0
+        if resourcesUIOn {  // a band per reserved resource shown (B3): the first 46 pt, each other one 12 (9 from level 2) and its gap
+            let n = stripBands.count
+            return n == 0 ? 0 : 46 + CGFloat(n - 1) * (smallBandHeight + MemoryChart.bandGap)
+        }
+        return m.historyLoaded && (!m.history.isEmpty || !m.isLocal) && !m.reservations.isEmpty ? 46 : 0
+    }
+    var smallBandHeight: CGFloat { store.compactLevel >= 2 ? 9 : 12 }
+    /// With the resources on: the strip's bands (02 §3.4.5, §3.7.6), each with its blocks: the shown resources reserved
+    /// in the 14 days, the focus's first; the Disk band is the tile's pool's. At the solo level only the first.
+    var stripBands: [(kind: Resource, blocks: [ResBlock])] {
+        guard resourcesUIOn, m.historyLoaded, !m.history.isEmpty || !m.isLocal, !m.reservations.isEmpty else { return [] }
+        let sel = store.selection(for: m)
+        let pool = Tile.pool(m.current?.disks?.v).pool?.id
+        let ks = Reservation.bands(m.reservations.map(\.res), shown: sel.shown, focus: sel.focus, pool: pool)
+        return (store.compactLevel >= 4 ? Array(ks.prefix(1)) : ks).map { k in (k, m.blocks(for: k, pool: pool)) }
     }
 
     /// The big chart with its time labels: 140 pt and its axis, 118 at the tight level (§3.7.5).
@@ -4923,7 +5331,7 @@ struct PopoverView: View {
                          xs: [plot.minX + 90], y: chartBottom, reach: zone.maxY - chartBottom + 10),
                 TourNote(title: "Reserved by agents",
                          text: resourcesUIOn
-                            ? "Claude sessions and other agents reserve before heavy work and take turns (the oomph skill). One colour per agent: every reservation of one session has its colour. Height is the amount, hatched while it waits. Hover a block for its peak and how it ended."
+                            ? "Claude sessions and other agents reserve before heavy work and take turns (the oomph skill). One band per resource shown, one colour per agent: every reservation of one session has its colour. Height is the amount, hatched while it waits. Hover a block or a row to find it in every band."
                             : "Claude sessions and other agents reserve memory before heavy work and take turns (the oomph skill). One block per reservation: its height the GB, hatched while it waited, stacked where they overlap. Hover a block for its peak and how it ended.",
                          left: m + half + 8, width: half, above: false,
                          xs: [strip.midX + 60], y: strip.maxY + 2, reach: zone.maxY - strip.maxY + 11),
@@ -7479,6 +7887,7 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
         if ai.hasPrefix("hoverlog:") { store.range = .infinity }
     }
     if ai.hasPrefix("blend:") { renderBlend = Double(ai.dropFirst(6)) }
+    if ai.hasPrefix("rowhover:") { renderResRowHover = Int(ai.dropFirst(9)) }  // the pointer on a row of the list
     if ai.hasPrefix("rhover:") {  // rhover:X:Y — the reservation strip's tooltip at (X, Y) in strip points
         let v = ai.split(separator: ":").dropFirst().compactMap { Double($0) }
         if v.count >= 2 { renderStripHover = CGPoint(x: v[0], y: v[1]) }
@@ -7786,6 +8195,45 @@ func chartVectors(_ path: String) -> Int32 {
         }
     }
     out["agent"] = cases("agent").map { Reservation.agentIndex($0["agent"]) }
+    // a band per reserved resource and the list's words (B3, 1.12.3): the bands of a selection, the rows of what holds a
+    // shown resource in their order with their amounts and status, the caption, the line for the rest
+    func merged(_ c: [String: Any]) -> [Reservation] {
+        let lines = ((c["records"] as? [Any]) ?? []).compactMap { r -> String? in
+            (try? JSONSerialization.data(withJSONObject: r)).flatMap { String(data: $0, encoding: .utf8) }
+        }
+        return Store.mergeReservations(records: lines.joined(separator: "\n").data(using: .utf8),
+                                       ledger: (c["ledger"] as? [String: Any]) ?? [:], now: num(c["now"]), holderGone: { _ in false })
+            .sorted { ($0.requested, $0.id) < ($1.requested, $1.id) }
+    }
+    out["rows"] = cases("rows").map { c -> [String: Any] in
+        let all = merged(c), now = num(c["now"])
+        let shown = ((c["shown"] as? [String]) ?? []).compactMap { Resource(rawValue: $0) }
+        let focus = Resource(rawValue: (c["focus"] as? String) ?? "") ?? .memory
+        let pool = c["pool"] as? String
+        let live = Reservation.listOrder(all.filter(\.live), flagsFirst: true)
+        let (rows, rest) = PopoverView.split(live, shown)
+        func opt(_ s: String?) -> Any { s.map { $0 as Any } ?? NSNull() }
+        let bands: [String] = Reservation.bands(all, shown: shown, focus: focus, pool: pool).map(\.rawValue)
+        let words: [[String]] = rows.map { (r: Reservation) -> [String] in
+            [r.id, r.amountsText(pool: pool), r.statusText(shown: shown, focus: focus, now: now)]
+        }
+        var o: [String: Any] = ["bands": bands, "rows": words, "rest": rest.map(\.id)]
+        o["caption"] = Reservation.captionText(rows, shown: shown, day: Int(num(c["day"])))
+        o["other"] = opt(Reservation.otherText(rest, short: false))
+        o["other_short"] = opt(Reservation.otherText(rest, short: true))
+        return o
+    }
+    out["band_stack"] = cases("band_stack").map { c -> [[String: Any]] in
+        let k = Resource(rawValue: (c["kind"] as? String) ?? "") ?? .memory
+        let pool = c["pool"] as? String
+        let rs = merged(c).filter { $0.holds(k, pool: pool) }
+        return ResBlock.stack(rs, now: num(c["now"]), kind: k).map { b in
+            ["key": b.res.id, "lane": b.lane, "steps": b.steps.map { [$0.a, $0.b, $0.lo, $0.hi] }] as [String: Any]
+        }
+    }
+    out["band_top"] = cases("band_top").map { c -> Double in
+        Reservation.bandTop(num(c["tallest"]), Resource(rawValue: (c["kind"] as? String) ?? "") ?? .memory)
+    }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)
     FileHandle.standardOutput.write("\n".data(using: .utf8)!)

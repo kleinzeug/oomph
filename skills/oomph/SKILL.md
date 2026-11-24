@@ -137,6 +137,28 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
   when the work changes.
 - Finished: `release_memory`. Don't shrink to zero instead.
 
+**Reserving several resources** (only those `OOMPH resources --json` lists under `reservable`):
+- Reserve what the step will really occupy, **in one call**: memory, and where they apply, cores and
+  disk space. One reservation of several resources is granted all at once or not at all.
+- **Cores:** ask for what the tool's parallelism would use: `cpu_cores: 8` (`--cpu 8`). You are
+  granted between half of that and all of it. **Run with the number in `run_with`**, not the one
+  you asked for (`make -j6`, `cargo build -j 6`, `pytest -n 6`). A tool without a `-j` takes every
+  core: reserve them all, or wrap it in `OOMPH run --cpu 4..12 -- …`, which hands it the number.
+  `cpu_min` (`--cpu 8..8`) only when the step really needs that many.
+- **Disk:** before a download, a dataset, an image build or anything else that writes more than
+  about 5 GB: `disk_gb` (`--disk 20G`), and `disk_path` (`--disk 20G@/Volumes/Scratch`) when it
+  is not the temporary folder's disk. Write at most that much; delete what you no longer need.
+- **The answer says what happens.** While queued, `waiting_on` names what you wait for (`ram`,
+  `cpu`, `disk:<volume>`); a request waiting for cores holds up nobody's memory. Once granted, an
+  answer may carry `flags` with its advice first: **`over`** (your processes use more cores than
+  granted, or wrote more than the disk space reserved: lower the parallelism or `amend` it) or
+  **`idle`** (the cores have been nearly unused for ten minutes: release them, or `amend` with
+  `cpu_cores: 0`). They are advice; nothing is taken away, but other sessions see them.
+- A busy CPU is not an emergency. Only `tight` and `critical` change what you do, and they are
+  about memory and about the disks you write to.
+- Look at `reservation_history` for the `peak` of each resource the last time this purpose ran,
+  and shrink or grow accordingly.
+
 **3. When you are queued:**
 - Don't start the work, and don't "just start it anyway" because memory looks free —
   the memory you see is promised to whoever is ahead of you.

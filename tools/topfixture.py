@@ -141,6 +141,36 @@ LIVE_CRISIS = [("xcodebuild test", 10.0, "atlas-ios", 1310, 7.9, 3600, False),
                ("pytest -n 8", 4.0, "ml-eval", 240, 1.3, 1800, False), ("playwright e2e", 3.0, "webshop", 150, 1.1, 1800, False),
                ("pnpm check", 2.0, "webshop", 70, 0.3, 1800, False), ("docker build api", 8.0, "atlas", 95, 0.0, 1800, True),
                ("cargo build --release", 5.0, "indexer", 40, 0.0, 1800, True)]
+# The resources fixture's live reservations (B3, 1.12.3): the same four plus cores, disk space and their advice. The
+# eighth element is what the lease adds, given its request time and the clock: (req, now) → fields.
+def _vec(res, **more):
+    return lambda req, now: dict(more, v=2, res=res(req, now) if callable(res) else res, res_granted=req)
+
+
+LIVE_RES = [("gradle assembleDebug", 6.0, "atlas", 730, 4.1, 1800, False,
+             _vec(lambda req, now: {"ram": {"ask": 6.0, "got": 6.0}, "mem": {"got": 6.0},
+                                    "cpu": {"ask": 8, "min": 4, "got": 6, "used": 7.9, "peak": 8.4, "flag": "over",
+                                            "over_n": 3, "over_t": now - 40}})),
+            ("pytest -n 8", 4.0, "ml-eval", 1500, 1.3, 3600, False,
+             _vec(lambda req, now: {"ram": {"ask": 4.0, "got": 4.0}, "mem": {"got": 4.0},
+                                    "cpu": {"ask": 8, "min": 4, "got": 8, "used": 0.3, "peak": 7.6, "flag": "idle",
+                                            "low_t": now - 760}})),
+            ("pnpm check", 2.0, "webshop", 70, 0.3, 1800, False),
+            ("dataset download", 1.0, "ml-eval", 2100, 0.4, 3600, False,
+             _vec(lambda req, now: {"ram": {"ask": 1.0, "got": 1.0}, "mem": {"got": 1.0},
+                                    "disk": {"ask": 30, "got": 30, "pool": "data", "name": "Data", "w": 11.5,
+                                             "used": 11.5, "peak": 11.5}})),
+            ("render frames", 0.01, "atlas-ios", 3000, 0.0, 7200, False,
+             _vec({"disk": {"ask": 40, "got": 40, "pool": "vol:4F632FD2", "name": "Scratch", "w": 47.0, "used": 40.0,
+                            "peak": 40.0, "flag": "over", "over_t": NOW - 300}})),
+            ("docker build api", 8.0, "atlas", 40, 0.0, 1800, True),
+            ("cargo build --release", 0.01, "indexer", 95, 0.0, 1800, True,
+             lambda req, now: {"v": 2, "res": {"cpu": {"ask": 8, "min": 8}}, "waiting_on": ["cpu"], "hold": ["cpu"]})]
+# finished reservations of the resources fixture that also held cores or disk space, by purpose (no random numbers:
+# the memory blocks stay those of the other scenarios)
+RES_RECORDS = {"cargo build --release": {"cpu": 8}, "gradle assembleDebug": {"cpu": 6},
+               "playwright e2e": {"disk": 20.0, "disk_pool": "data"}}
+
 HOSTILE = [("\x1b]52;c;aGk=\x07clipboard \x1b[2J", 3.0, "\x1b[31mred", 300, 1.0, 1800, False),
            ("right\u202eto left \u2066x\u2069", 2.0, "שלום עולם", 200, 0.5, 1800, False),
            ("emoji \U0001F680\u26A0\uFE0F build", 1.0, "e\u0301\u0301\u0301tude", 100, 0.2, 1800, False),
@@ -183,8 +213,10 @@ def reservations(live, seed=82, now=NOW, agents=False):
                 rec["segments"] = [{"t": req, "gb": gb}, {"t": round(req + wait + dur * 0.4, 1), "gb": rec["gb"]}]
             if agents and req >= T(17, 0) and project in AGENTS:
                 rec["agent"] = {"key": AGENTS[project][0], "slot": AGENTS[project][1]}
+            if agents and req >= T(18, 0) and purpose in RES_RECORDS:   # a vector writer's record (1.12)
+                rec.update(v=2, res=dict(RES_RECORDS[purpose], ram=rec["gb"]))
             recs.append(rec)
-    for purpose, gb, project, ago_s, used, ttl, queued in live:
+    for purpose, gb, project, ago_s, used, ttl, queued, *more in live:
         seq += 1
         req = now - ago_s
         lease = {"id": "r%d" % seq, "key": "r%d@%d" % (seq, int(req)), "state": "queued" if queued else "granted",
@@ -193,6 +225,8 @@ def reservations(live, seed=82, now=NOW, agents=False):
                  "used_gb": used, "peak_gb": used}
         if not queued:
             lease.update(granted=req, ttl=ttl, expires=req + ttl)
+        if more:
+            lease.update(more[0](req, now))
         if agents and project in AGENTS:
             lease["agent"] = {"key": AGENTS[project][0], "slot": AGENTS[project][1]}
         leases.append(lease)
@@ -296,7 +330,8 @@ def write_fixture(d, scenario):
                        "summary": dict(INCIDENT_SUMMARY, jetsam_kills=kills) if kills == 14 else
                        {"jetsam_kills": kills}}, f)
     if scenario != "fresh":
-        recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else LIVE, agents=res)
+        recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else LIVE_RES if res
+                                    else LIVE, agents=res)
         with open(os.path.join(led, "reservations.jsonl"), "w") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")

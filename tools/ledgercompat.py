@@ -22,6 +22,13 @@ process next to this checkout's, on one ledger directory, in both directions:
      it writes; pinned, for B1. (CI clones have tags up to v1.8.4 only: A2 runs locally.)
   F  a disk request (B2, 1.12.1) on a pool id: 1.8.1 keeps its fields; a 1.12.0 client (with the tag)
      cannot weigh it and waits behind it, and the next refresh here grants that client's request.
+  S  the skill and older CLIs (roadmap 4.7, B3): every example of the skill's "Reserving several resources"
+     (`--cpu 8`, `--disk 20G@/Volumes/Scratch`, `OOMPH run --cpu 4..12 -- …`) against the CLI of every tag in
+     this clone and this one. A CLI that does not know a flag must never take it: from 1.8.5 (strict options)
+     it refuses it with exit 2; before that (1.8.1 to 1.8.4 read `--cpu 8 6G` as 8 GB) `oomph resources` does
+     not exist, so the skill's first-line guard keeps an agent at memory only. No CLI before 1.12.0 lists
+     anything but memory as reservable; 1.12.0 not disk. A CLI that knows the flags (and this one) reads each
+     example as the skill means it.
   C  1.8.1's own files: this code reads them, makes a memory vector of an old lease without
      writing one, and writes back what 1.8.1 writes plus `agent` (D11) and, from 1.9.4 (L1), `user`
      and the holder's uid (03 §6.5); 1.8.1 reads that back.
@@ -32,10 +39,15 @@ Exit 0 when every check passes, 1 when one fails, 2 when it could not run (no ta
 clone: a skip, except under CI, where it fails).
 """
 import atexit
+import contextlib
 import copy
+import gc
 import importlib.util
+import io
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -70,8 +82,7 @@ def old_module(tag="v1.8.1"):
         src = b""
     if b"def _evaluate" not in src:
         return None
-    d = os.path.join(TMP, tag)
-    os.mkdir(d)
+    d = tempfile.mkdtemp(prefix=tag + "-", dir=TMP)
     path = os.path.join(d, "oomph.py")
     open(path, "wb").write(src)
     spec = importlib.util.spec_from_file_location("oomph_" + tag[1:].replace(".", "_"), path)
@@ -653,6 +664,102 @@ st = new.reserve(0.25, "run", dict(HOLDER, kind="run", agent=new.agent_key(SES, 
 check(agent_is(lease(raw(d), st["id"])["agent"], new.agent_key(SES, START - 50))
       and "agent" not in lease(raw(d), st["id"])["holder"],
       "D a reservation made by `oomph run` inside a session has the session's agent key")
+
+# --- S: the skill's vector syntax against older CLIs (roadmap 4.7: "the new skill's commands against a frozen CLI")
+SKILL = open(os.path.join(ROOT, "skills", "oomph", "SKILL.md"), encoding="utf-8").read()
+sec = SKILL[SKILL.index("**Reserving several resources**"):]
+sec = sec[:sec.index("\n\n")]
+spans = re.findall(r"`([^`]+)`", sec)
+opts = sorted({x for x in spans if re.match(r"--(cpu|disk) \S+$", x)})
+runs = [x.replace("OOMPH ", "", 1).replace("\u2026", "true") for x in spans if x.startswith("OOMPH run ")]
+check(any(o.startswith("--cpu") for o in opts) and any("@" in o for o in opts) and runs,
+      "S the skill's section on several resources has its examples (%s; %s)" % (", ".join(opts), "; ".join(runs)))
+CMDS = ([["reserve"] + o.split() + ["--for", "x"] for o in opts] + [["reserve", "6G"] + o.split() + ["--for", "x"]
+                                                                     for o in opts]
+        + [["amend", "r1"] + o.split() for o in opts if "@" not in o] + [["amend", "r1", "--cpu", "0"]]
+        + [shlex.split(x) for x in runs])
+
+
+def drive(m, argv):
+    """m's main on argv with acquire and amend stood in for: (exit status, [what reached them])."""
+    calls = []
+
+    def stand_in(*a, **kw):
+        calls.append((a, kw))
+        return {"status": "refused", "advice": "stand-in", "id": "r1"}
+    saved = {k: getattr(m, k) for k in ("acquire", "amend", "holder_for") if hasattr(m, k)}
+    m.acquire = m.amend = stand_in
+    m.holder_for = lambda pid=None: dict(HOLDER)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = m.main(list(argv))
+            except SystemExit as e:
+                rc = e.code
+            except Exception as e:  # noqa: B902
+                rc = e
+    finally:
+        for k, v in saved.items():
+            setattr(m, k, v)
+    return rc, calls, out.getvalue()
+
+
+def meant(argv, calls):
+    """Did the call that reached acquire/amend carry what the example means: its gb, cores only with --cpu, disk
+    space (and its path) only with --disk?"""
+    if len(calls) != 1:
+        return False
+    a, kw = calls[0]
+    gb = 6.0 if "6G" in argv else (None if argv[0] == "amend" else 0)
+    disk = next((x for x in argv if re.match(r"\d+G", x) and argv[argv.index(x) - 1] == "--disk"), None)
+    return ((argv[0] == "amend" or a[0] == gb) and (kw.get("cpu") is not None) == ("--cpu" in argv)
+            and (kw.get("disk") is not None) == ("--disk" in argv)
+            and (disk is None or "@" not in disk or kw.get("disk_path") == disk.split("@", 1)[1]))
+
+
+def ver(tag):
+    return tuple(int(x) for x in tag[1:].split("."))
+
+
+tags = sorted((t for t in subprocess.run(["git", "-C", ROOT, "tag", "-l", "v*"], capture_output=True, text=True,
+                                         timeout=30).stdout.split() if re.match(r"v\d+\.\d+\.\d+$", t)
+               and ver(t) >= (1, 8, 1)), key=ver)
+for tag in tags + ["this checkout"]:
+    m = new if tag == "this checkout" else old_module(tag)
+    if m is None:
+        continue
+    v = (99, 0, 0) if m is new else ver(tag)
+    m._oomphd = m._plat = Procs
+    m._sample_override = lambda: dict(SAMPLE)
+    if hasattr(m, "resource_sample"):
+        m.resource_sample = lambda *a, **kw: dict(SAMPLE)
+    m.LEDGER_DIR = os.path.join(TMP, "unused")
+    rc, _, out = drive(m, ["resources", "--json"])
+    try:
+        listed = json.loads(out).get("reservable") if rc == 0 else None
+    except ValueError:
+        listed = None
+    if v < (1, 12, 0):
+        check(rc != 0 or listed == ["memory"],
+              "S %s: `oomph resources --json` %s, so the skill's guard reserves memory only" % (
+                  tag, "lists only memory" if rc == 0 else "fails (exit %s)" % rc))
+    elif v < (1, 12, 1):
+        check(rc == 0 and "disk" not in (listed or []), "S %s: `oomph resources --json` does not list disk" % tag)
+    bad = []
+    for argv in CMDS:
+        knows = ("--cpu" not in argv or v >= (1, 12, 0)) and ("--disk" not in argv or v >= (1, 12, 1))
+        rc, calls, _ = drive(m, argv)
+        if knows:
+            if not (rc in (0, 75) and meant(argv, calls)):
+                bad.append("%s → %s %s" % (" ".join(argv), rc, calls[:1]))
+        elif v >= (1, 8, 5) and (rc != 2 or calls):
+            bad.append("%s → %s %s (should refuse it, exit 2)" % (" ".join(argv), rc, calls[:1]))
+    check(not bad, "S %s: %s" % (tag, "every example of the skill is %s" % (
+        "read as meant" if v >= (1, 12, 1) else "refused with exit 2 where it names an unknown flag, read as meant "
+        "otherwise" if v >= (1, 8, 5) else "behind the guard (no `oomph resources`)") if not bad else "; ".join(bad[:4])))
+    if m is not new:
+        del m
+        gc.collect()
 
 print("ledger compatibility: %s" % ("all %s" % "ok" if not failures else "%d FAILED" % len(failures)))
 sys.exit(1 if failures else 0)

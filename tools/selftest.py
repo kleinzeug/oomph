@@ -3632,6 +3632,140 @@ if MAC:  # the real mount table: any path names its volume; the system's pool an
           and "part of the system" in (why_dev or "") and "No such file" in (why_no or ""),
           "disk: on this Mac the temporary folder is on the system's pool; /dev is ignored, with the reason (%s)" % why_dev)
 
+# --- B3 + T4b (1.12.3): the advice on a grant (over, idle), and a band per reserved resource with its words in the
+# terminal (roadmap 02 §3.4.5, §3.4.6, §3.7.6, §3.7.7, §6.3). The app's words are held to these by tools/vectors/chart.json.
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import oomph_top as T3  # noqa: E402
+import oomph_view as V3  # noqa: E402
+import topfixture  # noqa: E402
+
+now3 = time.time()
+
+
+def b3lease(rid, watch, cpu=None, disk=None, gb=oomph.NO_MEM_GB, granted=None):
+    res = {}
+    if cpu is not None:
+        res["cpu"] = {"ask": cpu, "got": cpu}
+    if disk is not None:
+        res["disk"] = {"ask": disk, "got": disk, "pool": "data", "w": 0.0, "wt": now3 - 1}
+    return {"id": rid, "state": "granted", "gb": gb, "v": 2, "watch": watch, "granted": granted or now3 - 900,
+            "res": res, "purpose": "b3 " + rid, "holder": {"pid": watch, "start": 1, "kind": "session"},
+            "requested": now3 - 900, "base": {"free_gb": 100.0}}
+
+
+procs3 = {21: {"pid": 21, "ppid": 1, "cpu": 9.0}, 22: {"pid": 22, "ppid": 1, "cpu": 0.2}, 23: {"pid": 23, "ppid": 1}}
+L3 = {"leases": [b3lease("ro", 21, cpu=6), b3lease("ri", 22, cpu=8)]}
+oomph._charge_cpu(L3, procs3, oomph._children(procs3), now3 - 700)
+first = [dict(x["res"]["cpu"]) for x in L3["leases"]]
+oomph._charge_cpu(L3, procs3, oomph._children(procs3), now3 - 650)
+second = [dict(x["res"]["cpu"]) for x in L3["leases"]]
+oomph._charge_cpu(L3, procs3, oomph._children(procs3), now3)
+third = [dict(x["res"]["cpu"]) for x in L3["leases"]]
+check("flag" not in first[0] and first[0].get("over_n") == 1 and second[0].get("flag") == "over"
+      and second[0].get("over_t") == first[0].get("over_t") and "flag" not in second[1] and third[1].get("flag") == "idle"
+      and third[1].get("low_t") == first[1].get("low_t") and oomph.advice_flags(L3["leases"][0])["cpu"][0] == "over",
+      "advice: cores used at more than 1.25 × the grant are `over` from the second evaluation on, under 10 %% for ten "
+      "minutes `idle`, each since when it began (%s)" % [first[0].get("over_n"), second[0].get("flag"), third[1].get("flag")])
+procs3[21]["cpu"], procs3[22]["cpu"] = 6.5, 2.0
+oomph._charge_cpu(L3, procs3, oomph._children(procs3), now3 + 5)
+calm = [x["res"]["cpu"] for x in L3["leases"]]
+check(not any(set(c) & {"flag", "over_n", "over_t", "low_t", "rate_t"} for c in calm)
+      and not oomph.advice_flags(L3["leases"][1]),
+      "advice: back within the grant (6.5 of 6 is under 1.25 ×; 2 of 8 is over 10 %), the flags and their counters go")
+LT3 = {"leases": [b3lease("rt", 21, cpu=6), b3lease("ru", 22, cpu=6)]}
+LT3["leases"][0]["res"]["cpu"].update(second[0])
+LT3["leases"][1]["res"]["cpu"].update(flag="over", over_n=3, over_t=now3 - 700)   # no rate_t: an older evaluation's
+oomph._advice_stale(LT3, now3 - 650 + 60)
+kept = dict(LT3["leases"][0]["res"]["cpu"])
+oomph._advice_stale(LT3, now3 - 650 + oomph.ADVICE_STALE_S + 1)
+check(kept.get("flag") == "over" and kept.get("rate_t") == round(now3 - 650, 1)
+      and not set(LT3["leases"][0]["res"]["cpu"]) & set(oomph.ADVICE_FIELDS)
+      and not set(LT3["leases"][1]["res"]["cpu"]) & set(oomph.ADVICE_FIELDS) and not oomph.advice_flags(LT3["leases"][0]),
+      "advice the logger no longer rates (it stopped, the pool left the sample) is dropped after %d s: no stale "
+      "'over on CPU since …'" % oomph.ADVICE_STALE_S)
+D3 = {"leases": [b3lease("rd", 23, disk=5.0)]}
+s3_ = {"disks": [{"id": "data", "name": "Data", "free_gb": 90.0, "total_gb": 500.0, "watch": True}]}
+procs3[23]["w"] = 1024.0 * 6 / 120.0  # 6 GB over the longest interval counted
+oomph._charge_disk(D3, s3_, procs3, oomph._children(procs3), now3 + 300)
+dd3 = D3["leases"][0]["res"]["disk"]
+check(dd3.get("flag") == "over" and dd3["w"] > dd3["got"] and dd3.get("used") == 5.0,
+      "advice: a disk grant whose processes wrote more than it reserved is `over` (%s)" % dd3)
+san = oomph._res({"cpu": {"ask": 4, "got": 4, "flag": "on fire", "over_n": -1, "over_t": "x", "low_t": 1e99},
+                  "disk": {"ask": 2, "got": 2, "pool": "data", "flag": "over", "over_t": now3}})
+check(san["cpu"] == {"ask": 4, "got": 4} and san["disk"]["flag"] == "over",
+      "advice: a flag or a counter of the wrong type in the shared ledger is dropped (%s)" % san["cpu"])
+LS3 = {"leases": [dict(L3["leases"][0], expires=now3 + 1200, ttl=1800.0, res={"cpu": {"ask": 8, "min": 4, "got": 6,
+       "used": 9.1, "flag": "over", "over_n": 3, "over_t": now3 - 60}}), dict(D3["leases"][0], expires=None)],
+       "history": [], "state": {}}
+st3, br3 = oomph._status(LS3, "ro", now3), oomph._brief(LS3["leases"][0], now3)
+st3d = oomph._status(LS3, "rd", now3)
+check(st3.get("flags") == {"cpu": "over"} and st3["advice"].startswith("Your processes keep 9.1 cores busy, more than the "
+      "6 granted: run with fewer jobs (-j6)") and br3.get("flags") == {"cpu": "over"} and "over on CPU" in oomph._fmt_brief(br3)
+      and st3d.get("flags") == {"disk": "over"} and "more than the 5.0 GB reserved" in st3d["advice"],
+      "advice: the holder's answer leads with it, the brief and `oomph reservations` name it (%s)" % st3["advice"][:80])
+q3 = dict(LS3["leases"][0], state="granted", res_granted=None)
+q3.pop("res_granted")
+LQ = {"leases": [q3], "history": []}
+oomph._normalize(LQ)
+check(LQ["leases"][0]["state"] == "queued" and not set(LQ["leases"][0]["res"]["cpu"]) & {"flag", "over_n", "over_t"},
+      "advice: a grant put back in the queue (made by older code) loses its advice with its figures")
+# the terminal's words (oomph_view): a lease and a record of the resources fixture, through the model
+rec3, led3 = topfixture.reservations(topfixture.LIVE_RES, agents=True)
+rs3 = V3.merge_reservations(rec3, led3, topfixture.NOW)
+by3 = {r["purpose"]: r for r in rs3 if r["ended"] is None}
+g3, c3, d3 = by3["gradle assembleDebug"], by3["cargo build --release"], by3["render frames"]
+check(g3.get("mem", True) and g3["cpu"] == 6 and g3["flags"]["cpu"][0] == "over" and not c3.get("mem", True)
+      and c3["waiting"] == ["cpu"] and d3["pool"] == "vol:4F632FD2" and d3["disk_w"] == 47.0
+      and by3["docker build api"]["waiting"] == ["memory"] and not set(by3["pnpm check"]) & {"mem", "cpu", "flags", "rsegs"},
+      "the terminal reads a reservation's cores, disk, advice and what it waits for (%s)" % [g3["cpu"], c3["waiting"]])
+check(V3.amounts_text(g3, "data") == "6G · 6 cores" and V3.amounts_text(d3, "data") == "40G Scratch"
+      and V3.status_text(c3, ["cpu"], "cpu", topfixture.NOW) == "waiting 1 min · for CPU"
+      and V3.status_text(g3, ["memory"], "memory", topfixture.NOW) == "over on CPU · using 4.1G · 18m left"
+      and V3.status_text(by3["pytest -n 8"], ["cpu"], "cpu", topfixture.NOW) == "idle 12 min · 35m left",
+      "a row's amounts and status: chips as text, the flag (on CPU when not the focus), one use figure, the time left")
+check(V3.bands(rs3, ["memory", "cpu", "gpu", "disk"], "cpu", "data") == ["cpu", "memory", "disk"]
+      and V3.bands(rs3, ["gpu"], "gpu", "data") == [] and V3.bands(rs3, ["disk"], "disk", "vol:none") == []
+      and V3.ordered_res(rs3, flags_first=True)[0][0]["purpose"] in ("gradle assembleDebug", "pytest -n 8", "render frames"),
+      "bands: of the resources shown those reserved in 14 days, the focus's first; none for the GPU; flagged rows first")
+base3, saved3 = tempfile.mkdtemp(prefix="oomph-b3-"), oomph.LEDGER_DIR
+try:
+    log3, ledd3 = topfixture.write_fixture(os.path.join(base3, "fx"), "resources")
+    oomph.LEDGER_DIR = ledd3
+    m3 = T3.load_model("6h", topfixture.NOW, log_dir=log3, live=False, rv={"sel": ["memory", "cpu", "disk"], "focus": "memory"})
+    m3.update(host="studio", os="macOS")
+    fr3 = V3.render(m3, 100, 40, V3.Caps("256", "unicode", "dark"), {"span": "6h"})
+    txt3 = "\n".join("".join(c[0] for c in row) for row in fr3.c)
+    m4 = T3.load_model("6h", topfixture.NOW, log_dir=log3, live=False, rv={"sel": ["memory"], "focus": "memory"})
+    m4.update(host="studio", os="macOS")
+    txt4 = "\n".join("".join(c[0] for c in row) for row in V3.render(m4, 100, 40, V3.Caps("256", "unicode", "dark"),
+                                                                     {"span": "6h"}).c)
+    plain = T3.load_model("6h", topfixture.NOW, log_dir=log3, live=False)
+    plain.update(host="studio", os="macOS")
+    txt5 = "\n".join("".join(c[0] for c in row) for row in V3.render(plain, 100, 40, V3.Caps("256", "unicode", "dark"),
+                                                                     {"span": "6h"}).c)
+    cards3 = {}                 # a reservation's card with the resources on (the app's ReservationCard)
+    for name in ("cargo build --release", "gradle assembleDebug"):
+        r3 = next(r for r in m3["res"] if r["purpose"] == name and r["ended"] is None)
+        fc = V3.Frame(100, 40)
+        V3.card_res(fc, V3.Caps("256", "unicode", "dark"), V3.GLYPHS["unicode"], m3, r3)
+        cards3[name] = "\n".join("".join(c[0] for c in row) for row in fc.c)
+finally:
+    oomph.LEDGER_DIR = saved3
+    shutil.rmtree(base3, ignore_errors=True)
+check("Waits for  CPU" in cards3["cargo build --release"] and "Needs" not in cards3["cargo build --release"]
+      and "0.0 GB" not in cards3["cargo build --release"] and "Using" in cards3["gradle assembleDebug"]
+      and "Cores" in cards3["gradle assembleDebug"],
+      "a card with the resources on: a request without memory says what it waits for and no memory figures")
+check(" CPU│" in txt3 and "Disk│" in txt3 and "over on CPU" in txt3 and "waiting 1 min · for CPU" in txt3
+      and "14 cores · 70 GB disk" in txt3 and m3["tiles"]["cpu"]["queue"] == 1 and m3["tiles"]["memory"]["queue"] == 1,
+      "oomph top with the resources on: a band per reserved resource shown (named in the gutter), the rows' flags and "
+      "what they wait for, the caption sums the shown resources, each tile counts its own queue")
+check("On other resources: 40 GB disk reserved · 1 waiting for CPU" in txt4 and " CPU│" not in txt4
+      and "cargo build" not in txt4, "oomph top, Memory alone: no other band; what holds no memory is one line "
+      "under the rows")
+check(" CPU│" not in txt5 and "6 cores" not in txt5 and "0.0G" in txt5,
+      "oomph top with the resources off: the strip and the list as before (a reservation without memory shows 0.0G)")
+
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,
                    timeout=600, env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR")})

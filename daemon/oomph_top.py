@@ -179,13 +179,17 @@ def res_view(settings):
 
 
 def resource_facts(model, s):
-    """The capsule (oomph's verdict in two words) and the tiles of a sample, into the model. A request
-    waits for memory until 1.12 (nothing else can be asked for)."""
+    """The capsule (oomph's verdict in two words) and the tiles of a sample, into the model. A tile counts
+    the requests that wait for its resource (`waiting_on`, 02 §6.4; a request of 1.11 or older waits for memory)."""
     try:
         cap = oomph.capsule(s)
     except (KeyError, TypeError, ValueError):
         return
-    waiting = sum(1 for r in model.get("res") or () if r.get("granted") is None and r.get("ended") is None)
+    waiting = {}
+    for r in model.get("res") or ():
+        if r.get("granted") is None and r.get("ended") is None:
+            for k in r.get("waiting") or ["memory"]:
+                waiting[k] = waiting.get(k, 0) + 1
     c = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
     gl = s.get("gpu") if isinstance(s.get("gpu"), list) else []
     g = gl[0] if gl and isinstance(gl[0], dict) else {}
@@ -194,9 +198,9 @@ def resource_facts(model, s):
     rf = {"n": _num(c.get("n"), None), "sys": sys_, "user": busy - (sys_ or 0.0) if busy is not None else None,
           "util": _num(g.get("util"), None), "full": g.get("src") == "ioreport", "gmem": _num(g.get("mem_gb"), None),
           "free": _num(d.get("free_gb"), None) if d else _num(s.get("disk_free_gb"), None),
-          "pool": str(d.get("name") or d.get("id") or "") if d else None}
-    model.update(capsule=cap, tiles=view.tiles(s, cap, {"memory": waiting} if waiting else {}), avail=view.available(s),
-                 rfacts=rf)
+          "pool": str(d.get("name") or d.get("id") or "") if d else None,
+          "pool_id": d.get("id") if d and isinstance(d.get("id"), str) else None}
+    model.update(capsule=cap, tiles=view.tiles(s, cap, waiting), avail=view.available(s), rfacts=rf)
 
 
 def load_points(log_dir, now, since, res=False):
