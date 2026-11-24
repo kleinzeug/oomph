@@ -658,11 +658,13 @@ class Volumes:
     runs with every sample (0.1 ms, from the kernel's cache); what diskutil says about a device takes
     up to half a second, so it is asked once per newly seen mount, on a thread of its own, and until
     it has answered the volume is not listed. `wait`: ask in the caller's thread instead (the CLI).
-    A failed answer is asked again after RETRY_S."""
+    A failed answer is asked again after RETRY_S. `unsure` after a read: a disk is mounted that
+    diskutil has not answered for (yet, or it failed), so the pools listed may not be every pool and
+    one missing from them is not gone (the sample's `disks_partial`)."""
     RETRY_S = 600
 
     def __init__(self, P, wait=False):
-        self.P, self.wait = P, wait
+        self.P, self.wait, self.unsure = P, wait, False
         self.facts = {}      # mount_key -> facts ({} when diskutil failed)
         self.failed = {}     # mount_key -> when it failed
         self.todo = []       # (mount_key, device) to ask about
@@ -695,7 +697,10 @@ class Volumes:
                 self._answer(k, dev)
             with self.cond:
                 facts = dict(self.facts)
-            return P.disk_pools(recs, facts)
+            pools, rows = P.disk_pools(recs, facts)
+            ask = []
+        with self.cond:
+            self.unsure = bool(ask) or any(k in self.failed for k in live)
         if ask:
             with self.cond:
                 queued = {k for k, _ in self.todo}
@@ -821,11 +826,12 @@ class LedgerWorker:
         threading.Thread(target=self.loop, name="ledger", daemon=True).start()
         return self
 
-    def offer(self, s, procs, rates=None):
+    def offer(self, s, procs, rates=None, writes=None):
         """The newest sample and process table, and the cores each process kept busy ({pid: cores}, when the
-        Meter had an interval): the child charges every grant's cores from them (02 §6.3)."""
+        Meter had an interval) and the MB/s it wrote to disk ({pid: MB/s}): the child charges every grant's
+        cores and disk writes from them (02 §6.3)."""
         with self.cond:
-            self.slot = (s, procs, rates)
+            self.slot = (s, procs, rates, writes)
             self.cond.notify()
 
     def latest(self, max_age):
@@ -838,23 +844,24 @@ class LedgerWorker:
             with self.cond:
                 while self.slot is None:
                     self.cond.wait()
-                (s, procs, rates), self.slot = self.slot, None
+                (s, procs, rates, writes), self.slot = self.slot, None
             try:
-                self.run_once(s, procs, rates)
+                self.run_once(s, procs, rates, writes)
             except Exception as e:
                 self.sig = None
                 self.error(str(e) if isinstance(e, oomph.LedgerError) else repr(e))
                 with self.cond:
                     self.runs += 1
 
-    def run_once(self, s, procs, rates=None):
+    def run_once(self, s, procs, rates=None, writes=None):
         sig, now = ledger_signature(), time.time()
         if not self.leases and sig == self.sig and now - self.last_run < self.FORCE_EVERY:
             with self.cond:
                 self.at = now  # still nothing reserved
             return
         self.sig, self.last_run = sig, now
-        leases, err = self.tick(s, procs, rates=rates) if rates is not None else self.tick(s, procs)
+        leases, err = self.tick(s, procs, rates=rates, **({"writes": writes} if writes else {})) \
+            if rates is not None else self.tick(s, procs)
         if err:  # e.g. busy: the snapshot still counts
             self.sig = None
             self.error(err)
@@ -1087,6 +1094,8 @@ class Daemon:
             pools = self.volumes.read()[0]
             if pools is not None:
                 blocks["disks"] = pools
+                if self.volumes.unsure:  # a disk diskutil has not answered for: a pool missing here is not gone
+                    blocks["disks_partial"] = True
         except Exception as e:
             self.soft_error("disks", repr(e))
         return blocks, use
@@ -1278,9 +1287,10 @@ class Daemon:
             self.cpu_others = cp.get("others", self.cpu_others)
             pools = {"t": s["t"], "cpu": cp}
         rates = {pid: u["cpu"] for pid, u in use.items() if "cpu" in u} if use else None
+        writes = {pid: u["w"] for pid, u in use.items() if u.get("w")} if use else None
         self.ledger.offer(dict({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
                                 and k not in TOP_RATES}, **({"pools": pools} if pools else {})),
-                          procs, rates or None)
+                          procs, rates or None, writes or None)
         if leases:
             s["leases"] = leases  # memory sessions have reserved through oomph's ledger
         if gone:

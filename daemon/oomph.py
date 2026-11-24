@@ -29,12 +29,13 @@ for agents and scripts (work without the daemon too — they measure live):
   oomph wait [--timeout 10m] [--free 4G]   block until memory is ok again; exit 1 on timeout
   oomph status --json               the latest full sample
 
-coordinating memory and cores between sessions (a shared first-come-first-served ledger):
-  oomph run [--reserve 6G] [--cpu 4..12] [--for "what"] [--wait 30m] -- <cmd…>   wait for a grant, run, release;
-                                    records the peak; {cpu} in the command is the cores granted (also exported)
-  oomph reserve [6G] [--cpu 8] --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]   exit 0 granted, 75
-                                    not (yet); --cpu 8 grants 4 to 8 logical cores, 8..8 exactly 8 (or waits)
-  oomph amend <id> [--gb 3G] [--cpu 6] [--ttl 20m] [--for "what"] [--json]   change a reservation: shrinking applies at
+coordinating memory, cores and disk space between sessions (a shared first-come-first-served ledger):
+  oomph run [--reserve 6G] [--cpu 4..12] [--disk 20G[@PATH]] [--for "what"] [--wait 30m] -- <cmd…>   wait for a
+                                    grant, run, release; records the peak; {cpu} in the command is the cores granted
+  oomph reserve [6G] [--cpu 8] [--disk 20G[@PATH]] --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]
+                                    exit 0 granted, 75 not (yet); --cpu 8 grants 4 to 8 logical cores, 8..8 exactly
+                                    8 (or waits); --disk: space on the disk PATH is on (default: the temporary folder's)
+  oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--ttl 20m] [--for "what"] [--json]   change one: shrinking applies at
                                     once; growing a grant only if it fits now with nobody queued (else refused:
                                     reserve the extra separately); --ttl counts from now; exit 0 ok, 75 refused
   oomph release <id | all>          give a reservation back (all = this session's)
@@ -63,6 +64,7 @@ other machines (read-only, Mac to Mac over TLS, or anything with `oomph` over ss
   oomph serve --stdio               answer for this machine on stdin/stdout, read only (what ssh runs)
 """
 import datetime
+import errno
 import functools
 import glob
 import grp
@@ -2545,8 +2547,9 @@ THERMAL = {0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"
 
 
 def reservable():
-    """What can be reserved on this machine: memory, and cores where they are measured (cpu_reservable)."""
-    return ["memory"] + (["cpu"] if cpu_reservable() else [])
+    """What can be reserved on this machine: memory, cores where they are measured (cpu_reservable), and disk
+    space where volumes are listed by id (disk_reservable)."""
+    return ["memory"] + (["cpu"] if cpu_reservable() else []) + (["disk"] if disk_reservable() else [])
 NOT_MEASURED = "not measured (logging is off; `oomph check --measure` takes a quarter-second reading)"
 NOT_LOGGED = "not recorded by the logger, which is older than 1.9.1 (`oomph check --measure` reads it now)"
 NOT_READ = "not read by the logger this time (`oomph check --measure` reads it now)"
@@ -2669,8 +2672,8 @@ def resource_sample(measure=False, with_procs=False):
     if s.get("source") == "live" or "disks" not in s:  # no logger, or one older than 1.9.1
         try:
             d = live_disks()
-            if d is not None:
-                s["disks"] = d
+            if d is not None:  # the system's pool alone: not a list of every pool (a reserved one missing is not gone)
+                s["disks"], s["disks_partial"] = d, True
         except Exception:
             pass
         if measure:
@@ -2822,9 +2825,13 @@ def _resources(s, c=None):
                                                                     "mem_alloc_gb", "mem_limit_gb", "mem_limit_est",
                                                                     "unified") if k in g}, reservable=False)
                                              for g in gpus if isinstance(g, dict)]
+    pools = (c or {}).get("disk") if isinstance((c or {}).get("disk"), dict) else {}
     out["disks"] = [dict({k: d[k] for k in ("id", "name", "mount", "free_gb", "total_gb", "kind", "roles", "level",
                                             "low_gb", "crit_gb", "pinned") if k in d},
-                         watched=bool(d.get("watch")), reservable=False)
+                         watched=bool(d.get("watch")), reservable=disk_reservable(),
+                         **({k: pools[d["id"]][f] for k, f in (("margin_gb", "margin"), ("reserved_gb", "reserved"),
+                                                               ("left_gb", "available"))}
+                            if isinstance(pools.get(d["id"]), dict) else {}))
                     for d in disk_rows(s, pinned) if d["id"] not in hidden]
     out["reservable"] = reservable()
     return out
@@ -2854,7 +2861,12 @@ def cmd_resources(args):
     line("memory", "%.0f GB · %.1f free%s · reservable" % (m["ram_gb"] or 0, m["free_gb"], (
         " · %.1f GB reserved · %.1f GB left to reserve" % (m["reserved_gb"], m["left_gb"])) if "left_gb" in m else ""))
     cpu = r.get("cpu") or {}
+    drows = list(r["disks"])  # in the order resource_lines gives the disk lines
     for label, text in resource_lines(s, *volume_prefs()):
+        d = drows.pop(0) if label in ("disk", "") and drows else {}
+        if d.get("reservable"):
+            text += " · %s GB reserved · %s GB left to reserve" % (_gb(d["reserved_gb"]), _gb(max(0.0, d["left_gb"]))) \
+                if "left_gb" in d else " · reservable"
         if label == "cpu" and cpu.get("reservable") and "left" in cpu:
             text += " · %s reserved · %s left to reserve%s" % (
                 cores_text(cpu["reserved"]), cores_text(max(0.0, cpu["left"])),
@@ -2862,8 +2874,11 @@ def cmd_resources(args):
         elif label in ("cpu", "gpu") and not text.startswith("not measured"):
             text += " · not reservable yet" if label == "gpu" or not cpu.get("reservable") else " · reservable"
         line(label, text)
+    more = [x for x in (("cores", " --cpu 8") if "cpu" in r["reservable"] else None,
+                        ("disk space", " --disk 20G") if "disk" in r["reservable"] else None) if x]
     print(wrap("Memory%s can be reserved with this version: `oomph reserve 6G%s --for \"what\"`." % (
-        " and cores" if "cpu" in r["reservable"] else "", " --cpu 8" if "cpu" in r["reservable"] else ""), w, "  "))
+        "".join((" and " if i == len(more) - 1 else ", ") + x[0] for i, x in enumerate(more)),
+        "".join(x[1] for x in more)), w, "  "))
     return 0
 
 
@@ -3053,6 +3068,205 @@ def parse_cores(x):
     if vals[0] > vals[1]:
         raise ValueError("--cpu %s: the fewest cores come first (e.g. 4..8)" % x)
     return vals[1], vals[0]
+
+
+# ----- disk space on a volume (B2, 1.12.1; 02 §4.4, §6.1, §6.3, §7.1): a stock pool per volume, by the pool's id
+DISK_MAX_GB = 1e6            # GB in one request: more than any volume holds, to keep the arithmetic sane
+VOLUME_GONE_S = 120          # a reserved pool missing this long from a list of every pool: its reservations end
+                             # (volume_gone). A remount, or the logger asking diskutil about it anew, takes less
+DISK_STATE_MAX = 32          # disk pools in the ledger's state
+WRITE_DT_MAX_S = 120         # the longest interval one evaluation charges a tree's writes for (a sleep, a stall)
+
+
+def disk_reservable():
+    """Can disk space be reserved here? Only where this machine lists its volumes by pool id (`mounts`, the
+    classes of 02 §4.4: roadmap §4.4, what a machine cannot measure cannot be reserved there) and its backend
+    says so on purpose (`RESERVES_DISK`): macOS. Linux opts in once its logger lists volumes (L2)."""
+    try:
+        return getattr(plat(), "RESERVES_DISK", False) is True and hasattr(plat(), "mounts")
+    except Unsupported:
+        return False
+
+
+def disk_floors(p):
+    """(low, critical) GB of a pool: its own floors (the system's pool: 20 and 5), else those a pinned pool of
+    its size would have (5 % and 1 % of it, 02 §4.4)."""
+    if _num(p.get("low_gb"), 0, DISK_MAX_GB) and _num(p.get("crit_gb"), 0, DISK_MAX_GB):
+        return float(p["low_gb"]), float(p["crit_gb"])
+    return pool_floors(p["total_gb"] if _num(p.get("total_gb"), 0, DISK_MAX_GB) else 0.0)
+
+
+def disk_margin(low):
+    """What admission keeps back on a pool (02 §6.1): the low floor and the headroom a plan may be off by,
+    low + max(2, low / 4): 25 GB where the floor is 20. A reservation used exactly as planned then does not
+    leave the pool at its alert."""
+    return low + max(2.0, low / 4.0)
+
+
+DISK_MIN_GB = 0.01           # the least disk space a request holds: GB are kept to two decimals, and less is none
+
+
+def parse_disk(x, zero=False):
+    """`--disk 20G` (on the temporary folder's volume) or `--disk 20G@/Volumes/Scratch` (any path on the
+    volume, 02 §7.1): (GB, path or None), the GB to two decimals and at least DISK_MIN_GB, or with `zero`
+    (amend: drop the disk space) exactly 0. Raises ValueError."""
+    size, sep, path = str(x).partition("@")
+    try:
+        gb = _parse_gb(size)
+    except ValueError:
+        gb = None
+    if gb is None or not (math.isfinite(gb) and 0 <= gb <= DISK_MAX_GB) or (gb == 0 and not zero):
+        raise ValueError("not a disk size: %s (use e.g. 20G, or 20G@/Volumes/Scratch for a volume)" % x)
+    if gb and round(gb, 2) < DISK_MIN_GB:
+        raise ValueError("--disk %s: too little to reserve (at least 10M)" % x)
+    if sep and not path:
+        raise ValueError("--disk %s: a path on the volume comes after the @ (e.g. 20G@/Volumes/Scratch)" % x)
+    return round(gb, 2), (path or None)
+
+
+def default_disk_path():
+    """Where `--disk` without a path reserves: the temporary folder (02 §7.1), which is the system's pool on a
+    stock Mac."""
+    return os.environ.get("TMPDIR") or "/tmp"
+
+
+_VOLS = []  # this process's oomphd.Volumes: diskutil is asked once per newly seen mount, however often a list is read
+
+
+def live_volumes():
+    """(pools, rows) of this machine read now, every listed pool by its id: what the logger lists, without it.
+    diskutil is asked once per mount in this process (0.1 to 0.6 s each); (None, None) without a mount table."""
+    if not _VOLS:
+        _VOLS.append(_daemon_module().Volumes(plat(), wait=True))
+    return _VOLS[0].read()
+
+
+def live_volumes_partial():
+    """Did the last live_volumes() leave a disk out because diskutil did not answer for it? Then its
+    list is not every pool: one missing from it is not gone (`disks_partial`)."""
+    return bool(_VOLS) and _VOLS[0].unsure is True
+
+
+def _statvfs_gb(path):
+    """Free space where `path` is, read now (what df shows), in GB; None if it cannot be read. Admission asks
+    it for the one pool a request names: the mount table can be seconds old (02 §4.4)."""
+    try:
+        v = os.statvfs(path)
+    except OSError:
+        return None
+    return round(v.f_bavail * v.f_frsize / float(1 << 30), 1)
+
+
+def disk_pool_of(path, s):
+    """The pool a path is on (02 §7.1: any path on a volume names it, the reservation follows the volume's id):
+    (pool, None, pools), or (None, why, None). `pool` is the sample's entry for it with the free space read
+    now; `pools` every pool of this machine when the sample had no list of them and one had to be read.
+    Refused with the reason: no such path, or a volume the logger ignores (a disk image, removable media, a
+    network or read-only volume: `oomph volumes --all` says which). A path not made yet (the job's output
+    folder) is on the volume of the nearest folder above it that exists, but never / or /Volumes: a
+    mistyped volume name is not the startup disk."""
+    P = plat()
+    at, err = os.path.abspath(path), None
+    while True:
+        try:
+            dev = os.stat(at).st_dev & 0xFFFFFFFF
+            break
+        except OSError as e:
+            up, err = os.path.dirname(at), err or e
+            if e.errno not in (errno.ENOENT, errno.ENOTDIR) or up in ("/", "/Volumes") or up == at:
+                return None, "%s: %s" % (path, err.strerror or err), None
+            at = up
+    recs = P.mounts()
+    rec = next((r for r in recs or () if r["dev"] == dev), None)
+    if rec is None:
+        return None, "%s is on no volume this machine lists" % path, None
+    known = disk_pools_of(s) if isinstance(s.get("disks"), list) else None
+    sys_pools, rows = P.disk_pools(recs, {})  # the system's pool, and every class the mount flags decide alone
+    row = next((r for r in rows if r["mount"] == rec["mount"]), None) or {}
+    pool, pools = None, None
+    if row.get("cls") == "watched":
+        pool = next((p for p in known or () if p["id"] == "data"), None) or next(
+            (p for p in sys_pools if p["id"] == "data"), None)
+    elif row.get("cls") == "pending":  # a disk: its id is the logger's (by device, while mounted), or diskutil's
+        live = {r["mount"] for r in rows if r.get("pool") == row.get("pool")}
+        pool = next((p for p in known or () if p.get("dev") == row.get("pool") and p.get("mount") in live), None)
+        if pool is None and hasattr(P, "volume_facts"):  # diskutil about this mount alone (and its container)
+            try:
+                f = P.volume_facts(rec["from"])
+            except Exception:
+                f = None
+            if not f:
+                return None, "%s: diskutil did not answer about %s; try again in a moment" % (
+                    path, term_text(rec["mount"])[:64]), None
+            lp, rows = P.disk_pools(recs, {P.mount_key(rec): f})
+            row = next((r for r in rows if r["mount"] == rec["mount"]), None) or {}
+            pool = next((p for p in lp if p.get("dev") == row.get("pool")), None) \
+                if row.get("cls") == "listed" else None
+    if pool is None:
+        return None, "%s is on %s, which %s does not record (%s)" % (
+            path, term_text(row.get("name") or rec["mount"])[:64], BRAND, row.get("why") or "not a disk"), None
+    free = _statvfs_gb(at)
+    return dict(pool, free_gb=free if free is not None else pool["free_gb"]), None, pools
+
+
+def _disk_pool_by_id(s, pid):
+    """The sample with pool `pid`'s free space read now (statvfs of its mount, from this machine's own list,
+    never a path from the ledger): the logger's list where the sample has it, else every pool read live."""
+    pools = disk_pools_of(s) if isinstance(s.get("disks"), list) else None
+    if pools is None and disk_reservable():
+        pools = live_volumes()[0]
+        if pools is None:
+            return s
+        s = dict(s, disks=pools, **({"disks_partial": True} if live_volumes_partial() else {}))
+    p = next((x for x in pools or () if x["id"] == pid), None)
+    if p is None or not isinstance(p.get("mount"), str):
+        return s
+    free = _statvfs_gb(p["mount"])
+    return s if free is None else _with_disk(s, dict(p, free_gb=free))
+
+
+def _with_disk(s, pool, pools=None):
+    """The sample with `pool` as just read, and every pool of `pools` when the sample had no list. A sample whose
+    list holds only what was read here is marked `disks_partial`: a missing pool is then not gone."""
+    base = pools if pools is not None else disk_pools_of(s) if isinstance(s.get("disks"), list) else None
+    out = dict(s, disks=[p for p in base or () if p["id"] != pool["id"]] + [pool])
+    if base is None:
+        out["disks_partial"] = True
+    return out
+
+
+def _disk_of(r):
+    """A lease's disk part (`res.disk` with an `ask` and a `pool` id), or None."""
+    d = (r.get("res") or {}).get("disk") if ledger_version(r) >= 2 else None
+    return d if isinstance(d, dict) and _num(d.get("ask"), 0.001, DISK_MAX_GB) and _str(80, _ID)(d.get("pool")) \
+        else None
+
+
+def _disk_name(d):
+    """How a lease's volume is named to people: its name when it was reserved, else its pool id."""
+    n = d.get("name") if isinstance(d.get("name"), str) and d.get("name") else None
+    return term_text(n or d["pool"])[:64]
+
+
+def disk_view(s, leases):
+    """The disk pools as admission sees them (02 §6.1), by pool id: `free`, `low` and `crit` (floors),
+    `margin` (kept back: the low floor and headroom), `level` (critical below its critical floor),
+    `reserved` (Σ what grants got) and `left` = free − margin − Σ over grants max(0, got − used): what a
+    new reservation can have. And whether the sample lists every pool of this machine (the logger's
+    list, or one read live): only then is a reserved pool that is missing gone."""
+    out = {}
+    for p in disk_pools_of(s):
+        low, crit = disk_floors(p)
+        out[p["id"]] = {"free": p["free_gb"], "low": low, "crit": crit, "margin": disk_margin(low),
+                        "level": "critical" if p["free_gb"] < crit else "low" if p["free_gb"] < low else "ok",
+                        "name": p.get("name"), "reserved": 0.0, "left": p["free_gb"] - disk_margin(low)}
+    for r in leases:
+        d = _disk_of(r)
+        if r["state"] == "granted" and d and d["pool"] in out and _num(d.get("got"), 0, DISK_MAX_GB):
+            used = d["used"] if _num(d.get("used"), 0, DISK_MAX_GB) else 0.0
+            out[d["pool"]]["reserved"] += d["got"]
+            out[d["pool"]]["left"] -= max(0.0, d["got"] - used)
+    return out, isinstance(s.get("disks"), list) and not s.get("disks_partial")
 
 
 def _home_short(p):
@@ -3715,12 +3929,16 @@ def _cpu_of(r):
 
 def lease_need(r):
     """What a lease asks of each pool, as (least, wanted): `ram` (its gb, the mirror an older writer's amend
-    moves, so it always counts) unless it holds no memory, and `cpu` (its minimum to what it asked)."""
+    moves, so it always counts) unless it holds no memory, `cpu` (its minimum to what it asked), and
+    `disk:<pool id>` (what it asked, on that one pool: disk is a stock, granted in full or not at all)."""
     need = {} if no_memory(r) else {"ram": (r["gb"], r["gb"])}
     c = _cpu_of(r)
     if c:
         lo = c.get("min") if _num(c.get("min"), 0.1, c["ask"]) else elastic_min(c["ask"])
         need["cpu"] = (lo, c["ask"])
+    d = _disk_of(r)
+    if d:
+        need["disk:" + d["pool"]] = (d["ask"], d["ask"])
     return need
 
 
@@ -3839,6 +4057,9 @@ def _valid_ledger(L):
     st = L.get("state")
     out["state"] = {k: v for k, v in st.items() if _num(v) or (k == "level" and v in LEVELS)} \
         if isinstance(st, dict) else {}
+    dk = st.get("disk") if isinstance(st, dict) else None
+    if isinstance(dk, dict):  # what is left on each disk pool (1.12.1): pool ids and numbers only
+        out["state"]["disk"] = {k: v for k, v in list(dk.items())[:DISK_STATE_MAX] if _str(80, _ID)(k) and _num(v)}
     if "history_pruned" in L and not _num(L["history_pruned"]):
         out.pop("history_pruned")
     return _checked(L, out, V2_ROOT)
@@ -4276,7 +4497,8 @@ def _normalize(L):
             for k in ("granted", "expires", "baseline_gb", "used_gb", "peak_gb", "note"):
                 r.pop(k, None)
             for k, x in res.items():
-                for f in (("used", "peak") if k == "mem" else ("got", "used", "peak")):
+                for f in (("used", "peak") if k == "mem" else ("got", "used", "peak", "w", "wt") if k == "disk"
+                          else ("got", "used", "peak")):
                     x.pop(f, None)
         mem = res.get("mem")
         if isinstance(mem, dict) and _num(mem.get("got")) and abs(mem["got"] - r["gb"]) > 0.005:
@@ -4304,6 +4526,81 @@ def _charge_cpu(L, procs, children):
             load -= share
             c["used"] = round(share, 2)
             c["peak"] = round(max(c.get("peak", 0), share), 2)
+
+
+def _tree_w(procs, children, root):
+    """MB/s the process tree at `root` writes to disk: the sum of its processes' rates (`w`, given by the logger)."""
+    stack, seen, tot = [root], set(), 0.0
+    while stack:
+        x = stack.pop()
+        if x in seen or x not in procs:
+            continue
+        seen.add(x)
+        w = procs[x].get("w")
+        tot += w if _num(w, 0, 1e7) else 0.0
+        stack.extend(children.get(x, []))
+    return tot
+
+
+def _charge_disk(L, s, procs, children, now):
+    """What each disk grant has used of its pool (02 §6.3), from the logger's write rates per process: only
+    the logger's child has them, as for cores. `w` adds up what the grant's tree wrote since the grant (its
+    rate times the time since it was last counted, `wt`, at most WRITE_DT_MAX_S: a process that ends between
+    two samples is missed, which only makes `used` smaller and admission more careful). Then a pool's drop is
+    shared out in grant order, as memory shares a tree's growth: used = min(got, own writes, the pool's drop
+    since its own grant, what earlier grants left of the drop since the first), so Σ used over a pool never
+    exceeds what it lost, and space someone else filled is not credited to a grant that wrote nothing.
+    `base.free_gb` is the pool's free space at the grant."""
+    free = {p["id"]: p["free_gb"] for p in disk_pools_of(s)}
+    groups = {}
+    for r in L["leases"]:
+        d = _disk_of(r)
+        if r["state"] == "granted" and d and _num(d.get("got")) and d["pool"] in free:
+            groups.setdefault(d["pool"], []).append(r)
+    for pid, rs in groups.items():
+        rs.sort(key=lambda r: r["granted"])
+        base = [(r.get("base") or {}).get("free_gb") for r in rs]
+        drops = [max(0.0, b - free[pid]) if _num(b) else 0.0 for b in base]
+        left = drops[0]
+        for r, drop in zip(rs, drops):
+            d, w = r["res"]["disk"], r.get("watch")
+            t0 = d["wt"] if _t(d.get("wt")) and d["wt"] <= now else r["granted"]
+            rate = _tree_w(procs, children, w) if w in procs else 0.0
+            d["w"] = round((d["w"] if _num(d.get("w"), 0, 1e7) else 0.0)
+                           + rate * min(max(0.0, now - t0), WRITE_DT_MAX_S) / 1024.0, 3)
+            d["wt"] = round(now, 1)
+            u = max(0.0, min(d["got"], d["w"], drop, left))
+            left -= u
+            d["used"] = round(u, 2)
+            d["peak"] = round(max(d["peak"] if _num(d.get("peak")) else 0.0, u), 2)
+
+
+def _volumes_gone(L, s, now):
+    """Reservations on a pool that is no longer there (02 §6.2, outcome volume_gone): unplugged, or ejected. Only
+    a sample that lists every pool of this machine can say a pool is missing (disk_view); one missing from it
+    is marked (`missing`, when it was first missed) and its reservations end once it has been missing for
+    VOLUME_GONE_S, at that first time: a remount (even at another mount point: the id is the volume's) or the
+    logger asking diskutil about it again takes less. A pool that is back clears the mark. The grace counts
+    only while it is looked at (`mseen`, when it was last missed): after a gap of more than VOLUME_GONE_S (the
+    Mac slept, nothing evaluated) it starts again, so a volume remounted after waking is not taken for gone."""
+    if not (isinstance(s.get("disks"), list) and not s.get("disks_partial")):
+        return
+    ids = {p["id"] for p in disk_pools_of(s)}
+    for r in list(L["leases"]):
+        d = _disk_of(r)
+        if d is None:
+            continue
+        if d["pool"] in ids:
+            d.pop("missing", None)
+            d.pop("mseen", None)
+        elif not (_t(d.get("missing")) and _t(d.get("mseen"))) or d["missing"] > now or d["mseen"] > now \
+                or now - d["mseen"] > VOLUME_GONE_S:
+            d["missing"] = d["mseen"] = round(now, 1)
+        elif now - d["missing"] >= VOLUME_GONE_S:
+            _retire(L, r, "volume_gone", now, at=d["missing"])
+            L["leases"].remove(r)
+        else:
+            d["mseen"] = round(now, 1)
 
 
 def cpu_pool(s, leases, now):
@@ -4335,19 +4632,25 @@ def cpu_pool(s, leases, now):
 
 
 RATE_POOLS = frozenset(("cpu",))  # pools that saturate rather than run out (02 §6.1)
-POOLS = frozenset(("ram", "cpu"))   # every pool this code weighs
-KNOWN_RES = frozenset(("ram", "cpu", "mem"))  # the parts of a `res` it knows (mem: the memory mirror)
+POOLS = frozenset(("ram", "cpu", "disk:*"))   # every pool this code weighs (disk:*: every disk pool)
+KNOWN_RES = frozenset(("ram", "cpu", "disk", "mem"))  # the parts of a `res` it knows (mem: the memory mirror)
+
+
+def _behind(need, blocked):
+    """The pools of `need` that an earlier request still waiting holds up (`disk:*` in `blocked`: every disk)."""
+    return {p for p in need if p in blocked or (p.startswith("disk:") and "disk:*" in blocked)}
 
 
 def weighable(r):
     """Can this code weigh every part of a lease? A 1.8-shaped lease always; a vector lease only when its `res`
-    names nothing beyond ram, cpu and mem, its cores part is one this code reads, and it asks for something.
-    A later writer's GPU or disk lease is not: this code neither grants it nor lets anyone pass it (02 §9.3,
-    as 1.9.2 to 1.11 did with every vector lease), so no stale process hands out what it cannot weigh."""
+    names nothing beyond ram, cpu, disk and mem, its cores and disk parts are ones this code reads, and it asks
+    for something. A later writer's GPU lease is not: this code neither grants it nor lets anyone pass it
+    (02 §9.3, as 1.9.2 to 1.11 did with every vector lease, and 1.12.0 with a disk lease), so no stale process
+    hands out what it cannot weigh."""
     if ledger_version(r) < 2:
         return True
     res = r.get("res") or {}
-    if not set(res) <= KNOWN_RES or ("cpu" in res and _cpu_of(r) is None):
+    if not set(res) <= KNOWN_RES or ("cpu" in res and _cpu_of(r) is None) or ("disk" in res and _disk_of(r) is None):
         return False
     return bool(lease_need(r))
 
@@ -4364,18 +4667,19 @@ def _evaluate(L, s, procs, now, rated=False):
     vector lease, account for what grants already use, then grant queued requests in arrival order,
     pool by pool (02 §6.4).
 
-    A request needs some pools: `ram` (its gb, unless it holds no memory) and `cpu` (between its
-    minimum and what it asked). It is granted all of them at once or none: memory when it fits (or,
-    as before, when no grant holds memory and the level is ok: alone), cores when what can still be
-    reserved (room) covers its minimum, and then as many as are idle, between its minimum and what it
-    asked. Nothing is granted while memory is critical. A request that waits holds up the pools it waits
+    A request needs some pools: `ram` (its gb, unless it holds no memory), `cpu` (between its
+    minimum and what it asked) and one disk pool (`disk:<id>`, what it asked). It is granted all of
+    them at once or none: memory when it fits (or, as before, when no grant holds memory and the level
+    is ok: alone), cores when what can still be reserved (room) covers its minimum, and then as many as
+    are idle, between its minimum and what it asked, disk space when what is left of the pool covers it
+    and the pool is not critical (never alone). Nothing is granted while memory is critical. A request that waits holds up the pools it waits
     for, so nobody behind it takes them; while it waits for a turn at the cores (a rate pool) it holds up
     only those (and the rate pools it has ever been short of), so memory requests pass it; once its turn
     has come it holds up everything it has ever been short of, so it cannot alternate between two
     shortages. With memory alone this is today's strict first come, first served. A request of another
     scope (a cgroup, 03 §7.3) is granted only by a process in it, and does not hold the line here.
-    `rated`: the process table carries the logger's CPU rates (the logger's child), so each grant's
-    cores are charged."""
+    `rated`: the process table carries the logger's rates (the logger's child), so each grant's cores
+    and disk writes are charged. Reservations on a pool that is gone end first (_volumes_gone)."""
     keep = []
     bid = _boot_id()
     if bid and L.get("boot") and L["boot"] != bid:  # written before the last boot: no holder is alive
@@ -4404,6 +4708,7 @@ def _evaluate(L, s, procs, now, rated=False):
     L["leases"] = keep
     _normalize(L)
     _give_slots(L, now)  # the agent's colour (D11), before any grant record is written
+    _volumes_gone(L, s, now)
 
     # Memory a grant's processes have added since it was granted counts against the grant, so
     # it isn't counted twice (once as used, once as reserved). Grants watching the same process
@@ -4423,6 +4728,7 @@ def _evaluate(L, s, procs, now, rated=False):
             r["peak_gb"] = round(max(r.get("peak_gb", 0), share), 2)
     if rated:
         _charge_cpu(L, procs, children)
+        _charge_disk(L, s, procs, children, now)
 
     v = verdict(s)
     free = free_physical_gb(s)
@@ -4440,6 +4746,7 @@ def _evaluate(L, s, procs, now, rated=False):
         avail = min(avail, sc["host_avail_gb"] - out_all - sc["host_margin_gb"])
     big = oversize_for(s)
     cpu = cpu_pool(s, L["leases"], now)
+    disks = disk_view(s, L["leases"])[0]
     blocked, recs = set(), []
     for r in [x for x in L["leases"] if x["state"] == "queued"]:
         if (r.get("scope") or "host") != mine:  # granted only by a process that can measure its scope
@@ -4474,7 +4781,11 @@ def _evaluate(L, s, procs, now, rated=False):
                 continue
         if "cpu" in need and cpu["room"] < need["cpu"][0] - 1e-9:
             short.add("cpu")
-        behind = set(need) & blocked
+        for p in need:  # a disk pool: not while it is critical, and what is left of it must cover the request
+            d = disks.get(p[5:]) if p.startswith("disk:") else None
+            if p.startswith("disk:") and (d is None or d["level"] == "critical" or d["left"] < need[p][1] - 1e-9):
+                short.add(p)
+        behind = _behind(need, blocked)
         if short or behind:
             hold = set(r.get("hold") or ()) & set(need) | short
             _waits(r, short | behind, hold)
@@ -4515,10 +4826,18 @@ def _evaluate(L, s, procs, now, rated=False):
                 cpu["reserved"] += got
                 if cpu["idle"] is not None:
                     cpu["idle"] -= got
+            dk = _disk_of(r)
+            if dk:  # in full; what it has used is charged from here on (its writes, the pool's drop: 02 §6.3)
+                d = disks[dk["pool"]]
+                res["disk"] = dict({k: x for k, x in dk.items() if k not in ("w", "wt", "used", "peak")},
+                                   got=dk["ask"], w=0.0, wt=round(now, 1))  # used and peak: once measured
+                r["base"] = dict(r.get("base") or {}, free_gb=d["free"])
+                d["left"] -= dk["ask"]
+                d["reserved"] += dk["ask"]
             segs = r.get("segments")
             if segs:
-                segs[-1]["res"] = {k: x.get("got", x.get("ask")) for k, x in res.items()
-                                   if k in ("ram", "cpu") and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
+                segs[-1]["res"] = {k: x.get("got", x.get("ask")) for k, x in res.items() if k in ("ram", "cpu", "disk")
+                                   and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
             r["res_granted"] = round(now, 1)
             r.pop("waiting_on", None)
             r.pop("hold", None)
@@ -4536,6 +4855,8 @@ def _evaluate(L, s, procs, now, rated=False):
                   "cpu_available": round(cpu["room"], 1)}
     if cpu["idle"] is not None:
         L["state"]["cpu_idle"] = round(cpu["idle"], 1)
+    if disks:  # what can still be reserved on each disk pool (by id), for the answers (_available)
+        L["state"]["disk"] = {k: round(d["left"], 1) for k, d in sorted(disks.items())[:DISK_STATE_MAX]}
 
 
 # ----- root callers: the ledger operation runs in a child as the invoking user (H0)
@@ -4733,10 +5054,15 @@ def _decide_inputs(s=None):
 
 def _with_pools(s):
     """A live sample with what only the logger knows well, while its current.json is fresh (02 §5.2, §6.1): the
-    pools (`others` on the cores) and its cpu block (how busy the cores were); else as it is."""
+    pools (`others` on the cores), its cpu block (how busy the cores were) and its disks (every pool of this
+    machine by id: what says a reserved volume is gone); else as it is."""
     d = _daemon_sample()
     if d:
         s.update((k, d[k]) for k in ("pools", "cpu") if isinstance(d.get(k), dict) and k not in s)
+        if isinstance(d.get("disks"), list) and "disks" not in s:
+            s["disks"] = d["disks"]
+            if d.get("disks_partial") is True:  # the logger waits for diskutil about a disk
+                s["disks_partial"] = True
     return s
 
 
@@ -4745,13 +5071,20 @@ def _brief(r, now):
          "project": os.path.basename(r.get("project") or "") or None, "holder_pid": r["holder"]["pid"]}
     if r.get("user"):
         b["user"] = r["user"]
-    c = _cpu_of(r)
+    c, d = _cpu_of(r), _disk_of(r)
     if c:  # cores: what it got, or while queued what it asked
         b["cpu"] = c["got"] if r["state"] == "granted" and _num(c.get("got")) else c["ask"]
+    if d:  # disk space on one pool: likewise, and which pool
+        b["disk"] = d["got"] if r["state"] == "granted" and _num(d.get("got")) else d["ask"]
+        b["disk_pool"] = d["pool"]
+        if isinstance(d.get("name"), str) and d["name"]:
+            b["disk_name"] = _disk_name(d)
     if r["state"] == "granted":
         b.update(used_gb=r.get("used_gb", 0), for_min=round((now - r["granted"]) / 60, 1))
         if c and _num(c.get("used")):
             b["cpu_used"] = c["used"]
+        if d and _num(d.get("used")):
+            b["disk_used"] = d["used"]
         if r.get("expires"):
             b["expires_in_min"] = round((r["expires"] - now) / 60, 1)
     else:
@@ -4760,11 +5093,14 @@ def _brief(r, now):
 
 
 def _available(st):
-    """What can still be reserved, by resource, from the ledger's state (cores only once evaluated by this code)."""
+    """What can still be reserved, by resource, from the ledger's state (cores and disk only once evaluated by this
+    code; disk by pool id, 02 §7.2)."""
     out = {"ram_gb": st.get("available_gb")}
     for k, f in (("cpu_cores", "cpu_available"), ("cpu_idle", "cpu_idle")):
         if _num(st.get(f)):
             out[k] = st[f]
+    if isinstance(st.get("disk"), dict) and st["disk"]:
+        out["disk_gb"] = {k: max(0.0, v) for k, v in st["disk"].items()}
     return out
 
 
@@ -4780,26 +5116,35 @@ def _status(L, rid, now):
         return {"status": "gone", "id": rid, "outcome": h and h["outcome"],
                 "advice": "This reservation no longer exists (%s). Request a new one if you still need it."
                           % (h["outcome"] if h else "unknown id")}
-    nm, c, need = no_memory(r), _cpu_of(r), lease_need(r)
+    nm, c, dk, need = no_memory(r), _cpu_of(r), _disk_of(r), lease_need(r)
     out = {"status": r["state"], "id": r["id"], "gb": 0.0 if nm else r["gb"], "purpose": r["purpose"],
            "available_gb": st.get("available_gb"), "reserved_gb": st.get("reserved_gb"),
            "free_gb": st.get("free_gb"), "level": st.get("level")}
-    if c:  # a vector request: what it asked, and what can be had (02 §7.2)
-        out["asked"] = dict({} if nm else {"ram_gb": r["gb"]}, cpu_cores=_cn(c["ask"]), cpu_min=_cn(need["cpu"][0]))
+    if c or dk:  # a vector request: what it asked, and what can be had (02 §7.2)
+        out["asked"] = {} if nm else {"ram_gb": r["gb"]}
+        if c:
+            out["asked"].update(cpu_cores=_cn(c["ask"]), cpu_min=_cn(need["cpu"][0]))
+        if dk:
+            out["asked"].update(disk_gb=dk["ask"], disk=dk["pool"], disk_name=_disk_name(dk))
         out["available"] = _available(st)
-    heavy = "heavy" if c else "memory-heavy"
+    heavy = "heavy" if c or dk else "memory-heavy"
     if r["state"] == "granted":
         out["expires_in_min"] = round((r["expires"] - now) / 60, 1) if r.get("expires") else None
         if r.get("note"):
             out["note"] = r["note"]
         run = ""
+        if (c and _num(c.get("got"))) or (dk and _num(dk.get("got"))):
+            out["granted"] = {} if nm else {"ram_gb": r["gb"]}
         if c and _num(c.get("got")):
             got = _cn(c["got"])
-            out["granted"] = dict({} if nm else {"ram_gb": r["gb"]}, cpu_cores=got)
+            out["granted"]["cpu_cores"] = got
             out["run_with"] = {"cpu_cores": got}
             run = "Run with %s cores (-j%d): you asked for %s%s. " % (
                 cores_text(got), max(1, int(got)), cores_text(c["ask"]),
                 "" if got >= c["ask"] else ", and %s are what can be had now" % cores_text(got))
+        if dk and _num(dk.get("got")):
+            out["granted"]["disk_gb"] = dk["got"]
+            run += "Write at most %s GB to %s for it. " % (_gb(dk["got"]), _disk_name(dk))
         out["advice"] = ("%sGranted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
                          "%s part is over%s." % (run, r["id"], heavy, "" if not r.get("expires") else
                                                  "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
@@ -4811,7 +5156,7 @@ def _status(L, rid, now):
         out["ahead"] = [_brief(x, now) for x in L["leases"]
                         if (x["state"] == "granted" and set(lease_need(x)) & set(need)) or x in before]
         waiting = r.get("waiting_on") if isinstance(r.get("waiting_on"), list) else ["ram"]
-        if c:
+        if c or dk:
             out["waiting_on"] = waiting
         room = st.get("cpu_available")
         why = ["memory is critical"] if st.get("level") == "critical" or "critical" in waiting else []
@@ -4823,6 +5168,13 @@ def _status(L, rid, now):
                 cores_text(max(0.0, room)), cores_text(st.get("cpu_reserved") or 0)))
         if not why and "ram" in waiting:
             why.append("only %.1f GB is available for new reservations" % max(0.0, st.get("available_gb") or 0))
+        if not why and dk and "disk:" + dk["pool"] in waiting:
+            left = (st.get("disk") or {}).get(dk["pool"])
+            why.append(("%s is not mounted%s" % (_disk_name(dk), ", and this ends in %d min unless it comes back" % max(
+                1, round((dk["missing"] + VOLUME_GONE_S - now) / 60)) if _t(dk.get("missing")) else "")) if left is None
+                else "an earlier request waits for space on %s" % _disk_name(dk) if left >= dk["ask"]
+                else "you asked for %s GB on %s, and %s GB can be reserved there now" % (
+                    _gb(dk["ask"]), _disk_name(dk), _gb(max(0.0, left))))
         hint = ""
         if c and "cpu" in waiting and _num(room) and room >= 1 and need["cpu"][0] > _cores(room, c["ask"]):
             n = _cores(room, c["ask"])
@@ -4903,17 +5255,72 @@ def _to_weigh(ticket):
         return True
 
 
+def _quietly_leases():
+    """The ledger's leases as they are now (read without the lock), or none."""
+    try:
+        return read_ledger()["leases"]
+    except Exception:  # noqa: B902 — a bonus: the evaluation reads it again
+        return []
+
+
+def _ticket_lease(ticket):
+    """The lease a ticket names as the ledger has it now (read without the lock), or None."""
+    try:
+        return next((r for r in read_ledger()["leases"] if r.get("id") == ticket), None) if ticket else None
+    except Exception:  # noqa: B902 — as a new request
+        return None
+
+
+def _refuse_disk(s, gb, pool, why):
+    """Why a request for `gb` of disk space on `pool` (disk_pool_of's answer, or `why` it has none) cannot be made
+    here, or None (02 §6.4: a volume the logger ignores, with the reason; more than free − margin)."""
+    if not disk_reservable():
+        return ("Disk space can't be reserved on this machine: %s does not list its volumes here yet. Reserve "
+                "memory alone, and check the free space with `oomph check`." % BRAND)
+    if pool is None:
+        return ("Can't reserve disk space there: %s. Name a path on a disk %s records (`oomph volumes` lists them), "
+                "or leave the path out for the temporary folder's disk." % (why, BRAND))
+    if not _str(80, _ID)(pool.get("id")):
+        return ("Can't reserve disk space on %s: %s has no id for this volume that a reservation can keep. Reserve "
+                "on another volume, or leave the path out for the temporary folder's disk."
+                % (term_text(pool.get("name") or "it")[:64], BRAND))
+    if not (DISK_MIN_GB <= gb <= DISK_MAX_GB):
+        return "Can't reserve %s GB of disk space: ask for 0.01 to %d GB." % ("%g" % gb, DISK_MAX_GB)
+    margin = disk_margin(disk_floors(pool)[0])
+    if gb > pool["free_gb"] - margin:
+        return ("Can't reserve %s GB on %s: it has %s GB free, and %s keeps %s GB of it back, so at most %s GB can "
+                "be reserved there. Free space first, ask for less, or reserve on another volume (disk_path / "
+                "`--disk %sG@/Volumes/…`)." % (_gb(gb), term_text(pool.get("name") or pool["id"])[:64],
+                                               _gb(pool["free_gb"]), BRAND, _gb(margin),
+                                               _gb(max(0.0, pool["free_gb"] - margin)), "%g" % gb))
+    return None
+
+
 @_unprivileged(inputs=True)
-def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder", cpu=None, cpu_min=None):
+def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder", cpu=None, cpu_min=None,
+            disk=None, disk_path=None):
     """Request (or re-poll with `ticket`) a reservation of `gb` of memory and, with `cpu`, cores: between
-    `cpu_min` (default half, rounded up) and `cpu`. A request with cores is a lease of version 2 (02 §6.2);
-    one for memory alone keeps the shape every older reader writes. Returns its status dict."""
+    `cpu_min` (default half, rounded up) and `cpu`; with `disk`, that many GB of space on the volume
+    `disk_path` is on (default the temporary folder's), named by the pool's id when the request is made, so
+    the reservation follows the volume, not the path (02 §7.1). A request with cores or disk is a lease of
+    version 2 (02 §6.2); one for memory alone keeps the shape every older reader writes. Returns its status
+    dict."""
     s, procs, now = _decide_inputs()
     if cpu is not None:
         cpu = _cn(round(float(cpu), 1))
         cpu_min = elastic_min(cpu) if cpu_min is None else _cn(min(round(float(cpu_min), 1), cpu))
         if cpu_min < cpu and cpu_reservable() and _to_weigh(ticket):
             s = _cpu_busy(s, now)
+    dpool = why_disk = None
+    if disk is not None:
+        disk = round(float(disk), 2) or float(disk)  # 0.004 stays itself: refused, not kept as none
+    tl = _ticket_lease(ticket)
+    if tl is not None and _disk_of(tl) and disk_reservable():  # a poll: its pool's free space, read now
+        s = _disk_pool_by_id(s, _disk_of(tl)["pool"])
+    elif tl is None and disk is not None and not ticket and disk_reservable():  # its volume, from the path
+        dpool, why_disk, pools = disk_pool_of(disk_path or default_disk_path(), s)
+        if dpool:
+            s = _with_disk(s, dpool, pools)
     with Ledger() as L:
         r = next((x for x in L["leases"] if x["id"] == ticket), None) if ticket else None
         if ticket and r is None:
@@ -4921,7 +5328,9 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
         if r is None:
             ram = s.get("ram_gb") or 0
             why = _refuse_cpu(s, cpu, cpu_min) if cpu is not None else None
-            if why or (gb <= 0 and cpu is None) or gb < 0 or (ram and gb > 0.9 * ram):
+            if why is None and disk is not None:
+                why = _refuse_disk(s, disk, dpool, why_disk)
+            if why or (gb <= 0 and cpu is None and disk is None) or gb < 0 or (ram and gb > 0.9 * ram):
                 return {"status": "refused", "gb": gb,
                         "advice": why or "Can't reserve %.1f GB %s. Split the work or lower its parallelism."
                                          % (gb, _on_ram(s))}
@@ -4933,12 +5342,18 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                  "ttl": None if ttl_s is None else min(max(60, ttl_s), MAX_TTL_S),
                  "requested": round(now, 1), "seen": round(now, 1),
                  "segments": [{"t": round(now, 1), "gb": mirror}]}
-            if cpu is not None:  # a vector (02 §6.2): `v` once, at creation
+            if cpu is not None or disk is not None:  # a vector (02 §6.2): `v` once, at creation
                 r["v"] = 2
-                r["res"] = {"cpu": {"ask": cpu, "min": cpu_min}}
+                r["res"] = {}
+                if cpu is not None:
+                    r["res"]["cpu"] = {"ask": cpu, "min": cpu_min}
+                if disk is not None:  # the pool's id; its name only to tell people which volume
+                    r["res"]["disk"] = {"ask": disk, "pool": dpool["id"],
+                                        "name": notify_text(dpool.get("name") or dpool["id"], 64)}
                 if gb > 0:
                     r["res"].update(ram={"ask": mirror}, mem={"got": mirror})
-                r["segments"][0]["res"] = dict({"ram": mirror} if gb > 0 else {}, cpu=cpu)
+                r["segments"][0]["res"] = dict({"ram": mirror} if gb > 0 else {},
+                                               **{k: x["ask"] for k, x in r["res"].items() if k in ("cpu", "disk")})
             r["key"] = _key(r)
             r["user"] = _whoami()  # who asked (03 §6.5): shown once several accounts hold reservations
             r["holder"]["uid"] = os.getuid()
@@ -4950,6 +5365,11 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
             k = k if isinstance(k, str) and _AGENT.fullmatch(k) else agent_key(holder.get("pid"), holder.get("start"))
             if k:
                 r["agent"] = {"key": k}
+            seen = _valid_lease(json.loads(json.dumps(r)))  # as every reader will see it: never one that jams the line
+            if seen is None or not weighable(seen):
+                L["seq"] -= 1
+                return {"status": "refused", "gb": gb, "advice": "Can't make this reservation: %s could not record it in "
+                        "a form it can weigh. Ask for memory, cores or disk space in plain amounts." % BRAND}
             L["leases"].append(r)
         else:
             r["seen"] = round(now, 1)
@@ -4964,8 +5384,10 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
 
 
 def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, watch="holder", progress=None,
-            cpu=None, cpu_min=None):
+            cpu=None, cpu_min=None, disk=None, disk_path=None):
     kw = {"cpu": cpu, "cpu_min": cpu_min} if cpu is not None else {}
+    if disk is not None:
+        kw.update(disk=disk, disk_path=disk_path)
     st = reserve(gb, purpose, holder, ttl_s, ticket, watch, **kw)
     t0 = time.time()
     while st["status"] == "queued" and time.time() - t0 < wait_s:
@@ -5004,7 +5426,7 @@ def _amend_cpu(L, r, cpu, cpu_min):
                       "\"…\"`)." % (r["id"], cores_text(cpu), cores_text(cpu))) if cpu else (None, None)
     was = c["got"] if r["state"] == "granted" and _num(c.get("got")) else c["ask"]
     if cpu == 0:
-        if no_memory(r):
+        if no_memory(r) and _disk_of(r) is None:
             return None, "%s holds nothing but cores: release it instead (release_memory / `oomph release %s`)." % (
                 r["id"], r["id"])
         del r["res"]["cpu"]
@@ -5030,19 +5452,65 @@ def _amend_cpu(L, r, cpu, cpu_min):
     return [was, cpu], None
 
 
+def _amend_disk(L, r, disk):
+    """amend's disk space (02 §6.4, today's rules per resource): (change, refusal). It stays on its pool.
+    Shrinking applies at once; growing a grant only if the extra can be reserved on that pool now and nobody
+    is queued for it; a bigger queued request goes to the back of the line; 0 drops the disk space."""
+    d = _disk_of(r)
+    if d is None:
+        return (None, ("%s holds no disk space, and it cannot take some now: reserve the space separately (reserve "
+                       "disk_gb=%s / `oomph reserve --disk %sG --for \"…\"`)." % (r["id"], "%g" % disk, "%g" % disk))) \
+            if disk else (None, None)
+    if disk and not (DISK_MIN_GB <= disk <= DISK_MAX_GB):
+        return None, "Can't make %s's disk space %s GB: ask for 0.01 to %d GB, or 0 to drop it." % (
+            r["id"], "%g" % disk, DISK_MAX_GB)
+    was = d["got"] if r["state"] == "granted" and _num(d.get("got")) else d["ask"]
+    if disk == 0:
+        if no_memory(r) and _cpu_of(r) is None:
+            return None, ("%s holds nothing but disk space: release it instead (release_memory / `oomph release %s`)."
+                          % (r["id"], r["id"]))
+        del r["res"]["disk"]
+        return [was, 0], None
+    if r["state"] == "granted":
+        if disk > was:
+            room = (L.get("state", {}).get("disk") or {}).get(d["pool"])
+            room = room if _num(room) else 0.0
+            pool = "disk:" + d["pool"]
+            waiting = [x for x in L["leases"] if x["state"] == "queued" and (pool in lease_need(x) or not weighable(x))]
+            if waiting or disk - was > room:
+                return None, ("Can't grow %s from %s to %s GB on %s now: %s. Keep the %s GB and reserve the extra %s GB "
+                              "separately (`oomph reserve --disk %sG --for \"…\"`): it queues fairly." % (
+                                  r["id"], _gb(was), _gb(disk), _disk_name(d),
+                                  "%d request(s) for space there are queued and come first" % len(waiting) if waiting
+                                  else "only %s GB more can be reserved there" % _gb(max(0.0, room)),
+                                  _gb(was), _gb(disk - was), "%g" % round(disk - was, 2)))
+        d.update(ask=disk, got=disk)
+    else:
+        d["ask"] = disk
+        if disk > was:  # a bigger request takes a new place in line
+            L["leases"].remove(r)
+            L["leases"].append(r)
+    return [was, disk], None
+
+
 @_unprivileged(inputs=True)
-def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None):
-    """Change a reservation in place: its size, its cores, its time to live (from now) or its purpose.
-    Shrinking applies at once and hands the room to whoever waits. Growing a grant applies only
-    when the extra would be granted to a new request right now (it fits, and nobody is queued
-    for it); otherwise it is refused, with advice to reserve the extra separately, which queues
-    fairly. Growing a queued request moves it to the back of the queue. A reservation with cores
-    can drop its memory or its cores (0), not both. Every applied change is written to the history
-    log, and a new size starts a new segment of the reservation's span."""
+def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=None):
+    """Change a reservation in place: its size, its cores, its disk space (on the volume it has), its time
+    to live (from now) or its purpose. Shrinking applies at once and hands the room to whoever waits.
+    Growing a grant applies only when the extra would be granted to a new request right now (it fits,
+    and nobody is queued for it); otherwise it is refused, with advice to reserve the extra separately,
+    which queues fairly. Growing a queued request moves it to the back of the queue. A reservation of
+    several resources can drop all but one (0). Every applied change is written to the history log, and
+    a new size starts a new segment of the reservation's span."""
     s, procs, now = _decide_inputs()
     if cpu is not None:
         cpu = _cn(round(float(cpu), 1))
         cpu_min = None if cpu_min is None else _cn(round(float(cpu_min), 1))
+    if disk is not None:
+        disk = round(float(disk), 2) or float(disk)  # 0.004 stays itself: refused below, not taken for 0 (drop)
+        tl = _ticket_lease(rid)
+        if tl is not None and _disk_of(tl) and disk_reservable():  # its pool's free space, read now
+            s = _disk_pool_by_id(s, _disk_of(tl)["pool"])
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         r = next((x for x in L["leases"] if x["id"] == rid), None)
@@ -5050,13 +5518,14 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None):
             return _status(L, rid, now)
         ram = s.get("ram_gb") or 0
         change, refused = {}, None
-        vec = _cpu_of(r) is not None
+        vec = _cpu_of(r) is not None or _disk_of(r) is not None
+        rest = (_cpu_of(r) is not None and cpu != 0) or (_disk_of(r) is not None and disk != 0)  # kept besides memory
         before, order = json.loads(json.dumps(r)), list(L["leases"])  # all or nothing: restored when refused
         if gb is not None and round(gb, 2) != (0.0 if no_memory(r) else r["gb"]):
             gb = round(gb, 2)
             old = 0.0 if no_memory(r) else r["gb"]
-            if gb == 0 and vec and cpu != 0:
-                pass  # a reservation with cores drops its memory
+            if gb == 0 and rest:
+                pass  # a reservation with cores or disk space drops its memory
             elif gb <= 0 or (ram and gb > 0.9 * ram):
                 refused = ("Can't reserve %.1f GB %s. Release the reservation instead "
                            "(release_memory / `oomph release %s`) if the work is done." % (gb, _on_ram(s), rid))
@@ -5093,16 +5562,24 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None):
                     change["requeued"] = True
             if refused and "gb" in change:  # the memory part is not applied alone
                 refused += " Nothing was changed."
+        if refused is None and disk is not None and (vec or disk):
+            ch, refused = _amend_disk(L, r, disk)
+            if ch and ch[0] != ch[1]:
+                change["disk"] = ch
+                if ch[1] > ch[0] and r["state"] == "queued":
+                    change["requeued"] = True
+            if refused and ("gb" in change or "cpu" in change):  # nor the other parts alone
+                refused += " Nothing was changed."
         if refused:
             r.clear()
             r.update(before)
             L["leases"][:] = order
             change = {}
-        if "gb" in change or "cpu" in change:
+        if "gb" in change or "cpu" in change or "disk" in change:
             seg = {"t": round(now, 1), "gb": r["gb"]}
             if vec:
                 seg["res"] = {k: x.get("got", x.get("ask")) for k, x in r["res"].items()
-                              if k in ("ram", "cpu") and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
+                              if k in ("ram", "cpu", "disk") and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
             r.setdefault("segments", [{"t": r.get("granted") or r["requested"],
                                        "gb": change["gb"][0] or NO_MEM_GB if "gb" in change else r["gb"]}])
             if r["segments"][-1]["t"] >= round(now, 1):
@@ -5134,6 +5611,8 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None):
                        advice=refused, keeps=r["state"])
             if cpu is not None:
                 out["requested_cpu"] = cpu
+            if disk is not None:
+                out["requested_disk"] = disk
         else:
             out["changed"] = change
         return out
@@ -5152,8 +5631,17 @@ def set_watch(rid, pid):
 
 @_unprivileged(inputs=True)
 def coordination(mine=None, s=None):
-    """Current reservations (refreshed), seen from session `mine`: what others hold or wait for."""
+    """Current reservations (refreshed), seen from session `mine`: what others hold or wait for. Asked without a
+    sample (`oomph reservations`, MCP, `oomph run`'s refresh), without the logger's list of disks and with disk
+    space reserved, every pool is read live (what is left on each). Never for `check` or the hook, which hand in
+    their sample: their cost stays what it was (02 §7.4: the hook never touches a volume)."""
+    given = s is not None
     s, procs, now = _decide_inputs(s)
+    if not given and disk_reservable() and not (isinstance(s.get("disks"), list) and not s.get("disks_partial")) \
+            and any(_disk_of(r) for r in _quietly_leases()):
+        pools = live_volumes()[0]
+        if pools is not None:
+            s = dict(s, disks=pools, disks_partial=live_volumes_partial())
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         st = L["state"]
@@ -5164,12 +5652,15 @@ def coordination(mine=None, s=None):
                "available": st["cpu_available"], "reservable": cpu_reservable()}
         if "cpu_idle" in st:
             cpu["idle"] = st["cpu_idle"]
+        disk = {k: {"name": d["name"], "free": d["free"], "margin": round(d["margin"], 1), "level": d["level"],
+                    "reserved": round(d["reserved"], 1), "available": round(max(0.0, d["left"]), 1)}
+                for k, d in disk_view(s, L["leases"])[0].items()} if disk_reservable() else {}
         return {
             "free_gb": st["free_gb"], "margin_gb": st["margin_gb"], "reserved_gb": st["reserved_gb"],
             "available_gb": st["available_gb"], "grantable_gb": st["available_gb"], "ledger": ledger_info(),
             "reserved_by_others_gb": round(others_out, 1),
             "available_to_me_gb": round(st["free_gb"] - others_out - st["margin_gb"], 1),
-            "cpu": cpu,
+            "cpu": cpu, "disk": disk,
             "others": [_brief(r, now) for r in others], "mine": [_brief(r, now) for r in own],
             "history": [dict(h, project=os.path.basename(h.get("project") or "") or None)
                         for h in L["history"][-15:]][::-1],
@@ -5268,7 +5759,7 @@ def refresh_ledger(s, procs, rated=False):
 PROC_KEYS = ("pid", "ppid", "uid", "name", "start", "fp", "rss", "path")  # what the ledger's child is told of a process
 
 
-def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None):
+def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None):
     """The daemon's ledger work for one sample: refresh_ledger, then the snapshot of live
     reservations for the sample, both in a child — as nobody when the daemon is root (root
     never opens anything in the shared directory, to read or to write), as the same user when
@@ -5276,13 +5767,16 @@ def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None):
     sample's block is rebuilt from it field by field (sample_leases). Returns (leases, error
     or None). The daemon calls this from a thread of its own: the sampler never waits on it.
     `rates`: the cores each process kept busy over the last interval ({pid: cores}, the logger's
-    Meter); given, the child's input is of version 2 (02 §5.2) and it charges every grant's cores."""
+    Meter); given, the child's input is of version 2 (02 §5.2) and it charges every grant's cores,
+    and with `writes` ({pid: MB/s written to disk}) every disk grant's writes."""
     rows = [{k: p[k] for k in PROC_KEYS if k in p} for p in procs.values()]
     if rates is not None:
         for x in rows:
-            c = rates.get(x["pid"])
+            c, w = rates.get(x["pid"]), (writes or {}).get(x["pid"])
             if _num(c, 0, CPU_MAX):
                 x["cpu"] = round(c, 3)
+            if _num(w, 0, 1e7) and w > 0:
+                x["w"] = round(w, 3)
     payload = json.dumps(dict({"s": s, "procs": rows}, **({"v": 2} if rates is not None else {})),
                          default=str).encode()
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"], payload,
@@ -5350,14 +5844,14 @@ def ledger_snapshot(procs=None):
     return out
 
 
-SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min", "cpu", "cpu_used")
+SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min", "cpu", "cpu_used", "disk", "disk_used")
 
 
 def sample_leases(x):
     """The leases block of a sample, rebuilt from typed fields only — what root republishes can't
     be bigger, deeper or differently shaped than this, whatever the shared directory held: at
     most LIMITS["leases_n"] entries of id, state, gb, purpose, project and the numbers of
-    SAMPLE_LEASE_NUMS, strings cut to LIMITS["str"], LIMITS["leases"] bytes in all. A malformed
+    SAMPLE_LEASE_NUMS and a disk's pool id, strings cut to LIMITS["str"], LIMITS["leases"] bytes in all. A malformed
     entry is skipped, never raised."""
     out, size, n = [], 2, LIMITS["str"]
     for b in x if isinstance(x, list) else []:
@@ -5370,6 +5864,8 @@ def sample_leases(x):
              "purpose": b["purpose"][:n] if isinstance(b.get("purpose"), str) else "?",
              "project": b["project"][:n] if isinstance(b.get("project"), str) else None}
         e.update((k, b[k]) for k in SAMPLE_LEASE_NUMS if _num(b.get(k)))
+        if _str(80, _ID)(b.get("disk_pool")) and "disk" in e:  # which pool: an id, compared as a string, never opened
+            e["disk_pool"] = b["disk_pool"]
         size += len(json.dumps(e)) + 1
         if size > LIMITS["leases"]:
             break
@@ -5397,6 +5893,9 @@ def _fmt_brief(b, purpose_w=22):
     middle, 10), what it uses or how long it waits. 78 columns with the default budget."""
     cores = ("%s cores%s, " % (cores_text(b["cpu"]), " (%.1f busy)" % b["cpu_used"] if _num(b.get("cpu_used")) else "")
              if _num(b.get("cpu")) else "")
+    if _num(b.get("disk")):
+        cores += "%sG on %s%s, " % (_gb(b["disk"]), cut_middle(term_text(b.get("disk_name") or b.get("disk_pool") or "?"), 12),
+                                    " (%sG used)" % _gb(b["disk_used"]) if _num(b.get("disk_used")) else "")
     tail = cores + ((("using %.1fG, " % b.get("used_gb", 0)) if b["gb"] > 0 else "") + "%.0f min" % max(0.0, b["for_min"])
                     if b["state"] == "granted" else "waiting %.0f min" % max(0.0, b["waiting_min"]))
     size = "%5.1fG" % b["gb"] if b["gb"] > 0 or not cores else "%6s" % "-"
@@ -5455,12 +5954,12 @@ def _usage_error(cmd, e, text):
     return 2
 
 
-RESERVE_USAGE = ("usage: oomph reserve [size, e.g. 6G] [--cpu 8 | --cpu 4..8 | --cpu 8..8] --for \"what\" [--wait 10m] "
-                 "[--ttl 30m] [--ticket rN] [--json]")
+RESERVE_USAGE = ("usage: oomph reserve [size, e.g. 6G] [--cpu 8 | --cpu 4..8 | --cpu 8..8] [--disk 20G[@PATH]] "
+                 "--for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
 RELEASE_USAGE = "usage: oomph release <id | all>   (all = every reservation held by this session)"
-AMEND_USAGE = "usage: oomph amend <id> [--gb 3G] [--cpu 6] [--ttl 20m] [--for \"what\"] [--json]"
-RUN_USAGE = ("usage: oomph run [--reserve 6G] [--cpu 4..12] [--for \"what\"] [--wait 30m] -- <command> [args…]   "
-             "({cpu} in the command is the number of cores granted)")
+AMEND_USAGE = "usage: oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--ttl 20m] [--for \"what\"] [--json]"
+RUN_USAGE = ("usage: oomph run [--reserve 6G] [--cpu 4..12] [--disk 20G[@PATH]] [--for \"what\"] [--wait 30m] -- "
+             "<command> [args…]   ({cpu} in the command is the number of cores granted)")
 
 
 def _cpu_opt(o):
@@ -5473,12 +5972,24 @@ def _cpu_opt(o):
         raise UsageError(str(e))
 
 
+def _disk_opt(o, zero=False):
+    """--disk's (GB, path or None), or (None, None); UsageError when it is not a disk size (`zero`: 0 is one)."""
+    if "--disk" not in o:
+        return None, None
+    try:
+        return parse_disk(o["--disk"], zero)
+    except ValueError as e:
+        raise UsageError(str(e))
+
+
 def cmd_reserve(args):
     try:
-        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu"), ("--json", "--help", "-h"))
+        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu", "--disk"),
+                         ("--json", "--help", "-h"))
         ticket = o.get("--ticket")
         cpu, cpu_min = _cpu_opt(o)
-        if "--help" in o or "-h" in o or (not pos and not ticket and cpu is None):
+        disk, disk_path = _disk_opt(o)
+        if "--help" in o or "-h" in o or (not pos and not ticket and cpu is None and disk is None):
             print(RESERVE_USAGE)
             return 2
         gb = _size(pos[0]) if pos else 0
@@ -5489,7 +6000,8 @@ def cmd_reserve(args):
         return _usage_error("reserve", e, RESERVE_USAGE)
     holder = holder_for(int(pid) if pid is not None else None)
     st = acquire(gb, o.get("--for", "unspecified"), holder, parse_dur(o.get("--ttl", "30m")),
-                 parse_dur(o.get("--wait", "0s")), ticket, cpu=cpu, cpu_min=cpu_min)
+                 parse_dur(o.get("--wait", "0s")), ticket, cpu=cpu, cpu_min=cpu_min, disk=disk,
+                 disk_path=os.path.abspath(disk_path) if disk_path else None)
     if "--json" in o:
         print(json.dumps(st))
     else:
@@ -5518,10 +6030,13 @@ def cmd_release(args):
         return 1
     for h in res["released"]:
         cpu, peak = (h.get("res") or {}).get("cpu"), (h.get("peak") or {}).get("cpu")
-        mem = "%.1fG, peak %.1fG" % (h["gb"], h["peak_gb"]) if "ram" in (h.get("res") or {}) or not _num(cpu) else ""
+        dk, dpeak = (h.get("res") or {}).get("disk"), (h.get("peak") or {}).get("disk")
+        mem = "%.1fG, peak %.1fG" % (h["gb"], h["peak_gb"]) \
+            if "ram" in (h.get("res") or {}) or not (_num(cpu) or _num(dk)) else ""
         cores = "%s cores%s" % (cores_text(cpu), ", peak %.1f busy" % peak if _num(peak) else "") if _num(cpu) else ""
+        disk = "%sG of disk%s" % (_gb(dk), ", %sG used" % _gb(dpeak) if _num(dpeak) else "") if _num(dk) else ""
         print("oomph: released %s (%s) — reserved %s, held %ds" % (
-            h["id"], h["purpose"], " and ".join(x for x in (mem, cores) if x), h["held_s"]))
+            h["id"], h["purpose"], " and ".join(x for x in (mem, cores, disk) if x), h["held_s"]))
     if res["next_granted"]:
         print("oomph: now granted to " + ", ".join(res["next_granted"]))
     return 0
@@ -5529,22 +6044,27 @@ def cmd_release(args):
 
 def cmd_amend(args):
     try:
-        o, pos = _strict(args, ("--gb", "--ttl", "--for", "--cpu"), ("--json", "--help", "-h"))
-        if not pos or not any(k in o for k in ("--gb", "--ttl", "--for", "--cpu")) or "--help" in o or "-h" in o:
+        o, pos = _strict(args, ("--gb", "--ttl", "--for", "--cpu", "--disk"), ("--json", "--help", "-h"))
+        if not pos or not any(k in o for k in ("--gb", "--ttl", "--for", "--cpu", "--disk")) or "--help" in o or "-h" in o:
             print(AMEND_USAGE)
             return 2
         gb = _size(o["--gb"]) if "--gb" in o else None
         cpu, cpu_min = (0.0, None) if o.get("--cpu") == "0" else _cpu_opt(o)
+        disk, disk_path = _disk_opt(o, zero=True)  # 0 (0G, 0M, …) drops the disk space
+        if disk_path:
+            raise UsageError("--disk %s: a reservation stays on its volume; give the new size alone" % o["--disk"])
     except UsageError as e:
         return _usage_error("amend", e, AMEND_USAGE)
     rid = pos[0]
-    st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"), cpu=cpu, cpu_min=cpu_min)
+    st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"), cpu=cpu, cpu_min=cpu_min,
+               disk=disk)
     if "--json" in o:
         print(json.dumps(st))
     else:
         ch = st.get("changed") or {}
         what = ", ".join(("%.1fG → %.1fG" % tuple(v)) if k == "gb" else
                          ("%s → %s cores" % tuple(cores_text(x) for x in v)) if k == "cpu" else
+                         ("%sG → %sG of disk" % tuple(_gb(x) for x in v)) if k == "disk" else
                          ("expires in %.0f min" % v[1]) if k == "expires_in_min" else
                          ("ttl %.0f min" % v) if k == "ttl_min" else
                          ("for \"%s\"" % v[1]) if k == "purpose" else "back of the queue"
@@ -5566,6 +6086,8 @@ def cmd_reservation_history(args):
         gbs = " → ".join("%.1fG" % c["gb"] for c in x.get("gb_changes", [])) or "%.1fG" % x["gb"]
         if "cpu" in (x.get("res") or {}):  # and its cores
             gbs = ("%s cores" if not x["gb"] else gbs + " %sc") % cores_text(x["res"]["cpu"])
+        if _num((x.get("res") or {}).get("disk")):  # and its disk space
+            gbs = ("%sG disk" if not x["gb"] and "cpu" not in x["res"] else gbs + " %sGd") % _gb(x["res"]["disk"])
         print("  %-6s %s–%-5s %-13s peak %4.1fG  %-26s %-14s %s" % (
             x["id"], when, end, gbs, x["peak_gb"], x["purpose"][:26], (x["project"] or "")[:14], x["outcome"]))
     return 0
@@ -5608,12 +6130,15 @@ JOB_VARS = ("CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL", "GOMAXPROCS", "OMP
 
 
 def run_env(st, env):
-    """The environment of `oomph run`'s command for grant `st` (02 §7.1): OOMPH_RESERVATION, OOMPH_RAM_GB and,
-    with cores, OOMPH_CPU_CORES; and, only where not already set, the job counts that common tools read
-    (JOB_VARS, MAKEFLAGS=-jN): on by default (02 §15.9)."""
+    """The environment of `oomph run`'s command for grant `st` (02 §7.1): OOMPH_RESERVATION, OOMPH_RAM_GB,
+    with disk space OOMPH_DISK_GB and, with cores, OOMPH_CPU_CORES; and, only where not already set, the job
+    counts that common tools read (JOB_VARS, MAKEFLAGS=-jN): on by default (02 §15.9)."""
     out = dict(env, OOMPH_RESERVATION=st["id"])
     if st.get("gb"):
         out["OOMPH_RAM_GB"] = "%g" % st["gb"]
+    dk = (st.get("granted") or {}).get("disk_gb")
+    if _num(dk, 0.001, DISK_MAX_GB):
+        out["OOMPH_DISK_GB"] = "%g" % dk
     got = (st.get("run_with") or {}).get("cpu_cores")
     if _num(got, 0.1, CPU_MAX):
         out["OOMPH_CPU_CORES"] = cores_text(got)
@@ -5635,15 +6160,16 @@ def run_argv(cmd, st):
 
 
 def cmd_run(args):
-    if "--" not in args or not ("--reserve" in args[:args.index("--")] or "--cpu" in args[:args.index("--")]):
+    if "--" not in args or not any(k in args[:args.index("--")] for k in ("--reserve", "--cpu", "--disk")):
         print(RUN_USAGE)
         return 2
     i = args.index("--")
     cmd = args[i + 1:]
     try:
-        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu"), npos=0)
+        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu", "--disk"), npos=0)
         gb = _size(opts["--reserve"]) if "--reserve" in opts else 0
         cpu, cpu_min = _cpu_opt(opts)
+        disk, disk_path = _disk_opt(opts)
     except UsageError as e:
         return _usage_error("run", e, RUN_USAGE)
     if not cmd:
@@ -5658,7 +6184,7 @@ def cmd_run(args):
           "agent": agent_key(ses["pid"], ses["start"]) if ses["kind"] == "session" else None}
     last = [0.0]
     want = " and ".join(([("%.1fG" % gb)] if gb else []) + (["%s cores" % cores_text(cpu_min if cpu_min == cpu else cpu)]
-                                                           if cpu else []))
+                                                           if cpu else []) + (["%sG of disk" % _gb(disk)] if disk else []))
 
     def progress(st):
         if time.time() - last[0] >= 30:
@@ -5670,7 +6196,8 @@ def cmd_run(args):
                 first="oomph: ") + "\n")
             sys.stderr.flush()
 
-    st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress, cpu=cpu, cpu_min=cpu_min)
+    st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress, cpu=cpu, cpu_min=cpu_min, disk=disk,
+                 disk_path=os.path.abspath(disk_path) if disk_path else None)
     if st["status"] != "granted":
         if st["status"] == "queued":
             _quietly(release, st["id"])
@@ -5701,12 +6228,14 @@ def cmd_run(args):
     finally:
         res = _quietly(release, st["id"]) or {"released": []}  # else it ends when this process does
     h = (res["released"] or [{}])[0]
-    cores = (h.get("peak") or {}).get("cpu")
-    sys.stderr.write("oomph: %s — %s%s, %ds\n" % (
-        st["id"], "reserved %.1fG, peak %.1fG" % (gb, h.get("peak_gb", 0)) if gb else "",
-        ("%s%s cores, peak %.1f busy" % (", " if gb else "", cores_text(st["run_with"]["cpu_cores"]), cores))
-        if _num(cores) else (("%s%s cores" % (", " if gb else "", cores_text(st["run_with"]["cpu_cores"])))
-                             if st.get("run_with") else ""), time.time() - t0))
+    cores, dpeak = (h.get("peak") or {}).get("cpu"), (h.get("peak") or {}).get("disk")
+    parts = ["reserved %.1fG, peak %.1fG" % (gb, h.get("peak_gb", 0))] if gb else []
+    if st.get("run_with"):
+        parts.append("%s cores%s" % (cores_text(st["run_with"]["cpu_cores"]), ", peak %.1f busy" % cores
+                                     if _num(cores) else ""))
+    if disk:
+        parts.append("%sG of disk%s" % (_gb(disk), ", %sG used" % _gb(dpeak) if _num(dpeak) else ""))
+    sys.stderr.write("oomph: %s — %s, %ds\n" % (st["id"], ", ".join(parts), time.time() - t0))
     return rc if rc >= 0 else 128 - rc
 
 
@@ -5821,15 +6350,19 @@ MCP_TOOLS = [
                     "and release it with release_memory when the heavy part is over. For parallel work (builds, test "
                     "runners, -j) also ask for cpu_cores, in the same call: what its parallelism would use. You are "
                     "granted between half of that and all of it, and the answer's run_with.cpu_cores is the number "
-                    "to run with (-jN), not the number you asked for.",
+                    "to run with (-jN), not the number you asked for. Before writing more than about 5 GB (a download, "
+                    "a dataset, an image build) also ask for disk_gb, and disk_path when it is not the temporary "
+                    "folder's disk.",
      "inputSchema": {"type": "object", "required": ["purpose"], "additionalProperties": False, "properties": {
-         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB (gb or "
-                                                                        "cpu_cores, or both)"},
+         "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB (gb, "
+                                                                        "cpu_cores or disk_gb, or several)"},
          "cpu_cores": {"type": "number", "exclusiveMinimum": 0, "description": "logical cores the work would use "
                                                                                "(e.g. its -j); granted half to all"},
          "cpu_min": {"type": "number", "exclusiveMinimum": 0, "description": "the fewest cores to start with (default "
                                                                              "half of cpu_cores; equal to it: exactly "
                                                                              "that many, or wait)"},
+         "disk_gb": {"type": "number", "exclusiveMinimum": 0, "description": "GB the work will write to one disk"},
+         "disk_path": {"type": "string", "description": "any path on that disk (default: the temporary folder's)"},
          "purpose": {"type": "string", "description": "short label, e.g. 'gradle assembleDebug' — reuse the same "
                                                        "label for the same work so its measured peak can guide estimates"},
          "wait_s": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120,
@@ -5853,8 +6386,9 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "required": ["id"], "additionalProperties": False, "properties": {
          "id": {"type": "string", "description": "the reservation's id, e.g. r12"},
          "gb": {"type": "number", "minimum": 0, "description": "new size in GB (0 drops the memory of a "
-                                                                 "reservation that also holds cores)"},
+                                                                 "reservation that also holds cores or disk space)"},
          "cpu_cores": {"type": "number", "minimum": 0, "description": "new number of cores (0 drops them)"},
+         "disk_gb": {"type": "number", "minimum": 0, "description": "new disk space in GB, on the same disk (0 drops it)"},
          "ttl_min": {"type": "integer", "minimum": 1, "maximum": 480, "description": "expire this many minutes from now"},
          "purpose": {"type": "string", "description": "new short label"}}}},
     {"name": "reservations",
@@ -5871,7 +6405,7 @@ MCP_TOOLS = [
          "hours": {"type": "number", "minimum": 0.1, "maximum": 336, "default": 24},
          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
          "purpose": {"type": "string", "description": "only reservations whose purpose contains this text"},
-         "resource": {"type": "string", "enum": ["memory", "cpu"],
+         "resource": {"type": "string", "enum": ["memory", "cpu", "disk"],
                       "description": "only reservations that held this resource"}}}},
     {"name": "my_session",
      "description": "Memory used by the Claude Code session this server belongs to: its whole process tree, total, "
@@ -5903,7 +6437,7 @@ class ToolArgError(ValueError):
     """A tool call's arguments don't fit its schema; the caller gets an error result saying so."""
 
 
-_MCP_NEEDS = {"reserve_memory": ()}  # purpose is asked for, but a call without it is "unspecified"; gb or cpu_cores
+_MCP_NEEDS = {"reserve_memory": ()}  # purpose is asked for, but a call without it is "unspecified"; gb, cores or disk
 
 
 def _mcp_args(name, a):
@@ -5924,12 +6458,17 @@ def _mcp_args(name, a):
     if extra:
         raise ToolArgError("%s takes no argument %s (it takes %s)" % (
             name, ", ".join(extra), ", ".join(sch["properties"])))
-    for k in ("cpu_cores", "cpu_min"):  # numbers, as the schema says (gb is read as before: float() of it)
+    for k in ("cpu_cores", "cpu_min", "disk_gb"):  # numbers, as the schema says (gb is read as before: float() of it)
         if a.get(k) is not None and not _num(a[k], 0, 1e6):
             raise ToolArgError("%s: %s takes a number from 0 up, not %r" % (name, k, a[k]))
+    if a.get("disk_gb") and round(float(a["disk_gb"]), 2) < DISK_MIN_GB:  # 0.004 would be kept as none
+        raise ToolArgError("%s: disk_gb takes at least %g (GB), not %r" % (name, DISK_MIN_GB, a["disk_gb"]))
     if name == "reserve_memory":
-        if not (a.get("gb") or a.get("cpu_cores")):
-            raise ToolArgError("reserve_memory needs gb or cpu_cores (or both)")
+        if not (a.get("gb") or a.get("cpu_cores") or a.get("disk_gb")):
+            raise ToolArgError("reserve_memory needs gb, cpu_cores or disk_gb (or several)")
+        if a.get("disk_path") is not None and not (a.get("disk_gb") and isinstance(a["disk_path"], str)
+                                                   and 0 < len(a["disk_path"]) <= 4096 and "\0" not in a["disk_path"]):
+            raise ToolArgError("reserve_memory: disk_path is a path on the disk, and comes with disk_gb")
         if a.get("cpu_min") is not None and not a.get("cpu_cores"):
             raise ToolArgError("reserve_memory: cpu_min comes with cpu_cores")
         if a.get("cpu_cores"):
@@ -5955,9 +6494,12 @@ def _mcp_call(name, a):
     if name == "reserve_memory":
         ttl = min(max(int(a.get("ttl_min", 30)), 1), 480) * 60
         cpu = parse_cores(a["cpu_cores"])[0] if a.get("cpu_cores") else None
+        path = a.get("disk_path")
         return acquire(float(a.get("gb") or 0), str(a.get("purpose", "unspecified")), holder_for(), ttl,
                        min(max(int(a.get("wait_s", 120)), 0), 300), a.get("ticket"), cpu=cpu,
-                       cpu_min=round(float(a["cpu_min"]), 1) if cpu and a.get("cpu_min") is not None else None)
+                       cpu_min=round(float(a["cpu_min"]), 1) if cpu and a.get("cpu_min") is not None else None,
+                       disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") else None,
+                       disk_path=os.path.abspath(os.path.expanduser(path)) if path else None)
     if name == "release_memory":
         rid = str(a.get("id", ""))
         return release(rid, holder_for()["pid"] if rid == "all" else None)
@@ -5966,7 +6508,8 @@ def _mcp_call(name, a):
                      min(max(int(a["ttl_min"]), 1), 480) * 60 if a.get("ttl_min") else None,
                      str(a["purpose"]) if a.get("purpose") else None,
                      cpu=(parse_cores(a["cpu_cores"])[0] if a["cpu_cores"] else 0.0)
-                     if a.get("cpu_cores") is not None else None)
+                     if a.get("cpu_cores") is not None else None,
+                     disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") is not None else None)
     if name == "reservations":
         return coordination(holder_for()["pid"])
     if name == "reservation_history":
@@ -5975,6 +6518,8 @@ def _mcp_call(name, a):
             h["reservations"] = [x for x in h["reservations"] if str(a["purpose"]).lower() in x["purpose"].lower()]
         if a.get("resource") == "cpu":
             h["reservations"] = [x for x in h["reservations"] if "cpu" in (x.get("res") or {})]
+        elif a.get("resource") == "disk":
+            h["reservations"] = [x for x in h["reservations"] if "disk" in (x.get("res") or {})]
         elif a.get("resource") == "memory":
             h["reservations"] = [x for x in h["reservations"] if x["gb"] > 0]
         h["reservations"] = h["reservations"][:int(a.get("limit", 50))]
@@ -6025,9 +6570,9 @@ MCP_SELFCHECK_S = 5      # the new code's time to answer `mcp --selfcheck` (a te
 MCP_INSTRUCTIONS = (
     "%s reports %s memory, swap and disk, and coordinates memory between Claude sessions and other agents. "
     "Before memory-heavy work call reserve_memory with the work's estimated peak (reservation_history shows what "
-    "similar work really needed), and for parallel work its cores (cpu_cores; run with run_with.cpu_cores); start "
-    "only when granted. Shrink or extend it with update_reservation as the work "
-    "changes, and release_memory when done. Call memory_check periodically and back off when it says tight or "
+    "similar work really needed), for parallel work its cores (cpu_cores; run with run_with.cpu_cores), and before "
+    "writing many GB the disk space (disk_gb); start only when granted. Shrink or extend it with update_reservation "
+    "as the work changes, and release_memory when done. Call memory_check periodically and back off when it says tight or "
     "critical.")
 
 

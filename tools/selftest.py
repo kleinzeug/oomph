@@ -1203,7 +1203,7 @@ if MAC:  # MCP argument checks in a child process
     resp2 = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
     errs = [resp2.get(20 + i, {}).get("result", {}) for i in range(4)]
     check(all(e.get("isError") for e in errs) and "takes no argument cpu" in errs[0]["content"][0]["text"] and
-          "needs gb or cpu_cores" in errs[3]["content"][0]["text"],
+          "needs gb, cpu_cores or disk_gb" in errs[3]["content"][0]["text"],
           "MCP: the reservation tools refuse unknown and missing arguments (%s)" % [e.get("isError") for e in errs])
     ok2 = [resp2.get(24 + i, {}).get("result", {}) for i in range(2)]
     check(all(e and not e.get("isError") for e in ok2),
@@ -2338,8 +2338,12 @@ if MAC:
     check([p["id"] for p in p2[1:]] == ["vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10", "vol:77777777-0000-4000-8000-000000000000"],
           "volumes: the same volume at a new mount point is the same pool; another of the same name is another")
     weak = P.disk_pools([vfix[0]["rec"], vfix[WORK]["rec"]], {P.mount_key(vfix[WORK]["rec"]): dict(vfix[WORK]["facts"], pool_uuid=None)})[0]
-    check(weak[1]["id"] == "mnt:/Volumes/Work" and weak[1].get("weak"), "volumes: a volume without a UUID is listed by "
-          "its mount point, weakly")
+    odd = dict(vfix[WORK]["rec"], mount="/Volumes/My Disk \u00e9" + "x" * 90)
+    weak2 = P.disk_pools([vfix[0]["rec"], odd], {P.mount_key(odd): dict(vfix[WORK]["facts"], pool_uuid="bad uuid\x1b")})[0]
+    check(re.fullmatch(r"mnt:[0-9a-f]{16}", weak[1]["id"]) and weak[1]["id"] == P.mount_id("/Volumes/Work")
+          and weak[1].get("weak") and oomph._str(80, oomph._ID)(weak2[1]["id"]) and weak2[1].get("weak"),
+          "volumes: a volume without a UUID (or with one that is not one) is listed by a hash of its mount point, "
+          "weakly: an id the ledger keeps, whatever the mount point holds (%s)" % weak2[1]["id"])
     low = P.disk_pools([dict(vfix[0]["rec"], free_gb=4.0)], {})[0][0]
     check(low["level"] == "critical" and P.disk_pools([dict(vfix[0]["rec"], free_gb=19.0)], {})[0][0]["level"] == "low",
           "volumes: the system's pool is low under 20 GB, critical under 5")
@@ -2370,6 +2374,7 @@ if MAC:
     n_ask, VolPlat.asked = len(VolPlat.asked), []
     bg = oomphd.Volumes(VolPlat)
     first = [p["id"] for p in bg.read()[0]]
+    u0 = bg.unsure
     deadline = time.time() + 10
     while len(VolPlat.asked) < n_ask and time.time() < deadline:
         time.sleep(0.05)
@@ -2377,6 +2382,18 @@ if MAC:
     later = [p["id"] for p in bg.read()[0]]
     check(first == ["data"] and later == ids, "volumes: the logger's first sample lists the system's pool only; the "
           "others follow once diskutil has answered, off the sampling path")
+
+    class FailPlat(VolPlat):
+        volume_facts = staticmethod(lambda dev: None)
+
+    class OkPlat(VolPlat):
+        volume_facts = staticmethod(lambda dev: VolPlat.volume_facts(dev) or {"VolumeName": "Any", "Internal": True})
+    vf, vo = oomphd.Volumes(FailPlat, wait=True), oomphd.Volumes(OkPlat, wait=True)
+    vf.read()
+    vo.read()
+    check(u0 is True and vf.unsure is True and vo.unsure is False,
+          "volumes: a list is unsure (a missing pool is not gone) while diskutil has not answered, or failed, for a "
+          "mounted disk (%s, %s, %s)" % (u0, vf.unsure, vo.unsure))
 else:
     print("skip  the volume class table is the Mac backend's")
 
@@ -2573,18 +2590,22 @@ buf = io.StringIO()
 with redirect_stdout(buf):
     rc = oomph.main(["resources", "--json"])
 d = json.loads(buf.getvalue())
-check(rc == 0 and d["reservable"] == ["memory"] + (["cpu"] if oomph.cpu_reservable() else []) and
+check(rc == 0 and d["reservable"] == ["memory"] + (["cpu"] if oomph.cpu_reservable() else []) +
+      (["disk"] if oomph.disk_reservable() else []) and
       d["memory"]["reservable"] and d["cpu"]["n"] == 14 and d["cpu"]["reservable"] == oomph.cpu_reservable() and
       (not oomph.cpu_reservable() or {"reserved", "left", "margin"} <= set(d["cpu"])) and
       d["gpu"][0]["name"] == "Apple M3 Max" and not d["gpu"][0]["reservable"] and
-      [x["id"] for x in d["disks"]] == ["data", "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"] and d["disks"][0]["watched"],
-      "oomph resources --json: memory reservable, cores where they are measured (with what is reserved and left); "
-      "GPU and disks listed, not yet reservable")
+      [x["id"] for x in d["disks"]] == ["data", "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"] and d["disks"][0]["watched"]
+      and all(x["reservable"] == oomph.disk_reservable() for x in d["disks"]),
+      "oomph resources --json: memory reservable, cores where they are measured (with what is reserved and left), "
+      "disks where volumes are listed by id; the GPU listed, not yet reservable")
 buf = io.StringIO()
 with redirect_stdout(buf):
     rc = oomph.main(["resources"])
+can = {(True, True): "Memory, cores and disk space can be reserved", (True, False): "Memory and cores can be reserved",
+       (False, True): "Memory and disk space can be reserved", (False, False): "Memory can be reserved"}
 check(rc == 0 and "not reservable yet" in buf.getvalue() and
-      ("Memory and cores can be reserved" if oomph.cpu_reservable() else "Memory can be reserved") in buf.getvalue(),
+      can[oomph.cpu_reservable(), oomph.disk_reservable()] in buf.getvalue(),
       "oomph resources: says what can be reserved")
 oomph.LOG_DIR = saved_log
 oomph._sample_override = None
@@ -3273,6 +3294,343 @@ finally:
     oomph.LEDGER_DIR, oomph.cpu_reservable = saved_ld, saved_res
     os.environ["OOMPH_LEDGER_DIR"] = saved_env_ld
     oomph._sample_override = None
+
+# --- B2 (1.12.1): disk space on a volume, by the pool's id; volume_gone (roadmap 02 §4.4, §6.1 to §6.4, §7, §13)
+b2_dir = os.path.join(LOG, "ledger-b2")
+saved_b2 = (oomph.LEDGER_DIR, os.environ["OOMPH_LEDGER_DIR"], oomph.disk_reservable, oomph.disk_pool_of,
+            oomph.live_volumes, oomph.VOLUME_GONE_S)
+oomph.LEDGER_DIR = os.environ["OOMPH_LEDGER_DIR"] = b2_dir
+SCR = "vol:5E0C61B2-0F4A-4D1B-9C57-3A1D2B7E9F10"
+B2_DATA = {"id": "data", "name": "Data", "mount": "/nonexistent-oomph-selftest/data", "dev": "disk3", "fs": "apfs",
+           "total_gb": 994.7, "free_gb": 40.0, "roles": ["home", "tmp", "swap"], "watch": True, "low_gb": 20,
+           "crit_gb": 5, "level": "ok"}
+B2_SCR = {"id": SCR, "name": "Scratch", "mount": "/nonexistent-oomph-selftest/Scratch", "dev": "disk7", "fs": "apfs",
+          "total_gb": 1863.0, "free_gb": 912.4, "roles": [], "kind": "external", "watch": False}
+b2 = dict(ram_gb=36.0, app_gb=20.0, wired_gb=4.0, compressed_gb=2.0, pressure=1, disk_free_gb=40.0,
+          swap_used_gb=0.0, swap_total_gb=0.0, os="macos", t=time.time(), cpu={"n": 14, "busy": 0.0},
+          disks=[dict(B2_DATA), dict(B2_SCR)])
+oomph._sample_override = lambda: json.loads(json.dumps(b2))
+B2_PATHS = {"/tmp/b2-data": B2_DATA, "/tmp/b2-scratch": B2_SCR}
+
+
+def b2_pool_of(path, s):  # the stand-in for the mount table: two pools, and a disk image the logger ignores
+    if path == "/tmp/b2-image":
+        return None, "/tmp/b2-image is on b2-image, which oomph does not record (disk image)", None
+    p = next((x for x in s.get("disks") or () if x["id"] == B2_PATHS.get(path, B2_DATA)["id"]), None)
+    return (dict(p), None, None) if p else (None, "%s: No such file or directory" % path, None)
+
+
+oomph.disk_reservable = lambda: True
+oomph.disk_pool_of = b2_pool_of
+oomph.live_volumes = lambda: (json.loads(json.dumps(b2["disks"])), [])
+b2sl = [subprocess.Popen(["/bin/sleep", "120"]) for _ in range(3)]
+H2 = [{"pid": x.pid, "start": None, "kind": "session", "project": "/tmp/b2-%d" % i} for i, x in enumerate(b2sl)]
+b2l = lambda rid: next((x for x in oomph.read_ledger()["leases"] if x["id"] == rid), {})  # noqa: E731
+b2recs = lambda rid: [json.loads(x) for x in open(os.path.join(b2_dir, "reservations.jsonl"))  # noqa: E731
+                      if json.loads(x)["id"] == rid] if os.path.exists(os.path.join(b2_dir, "reservations.jsonl")) else []
+
+
+def b2_clear():
+    for h in H2 + [me]:
+        oomph.release("all", h["pid"])
+    b2.update(pressure=1, disks=[dict(B2_DATA), dict(B2_SCR)])
+
+
+try:
+    bad = []
+    for x in ("0G", "lots", "20G@", "-5G", "nanG", "4M", "0.004G"):
+        try:
+            oomph.parse_disk(x)
+        except ValueError:
+            bad.append(x)
+    check(oomph.parse_disk("20G") == (20.0, None) and oomph.parse_disk("512M@/Volumes/Scratch") == (0.5, "/Volumes/Scratch")
+          and oomph.parse_disk("0M", zero=True) == (0.0, None) and oomph.parse_disk("0.0G", zero=True) == (0.0, None)
+          and oomph.parse_disk("11M") == (0.01, None) and len(bad) == 7 and oomph.disk_margin(20) == 25 and oomph.disk_margin(5) == 7.0
+          and oomph.disk_floors(B2_SCR) == (20.0, 5.0) and oomph.disk_floors(dict(B2_SCR, total_gb=100)) == (5.0, 1.0),
+          "disk: --disk 20G[@PATH]; the margin is the low floor and headroom, 25 GB where the floor is 20 (%s)" % bad)
+    # a listed volume, by its id: granted in full, a vector lease without memory, the pool's free space as its base
+    g = oomph.reserve(0, "dataset download", H2[0], disk=20, disk_path="/tmp/b2-scratch")
+    lz = b2l(g.get("id"))
+    dz = lz.get("res", {}).get("disk", {})
+    check(g["status"] == "granted" and g.get("granted") == {"disk_gb": 20.0} and g.get("asked", {}).get("disk") == SCR
+          and lz.get("v") == 2 and lz["gb"] == oomph.NO_MEM_GB and oomph.no_memory(lz) and dz.get("pool") == SCR
+          and dz.get("name") == "Scratch" and dz.get("got") == 20.0 and lz.get("base", {}).get("free_gb") == 912.4
+          and "Write at most 20 GB to Scratch" in g["advice"],
+          "disk: 20 GB on the Scratch volume, named by its pool id, granted in full; gb only the mirror (%s)"
+          % g.get("advice", "")[:60])
+    check(g.get("available", {}).get("disk_gb", {}).get(SCR) == round(912.4 - 25 - 20, 1)
+          and g.get("available", {}).get("disk_gb", {}).get("data") == 15.0,
+          "disk: the answer says what is left to reserve on each pool: free − margin − what grants have not "
+          "written (%s)" % g.get("available"))
+    check([r.get("res") for r in b2recs(g["id"]) if r.get("event") == "grant"] == [{"disk": 20.0, "disk_pool": SCR}]
+          and lz["segments"][0].get("res") == {"disk": 20.0},
+          "disk: the grant record and the segment carry the disk part and its pool")
+    # refusals: beyond free − margin, an ignored volume, a machine that lists no volumes; nothing written
+    n0 = len(oomph.read_ledger()["leases"])
+    r1 = oomph.reserve(0, "too big", H2[1], disk=16, disk_path="/tmp/b2-data")
+    r2 = oomph.reserve(0, "on an image", H2[1], disk=1, disk_path="/tmp/b2-image")
+    oomph.disk_reservable = lambda: False
+    r3 = oomph.reserve(1, "elsewhere", H2[1], disk=1)
+    oomph.disk_reservable = lambda: True
+    check(r1["status"] == r2["status"] == r3["status"] == "refused" and "at most 15 GB can be reserved there"
+          in r1["advice"] and "disk image" in r2["advice"] and "list its volumes" in r3["advice"]
+          and len(oomph.read_ledger()["leases"]) == n0,
+          "disk: refused beyond free − margin (40 − 25), on a volume the logger ignores (with the reason), and where "
+          "volumes are not listed; nothing written (%s)" % [r1["advice"][:40], r2["advice"][:40]])
+    # too little to keep (rounds to 0.00), a pool id the ledger cannot keep: refused, so nothing jams the line
+    t1 = oomph.reserve(0, "tiny", H2[1], disk=0.004, disk_path="/tmp/b2-scratch")
+    B2_PATHS["/tmp/b2-odd"] = dict(B2_SCR, id="mnt:/Volumes/My Disk")
+    b2["disks"].append(dict(B2_SCR, id="mnt:/Volumes/My Disk", name="My Disk"))
+    t2 = oomph.reserve(0, "odd id", H2[1], disk=1, disk_path="/tmp/b2-odd")
+    saved_rd = oomph._refuse_disk
+    oomph._refuse_disk = lambda *a: None  # the backstop: a lease the reader could not weigh is never written
+    t3 = oomph.reserve(0, "odd id, unchecked", H2[1], disk=1, disk_path="/tmp/b2-odd")
+    oomph._refuse_disk = saved_rd
+    t4 = oomph.reserve(1, "memory after", H2[1])
+    check(t1["status"] == t2["status"] == t3["status"] == "refused" and "0.01" in t1["advice"] and "no id" in t2["advice"]
+          and "weigh" in t3["advice"] and t4["status"] == "granted" and len(oomph.read_ledger()["leases"]) == n0 + 1,
+          "disk: 0.004 GB, a pool whose id the ledger cannot keep: refused, nothing written; memory after them is "
+          "granted (%s)" % [t1.get("advice", "")[:50], t2.get("advice", "")[:50], t3.get("advice", "")[:50]])
+    oomph.release(t4.get("id", "r0"))
+    b2["disks"].pop()
+    # admission per pool: a request short of space waits and holds up only that pool
+    a = oomph.reserve(0, "first on data", H2[1], disk=10, disk_path="/tmp/b2-data")
+    b = oomph.reserve(0, "second on data", H2[1], disk=10, disk_path="/tmp/b2-data")
+    m = oomph.reserve(1, "memory meanwhile", H2[2])
+    c3 = oomph.reserve(0, "small, behind it", H2[2], disk=3, disk_path="/tmp/b2-data")
+    sc = oomph.reserve(0, "other volume", H2[2], disk=3, disk_path="/tmp/b2-scratch")
+    check(a["status"] == "granted" and b["status"] == "queued" and b.get("waiting_on") == ["disk:data"]
+          and "5.0 GB can be reserved there" in b["advice"] and m["status"] == "granted" and c3["status"] == "queued"
+          and c3.get("waiting_on") == ["disk:data"] and sc["status"] == "granted",
+          "disk: 10 + 10 GB on a pool with 15 to reserve: the second waits for disk:data; memory and another volume "
+          "pass it, a smaller request on the same pool does not (%s)" % [b.get("waiting_on"), c3.get("waiting_on")])
+    rel = oomph.release(a["id"])
+    check(b2l(b["id"]).get("state") == b2l(c3["id"]).get("state") == "granted" and b["id"] in rel["next_granted"],
+          "disk: a release hands the space to those in line, in their order (%s)" % rel["next_granted"])
+    b2_clear()
+    # the shared drop (02 §6.3): Σ used over a pool never exceeds what the pool lost; no credit without own writes
+    now = time.time()
+    t0 = now - 60
+
+    def b2lease(rid, watch, got, gt):
+        return {"id": rid, "state": "granted", "gb": oomph.NO_MEM_GB, "v": 2, "watch": watch, "granted": gt,
+                "res": {"disk": {"ask": got, "got": got, "pool": SCR, "used": 0.0, "peak": 0.0, "w": 0.0, "wt": gt}},
+                "base": {"free_gb": 912.4}}
+    procs2 = {11: {"pid": 11, "ppid": 1}, 12: {"pid": 12, "ppid": 1, "w": 512.0}, 13: {"pid": 13, "ppid": 12, "w": 0.0}}
+    L2 = {"leases": [b2lease("ra", 11, 20.0, t0), b2lease("rb", 12, 20.0, t0 + 1)]}
+    s2 = dict(b2, disks=[dict(B2_DATA), dict(B2_SCR, free_gb=882.4)])
+    oomph._charge_disk(L2, s2, procs2, oomph._children(procs2), now)
+    da, db = (x["res"]["disk"] for x in L2["leases"])
+    check(da["used"] == 0.0 and da["w"] == 0.0 and db["w"] == 29.5 and db["used"] == 20.0 and db["peak"] == 20.0,
+          "disk: the pool lost 30 GB; a grant whose tree wrote nothing is charged nothing, the writer its 20 "
+          "(%s, %s)" % (da, db))
+    procs2[11]["w"] = 512.0
+    for x in L2["leases"]:
+        x["res"]["disk"].update(w=0.0, wt=t0 + 1)
+    oomph._charge_disk(L2, s2, procs2, oomph._children(procs2), now)
+    da, db = (x["res"]["disk"] for x in L2["leases"])
+    view2 = oomph.disk_view(s2, L2["leases"])[0][SCR]
+    check(da["used"] + db["used"] == 30.0 and da["used"] == 20.0 and round(view2["left"], 1) == 847.4,
+          "disk: both wrote 30 GB, the pool lost 30: Σ used is 30, never 60, and what is left counts the 10 "
+          "not yet written (%s, %s)" % (da.get("used"), db.get("used")))
+    # the refresh child (the logger's rates): it charges a grant's writes; the snapshot carries the disk part
+    gd = oomph.reserve(0, "writes", H2[0], disk=5, disk_path="/tmp/b2-scratch")
+    procs_b2 = P.collect_procs()
+    payload = json.dumps({"v": 2, "s": dict(b2, t=time.time()), "procs": [
+        dict({k: x[k] for k in oomph.PROC_KEYS if k in x}, **({"cpu": 0.5, "w": 100.0} if x["pid"] == H2[0]["pid"] else {}))
+        for x in procs_b2.values()]}, default=str)
+    time.sleep(0.25)
+    rr = subprocess.run([sys.executable, "-I", "-B", oomph.__file__, "_ledger-refresh"], input=payload,
+                        capture_output=True, text=True, env=dict(os.environ), timeout=60)
+    snap = [x for x in json.loads(rr.stdout or "{}").get("leases") or [] if x.get("id") == gd.get("id")]
+    dd = b2l(gd.get("id")).get("res", {}).get("disk", {})
+    check(rr.returncode == 0 and dd.get("w", 0) > 0 and dd.get("wt", 0) > dd.get("w", 0) and snap and snap[0].get("disk") == 5.0
+          and snap[0].get("disk_pool") == SCR and "disk_used" in snap[0],
+          "disk: the refresh child counts the tree's writes from the logger's rates; the sample's lease carries "
+          "the disk, its pool and its use (%s, %s)" % (dd, rr.stderr[-200:]))
+    check(oomph.sample_leases([{"id": "r1", "state": "granted", "gb": 0.0, "disk": 5.0, "disk_pool": "vol:\x1b[2J"},
+                               {"id": "r2", "state": "granted", "gb": 0.0, "disk": 5.0, "disk_pool": "x" * 81}])
+          == [{"id": "r1", "state": "granted", "gb": 0.0, "purpose": "?", "project": None, "disk": 5.0},
+              {"id": "r2", "state": "granted", "gb": 0.0, "purpose": "?", "project": None, "disk": 5.0}],
+          "disk: a pool id from the shared ledger reaches the sample only as printable text of at most 80")
+    b2_clear()
+    # volume_gone: unplugged, the reservation ends; remounted in time (even at another mount point), it stays
+    oomph.VOLUME_GONE_S = 1.0
+    v1 = oomph.reserve(0, "on the volume", H2[0], disk=20, disk_path="/tmp/b2-scratch")
+    b2["disks"] = [dict(B2_DATA)]  # unplugged
+    oomph.reserve(0.5, "someone evaluates", H2[1])
+    miss = b2l(v1["id"]).get("res", {}).get("disk", {}).get("missing")
+    b2["disks"] = [dict(B2_DATA), dict(B2_SCR, mount="/Volumes/Scratch 1")]  # back, at another mount point
+    time.sleep(1.1)
+    oomph.reserve(0.5, "someone evaluates", H2[1])
+    lv = b2l(v1["id"])
+    check(miss and lv.get("state") == "granted" and "missing" not in lv["res"]["disk"],
+          "volume_gone: a pool missing from the logger's list is marked; back in time (another mount point, the same "
+          "id) the reservation stays and the mark is cleared")
+    for partial in ({"disks": [dict(B2_DATA)], "disks_partial": True}, {"disks": None}):
+        b2.update(partial)
+        oomph.reserve(0.5, "someone evaluates", H2[1])
+    b2.pop("disks_partial", None)
+    check("missing" not in b2l(v1["id"]).get("res", {}).get("disk", {"missing": 1}),
+          "volume_gone: a sample without a list of every pool (the system's pool alone, or none) says nothing is gone")
+    b2["disks"] = [dict(B2_DATA)]
+    oomph.reserve(0.5, "someone evaluates", H2[1])
+    m1 = b2l(v1["id"]).get("res", {}).get("disk", {}).get("missing")
+    time.sleep(1.2)  # nothing evaluated for longer than the grace (the Mac slept): it starts again
+    oomph.reserve(0.5, "someone evaluates", H2[1])
+    lw = b2l(v1["id"])
+    check(m1 and lw.get("state") == "granted" and lw["res"]["disk"].get("missing", 0) > m1,
+          "volume_gone: after a gap in evaluating longer than the grace (a sleep), the grace starts again")
+    for _ in range(3):
+        time.sleep(0.4)
+        oomph.reserve(0.5, "someone evaluates", H2[1])
+    ends = [r for r in b2recs(v1["id"]) if r.get("event") == "end"]
+    gone = oomph._status(oomph.read_ledger(), v1["id"], time.time())
+    check(not b2l(v1["id"]) and ends and ends[-1].get("outcome") == "volume_gone"
+          and ends[-1].get("res") == {"disk": 20.0, "disk_pool": SCR} and gone.get("outcome") == "volume_gone",
+          "volume_gone: unplugged for longer, the reservation ends with outcome volume_gone, its vector in the end "
+          "record (%s)" % (ends[-1].get("outcome") if ends else None))
+    oomph.VOLUME_GONE_S = saved_b2[5]
+    b2_clear()
+    # amend per resource: shrink at once, grow only if it fits with nobody queued for the pool, drop, refuse
+    g1 = oomph.reserve(0, "amend me", H2[0], disk=10, disk_path="/tmp/b2-data")
+    sh = oomph.amend(g1["id"], disk=4)
+    qd = oomph.reserve(0, "waits for data", H2[1], disk=12, disk_path="/tmp/b2-data")
+    gr = oomph.amend(g1["id"], disk=6)
+    check(sh.get("changed", {}).get("disk") == [10.0, 4.0] and b2l(g1["id"])["res"]["disk"]["got"] == 4.0
+          and qd["status"] == "queued" and gr["status"] == "refused" and "queued" in gr["advice"]
+          and b2l(g1["id"])["res"]["disk"]["got"] == 4.0,
+          "amend: shrinking disk space applies at once; growing while a request for that pool waits is refused "
+          "(%s)" % [sh.get("changed"), gr["status"]])
+    dr = oomph.amend(g1["id"], disk=0)
+    both = oomph.reserve(1, "memory and disk", H2[2], disk=2, disk_path="/tmp/b2-scratch")
+    nod = oomph.amend(both["id"], disk=0)
+    old = oomph.reserve(0.5, "memory alone", H2[2])
+    add = oomph.amend(old["id"], disk=2)
+    check(dr["status"] == "refused" and "release it instead" in dr["advice"] and nod.get("changed", {}).get("disk")
+          == [2.0, 0] and "disk" not in b2l(both["id"])["res"] and b2l(both["id"])["gb"] == 1
+          and add["status"] == "refused" and "separately" in add["advice"] and "res" not in b2l(old["id"]),
+          "amend: a reservation of disk alone cannot drop it; one with memory can; one of memory alone takes none")
+    b2_clear()
+    both = oomph.reserve(1, "memory and disk", H2[2], disk=2, disk_path="/tmp/b2-scratch")
+    tiny = oomph.amend(both["id"], disk=0.004)
+    outs = []
+    for x in ("4M", "0M"):
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            outs.append(oomph.main(["amend", both["id"], "--disk", x]))
+    check(tiny["status"] == "refused" and b2l(both["id"])["res"].get("disk", {}).get("ask") is None and outs == [2, 0],
+          "amend: 0.004 GB of disk is refused, not kept as none; `--disk 4M` is a usage error, `--disk 0M` drops it "
+          "(%s, %s)" % (tiny.get("advice", "")[:50], outs))
+    b2_clear()
+    both = oomph.reserve(1, "memory and disk", H2[2], disk=2, disk_path="/tmp/b2-scratch")
+    nom = oomph.amend(both["id"], gb=0)
+    lb = b2l(both["id"])
+    check(nom.get("changed", {}).get("gb") == [1, 0] and lb["gb"] == oomph.NO_MEM_GB and "ram" not in lb["res"]
+          and lb["segments"][-1].get("res") == {"disk": 2.0}, "amend: a reservation with disk space can drop its memory")
+    b2_clear()
+    # weighing: a disk part this code cannot read holds the line, as a later writer's lease does
+    check(not oomph.weighable({"v": 2, "gb": 0.01, "state": "queued", "res": {"disk": {"ask": 5}}})
+          and oomph.weighable({"v": 2, "gb": 0.01, "state": "queued", "res": {"disk": {"ask": 5, "pool": "data"}}})
+          and oomph.lease_need({"v": 2, "gb": 0.01, "res": {"disk": {"ask": 5, "pool": "data"}}}) == {"disk:data": (5, 5)},
+          "disk: a lease's disk part needs its pool to be weighed; it asks for disk:<pool id>")
+    # oomph run --disk: OOMPH_DISK_GB, the history keeps the disk part
+    out_f = os.path.join(LOG, "b2-run.txt")
+    rc = oomph.main(["run", "--disk", "2G@/tmp/b2-scratch", "--for", "b2 run", "--", "/bin/sh", "-c",
+                     'echo "$OOMPH_DISK_GB $OOMPH_RESERVATION" > ' + out_f])
+    words = open(out_f).read().split() if os.path.exists(out_f) else []
+    check(rc == 0 and words[:1] == ["2"] and not oomph.read_ledger()["leases"]
+          and oomph.read_ledger()["history"][-1].get("res") == {"disk": 2.0, "disk_pool": SCR},
+          "oomph run --disk 2G@PATH: the grant in OOMPH_DISK_GB; released afterwards, its history keeps the disk (%s)" % words)
+    # the CLI: what is not a disk size is refused, a new volume on amend too
+    for args in (["reserve", "--disk", "lots", "--for", "x"], ["reserve", "--disk", "20G@", "--for", "x"],
+                 ["amend", "r1", "--disk", "5G@/tmp"], ["run", "--disk", "0G", "--", "/usr/bin/true"]):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = oomph.main(args)
+        check(rc == 2 and "usage: oomph %s" % args[0] in err.getvalue(), "strict: `oomph %s` exits 2 (%s)" % (
+            " ".join(args), (err.getvalue().splitlines() or [rc])[0]))
+    out = io.StringIO()
+    with redirect_stdout(out):
+        rc = oomph.main(["reserve", "--disk", "3G@/tmp/b2-scratch", "--for", "cli disk", "--json"])
+    cl = json.loads(out.getvalue() or "{}")
+    out2 = io.StringIO()
+    with redirect_stdout(out2):
+        oomph.main(["reservations"])
+    oomph.release(cl.get("id", "r0"))
+    check(rc == 0 and cl.get("granted") == {"disk_gb": 3.0} and "3.0G on Scratch" in out2.getvalue(),
+          "oomph reserve --disk 3G@PATH --json: granted; `oomph reservations` shows the disk and its volume")
+    b2_clear()
+    # MCP: the tools take disk_gb and disk_path
+    tl = {t["name"]: t for t in oomph.MCP_TOOLS}
+    check({"disk_gb", "disk_path"} <= set(tl["reserve_memory"]["inputSchema"]["properties"])
+          and "disk_gb" in tl["update_reservation"]["inputSchema"]["properties"]
+          and "disk" in tl["reservation_history"]["inputSchema"]["properties"]["resource"]["enum"],
+          "MCP: reserve_memory takes disk_gb and disk_path, update_reservation disk_gb, the history resource disk")
+    mc = oomph._mcp_call("reserve_memory", {"purpose": "mcp disk", "disk_gb": 4, "disk_path": "/tmp/b2-scratch", "wait_s": 0})
+    mu = oomph._mcp_call("update_reservation", {"id": mc.get("id", "r0"), "disk_gb": 3})
+    mh = oomph._mcp_call("reservation_history", {"resource": "disk", "hours": 1})
+    mr = oomph._mcp_call("reservations", {})
+    check(mc.get("status") == "granted" and mc.get("granted") == {"disk_gb": 4.0} and mu.get("changed", {}).get("disk")
+          == [4.0, 3.0] and mr.get("disk", {}).get(SCR, {}).get("reserved") == 3.0
+          and mc["id"] in [x["id"] for x in mh["reservations"]] and all("disk" in x.get("res", {}) for x in mh["reservations"]),
+          "MCP: reserve_memory with disk_gb, update_reservation, reservations (by pool) and the history by resource")
+    oomph._mcp_call("release_memory", {"id": mc.get("id", "r0")})
+    bad = []
+    for a2 in ({"purpose": "x", "disk_path": "/tmp"}, {"purpose": "x", "disk_gb": "5"}, {"purpose": "x", "disk_gb": 0},
+               {"purpose": "x", "disk_gb": 2, "disk_path": 5}, {"purpose": "x", "disk_gb": 0.004}):
+        try:
+            oomph._mcp_args("reserve_memory", a2)
+        except oomph.ToolArgError as e:
+            bad.append(str(e))
+    try:
+        oomph._mcp_args("update_reservation", {"id": "r1", "disk_gb": 0.004})
+    except oomph.ToolArgError as e:
+        bad.append(str(e))
+    check(len(bad) == 6, "MCP: reserve_memory refuses a path without disk_gb, a disk_gb that is not a number, 0 or "
+          "below 0.01, a path that is not text; update_reservation a disk_gb below 0.01 (%d of 6)" % len(bad))
+    b2_clear()
+    # resources: disks are reservable, with what is reserved and left
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        oomph.main(["resources", "--json"])
+    rj = json.loads(buf.getvalue())
+    check("disk" in rj["reservable"] and all(d["reservable"] for d in rj["disks"])
+          and {"left_gb", "reserved_gb", "margin_gb"} <= set(rj["disks"][0]),
+          "oomph resources --json: disks are reservable, each with what is reserved and left (%s)" % rj["disks"][:1])
+    # without the logger's list: `oomph reservations` reads every pool live; check and the hook never do (02 §7.4)
+    held = oomph.reserve(0, "held for the hook", H2[0], disk=2, disk_path="/tmp/b2-scratch")
+    asked = []
+    oomph.live_volumes = lambda: (asked.append(1), (json.loads(json.dumps([B2_DATA, B2_SCR])), []))[1]
+    b2["disks"] = None
+    oomph.checked_verdict(s=oomph._sample_override())
+    n_check = len(asked)
+    cz = oomph.coordination(me["pid"])
+    check(held["status"] == "granted" and n_check == 0 and len(asked) == 1 and SCR in cz.get("disk", {}),
+          "disk: without the logger's list, check and the hook read no volume; `oomph reservations` reads them live "
+          "(%s, %s)" % (n_check, len(asked)))
+    b2_clear()
+finally:
+    for x in b2sl:
+        x.kill()
+        x.wait()
+    (oomph.LEDGER_DIR, os.environ["OOMPH_LEDGER_DIR"], oomph.disk_reservable, oomph.disk_pool_of, oomph.live_volumes,
+     oomph.VOLUME_GONE_S) = saved_b2
+    oomph._sample_override = None
+
+if MAC:  # the real mount table: any path names its volume; the system's pool and what the logger ignores
+    s_ = oomph.live_sample(with_procs=False)
+    pd, _, _ = oomph.disk_pool_of(tempfile.gettempdir(), s_)
+    _, why_dev, _ = oomph.disk_pool_of("/dev", s_)
+    _, why_no, _ = oomph.disk_pool_of("/nonexistent-oomph-path", s_)
+    pn, _, _ = oomph.disk_pool_of(os.path.join(tempfile.gettempdir(), "oomph-not-made-yet", "out"), s_)
+    _, why_vol, _ = oomph.disk_pool_of("/Volumes/oomph-no-such-volume/out", s_)
+    check(pn and pn["id"] == "data" and "No such file" in (why_vol or ""),
+          "disk: a folder not made yet is on the volume of the nearest one above it; a volume that is not there is "
+          "not the startup disk (%s)" % why_vol)
+    check(oomph.disk_reservable() and pd and pd["id"] == "data" and oomph._num(pd["free_gb"], 0)
+          and "part of the system" in (why_dev or "") and "No such file" in (why_no or ""),
+          "disk: on this Mac the temporary folder is on the system's pool; /dev is ignored, with the reason (%s)" % why_dev)
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,

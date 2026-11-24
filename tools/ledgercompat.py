@@ -20,6 +20,8 @@ process next to this checkout's, on one ledger directory, in both directions:
   A2 1.9.1 (1.8.4 to 1.9.1 validate leases) on the same v2 ledger, when the tag is in this clone: it
      keeps the v2 fields but drops a lease without memory (gb 0) and the `res` of each segment when
      it writes; pinned, for B1. (CI clones have tags up to v1.8.4 only: A2 runs locally.)
+  F  a disk request (B2, 1.12.1) on a pool id: 1.8.1 keeps its fields; a 1.12.0 client (with the tag)
+     cannot weigh it and waits behind it, and the next refresh here grants that client's request.
   C  1.8.1's own files: this code reads them, makes a memory vector of an old lease without
      writing one, and writes back what 1.8.1 writes plus `agent` (D11) and, from 1.9.4 (L1), `user`
      and the holder's uid (03 §6.5); 1.8.1 reads that back.
@@ -482,6 +484,56 @@ else:
           "E the next refresh grants the old client's request on its behalf; the cores request still waits (%s)"
           % again.get("status"))
 new.release("all", ME)
+
+# ======================================= F: disk space (B2, 1.12.1): a disk request old code cannot weigh
+d = use("f")
+POOL = {"id": "data", "name": "Data", "mount": "/nonexistent-ledgercompat", "dev": "disk3", "total_gb": 994.7,
+        "free_gb": 40.0, "low_gb": 20, "crit_gb": 5, "watch": True}  # 40 free, 25 kept back: 15 can be reserved
+saved_f = (new.disk_reservable, new.disk_pool_of, new._sample_override)
+new.disk_reservable = lambda: True
+new.disk_pool_of = lambda path, s: (dict(POOL), None, None)
+new._sample_override = lambda: dict(SAMPLE, disks=[dict(POOL)])
+try:
+    held = new.reserve(0, "disk, 10", HOLDER, disk=10)
+    waits = new.reserve(0, "disk, 10 more", HOLDER, disk=10)
+    L0 = raw(d)
+    check(held.get("status") == "granted" and waits.get("status") == "queued" and waits.get("waiting_on") == ["disk:data"]
+          and lease(L0, waits["id"]).get("v") == 2 and lease(L0, waits["id"])["gb"] == new.NO_MEM_GB
+          and lease(L0, held["id"])["res"]["disk"]["pool"] == "data",
+          "F this code writes a disk request as a vector lease on its pool id, and the second waits for disk:data")
+    st = quietly(old.reserve, 0.5, "1.8.1 client", HOLDER)
+    L1 = raw(d)
+    ok, bad = True, []
+    for rid in (held["id"], waits["id"]):
+        x, y = lease(L0, rid), lease(L1, rid)
+        bad += [k for k in ("res", "v", "base") if (x or {}).get(k) != (y or {}).get(k)]
+    check(isinstance(st, dict) and not bad, "F 1.8.1 on a ledger with disk leases keeps their res, v and base (%s)"
+          % (bad or (st.get("status") if isinstance(st, dict) else repr(st))))
+    new.release("all", ME)
+    b12 = old_module("v1.12.0")  # cores, not disk: it cannot weigh a disk request, so its own requests wait behind one
+    if b12 is None:
+        print("skip  F a 1.12.0 client behind a disk request: tag v1.12.0 is not in this clone")
+    else:
+        b12._plat = Procs
+        b12._sample_override = lambda: dict(SAMPLE)
+        b12.LEDGER_DIR = d
+        held = new.reserve(0, "disk, 10", HOLDER, disk=10)
+        waits = new.reserve(0, "disk, 10 more", HOLDER, disk=10)
+        stuck = b12.reserve(0.5, "a 1.12.0 client", HOLDER)
+        check(waits.get("status") == "queued" and stuck.get("status") == "queued" and lease(raw(d), waits["id"]).get("v") == 2,
+              "F 1.12.0 cannot weigh the disk request that waits, so its own memory request waits behind it")
+        new.refresh_ledger(dict(SAMPLE, disks=[dict(POOL)]), Procs.collect_procs())
+        again = b12.reserve(0.5, "a 1.12.0 client", HOLDER, ticket=stuck["id"])
+        check(again.get("status") == "granted" and lease(raw(d), waits["id"])["state"] == "queued",
+              "F the next refresh here grants the 1.12.0 client's request; the disk request still waits (%s)"
+              % again.get("status"))
+        new.release(held["id"])
+        x = lease(raw(d), waits["id"])
+        check(x and x["state"] == "granted" and x.get("res_granted") and x["res"]["disk"]["got"] == 10,
+              "F and the disk request is granted by this code once the space is there")
+    new.release("all", ME)
+finally:
+    new.disk_reservable, new.disk_pool_of, new._sample_override = saved_f
 
 # ======================================= D: the normaliser, on v2 fields anyone could have planted
 base = {"id": "r30", "state": "granted", "gb": 1.0, "purpose": "p", "holder": {"pid": ME, "start": START},

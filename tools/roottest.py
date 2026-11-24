@@ -272,6 +272,24 @@ check(sys.platform != "darwin" or ((cur.get("pools") or {}).get("cpu") or {}).ge
       "cores: the logger as root writes pools.cpu into current.json (%s)" % (cur.get("pools") or {}).get("cpu"))
 no_hits("cores")
 
+# 1c. disk space (1.12.1): the path is resolved to its pool in the child, as the user; root opens nothing in the ledger
+p = case("disk")
+with Watch():
+    tick()
+    rd_ = cli("reserve", "--disk", "1G@" + base, "--for", "roottest disk", "--json")
+    tick()
+    s, dt, ran = tick()
+    got = json.loads(rd_[1] or "{}")
+    if got.get("id"):
+        cli("release", got["id"], "--json")
+granted = got.get("status") == "granted" and (got.get("asked") or {}).get("disk") == "data" and \
+    [(x.get("disk"), x.get("disk_pool")) for x in s.get("leases", [])] == [(1.0, "data")]
+short = got.get("status") == "refused" and "can be reserved there" in got.get("advice", "")  # a runner's full disk
+check(rd_[0] in (0, 75) and (granted or short),
+      "disk: `oomph reserve --disk 1G@PATH` as root names the system's pool, decided in a child; the sample carries it "
+      "(%s)" % [rd_[0], got.get("status"), got.get("asked"), rd_[2][-200:]])
+no_hits("disk")
+
 # 2. symbolic links planted at ledger.json and reservations.jsonl, to files only root may read and write
 p = case("symlink")
 secret = victim("root-ledger", json.dumps({"seq": 7, "history": [], "leases": [

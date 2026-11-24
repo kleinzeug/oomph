@@ -52,6 +52,7 @@ import time
 
 OS = "macos"
 RESERVES_CPU = True  # cores can be reserved here (1.12.0): a backend opts in on purpose, with its margins
+RESERVES_DISK = True  # and disk space on a volume (1.12.1), by the pool ids of disk_pools
 MB = 1024 * 1024
 GB = 1024 * MB
 
@@ -567,7 +568,8 @@ def volume_facts(dev):
     """What diskutil says about a device (`/dev/disk7s1`), FACT_KEYS only, plus `pool_uuid`: the
     APFS container's DiskUUID (one more call per container), else the volume's UUID. 120 to 600 ms a
     call, so the logger asks once per newly seen mount, off the sampling path. Called only for names
-    of the form /dev/diskN[sN…]: whoever mounts chooses that string (02 §4.4). None if diskutil failed."""
+    of the form /dev/diskN[sN…]: whoever mounts chooses that string (02 §4.4). None if diskutil
+    failed, for the volume or for its container."""
     m = _DISK_DEV.fullmatch(dev or "")
     if not m:
         return None
@@ -579,7 +581,9 @@ def volume_facts(dev):
     cont = f.get("APFSContainerReference")
     if isinstance(cont, str) and re.fullmatch(r"disk\d+", cont):
         c = _diskutil(cont)
-        uuid = c.get("DiskUUID") if c else None
+        if c is None:  # failed as a whole, not the volume's UUID instead: a pool's id never changes while mounted
+            return None
+        uuid = c.get("DiskUUID")
     f["pool_uuid"] = uuid if isinstance(uuid, str) else f.get("VolumeUUID") or f.get("DiskUUID")
     return f
 
@@ -604,6 +608,12 @@ def _pool_dev(rec):
     if not m:
         return None
     return re.match(r"disk\d+", m.group(1)).group(0) if rec.get("fs") == "apfs" else m.group(1)
+
+
+def mount_id(mount):
+    """The pool id of a volume without a UUID: `mnt:` and 16 hex digits of its mount point's SHA-256,
+    printable and short whatever the mount point holds (spaces, any script, any length)."""
+    return "mnt:" + hashlib.sha256(mount.encode("utf-8", "surrogateescape")).hexdigest()[:16]
 
 
 def _backup(rec, facts):
@@ -653,8 +663,9 @@ def disk_pools(recs, facts):
     dict for one that failed; absent: not asked yet). Rows: every mount with its class and reason.
     Pools: the system's pool (`data`: the container of /System/Volumes/Data, which holds home, the
     temporary folders and swap), watched, with its floors and level; then every listed pool, by the
-    APFS container's or the volume's UUID (`vol:<UUID>`), or `mnt:<mount point>` and `weak` without
-    one. The free space is what df shows (purgeable space is not counted)."""
+    APFS container's or the volume's UUID (`vol:<UUID>`), or `mnt:` and a hash of the mount point and
+    `weak` without one (an id is printable and at most 80 characters: the ledger keeps it). The free
+    space is what df shows (purgeable space is not counted)."""
     by_dev = {r["dev"]: r for r in recs}
     data_rec = next((r for r in recs if r["mount"] == "/System/Volumes/Data"), None) or \
         next((r for r in recs if r["mount"] == "/"), None)
@@ -679,7 +690,8 @@ def disk_pools(recs, facts):
                          or r["mount"]))
         if cls == "listed" and pool not in listed:
             uuid = (f or {}).get("pool_uuid")
-            p = {"id": "vol:" + uuid if uuid else "mnt:" + r["mount"], "name": rows[-1]["name"][:64],
+            uuid = uuid if isinstance(uuid, str) and re.fullmatch(r"[0-9A-Za-z-]{1,64}", uuid) else None
+            p = {"id": "vol:" + uuid if uuid else mount_id(r["mount"]), "name": rows[-1]["name"][:64],
                  "mount": r["mount"], "dev": pool, "fs": r["fs"], "total_gb": r["total_gb"], "free_gb": r["free_gb"],
                  "roles": sorted(roles.get(pool, ())), "kind": kind, "watch": False}
             if not uuid:
