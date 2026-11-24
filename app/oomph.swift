@@ -4278,6 +4278,9 @@ struct PopoverView: View {
             if tourStep != nil && store.machinesUI { Color.clear.frame(height: 34) }
         }
         .frame(width: popupWidth)
+        // taller than its content only while the panel animates down to it: the content stays at the top
+        // (and the panel, not AppKit's layout, decides when the window shrinks); a render keeps its own size
+        .frame(maxHeight: renderMode ? nil : .infinity, alignment: .top)
         .onChange(of: tourStep == nil) { _, _ in store.onResize?() }
         .sheet(isPresented: Binding(get: { store.connectShown && connectAsSheet && !renderMode },
                                     set: { if !$0 { store.connectShown = false } })) {
@@ -7499,6 +7502,17 @@ var connectAsSheet: Bool { UserDefaults.standard.bool(forKey: "connectSheet") }
 
 // MARK: - App delegate / status item
 
+/// The popup's SwiftUI content, which tells the panel when its ideal size changes (a click on a tile, the
+/// history arriving, a reservation coming or going), so the panel follows it at once and in step with the
+/// content's own animation, instead of at the next open, click or tick.
+final class PopupHostingView: NSHostingView<PopoverView> {
+    var onSizeChange: (() -> Void)?
+    override func invalidateIntrinsicContentSize() {
+        super.invalidateIntrinsicContentSize()
+        onSizeChange?()
+    }
+}
+
 /// Borderless panel used instead of NSPopover, positioned explicitly below the status item.
 final class PopupPanel: NSPanel {
     override var canBecomeKey: Bool { true }
@@ -7514,7 +7528,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     let store = Store()
     var item: NSStatusItem!
     var panel: PopupPanel!
-    var hosting: NSHostingView<PopoverView>!
+    var hosting: PopupHostingView!
+    /// A size change waits for the end of SwiftUI's pass (coalesced); the frame the panel is moving to;
+    /// the compact level being searched (each step changes the size: only its end places the panel).
+    var sizePending = false
+    var frameTarget: NSRect?
+    var choosingLevel = false
     var timer: Timer?
     var clickMonitor: Any?
     var lastClose = Date.distantPast
@@ -7550,7 +7569,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         fx.wantsLayer = true
         fx.layer?.cornerRadius = 10
         fx.layer?.masksToBounds = true
-        hosting = NSHostingView(rootView: PopoverView(store: store))
+        hosting = PopupHostingView(rootView: PopoverView(store: store))
+        hosting.onSizeChange = { [weak self] in self?.sizeChanged() }
         hosting.translatesAutoresizingMaskIntoConstraints = false
         fx.addSubview(hosting)
         NSLayoutConstraint.activate([
@@ -7562,9 +7582,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         store.local.loadIncidents()
         updateIcon()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.tick() }
-        store.onResize = { [weak self] in DispatchQueue.main.async { if self?.isShown == true { self?.position() } } }
+        store.onResize = { [weak self] in DispatchQueue.main.async { if self?.isShown == true { self?.position(animated: true) } } }
+        // the size follows by itself (sizeChanged); a compact popup searches its level again, as a smaller
+        // selection may fit a roomier level
         store.onSelectionChanged = { [weak self] in
-            DispatchQueue.main.async { if let self, self.isShown { self.chooseLevel(); self.position() } }
+            DispatchQueue.main.async { if let self, self.isShown, self.store.compactLevel > 0 { self.chooseLevel(animated: true) } }
         }
         store.onPlusMoved = { [weak self] in
             guard let self, let p = self.popover, p.isShown else { return }
@@ -7603,7 +7625,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
     func tick() {
         store.local.refreshCurrent()
         store.local.loadIncidents()
-        if isShown { store.machine.reloadPoints(); DispatchQueue.main.async { self.position() } }
+        if isShown { store.machine.reloadPoints(); DispatchQueue.main.async { self.position(animated: true) } }
         updateIcon()
     }
 
@@ -7679,9 +7701,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         }
     }
 
+    /// The content's ideal size changed: once SwiftUI has finished this pass, the panel takes the new size,
+    /// animated like the content (a click on a tile animates both for 0.2 s, its top edge staying put). Too tall
+    /// for the screen, a popup with the resources on goes to its next compact level instead.
+    func sizeChanged() {
+        guard !sizePending else { return }
+        sizePending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sizePending = false
+            guard self.isShown, !self.choosingLevel else { return }
+            if resourcesUIOn, self.store.compactLevel < 5, let room = self.room(),
+               self.hosting.fittingSize.height > room {
+                self.chooseLevel(from: self.store.compactLevel + 1, animated: true)
+            } else {
+                self.position(animated: true)
+            }
+        }
+    }
+
+    /// The height the popup may take on the screen of the status item: from just below the menu bar down.
+    func room() -> CGFloat? {
+        guard let button = item.button, let win = button.window else { return nil }
+        let screen = win.screen ?? NSScreen.main!
+        let r = win.convertToScreen(button.convert(button.bounds, to: nil))
+        return min(r.minY, screen.visibleFrame.maxY) - 4 - screen.visibleFrame.minY - 6
+    }
+
     /// Place the panel directly under the status item, top edge just below the menu bar,
-    /// clamped to the visible area of the screen the icon is on.
-    func position() {
+    /// clamped to the visible area of the screen the icon is on. Animated: a panel on screen moves to the new
+    /// frame in 0.2 s (none with reduced motion); the frame it is already moving to is left alone.
+    func position(animated: Bool = false) {
         guard let button = item.button, let win = button.window else { return }
         let r = win.convertToScreen(button.convert(button.bounds, to: nil))
         let screen = win.screen ?? NSScreen.main!
@@ -7692,23 +7742,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         var x = r.midX - size.width / 2
         x = max(vis.minX + 6, min(x, vis.maxX - size.width - 6))
         let y = max(vis.minY + 6, top - size.height)
-        panel.setFrame(NSRect(x: x, y: y, width: size.width, height: min(size.height, top - vis.minY - 6)), display: true)
+        let frame = NSRect(x: x, y: y, width: size.width, height: min(size.height, top - vis.minY - 6))
+        let smooth = animated && isShown && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        if smooth && frame == frameTarget { return }
+        frameTarget = frame
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = smooth ? 0.2 : 0
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            panel.animator().setFrame(frame, display: true)
+        }
     }
 
     /// The compact level (roadmap 02 §3.7.5): the first whose popup fits the screen's visible height, chosen
     /// when the popup opens and when the selection changes. Only with the resources on.
     /// SwiftUI takes a state change into its layout on a later pass, so each level is measured a moment after
     /// it is set; a screen too small for the full popup sees it shrink once.
-    func chooseLevel(from lv: Int = 0) {
-        guard resourcesUIOn, let button = item.button, let win = button.window else { return }
-        let screen = win.screen ?? NSScreen.main!
-        let r = win.convertToScreen(button.convert(button.bounds, to: nil))
-        let room = min(r.minY, screen.visibleFrame.maxY) - 4 - screen.visibleFrame.minY - 6
+    /// The panel keeps its frame while the levels are tried; the one chosen is placed at the end.
+    func chooseLevel(from lv: Int = 0, animated: Bool = false) {
+        guard resourcesUIOn, let room = room() else { choosingLevel = false; return }
+        choosingLevel = true
         store.compactLevel = lv
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) { [weak self] in
-            guard let self, self.isShown, self.store.compactLevel == lv else { return }
+            guard let self else { return }
+            guard self.isShown else { self.choosingLevel = false; return }
+            guard self.store.compactLevel == lv else { return }  // a newer search runs
             self.hosting.layoutSubtreeIfNeeded()
-            if self.hosting.fittingSize.height > room && lv < 5 { self.chooseLevel(from: lv + 1) } else { self.position() }
+            if self.hosting.fittingSize.height > room && lv < 5 { self.chooseLevel(from: lv + 1, animated: animated) } else {
+                self.choosingLevel = false
+                self.position(animated: animated)
+            }
         }
     }
 
