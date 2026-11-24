@@ -651,6 +651,67 @@ def test_arrays():
         shutil.rmtree(d, ignore_errors=True)
     check(n1 == 30 and changed and same, "history: today's file is read on from where it stopped, a half-written line "
                                          "whole the next time (%d, then %s)" % (n1, same))
+    test_series()
+
+
+def test_series():
+    """History.series is load_points column by column: days in order, a day out of order, days that
+    overlap and a sample in the future (the slow path raised on every typed array up to 1.11.0)."""
+    rnd = random.Random(5)
+    now = NOW
+    keys = ("t", "wired", "app", "comp", "swap", "away", "kills")
+
+    def sample(t):
+        return {"t": t, "app_gb": rnd.random() * 9, "wired_gb": 2.0 + rnd.random(), "compressed_gb": rnd.random(),
+                "swap_used_gb": 0.0, "jetsam_kills": rnd.randrange(2), "away": {"idle_s": rnd.choice((0, 9999))},
+                "cpu": {"busy": rnd.random() * 8, "sys": 0.5}, "gpu": [{"util": 40.0, "mem_gb": 1.5}],
+                "disk_free_gb": 100.0}
+
+    def day_of(t):
+        return time.strftime("%Y-%m-%d", time.localtime(t))
+
+    results = []
+    for case in ("ordered", "out of order", "overlap", "future"):
+        d = tempfile.mkdtemp(prefix="oomph-toptest-series-")
+        try:
+            days = {}
+            for k in range(3, -1, -1):
+                ts = [now - k * 86400 - 3600 + 60 * i for i in range(40)]
+                if case == "out of order" and k == 1:
+                    rnd.shuffle(ts)
+                if case == "overlap" and k == 1:
+                    ts += [now - 2 * 86400 - 1800 + 60 * i for i in range(10)]
+                if case == "future" and k == 0:
+                    ts += [now + 7200, now + 30]
+                days.setdefault(day_of(now - k * 86400), []).extend(ts)
+            for day, ts in days.items():
+                with open(os.path.join(d, "samples-%s.jsonl" % day), "w") as f:
+                    f.write("".join(json.dumps(sample(t)) + "\n" for t in ts))
+            for res in (False, True):
+                for since in (now - 3600, now - 2 * 86400, now - 30 * 86400):
+                    h = T.History(d, res)
+                    h.refresh()
+                    try:
+                        cols, older = h.series(now, since)
+                    except Exception as e:  # noqa: BLE001 -- reported as a failure below
+                        results.append("%s: %r" % (case, e))
+                        continue
+                    pts, older2 = T.load_points(d, now, since, res)
+                    want = [[p[k] for p in pts] for k in keys]
+                    want[5] = [1 if a else 0 for a in want[5]]
+                    if res:
+                        want += [[float("nan") if p[k] is None else p[k] for p in pts] for k in V.RES_POINT]
+                        want.append([1 if p["gfull"] else 0 for p in pts])
+                    got = [list(c) for c in cols]
+                    types = [getattr(c, "typecode", "b") for c in cols] == list("dddddbl" + "dddddb" * res) and \
+                        isinstance(cols[5], bytearray)
+                    if not (older == older2 and types and len(got) == len(want) and
+                            all(repr(g) == repr(w) for g, w in zip(got, want))):
+                        results.append("%s (res %s, since %d)" % (case, res, now - since))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    check(not results, "history: series() is load_points column by column, also for a day out of order, days that "
+                       "overlap and a sample in the future (%s)" % (", ".join(results) or "4 cases x 6"))
 
 
 # ------------------------------------------------------------------ in a pseudo-terminal

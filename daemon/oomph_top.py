@@ -649,35 +649,43 @@ class History:
 
     def series(self, now, since):
         """The samples from the day before `since` to now + 60 s, as seven arrays in time order, and
-        whether older days exist (the same window load_points reads)."""
+        whether older days exist (the same window load_points reads). Each array is made at its
+        full size and filled: grown day by day, every refresh left its outgrown buffers in the
+        allocator, a megabyte or two more resident each time a sample came (1.11.1)."""
         first_day = time.strftime("%Y-%m-%d", time.localtime(since - 86400))
-        cols = [array.array("d") for _ in range(5)] + [bytearray(), array.array("l")]
+        days = [self.days[day] for day in sorted(self.days) if day >= first_day]
+        older, n = len(days) < len(self.days), sum(len(d.t) for d in days)
+        cols = [array.array("d", [0.0]) * n for _ in range(5)] + [bytearray(n), array.array("l", [0]) * n]
         if self.res:
-            cols += [array.array("d") for _ in range(5)] + [bytearray()]
-        older, ordered, future, prev = False, True, False, float("-inf")
-        for day in sorted(self.days):
-            if day < first_day:
-                older = True
-                continue
-            d = self.days[day]
-            if len(d.t):
+            cols += [array.array("d", [0.0]) * n for _ in range(5)] + [bytearray(n)]
+        ordered, future, prev, at = True, False, float("-inf"), 0
+        for d in days:
+            k = len(d.t)
+            if k:
                 ordered = ordered and d.ordered and d.t[0] >= prev
                 prev, future = d.tmax, future or d.tmax > now + 60
             for dst, src in zip(cols, (d.t, d.w, d.a, d.c, d.s, d.away, d.kills) + tuple(d.res or ())):
-                dst.extend(src)
+                dst[at:at + k] = src
+            at += k
         T = cols[0]
         if ordered and not future:          # the usual case: each day in order, the days in order
             return cols, older
         keep = [i for i in range(len(T)) if T[i] <= now + 60] if future else None
         if keep is not None:
-            cols = [type(c)(c[i] for i in keep) if not isinstance(c, bytearray) else bytearray(c[i] for i in keep)
-                    for c in cols]
+            cols = [_pick(c, keep) for c in cols]
             T = cols[0]
         if any(T[i] < T[i - 1] for i in range(1, len(T))):
             order = sorted(range(len(T)), key=T.__getitem__)
-            cols = [type(c)(c[i] for i in order) if not isinstance(c, bytearray) else bytearray(c[i] for i in order)
-                    for c in cols]
+            cols = [_pick(c, order) for c in cols]
         return cols, older
+
+
+def _pick(c, idx):
+    """The elements of a typed array (or bytearray) at `idx`, as the same type (array.array wants its
+    typecode first: given only a generator it raised, up to 1.11.0, on every day out of order)."""
+    if isinstance(c, bytearray):
+        return bytearray(c[i] for i in idx)
+    return array.array(c.typecode, (c[i] for i in idx))
 
 
 def multires_cols(cols, now):
