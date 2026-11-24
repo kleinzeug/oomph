@@ -7204,13 +7204,13 @@ def cmd_setup_claude(args):
     return 0
 
 
-def _has_bytecode():
-    """Whether this file has bytecode beside it (install.sh compiles every module once, as root)."""
-    import importlib.util
-    try:
-        return os.path.isfile(importlib.util.cache_from_source(os.path.realpath(__file__)))
-    except (NotImplementedError, ValueError):
-        return False
+def _importable():
+    """Whether this file can be imported by its name from its folder (oomph.py, installed or in a
+    checkout; behind a link, the link's target). Up to 1.12.1 `oomph top` started again only on
+    bytecode install.sh made: without it the dashboard ran on in this script's process, 18 MB more at
+    its peak (60 MB on Linux) than a fresh one that compiles its modules on import (1.12.2)."""
+    name = os.path.basename(os.path.realpath(__file__))
+    return name.endswith(".py") and name[:-3].isidentifier()
 
 
 def main(argv):
@@ -7261,10 +7261,10 @@ def _main(argv):
     if c == "top":
         if HERE not in sys.path:
             sys.path.insert(0, HERE)
-        if __name__ == "__main__" and "--once" not in rest and sys.executable and _has_bytecode():
+        if __name__ == "__main__" and "--once" not in rest and sys.executable and _importable():
             # Run as a script, this module was compiled from source, and what that leaves behind stays
-            # resident (about 9 MB) for as long as the dashboard runs: start again, same process and
-            # terminal, on the bytecode install.sh made. (-I, and -B if given, as this run had them.)
+            # resident for as long as the dashboard runs: start again, same process and terminal, as an
+            # import (of the bytecode install.sh made, or else of the source). (-I, and -B if given.)
             mod = os.path.splitext(os.path.basename(os.path.realpath(__file__)))[0]
             os.execv(sys.executable, [sys.executable, "-I"] + (["-B"] if sys.flags.dont_write_bytecode else []) +
                      ["-c", "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
