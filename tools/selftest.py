@@ -1478,8 +1478,10 @@ for label, cv in (("old", older), ("new", newer)):
     rows = [dict(cv, t=t_v - 60 * i, iso=oomphd.now_iso(t_v - 60 * i)) for i in range(30, -1, -1)]
     for row in rows:
         row.pop("daemon", None)
-    with open(os.path.join(vdir, label, "samples-%s.jsonl" % oomphd.datetime.date.fromtimestamp(t_v).isoformat()), "w") as f:
-        f.write("".join(json.dumps(x) + "\n" for x in rows))
+        # each row in its own day's file, as the logger writes it: a run just after midnight reads yesterday's file
+        with open(os.path.join(vdir, label, "samples-%s.jsonl" % oomphd.datetime.date.fromtimestamp(row["t"]).isoformat()),
+                  "a") as f:
+            f.write(json.dumps(row) + "\n")
     json.dump(dict(cv, t=t_v), open(os.path.join(vdir, label, "current.json"), "w"))
     # the events and an incident of each version: the new resources' kinds and summary fields (1.9.5, 02 §5.3)
     evl = [{"t": t_v - 900, "kind": "disk_low", "disk_free_gb": 12.0}, {"t": t_v - 800, "kind": "pressure_change", "old": 1,
