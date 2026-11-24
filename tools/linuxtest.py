@@ -1536,12 +1536,14 @@ def _service_checks(sh, as_user, user):
                                                        "read, in the unit's sandbox, ok) and names the 0700 hook it could not run: %s"
           % (r.stdout + r.stderr)[-400:])
     os.remove("/etc/oomph/alert.d/60-private")
-    # the machine's ledger: two accounts, one queue
+    # the machine's ledger: two accounts, one queue (held by this script, `--pid`: runuser forks, and a lease
+    # held by its pid would end with it, before `reservations` reads the ledger)
     if as_user:
         sh("id ocitest || useradd -m ocitest")
-        r1 = as_user("/usr/local/bin/oomph", "reserve", "0.1G", "--for", "ci one", "--json")
+        hold = ["--pid", str(os.getpid())]
+        r1 = as_user("/usr/local/bin/oomph", "reserve", "0.1G", "--for", "ci one", "--json", *hold)
         r2 = subprocess.run(["runuser", "-u", "ocitest", "--", "/usr/local/bin/oomph", "reserve", "0.1G", "--for", "ci two",
-                             "--json"], capture_output=True, text=True, timeout=60)
+                             "--json"] + hold, capture_output=True, text=True, timeout=60)
         r3 = as_user("/usr/local/bin/oomph", "reservations", "--json")
         res = json.loads(r3.stdout) if r3.stdout.strip() else {}
         led = res.get("ledger") or {}
