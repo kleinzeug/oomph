@@ -608,9 +608,10 @@ L = {"leases": [V(dict(q, id="r44", v=2, res={"cpu": {"ask": 13, "min": 13}})), 
 new._evaluate(L, dict(SAMPLE), Procs.collect_procs(), NOW)
 check([x["state"] for x in L["leases"]] == ["queued", "granted"] and L["leases"][0]["waiting_on"] == ["cpu"],
       "D a request waiting for its turn at the cores holds up only the cores: memory passes it")
-for i, res in enumerate(({"gpu": {"ask": 100}}, {"ram": {"ask": 500.0}, "disk": {"ask": 500}},
-                         {"cpu": {"ask": 5000}}, {"cpu": {"ask": 4}, "gpu": {"ask": 50}})):
-    keep = {"waiting_on": ["gpu"], "hold": ["gpu"]}
+for i, res in enumerate(({"npu": {"ask": 100}}, {"ram": {"ask": 500.0}, "disk": {"ask": 500}},
+                         {"cpu": {"ask": 5000}}, {"cpu": {"ask": 4}, "npu": {"ask": 50}},
+                         {"gpu": {"ask": 50, "uuid": "GPU-1f2e3d4c"}, "vram": {"ask": 4, "unified": True}})):
+    keep = {"waiting_on": ["npu"], "hold": ["npu"]}
     L = {"leases": [V(dict(q, id="r6%d" % i, v=2, gb=new.NO_MEM_GB if "ram" not in res else 500.0, res=res, **keep)),
                     V(dict(q, id="r7%d" % i)), V(dict(q, id="r8%d" % i, v=2, res={"cpu": {"ask": 2}}))], "history": []}
     new._evaluate(L, dict(SAMPLE), Procs.collect_procs(), NOW)
@@ -620,6 +621,14 @@ for i, res in enumerate(({"gpu": {"ask": 100}}, {"ram": {"ask": 500.0}, "disk": 
           and {k: x.get(k) for k in keep} == keep and not L["history"],
           "D a v2 request this code cannot weigh (res %s) is not granted and holds the line, as in 1.9.2 to 1.11: "
           "memory and cores requests behind it wait; its waiting_on and hold are left as they are" % sorted(res))
+# a GPU request this code weighs (1.14, 02 §6.5.1): on a Mac its share of gpu0, which holds up only gpu0
+L = {"leases": [V(dict(q, id="r95", v=2, gb=new.NO_MEM_GB, res={"gpu": {"ask": 60, "dev": "gpu0"}})),
+                V(dict(q, id="r96", v=2, gb=new.NO_MEM_GB, res={"gpu": {"ask": 50, "dev": "gpu0"}})),
+                V(dict(q, id="r97"))], "history": []}
+new._evaluate(L, dict(SAMPLE), Procs.collect_procs(), NOW)
+check([x["state"] for x in L["leases"]] == ["granted", "queued", "granted"] and L["leases"][0]["res"]["gpu"]["got"] == 60
+      and L["leases"][1]["waiting_on"] == ["gpu:gpu0"],
+      "D a GPU request is weighed since 1.14: 60 %% of gpu0 granted, 50 %% more waits for gpu0 alone, memory passes")
 import oomph_view as view  # noqa: E402
 ns_lease = dict(base, holder={"pid": DEAD, "start": START, "ns": OTHER_NS}, key="k50", id="r50", seen=NOW)
 for own, gone in ((None, False), (OTHER_NS, True)):

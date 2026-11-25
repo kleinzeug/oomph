@@ -482,7 +482,7 @@ What a session gets:
 | `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
 | `oomph run --cpu 4..12 -- make -j{cpu}` | the same for cores: `{cpu}` becomes the number granted, which also goes to `OOMPH_CPU_CORES` and, where not already set, to `MAKEFLAGS`, `CARGO_BUILD_JOBS`, `GOMAXPROCS` and friends |
 | `oomph run --disk 30G@/Volumes/Scratch -- ./fetch-dataset.sh` | the same for disk space on a volume: any path on it names it (default: the temporary folder's disk); the grant goes to `OOMPH_DISK_GB` |
-| `oomph reserve 6G [--cpu 8] [--disk 20G[@PATH]] --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
+| `oomph reserve 6G [--cpu 8] [--disk 20G[@PATH]] [--gpu-mem 16G[@CARD]] --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
 | `oomph amend r7 --gb 2G [--cpu 4] [--disk 10G] [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
 | `oomph reservations` | who holds or waits for how much (project, purpose, memory actually used), what's available, and the measured peaks of recent work |
 | `oomph reservations --history --last 3d` | every reservation of the last 14 days, also of sessions that are gone: span, size changes, reserved vs. peak, how it ended |
@@ -539,6 +539,24 @@ session B  → granted r8, tests start
   image, a memory card, a network volume). A request waiting for one disk holds up only that disk.
   With the logger (1.12.1 or later) installed, what a holder's processes write counts against its
   reservation, shared out so that a disk never counts as filled twice.
+- **A GPU** (1.14.0, switched off for now): `--gpu-mem 16G` (MCP `gpu_mem_gb`) reserves GPU memory
+  and `--gpu 60` (`gpu_pct`) a share of a GPU's time. On a Mac the GPU's memory is the Mac's own:
+  it is counted as memory (the reservation's GB include it), and more than the GPU may address
+  (`iogpu.wired_limit_mb`) is refused, or waits while other reservations hold the rest of it. On Linux each NVIDIA card is a pool of its own, by its UUID:
+  a request lands on the card with room (the least committed one) or on the one it names
+  (`--gpu-mem 16G@1`, `@GPU-6ab19ebf`), the driver's own memory and 5 % of the rest stay free, and
+  the grant says which card (`run_with.gpu`). Jobs are not pinned: run them with
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<index>`, or `oomph run --pin-gpu`, which sets
+  both (`oomph run` always hands `OOMPH_GPU_INDEX`, `OOMPH_GPU_UUID` and `OOMPH_GPU_MEM_GB` to the
+  job). What a job's processes add on its card after the grant counts against its reservation
+  (from `nvidia-smi`, any account's), and a job found on another card is flagged *elsewhere*
+  (never for a card where the same job holds a reservation of its own). A model
+  served by another account's process (an Ollama or ComfyUI service) is not measured against the
+  reservation in 1.14: the grant then counts in full. A card that
+  is gone for two minutes ends its reservations (`gpu_gone`). It ships switched off until it has
+  been measured with real model runs; without the switch a GPU flag is refused (exit 75) and says
+  how to switch it on: `"gpu_reservations": true` in the settings file below
+  (`/etc/oomph/config.json` on Linux), or `OOMPH_GPU_RESERVATIONS=1` for one command.
 - **Advice on a grant** (1.12.3, with the logger): a grant whose processes keep more cores busy
   than 1.25 × what it got, two samples in a row, or that wrote more than the disk space it
   reserved, is *over*; one that has used less than a tenth of its cores for ten minutes is
@@ -734,6 +752,7 @@ write them (`sudo mkdir -p "/Library/Application Support/oomph"`, then edit the 
 |---|---|
 | `"ioreport": true` | the GPU's figure at full speed, from the IOReport helper (from 1.9.3; `false` switches it off; see above) |
 | `"no_ioreport": true` | never start the IOReport helper, also once it is on by default |
+| `"gpu_reservations": true` | GPU reservations, `--gpu` and `--gpu-mem` (from 1.14.0, off by default; read per request, no restart) |
 
 ### Privacy
 
@@ -763,6 +782,8 @@ daemon/oomph_darwin.py            everything that measures a Mac (the backend th
 daemon/oomph_linux.py             everything that measures a Linux machine, from /proc and /sys (no root); kills
                                   from the journal, NVIDIA cards through nvidia-smi
 daemon/oomph_ioreport.py          the IOReport helper: the GPU's performance states, as nobody (never root)
+daemon/oomph_gpu.py               GPU reservations (1.14): the NVIDIA pools per card, a Mac's GPU; loaded only when a
+                                  request or lease has a GPU part
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)

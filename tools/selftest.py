@@ -1171,14 +1171,14 @@ bl = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "br
 check(bl.returncode == 0, "brandlint: prose and identifiers kept apart (%s)" % bl.stdout.strip().splitlines()[-1:])
 
 # --- strict options: an option this oomph doesn't know is refused, never taken for gigabytes (since 1.12.0 it
-# knows --cpu: the GPU's --gpu, of a later release, stands in for an option from a newer oomph)
+# knows --cpu, since 1.14.0 --gpu: --npu stands in for an option from a newer oomph)
 oomph._sample_override = lambda: dict(fixed)
 n_before = len(oomph.read_ledger()["leases"])
-for args in (["reserve", "--gpu", "60", "5G", "--for", "x"], ["reserve", "5G", "8", "--for", "x"],
+for args in (["reserve", "--npu", "60", "5G", "--for", "x"], ["reserve", "5G", "8", "--for", "x"],
              ["reserve", "5G", "--for"], ["reserve", "lots", "--for", "x"], ["reserve", "--cpu", "lots", "--for", "x"],
              ["reserve", "--cpu", "8..4", "--for", "x"], ["reserve", "--cpu", "2.25", "--for", "x"],
-             ["amend", "r1", "--gb", "3G", "--gpu", "2"], ["release", "r1", "r2"], ["release", "--all"],
-             ["run", "--reserve", "1G", "--gpu", "2", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
+             ["amend", "r1", "--gb", "3G", "--npu", "2"], ["release", "r1", "r2"], ["release", "--all"],
+             ["run", "--reserve", "1G", "--npu", "2", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
              ["run", "--cpu", "two", "--", "/usr/bin/touch", os.path.join(LOG, "ran")],
              ["run", "--reserve", "1G", "8", "--", "/usr/bin/touch", os.path.join(LOG, "ran")]):
     out, err = io.StringIO(), io.StringIO()
@@ -1206,7 +1206,7 @@ if MAC:  # MCP argument checks in a child process
     resp2 = {m["id"]: m for m in map(json.loads, out.strip().splitlines())}
     errs = [resp2.get(20 + i, {}).get("result", {}) for i in range(4)]
     check(all(e.get("isError") for e in errs) and "takes no argument cpu" in errs[0]["content"][0]["text"] and
-          "needs gb, cpu_cores or disk_gb" in errs[3]["content"][0]["text"],
+          "needs gb, cpu_cores, disk_gb" in errs[3]["content"][0]["text"],
           "MCP: the reservation tools refuse unknown and missing arguments (%s)" % [e.get("isError") for e in errs])
     ok2 = [resp2.get(24 + i, {}).get("result", {}) for i in range(2)]
     check(all(e and not e.get("isError") for e in ok2),
@@ -1663,7 +1663,7 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
         d = os.path.join(inst, name)
         os.makedirs(os.path.join(d, "skills", "oomph"))
         for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_linux.py", "oomph_ioreport.py", "oomph_ai.py",
-                  "oomph_upgrade.py", "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py",
+                  "oomph_upgrade.py", "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py", "oomph_gpu.py",
                   "local.oomph.daemon.plist"):
             shutil.copy(os.path.join(ROOT, "daemon", f), d)
         for f in ("install.sh", "uninstall.sh"):
@@ -2621,7 +2621,7 @@ with redirect_stdout(buf):
     rc = oomph.main(["resources"])
 can = {(True, True): "Memory, cores and disk space can be reserved", (True, False): "Memory and cores can be reserved",
        (False, True): "Memory and disk space can be reserved", (False, False): "Memory can be reserved"}
-check(rc == 0 and "not reservable yet" in buf.getvalue() and
+check(rc == 0 and ("not reservable yet" in buf.getvalue() or "reservable: off (gpu_reservations)" in buf.getvalue()) and
       can[oomph.cpu_reservable(), oomph.disk_reservable()] in buf.getvalue(),
       "oomph resources: says what can be reserved")
 oomph.LOG_DIR = saved_log
@@ -3786,6 +3786,16 @@ check("On other resources: 40 GB disk reserved · 1 waiting for CPU" in txt4 and
       "under the rows")
 check(" CPU│" not in txt5 and "6 cores" not in txt5 and "0.0G" in txt5,
       "oomph top with the resources off: the strip and the list as before (a reservation without memory shows 0.0G)")
+
+# GPU reservations (1.14, roadmap 02 §6.5.1): the switch, a Mac's GPU, NVIDIA cards as pools (tools/gputest.py)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "gputest.py")], capture_output=True, text=True,
+                   timeout=300, env={k: v for k, v in os.environ.items()
+                                     if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR", "OOMPH_GPU_RESERVATIONS")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("      gpu: " + line)
+check(r.returncode == 0, "GPU reservations (tools/gputest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                    + r.stderr[-400:]))
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,

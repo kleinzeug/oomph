@@ -3084,10 +3084,13 @@ def cmd_status_json():
 THERMAL = {0: "nominal", 1: "moderate", 2: "heavy", 3: "trapping", 4: "sleeping"}
 
 
-def reservable():
-    """What can be reserved on this machine: memory, cores where they are measured (cpu_reservable), and disk
-    space where volumes are listed by id (disk_reservable)."""
-    return ["memory"] + (["cpu"] if cpu_reservable() else []) + (["disk"] if disk_reservable() else [])
+def reservable(s=None):
+    """What can be reserved on this machine: memory, cores where they are measured (cpu_reservable), disk
+    space where volumes are listed by id (disk_reservable), and with gpu_reservations on a GPU where the sample
+    `s` lists one that can be (02 §6.5.1)."""
+    gpu = gpu_reservations_on() and any(c["reservable"] for c in (_G().gpu_cards_of(s) or {}).values()) if s else False
+    return ["memory"] + (["cpu"] if cpu_reservable() else []) + (["disk"] if disk_reservable() else []) + \
+        (["gpu"] if gpu else [])
 NOT_MEASURED = "not measured (logging is off; `oomph check --measure` takes a quarter-second reading)"
 NOT_LOGGED = "not recorded by the logger, which is older than 1.9.1 (`oomph check --measure` reads it now)"
 NOT_READ = "not read by the logger this time (`oomph check --measure` reads it now)"
@@ -3359,10 +3362,13 @@ def _resources(s, c=None):
         out["cpu"].update(margin=c["cpu"]["margin"], reserved=c["cpu"]["reserved"], left=c["cpu"]["available"],
                           **({"idle": c["cpu"]["idle"]} if "idle" in c["cpu"] else {}))
     gpus = s.get("gpu") if isinstance(s.get("gpu"), list) else None
-    out["gpu"] = None if gpus is None else [dict({k: g[k] for k in ("id", "name", "util", "active", "src", "mem_gb",
-                                                                    "mem_alloc_gb", "mem_limit_gb", "mem_limit_est",
-                                                                    "unified", "procs") if k in g}, reservable=False)
-                                             for g in gpus if isinstance(g, dict)]
+    cards, on = {c["id"]: c for c in (_G().gpu_cards_of(s) or {}).values()}, gpu_reservations_on()
+    gst = (c or {}).get("gpu") if isinstance((c or {}).get("gpu"), dict) else {}
+    out["gpu"] = None if gpus is None else [dict(
+        {k: g[k] for k in ("id", "name", "util", "active", "src", "mem_gb", "mem_alloc_gb", "mem_limit_gb",
+                           "mem_limit_est", "unified", "procs", "uuid", "mem_free_gb", "mem_total_gb", "display", "mig")
+         if k in g}, **_G()._gpu_reservable(cards.get(g.get("id")), on, gst.get((cards.get(g.get("id")) or {}).get("key"))))
+        for g in gpus if isinstance(g, dict)]
     pools = (c or {}).get("disk") if isinstance((c or {}).get("disk"), dict) else {}
     out["disks"] = [dict({k: d[k] for k in ("id", "name", "mount", "free_gb", "total_gb", "kind", "roles", "level",
                                             "low_gb", "crit_gb", "pinned") if k in d},
@@ -3371,7 +3377,7 @@ def _resources(s, c=None):
                                                                ("left_gb", "available"))}
                             if isinstance(pools.get(d["id"]), dict) else {}))
                     for d in disk_rows(s, pinned) if d["id"] not in hidden]
-    out["reservable"] = reservable()
+    out["reservable"] = reservable(s)
     return out
 
 
@@ -3399,6 +3405,7 @@ def cmd_resources(args):
     line("memory", "%.0f GB · %.1f free%s · reservable" % (m["ram_gb"] or 0, m["free_gb"], (
         " · %.1f GB reserved · %.1f GB left to reserve" % (m["reserved_gb"], m["left_gb"])) if "left_gb" in m else ""))
     cpu = r.get("cpu") or {}
+    gl = list(r.get("gpu") or [])  # in the order resource_lines gives the GPU lines
     drows = list(r["disks"])  # in the order resource_lines gives the disk lines
     for label, text in resource_lines(s, *volume_prefs()):
         d = drows.pop(0) if label in ("disk", "") and drows else {}
@@ -3409,11 +3416,14 @@ def cmd_resources(args):
             text += " · %s reserved · %s left to reserve%s" % (
                 cores_text(cpu["reserved"]), cores_text(max(0.0, cpu["left"])),
                 " (%s idle)" % cores_text(max(0.0, cpu["idle"])) if "idle" in cpu else "")
+        elif label == "gpu" and gl:
+            text += _G()._gpu_line(gl.pop(0))
         elif label in ("cpu", "gpu") and not text.startswith("not measured"):
             text += " · not reservable yet" if label == "gpu" or not cpu.get("reservable") else " · reservable"
         line(label, text)
     more = [x for x in (("cores", " --cpu 8") if "cpu" in r["reservable"] else None,
-                        ("disk space", " --disk 20G") if "disk" in r["reservable"] else None) if x]
+                        ("disk space", " --disk 20G") if "disk" in r["reservable"] else None,
+                        ("a GPU", " --gpu-mem 16G") if "gpu" in r["reservable"] else None) if x]
     print(wrap("Memory%s can be reserved with this version: `oomph reserve 6G%s --for \"what\"`." % (
         "".join((" and " if i == len(more) - 1 else ", ") + x[0] for i, x in enumerate(more)),
         "".join(x[1] for x in more)), w, "  "))
@@ -3628,8 +3638,8 @@ OVER_X = 1.25                # a rate grant used at more than this × what it go
 OVER_N = 2                   # … for this many evaluations in a row is `over`; a disk grant is over once it wrote more
 IDLE_X = 0.1                 # a rate grant used at under this × what it got …
 IDLE_S = 600                 # … for this long is `idle`
-ADVICE_FLAGS = ("over", "idle")
-ADVICE_FIELDS = ("flag", "over_n", "over_t", "low_t", "rate_t")  # in res.cpu and res.disk: the advice, its counters
+ADVICE_FLAGS = ("over", "idle", "elsewhere")  # elsewhere (1.14): a GPU grant's job runs on another card
+ADVICE_FIELDS = ("flag", "over_n", "over_t", "low_t", "rate_t")  # in res.cpu, disk, vram: the advice, its counters
 ADVICE_STALE_S = 300         # and when the logger last rated them: advice older than this is dropped (_advice_stale)
 
 
@@ -3822,6 +3832,43 @@ def disk_view(s, leases):
             out[d["pool"]]["reserved"] += d["got"]
             out[d["pool"]]["left"] -= max(0.0, d["got"] - used)
     return out, isinstance(s.get("disks"), list) and not s.get("disks_partial")
+
+
+# ----- GPU reservations (G, 1.14.0; 02 §6.5.1): the code is oomph_gpu.py's, loaded when a lease or a request has a
+# GPU part (_G); what readers and the sanitizer need without it stays here.
+GPU_PCT_MAX = 100            # % of one GPU
+VRAM_MAX_GB = 4096           # GB of GPU memory in one request: more than any card has, to keep the arithmetic sane
+VRAM_MIN_GB = 0.01           # the least GPU memory a request holds (GB are kept to two decimals)
+GPU_STATE_MAX = 16           # cards in the ledger's state
+_GPU_UUID = re.compile(r"GPU-[0-9a-fA-F-]{8,60}")
+_GPU_DEV = re.compile(r"gpu\d{1,3}")
+_GPU_MOD = []
+
+
+def _G():
+    """oomph_gpu, bound to this module (it reads this module's names as its own): imported at the first GPU part,
+    so that what never meets one (oomph top, the hook) does not compile or hold it."""
+    if not _GPU_MOD:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        sys.modules["oomph_gpu_host"] = sys.modules[__name__]
+        import oomph_gpu
+        _GPU_MOD.append(oomph_gpu)
+    return _GPU_MOD[0]
+
+
+def _gpu_parts(r):
+    """A lease's GPU parts (oomph_gpu._gpu_parts), or None at once for a lease without one."""
+    res = r.get("res") if isinstance(r.get("res"), dict) else None
+    return _G()._gpu_parts(r) if res and ("gpu" in res or "vram" in res) else None
+
+
+def gpu_reservations_on(config=None):
+    """Are new GPU parts allowed here (02 §6.5.1)? "gpu_reservations" in the root-owned configuration file, or
+    OOMPH_GPU_RESERVATIONS=1 (tests, one command, a per-user Linux install without root); read per request. Off by
+    default in 1.14, until it has been measured with real model runs. It gates only new GPU parts: evaluating,
+    measuring, ending and showing GPU reservations always run."""
+    return switched_on(setting("gpu_reservations", config=config))
 
 
 def _home_short(p):
@@ -4233,9 +4280,10 @@ def _segments(x):
 #   history record: `event` "grant", `res` {resource: amount, "disk_pool"} and `peak` {resource:
 #     amount}, `v`, `agent`, `user`, `note`, outcomes "refused" and "volume_gone".
 LEASE_RES = ("ram", "cpu", "gpu", "vram", "disk", "mem")  # a v2 lease's resources (02 §6.2)
+SEG_RES = ("ram", "cpu", "disk", "gpu", "vram")           # the amounts a segment of a lease's span keeps
 _RES_NAME = re.compile(r"[a-z][a-z0-9_]{0,15}")  # a resource this code does not know: carried through, never used
 RES_MAX = 16                              # resources in one `res`, known ones first
-_RES_NUMS = ("ask", "min", "got", "used", "peak", "tree", "w")
+_RES_NUMS = ("ask", "min", "got", "used", "peak", "tree", "w", "else_gb", "base")
 _COUNTERS = ("t", "cpu_s", "gpu_s", "w_gb", "free_gb", "gpu_mem_gb")
 _ID = re.compile(r"[\x21-\x7e]{1,80}")    # pool and device ids: compared as strings, never opened
 _AGENT = re.compile(r"[0-9a-f]{8}")
@@ -4263,7 +4311,7 @@ def _res_names(x):
     """The resources of a `res` this code keeps: the six it knows, then up to RES_MAX in all of
     those a later writer may add (a lowercase name), which are carried through and never counted."""
     known = [k for k in LEASE_RES if k in x]
-    return known + [k for k in x if k not in LEASE_RES and k != "disk_pool" and isinstance(k, str)
+    return known + [k for k in x if k not in LEASE_RES and k not in ("disk_pool", "gpu_dev") and isinstance(k, str)
                     and _RES_NAME.fullmatch(k)][:RES_MAX - len(known)]
 
 
@@ -4287,10 +4335,15 @@ def _res(x):
             del o["dev"]
         if "pool" in o and not _str(80, _ID)(o["pool"]):
             del o["pool"]
+        if "uuid" in o and not _str(64, _GPU_UUID)(o["uuid"]):  # an NVIDIA card (1.14): compared as a string
+            del o["uuid"]
+        for f, n in (("name", 64), ("else_dev", 8)):  # the card's name and, for `elsewhere`, where the job is
+            if f in o and not (isinstance(o[f], str) and 0 < len(o[f]) <= n and o[f].isprintable()):
+                del o[f]
         if "unified" in o and not isinstance(o["unified"], bool):
             del o["unified"]
         for f, ok in (("flag", lambda v: v in ADVICE_FLAGS), ("over_n", lambda v: _int(v, 0, 10 ** 6)),
-                      ("over_t", _t), ("low_t", _t), ("rate_t", _t)):  # the advice of 1.12.3 (_rate_flag)
+                      ("over_t", _t), ("low_t", _t), ("rate_t", _t), ("missing", _t), ("mseen", _t)):
             if f in o and not ok(o[f]):
                 del o[f]
         out[k] = o
@@ -4305,6 +4358,8 @@ def _rec_amounts(x, extra=False):
     out = {k: x[k] for k in _res_names(x) if _num(x.get(k), 0, 1e6)}
     if extra and _str(80, _ID)(x.get("disk_pool")):
         out["disk_pool"] = x["disk_pool"]
+    if extra and _str(64, _ID)(x.get("gpu_dev")):  # the card a GPU grant was on (1.14): gpu1, or a UUID
+        out["gpu_dev"] = x["gpu_dev"]
     return out or None
 
 
@@ -4492,8 +4547,9 @@ def _cpu_of(r):
 
 def lease_need(r):
     """What a lease asks of each pool, as (least, wanted): `ram` (its gb, the mirror an older writer's amend
-    moves, so it always counts) unless it holds no memory, `cpu` (its minimum to what it asked), and
-    `disk:<pool id>` (what it asked, on that one pool: disk is a stock, granted in full or not at all)."""
+    moves, so it always counts: a Mac's GPU memory is in it) unless it holds no memory, `cpu` (its minimum to
+    what it asked), `disk:<pool id>` (what it asked, on that one pool: disk is a stock, granted in full or not at
+    all), and `gpu:<card>` and `vram:<card>` (what it asked of a GPU, 02 §6.5.1)."""
     need = {} if no_memory(r) else {"ram": (r["gb"], r["gb"])}
     c = _cpu_of(r)
     if c:
@@ -4502,6 +4558,11 @@ def lease_need(r):
     d = _disk_of(r)
     if d:
         need["disk:" + d["pool"]] = (d["ask"], d["ask"])
+    gp = _gpu_parts(r)
+    if gp:  # its share (gpu:<card>) and on an NVIDIA card its memory (vram:<card>; "*" while it names none)
+        for p in _G()._gpu_pools(gp):
+            x = gp["gpu"] if p.startswith("gpu:") else gp["vram"]
+            need[p] = (x["ask"], x["ask"])
     return need
 
 
@@ -4529,6 +4590,8 @@ def _record_vector(r):
             peak[k] = x["peak"]
         if k == "disk" and isinstance(x.get("pool"), str):
             amounts["disk_pool"] = x["pool"]
+        if k in ("gpu", "vram") and isinstance(x.get("uuid"), str):  # the NVIDIA card it was on (a Mac has one GPU)
+            amounts["gpu_dev"] = x["uuid"]
     if amounts:
         out["res"] = amounts
     if peak:
@@ -4623,6 +4686,11 @@ def _valid_ledger(L):
     dk = st.get("disk") if isinstance(st, dict) else None
     if isinstance(dk, dict):  # what is left on each disk pool (1.12.1): pool ids and numbers only
         out["state"]["disk"] = {k: v for k, v in list(dk.items())[:DISK_STATE_MAX] if _str(80, _ID)(k) and _num(v)}
+    gs = st.get("gpu") if isinstance(st, dict) else None
+    if isinstance(gs, dict):  # what is left on each GPU (1.14): card keys, a label and numbers only
+        out["state"]["gpu"] = {k: {f: x for f, x in v.items() if (f == "dev" and _str(8, _GPU_DEV)(x)) or
+                                   (f in ("pct", "gb") and _num(x, -1e6, 1e6))}
+                               for k, v in list(gs.items())[:GPU_STATE_MAX] if _str(64, _ID)(k) and isinstance(v, dict)}
     if "history_pruned" in L and not _num(L["history_pruned"]):
         out.pop("history_pruned")
     return _checked(L, out, V2_ROOT)
@@ -5112,7 +5180,7 @@ def _advice_stale(L, now):
     now. Every evaluation runs this, so the next `oomph` call or status poll clears it for every reader."""
     for r in L["leases"]:
         res = r.get("res") if isinstance(r.get("res"), dict) else {}
-        for k in ("cpu", "disk"):
+        for k in ("cpu", "disk", "vram"):
             part = res.get(k)
             if isinstance(part, dict) and any(f in part for f in ADVICE_FIELDS) and not (
                     _t(part.get("rate_t")) and -60 <= now - part["rate_t"] <= ADVICE_STALE_S):
@@ -5123,13 +5191,14 @@ def _advice_stale(L, now):
 def advice_flags(r):
     """{resource: (flag, since)} of a lease (02 §6.3; oomph_view.res_vector and the app read the same): `over`
     or `idle` on its cores (since its run of over or low use began), `over` on its disk space (since it first
-    wrote more than it got). A queued lease has none."""
+    wrote more than it got), `over` or `elsewhere` on an NVIDIA card's memory (02 §6.5.1). A queued lease has none."""
     out = {}
     if r.get("state") not in (None, "granted") or (r.get("state") is None and r.get("granted") is None):
         return out
-    for k, part in (("cpu", _cpu_of(r)), ("disk", _disk_of(r))):
+    gp = _gpu_parts(r) or {}
+    for k, part in (("cpu", _cpu_of(r)), ("disk", _disk_of(r)), ("vram", gp.get("vram") if gp.get("nvidia") else None)):
         if part and part.get("flag") in ADVICE_FLAGS:
-            t = part.get("over_t") if part["flag"] == "over" else part.get("low_t")
+            t = part.get("over_t") if part["flag"] in ("over", "elsewhere") else part.get("low_t")
             out[k] = (part["flag"], t if _t(t) else None)
     return out
 
@@ -5151,6 +5220,8 @@ def flag_advice(r, flags, now):
     if flags.get("disk", (None,))[0] == "over" and d and _num(d.get("got")):
         out.append("%s GB written to %s, more than the %s GB reserved: grow it (`oomph amend %s --disk NG`) before "
                    "writing more. " % (_gb(d["w"]) if _num(d.get("w")) else "More", _disk_name(d), _gb(d["got"]), r["id"]))
+    if "vram" in flags:
+        out.append(_G()._gpu_flag_text(r, flags["vram"][0]))
     return "".join(out)
 
 
@@ -5289,26 +5360,41 @@ def cpu_pool(s, leases, now):
             "idle": None if others is None else room - others}
 
 
-RATE_POOLS = frozenset(("cpu",))  # pools that saturate rather than run out (02 §6.1)
-POOLS = frozenset(("ram", "cpu", "disk:*"))   # every pool this code weighs (disk:*: every disk pool)
-KNOWN_RES = frozenset(("ram", "cpu", "disk", "mem"))  # the parts of a `res` it knows (mem: the memory mirror)
+POOLS = frozenset(("ram", "cpu", "disk:*", "gpu:*", "vram:*"))   # every pool this code weighs (<kind>:*: every one)
+KNOWN_RES = frozenset(("ram", "cpu", "disk", "mem", "gpu", "vram"))  # the parts of a `res` it knows (mem: the mirror)
+
+
+def _rate(p):
+    """Does pool `p` saturate rather than run out (02 §6.1): the cores, and a GPU's share."""
+    return p == "cpu" or p.startswith("gpu:")
+
+
+def _blocks(p, blocked):
+    """Is pool `p` held up by an earlier request that waits (`<kind>:*` in `blocked`: every pool of that kind)?"""
+    return p in blocked or (":" in p and p.split(":", 1)[0] + ":*" in blocked)
+
+
+def _meets(a, b):
+    """Do two leases ask for a pool in common (`<kind>:*`, an NVIDIA request that names no card: any of that kind)?"""
+    return any(_blocks(p, b) or _blocks(q, a) for p in a for q in b if p.split(":", 1)[0] == q.split(":", 1)[0])
 
 
 def _behind(need, blocked):
     """The pools of `need` that an earlier request still waiting holds up (`disk:*` in `blocked`: every disk)."""
-    return {p for p in need if p in blocked or (p.startswith("disk:") and "disk:*" in blocked)}
+    return {p for p in need if _blocks(p, blocked)}
 
 
 def weighable(r):
     """Can this code weigh every part of a lease? A 1.8-shaped lease always; a vector lease only when its `res`
-    names nothing beyond ram, cpu, disk and mem, its cores and disk parts are ones this code reads, and it asks
-    for something. A later writer's GPU lease is not: this code neither grants it nor lets anyone pass it
-    (02 §9.3, as 1.9.2 to 1.11 did with every vector lease, and 1.12.0 with a disk lease), so no stale process
-    hands out what it cannot weigh."""
+    names nothing beyond ram, cpu, disk, gpu, vram and mem, its cores, disk and GPU parts are ones this code reads,
+    and it asks for something. A later writer's lease of a resource this code does not know is not: this code
+    neither grants it nor lets anyone pass it (02 §9.3, as 1.9.2 to 1.11 did with every vector lease, 1.12.0 with a
+    disk lease and 1.12.1 to 1.13 with a GPU lease), so no stale process hands out what it cannot weigh."""
     if ledger_version(r) < 2:
         return True
     res = r.get("res") or {}
-    if not set(res) <= KNOWN_RES or ("cpu" in res and _cpu_of(r) is None) or ("disk" in res and _disk_of(r) is None):
+    if not set(res) <= KNOWN_RES or ("cpu" in res and _cpu_of(r) is None) or ("disk" in res and _disk_of(r) is None) \
+            or _gpu_parts(r) is False:
         return False
     return bool(lease_need(r))
 
@@ -5367,6 +5453,9 @@ def _evaluate(L, s, procs, now, rated=False):
     _normalize(L)
     _give_slots(L, now)  # the agent's colour (D11), before any grant record is written
     _volumes_gone(L, s, now)
+    anygpu = any(_gpu_parts(r) for r in L["leases"])  # oomph_gpu is loaded only then (_G)
+    if anygpu:
+        _G()._gpus_gone(L, s, now)
 
     # Memory a grant's processes have added since it was granted counts against the grant, so
     # it isn't counted twice (once as used, once as reserved). Grants watching the same process
@@ -5387,6 +5476,8 @@ def _evaluate(L, s, procs, now, rated=False):
     if rated:
         _charge_cpu(L, procs, children, now)
         _charge_disk(L, s, procs, children, now)
+    if anygpu:
+        _G()._charge_gpu(L, s, procs, children, now, rated)
     _advice_stale(L, now)
 
     v = verdict(s)
@@ -5406,6 +5497,7 @@ def _evaluate(L, s, procs, now, rated=False):
     big = oversize_for(s)
     cpu = cpu_pool(s, L["leases"], now)
     disks = disk_view(s, L["leases"])[0]
+    gview, glisted = _G().gpu_view(s, L["leases"]) if anygpu else ({}, False)
     blocked, recs = set(), []
     for r in [x for x in L["leases"] if x["state"] == "queued"]:
         if (r.get("scope") or "host") != mine:  # granted only by a process that can measure its scope
@@ -5444,12 +5536,16 @@ def _evaluate(L, s, procs, now, rated=False):
             d = disks.get(p[5:]) if p.startswith("disk:") else None
             if p.startswith("disk:") and (d is None or d["level"] == "critical" or d["left"] < need[p][1] - 1e-9):
                 short.add(p)
-        behind = _behind(need, blocked)
+        gp, gkey, gpools, gbehind = _gpu_parts(r), None, set(), set()
+        if gp:  # its card: the one it named, or where it fits now (02 §6.5.1)
+            gkey, gshort, gbehind, gpools = _G()._gpu_fit(gp, gview, glisted, blocked)
+            short |= gshort
+        behind = _behind([p for p in need if not p.startswith(("gpu:", "vram:"))], blocked) | gbehind
         if short or behind:
-            hold = set(r.get("hold") or ()) & set(need) | short
+            hold = set(r.get("hold") or ()) & (set(need) | gpools) | short
             _waits(r, short | behind, hold)
-            turn = (short | behind) & RATE_POOLS  # waiting for a turn at the cores: holds up only those
-            blocked |= (turn | (hold & RATE_POOLS)) if turn else (short | behind | hold)
+            turn = {p for p in short | behind if _rate(p)}  # waiting for a turn at the cores or a GPU: holds up only those
+            blocked |= (turn | {p for p in hold if _rate(p)}) if turn else (short | behind | hold)
             continue
         r["state"], r["granted"] = "granted", round(now, 1)
         r["expires"] = round(now + r["ttl"], 1) if r.get("ttl") else None
@@ -5464,8 +5560,11 @@ def _evaluate(L, s, procs, now, rated=False):
         notes = [note] if note else []
         if ledger_version(r) >= 2:
             res = r.setdefault("res", {})
-            if "ram" in need:
-                res["ram"] = dict(res.get("ram") or {}, ask=r["gb"], got=r["gb"])
+            if "ram" in need:  # a Mac's GPU memory is memory: in gb and mem, not in ram (02 §6.2)
+                u = gp["vram"]["ask"] if gp and gp["vram"] and not gp["nvidia"] else 0.0
+                if "ram" in res or not u:
+                    ram = round(max(0.0, r["gb"] - u), 2)
+                    res["ram"] = dict(res.get("ram") or {}, ask=ram, got=ram)
                 res["mem"] = dict(res.get("mem") or {}, got=r["gb"])
             if "cpu" in need:
                 lo, hi = need["cpu"]
@@ -5493,9 +5592,11 @@ def _evaluate(L, s, procs, now, rated=False):
                 r["base"] = dict(r.get("base") or {}, free_gb=d["free"])
                 d["left"] -= dk["ask"]
                 d["reserved"] += dk["ask"]
+            if gp:  # on its card, which each part keeps
+                _G()._gpu_grant(r, gp, gkey, gview, now, procs, children)
             segs = r.get("segments")
             if segs:
-                segs[-1]["res"] = {k: x.get("got", x.get("ask")) for k, x in res.items() if k in ("ram", "cpu", "disk")
+                segs[-1]["res"] = {k: x.get("got", x.get("ask")) for k, x in res.items() if k in SEG_RES
                                    and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
             r["res_granted"] = round(now, 1)
             r.pop("waiting_on", None)
@@ -5516,6 +5617,11 @@ def _evaluate(L, s, procs, now, rated=False):
         L["state"]["cpu_idle"] = round(cpu["idle"], 1)
     if disks:  # what can still be reserved on each disk pool (by id), for the answers (_available)
         L["state"]["disk"] = {k: round(d["left"], 1) for k, d in sorted(disks.items())[:DISK_STATE_MAX]}
+    gst = {k: dict({"dev": c["id"], "pct": round(c["room"], 1)},
+                   **({"gb": round(c["left"], 2)} if c["nvidia"] and c.get("left") is not None else {}))
+           for k, c in sorted(gview.items(), key=lambda kc: kc[1]["index"])[:GPU_STATE_MAX] if c["reservable"]}
+    if gst:  # and on each GPU (by card: share, and an NVIDIA card's memory), when known
+        L["state"]["gpu"] = gst
 
 
 # ----- root callers: the ledger operation runs in a child as the invoking user (H0)
@@ -5675,6 +5781,8 @@ def _in_group(user, gid):
 
 def _call_as_user(name, args, kw, inputs):
     d = {"args": [_enc(a) for a in args], "kw": {k: _enc(v) for k, v in kw.items()}}
+    if gpu_reservations_on():  # the switch as root's command has it (the child's environment is a minimal one)
+        d["gpu_reservations"] = True
     if inputs:
         s, procs, _ = _decide_inputs()
         d["s"], d["procs"] = s, list(procs.values())
@@ -5715,6 +5823,8 @@ def _cmd_ledger_call(name):
     d = json.loads(sys.stdin.read())
     if "s" in d:
         _given = (d["s"], {p["pid"]: p for p in d["procs"]})
+    if d.get("gpu_reservations") is True:  # OOMPH_GPU_RESERVATIONS=1 on root's command: for this operation too
+        os.environ["OOMPH_GPU_RESERVATIONS"] = "1"
     try:
         out = {"ok": fn(*[_dec(a) for a in d["args"]], **{k: _dec(v) for k, v in d["kw"].items()})}
     except LedgerBusy as e:
@@ -5736,11 +5846,14 @@ def _decide_inputs(s=None):
 
 def _with_pools(s):
     """A live sample with what only the logger knows well, while its current.json is fresh (02 §5.2, §6.1): the
-    pools (`others` on the cores), its cpu block (how busy the cores were) and its disks (every pool of this
-    machine by id: what says a reserved volume is gone); else as it is."""
+    pools (`others` on the cores), its cpu block (how busy the cores were), its disks (every pool of this
+    machine by id: what says a reserved volume is gone) and its GPUs (each card's memory and processes: what
+    GPU grants use, and what says a reserved card is gone); else as it is."""
     d = _daemon_sample()
     if d:
         s.update((k, d[k]) for k in ("pools", "cpu") if isinstance(d.get(k), dict) and k not in s)
+        if isinstance(d.get("gpu"), list) and "gpu" not in s:  # its GPUs (every NVIDIA card: what says one is gone)
+            s["gpu"] = d["gpu"]
         if isinstance(d.get("disks"), list) and "disks" not in s:
             s["disks"] = d["disks"]
             if d.get("disks_partial") is True:  # the logger waits for diskutil about a disk
@@ -5761,6 +5874,15 @@ def _brief(r, now):
         b["disk_pool"] = d["pool"]
         if isinstance(d.get("name"), str) and d["name"]:
             b["disk_name"] = _disk_name(d)
+    gp = _gpu_parts(r)
+    for k, f in (("gpu", "gpu"), ("vram", "vram")) if gp else ():  # a GPU's share and memory, and on which card
+        x = gp[k]
+        if x:
+            b[f] = x["got"] if r["state"] == "granted" and _num(x.get("got")) else x["ask"]
+            if r["state"] == "granted" and _num(x.get("used")):
+                b[f + "_used"] = x["used"]
+            if isinstance(x.get("dev"), str) and _GPU_DEV.fullmatch(x["dev"]):
+                b["gpu_dev"] = x["dev"]
     if r["state"] == "granted":
         b.update(used_gb=r.get("used_gb", 0), for_min=round((now - r["granted"]) / 60, 1))
         if c and _num(c.get("used")):
@@ -5778,14 +5900,18 @@ def _brief(r, now):
 
 
 def _available(st):
-    """What can still be reserved, by resource, from the ledger's state (cores and disk only once evaluated by this
-    code; disk by pool id, 02 §7.2)."""
+    """What can still be reserved, by resource, from the ledger's state (cores, disk and GPUs only once evaluated by
+    this code; disk by pool id, 02 §7.2; a GPU by its card)."""
     out = {"ram_gb": st.get("available_gb")}
     for k, f in (("cpu_cores", "cpu_available"), ("cpu_idle", "cpu_idle")):
         if _num(st.get(f)):
             out[k] = st[f]
     if isinstance(st.get("disk"), dict) and st["disk"]:
         out["disk_gb"] = {k: max(0.0, v) for k, v in st["disk"].items()}
+    if isinstance(st.get("gpu"), dict) and st["gpu"]:  # by card: its label, the share and (NVIDIA) the GB left
+        out["gpu"] = {k: dict({"dev": v.get("dev")}, pct=max(0.0, v.get("pct", 0.0)),
+                              **({"mem_gb": max(0.0, v["gb"])} if "gb" in v else {}))
+                      for k, v in st["gpu"].items()}
     return out
 
 
@@ -5801,18 +5927,21 @@ def _status(L, rid, now):
         return {"status": "gone", "id": rid, "outcome": h and h["outcome"],
                 "advice": "This reservation no longer exists (%s). Request a new one if you still need it."
                           % (h["outcome"] if h else "unknown id")}
-    nm, c, dk, need = no_memory(r), _cpu_of(r), _disk_of(r), lease_need(r)
+    nm, c, dk, need, gp = no_memory(r), _cpu_of(r), _disk_of(r), lease_need(r), _gpu_parts(r) or None
     out = {"status": r["state"], "id": r["id"], "gb": 0.0 if nm else r["gb"], "purpose": r["purpose"],
            "available_gb": st.get("available_gb"), "reserved_gb": st.get("reserved_gb"),
            "free_gb": st.get("free_gb"), "level": st.get("level")}
-    if c or dk:  # a vector request: what it asked, and what can be had (02 §7.2)
+    if c or dk or gp:  # a vector request: what it asked, and what can be had (02 §7.2)
         out["asked"] = {} if nm else {"ram_gb": r["gb"]}
         if c:
             out["asked"].update(cpu_cores=_cn(c["ask"]), cpu_min=_cn(need["cpu"][0]))
         if dk:
             out["asked"].update(disk_gb=dk["ask"], disk=dk["pool"], disk_name=_disk_name(dk))
+        if gp:  # a Mac's GPU memory is also in ram_gb (unified: it is memory)
+            out["asked"].update((k, x) for k, x in (("gpu_pct", (gp["gpu"] or {}).get("ask")), ("gpu_device", gp["key"]),
+                                                    ("gpu_mem_gb", (gp["vram"] or {}).get("ask"))) if x is not None)
         out["available"] = _available(st)
-    heavy = "heavy" if c or dk else "memory-heavy"
+    heavy = "heavy" if c or dk or gp else "memory-heavy"
     if r["state"] == "granted":
         out["expires_in_min"] = round((r["expires"] - now) / 60, 1) if r.get("expires") else None
         if r.get("note"):
@@ -5830,6 +5959,10 @@ def _status(L, rid, now):
         if dk and _num(dk.get("got")):
             out["granted"]["disk_gb"] = dk["got"]
             run += "Write at most %s GB to %s for it. " % (_gb(dk["got"]), _disk_name(dk))
+        if gp and gp["key"] and any(x and _num(x.get("got")) for x in (gp["gpu"], gp["vram"])):
+            out.setdefault("granted", {} if nm else {"ram_gb": r["gb"]})
+            gw, run = _G()._gpu_run_with(gp, out["granted"]), _G()._gpu_run_text(gp) + run
+            out.setdefault("run_with", {})["gpu"] = gw
         out["advice"] = ("%sGranted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
                          "%s part is over%s." % (run, r["id"], heavy, "" if not r.get("expires") else
                                                  "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
@@ -5839,13 +5972,13 @@ def _status(L, rid, now):
             out["advice"] = flag_advice(r, fl, now) + out["advice"]
     else:
         queued = [x for x in L["leases"] if x["state"] == "queued"]
-        before = [x for x in queued[:queued.index(r)] if set(lease_need(x)) & set(need)]
+        before = [x for x in queued[:queued.index(r)] if _meets(lease_need(x), need)]
         pos = len(before) + 1  # in the lines of the pools it asks for
         out["position"] = pos
         out["ahead"] = [_brief(x, now) for x in L["leases"]
-                        if (x["state"] == "granted" and set(lease_need(x)) & set(need)) or x in before]
+                        if (x["state"] == "granted" and _meets(lease_need(x), need)) or x in before]
         waiting = r.get("waiting_on") if isinstance(r.get("waiting_on"), list) else ["ram"]
-        if c or dk:
+        if c or dk or gp:
             out["waiting_on"] = waiting
         room = st.get("cpu_available")
         why = ["memory is critical"] if st.get("level") == "critical" or "critical" in waiting else []
@@ -5857,6 +5990,9 @@ def _status(L, rid, now):
                 cores_text(max(0.0, room)), cores_text(st.get("cpu_reserved") or 0)))
         if not why and "ram" in waiting:
             why.append("only %.1f GB is available for new reservations" % max(0.0, st.get("available_gb") or 0))
+        gw = [p for p in waiting if p.startswith(("gpu:", "vram:"))]
+        if not why and gp and gw:
+            why.append(_G()._gpu_wait_text(gp, gw, st))
         if not why and dk and "disk:" + dk["pool"] in waiting:
             left = (st.get("disk") or {}).get(dk["pool"])
             why.append(("%s is not mounted%s" % (_disk_name(dk), ", and this ends in %d min unless it comes back" % max(
@@ -5987,13 +6123,19 @@ def _refuse_disk(s, gb, pool, why):
 
 @_unprivileged(inputs=True)
 def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder", cpu=None, cpu_min=None,
-            disk=None, disk_path=None):
+            disk=None, disk_path=None, gpu=None, vram=None, gpu_device=None):
     """Request (or re-poll with `ticket`) a reservation of `gb` of memory and, with `cpu`, cores: between
     `cpu_min` (default half, rounded up) and `cpu`; with `disk`, that many GB of space on the volume
     `disk_path` is on (default the temporary folder's), named by the pool's id when the request is made, so
-    the reservation follows the volume, not the path (02 §7.1). A request with cores or disk is a lease of
+    the reservation follows the volume, not the path (02 §7.1); with `gpu` a share of a GPU (%) and with `vram`
+    GB of its memory (02 §6.5.1): on a Mac unified memory, charged against RAM; on Linux on one NVIDIA card,
+    `gpu_device` (an index or a UUID prefix, resolved to the card's UUID now) or any card with room, which the
+    grant names. GPU parts only while gpu_reservations is on. A request with cores, disk or a GPU is a lease of
     version 2 (02 §6.2); one for memory alone keeps the shape every older reader writes. Returns its status
     dict."""
+    gpu_new = not ticket and (gpu is not None or vram is not None or gpu_device is not None)
+    if gpu_new and not gpu_reservations_on():  # switched off (1.14): refused before anything is read or written
+        return {"status": "refused", "gb": gb, "advice": _G().gpu_switch_text(), "switch": "gpu_reservations"}
     s, procs, now = _decide_inputs()
     if cpu is not None:
         cpu = _cn(round(float(cpu), 1))
@@ -6010,6 +6152,14 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
         dpool, why_disk, pools = disk_pool_of(disk_path or default_disk_path(), s)
         if dpool:
             s = _with_disk(s, dpool, pools)
+    gcard = why_gpu = gnote = None
+    if gpu_new or (tl is not None and _gpu_parts(tl)):  # the cards' free memory, read now (02 §6.5.1)
+        s = _G()._with_gpus(s)
+    if gpu_new:
+        vram = None if vram is None else round(float(vram), 2)
+        gpu = None if gpu is None else _cn(round(float(gpu), 1))
+        gcard, why_gpu, gnote = _G()._gpu_request(s, vram, gpu_device, gpu)
+    unified = 0.0 if not gpu_new or why_gpu or vram is None or (gcard or {}).get("nvidia", True) else vram
     with Ledger() as L:
         r = next((x for x in L["leases"] if x["id"] == ticket), None) if ticket else None
         if ticket and r is None:
@@ -6019,19 +6169,22 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
             why = _refuse_cpu(s, cpu, cpu_min) if cpu is not None else None
             if why is None and disk is not None:
                 why = _refuse_disk(s, disk, dpool, why_disk)
-            if why or (gb <= 0 and cpu is None and disk is None) or gb < 0 or (ram and gb > 0.9 * ram):
+            if why is None and gpu_new:
+                why = why_gpu
+            whole = gb + unified  # a Mac's GPU memory is memory (02 §6.2)
+            if why or (gb <= 0 and cpu is None and disk is None and not gpu_new) or gb < 0 or (ram and whole > 0.9 * ram):
                 return {"status": "refused", "gb": gb,
-                        "advice": why or "Can't reserve %.1f GB %s. Split the work or lower its parallelism."
-                                         % (gb, _on_ram(s))}
+                        "advice": why or "Can't reserve %.1f GB%s %s. Split the work or lower its parallelism."
+                                         % (whole, " (memory and GPU memory)" if unified else "", _on_ram(s))}
             L["seq"] += 1
-            mirror = round(gb, 2) if gb > 0 else NO_MEM_GB
+            mirror = round(whole, 2) if whole > 0 else NO_MEM_GB
             r = {"id": "r%d" % L["seq"], "state": "queued", "gb": mirror, "purpose": (purpose or "?")[:80],
                  "project": holder.get("project"), "holder": {k: holder.get(k) for k in ("pid", "start", "kind")},
                  "watch": holder["pid"] if watch == "holder" else watch,
                  "ttl": None if ttl_s is None else min(max(60, ttl_s), MAX_TTL_S),
                  "requested": round(now, 1), "seen": round(now, 1),
                  "segments": [{"t": round(now, 1), "gb": mirror}]}
-            if cpu is not None or disk is not None:  # a vector (02 §6.2): `v` once, at creation
+            if cpu is not None or disk is not None or gpu_new:  # a vector (02 §6.2): `v` once, at creation
                 r["v"] = 2
                 r["res"] = {}
                 if cpu is not None:
@@ -6039,10 +6192,14 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                 if disk is not None:  # the pool's id; its name only to tell people which volume
                     r["res"]["disk"] = {"ask": disk, "pool": dpool["id"],
                                         "name": notify_text(dpool.get("name") or dpool["id"], 64)}
+                if gpu_new:  # its card: the one it named (an NVIDIA card's UUID), a Mac's gpu0, or none yet
+                    r["res"].update(_G()._gpu_asked(gcard, gpu, vram))
                 if gb > 0:
-                    r["res"].update(ram={"ask": mirror}, mem={"got": mirror})
-                r["segments"][0]["res"] = dict({"ram": mirror} if gb > 0 else {},
-                                               **{k: x["ask"] for k, x in r["res"].items() if k in ("cpu", "disk")})
+                    r["res"].update(ram={"ask": round(gb, 2)})
+                if whole > 0:
+                    r["res"]["mem"] = {"got": mirror}
+                r["segments"][0]["res"] = dict({"ram": round(gb, 2)} if gb > 0 else {},
+                                               **{k: x["ask"] for k, x in r["res"].items() if k in SEG_RES and k != "ram"})
             r["key"] = _key(r)
             r["user"] = _whoami()  # who asked (03 §6.5): shown once several accounts hold reservations
             r["holder"]["uid"] = os.getuid()
@@ -6058,7 +6215,7 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
             if seen is None or not weighable(seen):
                 L["seq"] -= 1
                 return {"status": "refused", "gb": gb, "advice": "Can't make this reservation: %s could not record it in "
-                        "a form it can weigh. Ask for memory, cores or disk space in plain amounts." % BRAND}
+                        "a form it can weigh. Ask for memory, cores, disk space or a GPU in plain amounts." % BRAND}
             L["leases"].append(r)
         else:
             r["seen"] = round(now, 1)
@@ -6067,16 +6224,19 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                 r["expires"] = round(now + r["ttl"], 1)
         _evaluate(L, s, procs, now)
         out = _status(L, r["id"], now)
-        if s.get("window_s") and out.get("status") == "granted" and "run_with" in out:
+        if s.get("window_s") and out.get("status") == "granted" and "cpu_cores" in out.get("run_with", {}):
             out["window_s"] = s["window_s"]  # how busy the cores were, measured just now (no logger)
+        if gnote and out.get("status") in ("granted", "queued"):  # an estimated working-set limit (02 §4.3)
+            out["note"] = "; ".join(x for x in (out.get("note"), gnote) if x)
         return out
 
 
 def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, watch="holder", progress=None,
-            cpu=None, cpu_min=None, disk=None, disk_path=None):
+            cpu=None, cpu_min=None, disk=None, disk_path=None, gpu=None, vram=None, gpu_device=None):
     kw = {"cpu": cpu, "cpu_min": cpu_min} if cpu is not None else {}
     if disk is not None:
         kw.update(disk=disk, disk_path=disk_path)
+    kw.update((k, x) for k, x in (("gpu", gpu), ("vram", vram), ("gpu_device", gpu_device)) if x is not None)
     st = reserve(gb, purpose, holder, ttl_s, ticket, watch, **kw)
     t0 = time.time()
     while st["status"] == "queued" and time.time() - t0 < wait_s:
@@ -6183,23 +6343,31 @@ def _amend_disk(L, r, disk):
 
 
 @_unprivileged(inputs=True)
-def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=None):
+def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=None, gpu=None, vram=None):
     """Change a reservation in place: its size, its cores, its disk space (on the volume it has), its time
     to live (from now) or its purpose. Shrinking applies at once and hands the room to whoever waits.
     Growing a grant applies only when the extra would be granted to a new request right now (it fits,
     and nobody is queued for it); otherwise it is refused, with advice to reserve the extra separately,
     which queues fairly. Growing a queued request moves it to the back of the queue. A reservation of
     several resources can drop all but one (0). Every applied change is written to the history log, and
-    a new size starts a new segment of the reservation's span."""
+    a new size starts a new segment of the reservation's span. A GPU part (`gpu` %, `vram` GB, 02 §6.5.1) stays
+    on its card; while gpu_reservations is off, one may shrink or be dropped, not be added or grow. On a Mac,
+    `gb` is the memory besides the GPU's (which the gb mirror also carries)."""
     s, procs, now = _decide_inputs()
     if cpu is not None:
         cpu = _cn(round(float(cpu), 1))
         cpu_min = None if cpu_min is None else _cn(round(float(cpu_min), 1))
+    tl = _ticket_lease(rid) if disk is not None or gpu is not None or vram is not None else None
     if disk is not None:
         disk = round(float(disk), 2) or float(disk)  # 0.004 stays itself: refused below, not taken for 0 (drop)
-        tl = _ticket_lease(rid)
         if tl is not None and _disk_of(tl) and disk_reservable():  # its pool's free space, read now
             s = _disk_pool_by_id(s, _disk_of(tl)["pool"])
+    if gpu is not None:
+        gpu = _cn(round(float(gpu), 1))
+    if vram is not None:
+        vram = round(float(vram), 2) or float(vram)
+    if tl is not None and _gpu_parts(tl) and (gpu or vram):  # its card's free memory, read now
+        s = _G()._with_gpus(s)
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         r = next((x for x in L["leases"] if x["id"] == rid), None)
@@ -6207,15 +6375,20 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
             return _status(L, rid, now)
         ram = s.get("ram_gb") or 0
         change, refused = {}, None
-        vec = _cpu_of(r) is not None or _disk_of(r) is not None
-        rest = (_cpu_of(r) is not None and cpu != 0) or (_disk_of(r) is not None and disk != 0)  # kept besides memory
+        gp = _gpu_parts(r) or None
+        vec = _cpu_of(r) is not None or _disk_of(r) is not None or gp is not None
+        rest = (_cpu_of(r) is not None and cpu != 0) or (_disk_of(r) is not None and disk != 0) or \
+            bool(gp and ((gp["gpu"] and gpu != 0) or (gp["vram"] and vram != 0)))  # kept besides memory
         before, order = json.loads(json.dumps(r)), list(L["leases"])  # all or nothing: restored when refused
-        if gb is not None and round(gb, 2) != (0.0 if no_memory(r) else r["gb"]):
+        if (gpu or vram) and not gpu_reservations_on() and _G()._gpu_grows(r, gp, gpu, vram):
+            refused = _G().gpu_switch_text()  # switched off: a GPU part may not be added or grow
+        u = _G()._unified_gb(r) if gp else 0.0  # a Mac's GPU memory, in the gb mirror too
+        if refused is None and gb is not None and round(gb, 2) != (0.0 if no_memory(r) else round(r["gb"] - u, 2)):
             gb = round(gb, 2)
-            old = 0.0 if no_memory(r) else r["gb"]
-            if gb == 0 and rest:
-                pass  # a reservation with cores or disk space drops its memory
-            elif gb <= 0 or (ram and gb > 0.9 * ram):
+            old = 0.0 if no_memory(r) else round(r["gb"] - u, 2)
+            if gb == 0 and (rest or u):
+                pass  # a reservation with cores, disk space or a GPU drops its memory
+            elif gb <= 0 or (ram and gb + u > 0.9 * ram):
                 refused = ("Can't reserve %.1f GB %s. Release the reservation instead "
                            "(release_memory / `oomph release %s`) if the work is done." % (gb, _on_ram(s), rid))
             elif gb > old and r["state"] == "granted":
@@ -6235,13 +6408,15 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
                     L["leases"].remove(r)
                     L["leases"].append(r)
                     change["requeued"] = True
-                r["gb"] = gb if gb > 0 else NO_MEM_GB
+                r["gb"] = round(gb + u, 2) if gb + u > 0 else NO_MEM_GB
                 if vec:  # the vector follows its memory mirror
                     if gb > 0:
                         r["res"]["ram"] = dict(r["res"].get("ram") or {}, ask=gb, **({"got": gb} if r["state"] == "granted" else {}))
-                        r["res"]["mem"] = dict(r["res"].get("mem") or {}, got=gb)
                     else:
                         r["res"].pop("ram", None)
+                    if gb + u > 0:
+                        r["res"]["mem"] = dict(r["res"].get("mem") or {}, got=r["gb"])
+                    else:
                         r["res"].pop("mem", None)
         if refused is None and cpu is not None and (vec or cpu):
             ch, refused = _amend_cpu(L, r, cpu, cpu_min)
@@ -6259,16 +6434,25 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
                     change["requeued"] = True
             if refused and ("gb" in change or "cpu" in change):  # nor the other parts alone
                 refused += " Nothing was changed."
+        for k, a in (("gpu", gpu), ("vram", vram)):
+            if refused is None and a is not None and (vec or a):
+                ch, refused = _G()._amend_gpu(L, r, k, a, s)
+                if ch and ch[0] != ch[1]:
+                    change[k] = ch
+                    if ch[1] > ch[0] and r["state"] == "queued":
+                        change["requeued"] = True
+                if refused and set(change) & {"gb", "cpu", "disk", "gpu"}:
+                    refused += " Nothing was changed."
         if refused:
             r.clear()
             r.update(before)
             L["leases"][:] = order
             change = {}
-        if "gb" in change or "cpu" in change or "disk" in change:
+        if set(change) & {"gb", "cpu", "disk", "gpu", "vram"}:
             seg = {"t": round(now, 1), "gb": r["gb"]}
             if vec:
                 seg["res"] = {k: x.get("got", x.get("ask")) for k, x in r["res"].items()
-                              if k in ("ram", "cpu", "disk") and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
+                              if k in SEG_RES and isinstance(x, dict) and _num(x.get("got", x.get("ask")))}
             r.setdefault("segments", [{"t": r.get("granted") or r["requested"],
                                        "gb": change["gb"][0] or NO_MEM_GB if "gb" in change else r["gb"]}])
             if r["segments"][-1]["t"] >= round(now, 1):
@@ -6302,6 +6486,11 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
                 out["requested_cpu"] = cpu
             if disk is not None:
                 out["requested_disk"] = disk
+            for k, a in (("requested_gpu", gpu), ("requested_gpu_mem", vram)):
+                if a is not None:
+                    out[k] = a
+            if refused.startswith("GPU reservations are switched off"):
+                out["switch"] = "gpu_reservations"
         else:
             out["changed"] = change
         return out
@@ -6322,8 +6511,9 @@ def set_watch(rid, pid):
 def coordination(mine=None, s=None):
     """Current reservations (refreshed), seen from session `mine`: what others hold or wait for. Asked without a
     sample (`oomph reservations`, MCP, `oomph run`'s refresh), without the logger's list of disks and with disk
-    space reserved, every pool is read live (what is left on each). Never for `check` or the hook, which hand in
-    their sample: their cost stays what it was (02 §7.4: the hook never touches a volume)."""
+    space reserved, every pool is read live (what is left on each); with an NVIDIA card reserved and no logger, the
+    cards are (nvidia-smi). Never for `check` or the hook, which hand in their sample: their cost stays what it was
+    (02 §7.4: the hook never touches a volume)."""
     given = s is not None
     s, procs, now = _decide_inputs(s)
     if not given and disk_reservable() and not (isinstance(s.get("disks"), list) and not s.get("disks_partial")) \
@@ -6331,6 +6521,9 @@ def coordination(mine=None, s=None):
         pools = live_volumes()[0]
         if pools is not None:
             s = dict(s, disks=pools, disks_partial=live_volumes_partial())
+    if not given and not isinstance(s.get("gpu"), list) and any(  # NVIDIA grants: what they use, read now
+            (_gpu_parts(r) or {}).get("nvidia") for r in _quietly_leases()):
+        s = _G()._with_gpus(s)
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         st = L["state"]
@@ -6349,7 +6542,7 @@ def coordination(mine=None, s=None):
             "available_gb": st["available_gb"], "grantable_gb": st["available_gb"], "ledger": ledger_info(),
             "reserved_by_others_gb": round(others_out, 1),
             "available_to_me_gb": round(st["free_gb"] - others_out - st["margin_gb"], 1),
-            "cpu": cpu, "disk": disk,
+            "cpu": cpu, "disk": disk, "gpu": st.get("gpu") or {},
             "others": [_brief(r, now) for r in others], "mine": [_brief(r, now) for r in own],
             "history": [dict(h, project=os.path.basename(h.get("project") or "") or None)
                         for h in L["history"][-15:]][::-1],
@@ -6459,7 +6652,7 @@ def refresh_ledger(s, procs, rated=False):
 PROC_KEYS = ("pid", "ppid", "uid", "name", "start", "fp", "rss", "path")  # what the ledger's child is told of a process
 
 
-def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None):
+def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None, gpus=None):
     """The daemon's ledger work for one sample: refresh_ledger, then the snapshot of live
     reservations for the sample, both in a child — as nobody when the daemon is root (root
     never opens anything in the shared directory, to read or to write), as the same user when
@@ -6468,15 +6661,18 @@ def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None):
     or None). The daemon calls this from a thread of its own: the sampler never waits on it.
     `rates`: the cores each process kept busy over the last interval ({pid: cores}, the logger's
     Meter); given, the child's input is of version 2 (02 §5.2) and it charges every grant's cores,
-    and with `writes` ({pid: MB/s written to disk}) every disk grant's writes."""
+    with `writes` ({pid: MB/s written to disk}) every disk grant's writes, and with `gpus` ({pid: % of the
+    GPU}) a Mac's GPU grants (an NVIDIA card's are charged from the sample's list of its processes)."""
     rows = [{k: p[k] for k in PROC_KEYS if k in p} for p in procs.values()]
     if rates is not None:
         for x in rows:
-            c, w = rates.get(x["pid"]), (writes or {}).get(x["pid"])
+            c, w, g = rates.get(x["pid"]), (writes or {}).get(x["pid"]), (gpus or {}).get(x["pid"])
             if _num(c, 0, CPU_MAX):
                 x["cpu"] = round(c, 3)
             if _num(w, 0, 1e7) and w > 0:
                 x["w"] = round(w, 3)
+            if _num(g, 0, 1e4) and g > 0:
+                x["gpu"] = round(g, 2)
     payload = json.dumps(dict({"s": s, "procs": rows}, **({"v": 2} if rates is not None else {})),
                          default=str).encode()
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"], payload,
@@ -6544,7 +6740,8 @@ def ledger_snapshot(procs=None):
     return out
 
 
-SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min", "cpu", "cpu_used", "disk", "disk_used")
+SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min", "cpu", "cpu_used", "disk", "disk_used",
+                     "gpu", "gpu_used", "vram", "vram_used")
 
 
 def sample_leases(x):
@@ -6566,6 +6763,8 @@ def sample_leases(x):
         e.update((k, b[k]) for k in SAMPLE_LEASE_NUMS if _num(b.get(k)))
         if _str(80, _ID)(b.get("disk_pool")) and "disk" in e:  # which pool: an id, compared as a string, never opened
             e["disk_pool"] = b["disk_pool"]
+        if _str(8, _GPU_DEV)(b.get("gpu_dev")) and ("gpu" in e or "vram" in e):  # which card: its label
+            e["gpu_dev"] = b["gpu_dev"]
         size += len(json.dumps(e)) + 1
         if size > LIMITS["leases"]:
             break
@@ -6596,6 +6795,8 @@ def _fmt_brief(b, purpose_w=22):
     if _num(b.get("disk")):
         cores += "%sG on %s%s, " % (_gb(b["disk"]), cut_middle(term_text(b.get("disk_name") or b.get("disk_pool") or "?"), 12),
                                     " (%sG used)" % _gb(b["disk_used"]) if _num(b.get("disk_used")) else "")
+    if _num(b.get("gpu")) or _num(b.get("vram")):  # a GPU's memory and share, on which card
+        cores += _G()._gpu_brief_text(b)
     tail = cores + ((("using %.1fG, " % b.get("used_gb", 0)) if b["gb"] > 0 else "") + "%.0f min" % max(0.0, b["for_min"])
                     if b["state"] == "granted" else "waiting %.0f min" % max(0.0, b["waiting_min"]))
     flags = b.get("flags") if isinstance(b.get("flags"), dict) else {}
@@ -6658,11 +6859,13 @@ def _usage_error(cmd, e, text):
 
 
 RESERVE_USAGE = ("usage: oomph reserve [size, e.g. 6G] [--cpu 8 | --cpu 4..8 | --cpu 8..8] [--disk 20G[@PATH]] "
-                 "--for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
+                 "[--gpu 60[@CARD]] [--gpu-mem 16G[@CARD]] --for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
 RELEASE_USAGE = "usage: oomph release <id | all>   (all = every reservation held by this session)"
-AMEND_USAGE = "usage: oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--ttl 20m] [--for \"what\"] [--json]"
-RUN_USAGE = ("usage: oomph run [--reserve 6G] [--cpu 4..12] [--disk 20G[@PATH]] [--for \"what\"] [--wait 30m] -- "
-             "<command> [args…]   ({cpu} in the command is the number of cores granted)")
+AMEND_USAGE = ("usage: oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--gpu 40] [--gpu-mem 12G] [--ttl 20m] "
+               "[--for \"what\"] [--json]")
+RUN_USAGE = ("usage: oomph run [--reserve 6G] [--cpu 4..12] [--disk 20G[@PATH]] [--gpu 60[@CARD]] [--gpu-mem 16G[@CARD]] "
+             "[--pin-gpu] [--for \"what\"] [--wait 30m] -- <command> [args…]   ({cpu} in the command is the number of "
+             "cores granted)")
 
 
 def _cpu_opt(o):
@@ -6685,14 +6888,27 @@ def _disk_opt(o, zero=False):
         raise UsageError(str(e))
 
 
+def _unified_rec_gb(h):
+    """The GB of a Mac's GPU memory in a finished reservation's gb (its `res` has vram and no NVIDIA card), else 0."""
+    res = h.get("res") if isinstance(h.get("res"), dict) else {}
+    return res["vram"] if _num(res.get("vram")) and not str(res.get("gpu_dev", "")).startswith("GPU-") else 0.0
+
+
+def _gpu_rec(h, short=False):
+    """A finished reservation's GPU parts in words (oomph_gpu._gpu_rec_text), "" at once without one."""
+    return _G()._gpu_rec_text(h, short) if set(h.get("res") or {}) & {"gpu", "vram"} else ""
+
+
 def cmd_reserve(args):
     try:
-        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu", "--disk"),
+        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu", "--disk", "--gpu", "--gpu-mem"),
                          ("--json", "--help", "-h"))
         ticket = o.get("--ticket")
         cpu, cpu_min = _cpu_opt(o)
         disk, disk_path = _disk_opt(o)
-        if "--help" in o or "-h" in o or (not pos and not ticket and cpu is None and disk is None):
+        gpu, vram, card = _G()._gpu_opts(o) if {"--gpu", "--gpu-mem"} & set(o) else (None, None, None)
+        if "--help" in o or "-h" in o or (not pos and not ticket and cpu is None and disk is None and gpu is None
+                                          and vram is None):
             print(RESERVE_USAGE)
             return 2
         gb = _size(pos[0]) if pos else 0
@@ -6701,10 +6917,13 @@ def cmd_reserve(args):
             raise UsageError("--pid takes a process id, not %s" % pid)
     except UsageError as e:
         return _usage_error("reserve", e, RESERVE_USAGE)
+    if (gpu is not None or vram is not None) and not ticket and not gpu_reservations_on():
+        return _G()._gpu_off(o, "--json" in o)
     holder = holder_for(int(pid) if pid is not None else None)
     st = acquire(gb, o.get("--for", "unspecified"), holder, parse_dur(o.get("--ttl", "30m")),
                  parse_dur(o.get("--wait", "0s")), ticket, cpu=cpu, cpu_min=cpu_min, disk=disk,
-                 disk_path=os.path.abspath(disk_path) if disk_path else None)
+                 disk_path=os.path.abspath(disk_path) if disk_path else None,
+                 **({"gpu": gpu, "vram": vram, "gpu_device": card} if gpu is not None or vram is not None else {}))
     if "--json" in o:
         print(json.dumps(st))
     else:
@@ -6734,21 +6953,24 @@ def cmd_release(args):
     for h in res["released"]:
         cpu, peak = (h.get("res") or {}).get("cpu"), (h.get("peak") or {}).get("cpu")
         dk, dpeak = (h.get("res") or {}).get("disk"), (h.get("peak") or {}).get("disk")
-        mem = "%.1fG, peak %.1fG" % (h["gb"], h["peak_gb"]) \
-            if "ram" in (h.get("res") or {}) or not (_num(cpu) or _num(dk)) else ""
+        uv = _unified_rec_gb(h)  # a Mac's GPU memory is in gb too: said once, as GPU memory
+        mem = "%.1fG, peak %.1fG" % (max(0.0, h["gb"] - uv), h["peak_gb"]) \
+            if ("ram" in (h.get("res") or {}) and h["gb"] - uv > 0.005) or not (_num(cpu) or _num(dk) or _gpu_rec(h)) \
+            else ""
         cores = "%s cores%s" % (cores_text(cpu), ", peak %.1f busy" % peak if _num(peak) else "") if _num(cpu) else ""
         disk = "%sG of disk%s" % (_gb(dk), ", %sG used" % _gb(dpeak) if _num(dpeak) else "") if _num(dk) else ""
         print("oomph: released %s (%s) — reserved %s, held %ds" % (
-            h["id"], h["purpose"], " and ".join(x for x in (mem, cores, disk) if x), h["held_s"]))
+            h["id"], h["purpose"], " and ".join(x for x in (mem, cores, disk, _gpu_rec(h)) if x), h["held_s"]))
     if res["next_granted"]:
         print("oomph: now granted to " + ", ".join(res["next_granted"]))
     return 0
 
 
 def cmd_amend(args):
+    opts = ("--gb", "--ttl", "--for", "--cpu", "--disk", "--gpu", "--gpu-mem")
     try:
-        o, pos = _strict(args, ("--gb", "--ttl", "--for", "--cpu", "--disk"), ("--json", "--help", "-h"))
-        if not pos or not any(k in o for k in ("--gb", "--ttl", "--for", "--cpu", "--disk")) or "--help" in o or "-h" in o:
+        o, pos = _strict(args, opts, ("--json", "--help", "-h"))
+        if not pos or not any(k in o for k in opts) or "--help" in o or "-h" in o:
             print(AMEND_USAGE)
             return 2
         gb = _size(o["--gb"]) if "--gb" in o else None
@@ -6756,11 +6978,14 @@ def cmd_amend(args):
         disk, disk_path = _disk_opt(o, zero=True)  # 0 (0G, 0M, …) drops the disk space
         if disk_path:
             raise UsageError("--disk %s: a reservation stays on its volume; give the new size alone" % o["--disk"])
+        gpu, vram, card = _G()._gpu_opts(o, zero=True) if {"--gpu", "--gpu-mem"} & set(o) else (None, None, None)  # 0 drops it
+        if card:
+            raise UsageError("a reservation stays on its card; give the new amount alone")
     except UsageError as e:
         return _usage_error("amend", e, AMEND_USAGE)
     rid = pos[0]
     st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"), cpu=cpu, cpu_min=cpu_min,
-               disk=disk)
+               disk=disk, **{k: x for k, x in (("gpu", gpu), ("vram", vram)) if x is not None})
     if "--json" in o:
         print(json.dumps(st))
     else:
@@ -6768,6 +6993,8 @@ def cmd_amend(args):
         what = ", ".join(("%.1fG → %.1fG" % tuple(v)) if k == "gb" else
                          ("%s → %s cores" % tuple(cores_text(x) for x in v)) if k == "cpu" else
                          ("%sG → %sG of disk" % tuple(_gb(x) for x in v)) if k == "disk" else
+                         ("%s → %s %% of the GPU" % tuple(cores_text(x) for x in v)) if k == "gpu" else
+                         ("%sG → %sG of GPU memory" % tuple(_gb(x) for x in v)) if k == "vram" else
                          ("expires in %.0f min" % v[1]) if k == "expires_in_min" else
                          ("ttl %.0f min" % v) if k == "ttl_min" else
                          ("for \"%s\"" % v[1]) if k == "purpose" else "back of the queue"
@@ -6791,6 +7018,9 @@ def cmd_reservation_history(args):
             gbs = ("%s cores" if not x["gb"] else gbs + " %sc") % cores_text(x["res"]["cpu"])
         if _num((x.get("res") or {}).get("disk")):  # and its disk space
             gbs = ("%sG disk" if not x["gb"] and "cpu" not in x["res"] else gbs + " %sGd") % _gb(x["res"]["disk"])
+        g = _gpu_rec(x, short=True)
+        if g:  # and a GPU
+            gbs = g if not x["gb"] and not set(x["res"]) & {"cpu", "disk"} else gbs + " " + g
         print("  %-6s %s–%-5s %-13s peak %4.1fG  %-26s %-14s %s" % (
             x["id"], when, end, gbs, x["peak_gb"], x["purpose"][:26], (x["project"] or "")[:14], x["outcome"]))
     return 0
@@ -6822,9 +7052,10 @@ def cmd_reservations(args):
     if c["history"]:
         print("\nrecent (reserved → peak actually added):")
         for h in c["history"][:10]:
-            print("  %-5s %5.1fG → %4.1fG  %-20s %-10s %-11s held %s" % (
+            print("  %-5s %5.1fG → %4.1fG  %-20s %-10s %-11s held %s%s" % (
                 h["id"], h["gb"], h["peak_gb"], cut_end(h["purpose"], 20), cut_middle(h.get("project") or "", 10),
-                h["outcome"], "%dm%02ds" % divmod(h["held_s"], 60)))
+                h["outcome"], "%dm%02ds" % divmod(h["held_s"], 60),
+                "  " + _gpu_rec(h, short=True) if _gpu_rec(h, short=True) else ""))
     return 0
 
 
@@ -6832,11 +7063,16 @@ JOB_VARS = ("CARGO_BUILD_JOBS", "CMAKE_BUILD_PARALLEL_LEVEL", "GOMAXPROCS", "OMP
             "PYTEST_XDIST_AUTO_NUM_WORKERS")  # what common tools read for their number of jobs (02 §7.1)
 
 
-def run_env(st, env):
+def run_env(st, env, pin=False):
     """The environment of `oomph run`'s command for grant `st` (02 §7.1): OOMPH_RESERVATION, OOMPH_RAM_GB,
     with disk space OOMPH_DISK_GB and, with cores, OOMPH_CPU_CORES; and, only where not already set, the job
-    counts that common tools read (JOB_VARS, MAKEFLAGS=-jN): on by default (02 §15.9)."""
+    counts that common tools read (JOB_VARS, MAKEFLAGS=-jN): on by default (02 §15.9). With a GPU (02 §6.5.1)
+    always OOMPH_GPU_INDEX, OOMPH_GPU_UUID (an NVIDIA card) and OOMPH_GPU_MEM_GB; with `pin` (--pin-gpu) on an
+    NVIDIA card also CUDA_DEVICE_ORDER=PCI_BUS_ID and CUDA_VISIBLE_DEVICES=<index>, replacing what was set
+    (gpu_pin_changes says what): jobs are not pinned unless asked."""
     out = dict(env, OOMPH_RESERVATION=st["id"])
+    if isinstance((st.get("run_with") or {}).get("gpu"), dict):
+        _G()._gpu_env(st["run_with"]["gpu"], out, pin)
     if st.get("gb"):
         out["OOMPH_RAM_GB"] = "%g" % st["gb"]
     dk = (st.get("granted") or {}).get("disk_gb")
@@ -6863,21 +7099,31 @@ def run_argv(cmd, st):
 
 
 def cmd_run(args):
-    if "--" not in args or not any(k in args[:args.index("--")] for k in ("--reserve", "--cpu", "--disk")):
+    if "--" not in args or not any(k in args[:args.index("--")] for k in ("--reserve", "--cpu", "--disk", "--gpu",
+                                                                            "--gpu-mem", "--pin-gpu")):
         print(RUN_USAGE)
         return 2
     i = args.index("--")
     cmd = args[i + 1:]
     try:
-        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu", "--disk"), npos=0)
+        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu", "--disk", "--gpu", "--gpu-mem"),
+                          ("--pin-gpu",), npos=0)
         gb = _size(opts["--reserve"]) if "--reserve" in opts else 0
         cpu, cpu_min = _cpu_opt(opts)
         disk, disk_path = _disk_opt(opts)
+        gpu, vram, card = _G()._gpu_opts(opts) if {"--gpu", "--gpu-mem"} & set(opts) else (None, None, None)
+        pin = "--pin-gpu" in opts
+        off = (pin or gpu is not None or vram is not None) and not gpu_reservations_on()  # 02 §6.5.1: the switch first
+        if pin and gpu is None and vram is None and not off:
+            raise UsageError("--pin-gpu comes with --gpu or --gpu-mem: it runs the job on the card granted")
     except UsageError as e:
         return _usage_error("run", e, RUN_USAGE)
     if not cmd:
         print("oomph run: no command given")
         return 2
+    if off:
+        sys.stderr.write(_G().gpu_switch_text("oomph: not started — ") + "\n")
+        return 75
     import signal
     purpose = opts.get("--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
     wait_s = parse_dur(opts.get("--wait", "30m"))
@@ -6887,7 +7133,9 @@ def cmd_run(args):
           "agent": agent_key(ses["pid"], ses["start"]) if ses["kind"] == "session" else None}
     last = [0.0]
     want = " and ".join(([("%.1fG" % gb)] if gb else []) + (["%s cores" % cores_text(cpu_min if cpu_min == cpu else cpu)]
-                                                           if cpu else []) + (["%sG of disk" % _gb(disk)] if disk else []))
+                                                           if cpu else []) + (["%sG of disk" % _gb(disk)] if disk else [])
+                        + (["%sG of GPU memory" % _gb(vram)] if vram else []) + (["%s %% of a GPU" % cores_text(gpu)]
+                                                                                 if gpu else []))
 
     def progress(st):
         if time.time() - last[0] >= 30:
@@ -6900,7 +7148,8 @@ def cmd_run(args):
             sys.stderr.flush()
 
     st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress, cpu=cpu, cpu_min=cpu_min, disk=disk,
-                 disk_path=os.path.abspath(disk_path) if disk_path else None)
+                 disk_path=os.path.abspath(disk_path) if disk_path else None,
+                 **({"gpu": gpu, "vram": vram, "gpu_device": card} if gpu is not None or vram is not None else {}))
     if st["status"] != "granted":
         if st["status"] == "queued":
             _quietly(release, st["id"])
@@ -6909,9 +7158,11 @@ def cmd_run(args):
         return 75
     if st.get("note"):
         sys.stderr.write("oomph: note — %s\n" % st["note"])
+    if (st.get("run_with") or {}).get("gpu"):  # where the job may run (02 §6.5.1): said once; pinned only when asked
+        _G()._gpu_run_note(st, pin)
     t0 = time.time()
     try:
-        child = subprocess.Popen(run_argv(cmd, st), env=run_env(st, os.environ))
+        child = subprocess.Popen(run_argv(cmd, st), env=run_env(st, os.environ, pin))
     except OSError as e:
         _quietly(release, st["id"])
         sys.stderr.write("oomph run: %s\n" % e)
@@ -6933,11 +7184,16 @@ def cmd_run(args):
     h = (res["released"] or [{}])[0]
     cores, dpeak = (h.get("peak") or {}).get("cpu"), (h.get("peak") or {}).get("disk")
     parts = ["reserved %.1fG, peak %.1fG" % (gb, h.get("peak_gb", 0))] if gb else []
-    if st.get("run_with"):
+    if "cpu_cores" in (st.get("run_with") or {}):
         parts.append("%s cores%s" % (cores_text(st["run_with"]["cpu_cores"]), ", peak %.1f busy" % cores
                                      if _num(cores) else ""))
     if disk:
         parts.append("%sG of disk%s" % (_gb(disk), ", %sG used" % _gb(dpeak) if _num(dpeak) else ""))
+    vpeak = (h.get("peak") or {}).get("vram")
+    if vram:
+        parts.append("%sG of GPU memory%s" % (_gb(vram), ", peak %sG" % _gb(vpeak) if _num(vpeak) else ""))
+    if gpu:
+        parts.append("%s %% of the GPU" % cores_text(gpu))
     sys.stderr.write("oomph: %s — %s, %ds\n" % (st["id"], ", ".join(parts), time.time() - t0))
     return rc if rc >= 0 else 128 - rc
 
@@ -7055,7 +7311,8 @@ MCP_TOOLS = [
                     "granted between half of that and all of it, and the answer's run_with.cpu_cores is the number "
                     "to run with (-jN), not the number you asked for. Before writing more than about 5 GB (a download, "
                     "a dataset, an image build) also ask for disk_gb, and disk_path when it is not the temporary "
-                    "folder's disk.",
+                    "folder's disk. For a model on a GPU, gpu_mem_gb (the model plus half a GB) and gpu_pct, only where "
+                    "`oomph resources` lists gpu as reservable: the answer's run_with.gpu names the card to run on.",
      "inputSchema": {"type": "object", "required": ["purpose"], "additionalProperties": False, "properties": {
          "gb": {"type": "number", "exclusiveMinimum": 0, "description": "estimated peak extra memory in GB (gb, "
                                                                         "cpu_cores or disk_gb, or several)"},
@@ -7066,6 +7323,12 @@ MCP_TOOLS = [
                                                                              "that many, or wait)"},
          "disk_gb": {"type": "number", "exclusiveMinimum": 0, "description": "GB the work will write to one disk"},
          "disk_path": {"type": "string", "description": "any path on that disk (default: the temporary folder's)"},
+         "gpu_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100,
+                     "description": "share of one GPU the work keeps busy, in % (where GPUs are reservable)"},
+         "gpu_mem_gb": {"type": "number", "exclusiveMinimum": 0, "description": "GB of GPU memory: the model plus half a "
+                                                                              "GB (a Mac: counted as memory)"},
+         "gpu_device": {"type": "string", "description": "the card to use: its index (e.g. '1') or UUID prefix; "
+                                                         "default: any card with room, named in run_with.gpu"},
          "purpose": {"type": "string", "description": "short label, e.g. 'gradle assembleDebug' — reuse the same "
                                                        "label for the same work so its measured peak can guide estimates"},
          "wait_s": {"type": "integer", "minimum": 0, "maximum": 300, "default": 120,
@@ -7092,6 +7355,8 @@ MCP_TOOLS = [
                                                                  "reservation that also holds cores or disk space)"},
          "cpu_cores": {"type": "number", "minimum": 0, "description": "new number of cores (0 drops them)"},
          "disk_gb": {"type": "number", "minimum": 0, "description": "new disk space in GB, on the same disk (0 drops it)"},
+         "gpu_pct": {"type": "number", "minimum": 0, "maximum": 100, "description": "new share of the GPU (0 drops it)"},
+         "gpu_mem_gb": {"type": "number", "minimum": 0, "description": "new GPU memory in GB, on the same card (0 drops it)"},
          "ttl_min": {"type": "integer", "minimum": 1, "maximum": 480, "description": "expire this many minutes from now"},
          "purpose": {"type": "string", "description": "new short label"}}}},
     {"name": "reservations",
@@ -7108,7 +7373,7 @@ MCP_TOOLS = [
          "hours": {"type": "number", "minimum": 0.1, "maximum": 336, "default": 24},
          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
          "purpose": {"type": "string", "description": "only reservations whose purpose contains this text"},
-         "resource": {"type": "string", "enum": ["memory", "cpu", "disk"],
+         "resource": {"type": "string", "enum": ["memory", "cpu", "disk", "gpu"],
                       "description": "only reservations that held this resource"}}}},
     {"name": "my_session",
      "description": "Memory used by the Claude Code session this server belongs to: its whole process tree, total, "
@@ -7161,14 +7426,16 @@ def _mcp_args(name, a):
     if extra:
         raise ToolArgError("%s takes no argument %s (it takes %s)" % (
             name, ", ".join(extra), ", ".join(sch["properties"])))
-    for k in ("cpu_cores", "cpu_min", "disk_gb"):  # numbers, as the schema says (gb is read as before: float() of it)
+    for k in ("cpu_cores", "cpu_min", "disk_gb", "gpu_pct", "gpu_mem_gb"):  # numbers, as the schema says (gb: float())
         if a.get(k) is not None and not _num(a[k], 0, 1e6):
             raise ToolArgError("%s: %s takes a number from 0 up, not %r" % (name, k, a[k]))
+    if any(a.get(k) is not None for k in ("gpu_pct", "gpu_mem_gb", "gpu_device")):
+        _G()._gpu_mcp_args(name, a)
     if a.get("disk_gb") and round(float(a["disk_gb"]), 2) < DISK_MIN_GB:  # 0.004 would be kept as none
         raise ToolArgError("%s: disk_gb takes at least %g (GB), not %r" % (name, DISK_MIN_GB, a["disk_gb"]))
     if name == "reserve_memory":
-        if not (a.get("gb") or a.get("cpu_cores") or a.get("disk_gb")):
-            raise ToolArgError("reserve_memory needs gb, cpu_cores or disk_gb (or several)")
+        if not (a.get("gb") or a.get("cpu_cores") or a.get("disk_gb") or a.get("gpu_pct") or a.get("gpu_mem_gb")):
+            raise ToolArgError("reserve_memory needs gb, cpu_cores, disk_gb, gpu_pct or gpu_mem_gb (or several)")
         if a.get("disk_path") is not None and not (a.get("disk_gb") and isinstance(a["disk_path"], str)
                                                    and 0 < len(a["disk_path"]) <= 4096 and "\0" not in a["disk_path"]):
             raise ToolArgError("reserve_memory: disk_path is a path on the disk, and comes with disk_gb")
@@ -7198,11 +7465,14 @@ def _mcp_call(name, a):
         ttl = min(max(int(a.get("ttl_min", 30)), 1), 480) * 60
         cpu = parse_cores(a["cpu_cores"])[0] if a.get("cpu_cores") else None
         path = a.get("disk_path")
+        gpu = {k: x for k, x in (("gpu", round(float(a["gpu_pct"]), 1) if a.get("gpu_pct") else None),
+                                 ("vram", round(float(a["gpu_mem_gb"]), 2) if a.get("gpu_mem_gb") else None),
+                                 ("gpu_device", a.get("gpu_device"))) if x is not None}
         return acquire(float(a.get("gb") or 0), str(a.get("purpose", "unspecified")), holder_for(), ttl,
                        min(max(int(a.get("wait_s", 120)), 0), 300), a.get("ticket"), cpu=cpu,
                        cpu_min=round(float(a["cpu_min"]), 1) if cpu and a.get("cpu_min") is not None else None,
                        disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") else None,
-                       disk_path=os.path.abspath(os.path.expanduser(path)) if path else None)
+                       disk_path=os.path.abspath(os.path.expanduser(path)) if path else None, **gpu)
     if name == "release_memory":
         rid = str(a.get("id", ""))
         return release(rid, holder_for()["pid"] if rid == "all" else None)
@@ -7212,7 +7482,10 @@ def _mcp_call(name, a):
                      str(a["purpose"]) if a.get("purpose") else None,
                      cpu=(parse_cores(a["cpu_cores"])[0] if a["cpu_cores"] else 0.0)
                      if a.get("cpu_cores") is not None else None,
-                     disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") is not None else None)
+                     disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") is not None else None,
+                     **{k: x for k, x in (("gpu", round(float(a["gpu_pct"]), 1) if a.get("gpu_pct") is not None else None),
+                                          ("vram", round(float(a["gpu_mem_gb"]), 2) if a.get("gpu_mem_gb") is not None
+                                           else None)) if x is not None})
     if name == "reservations":
         return coordination(holder_for()["pid"])
     if name == "reservation_history":
@@ -7223,6 +7496,8 @@ def _mcp_call(name, a):
             h["reservations"] = [x for x in h["reservations"] if "cpu" in (x.get("res") or {})]
         elif a.get("resource") == "disk":
             h["reservations"] = [x for x in h["reservations"] if "disk" in (x.get("res") or {})]
+        elif a.get("resource") == "gpu":
+            h["reservations"] = [x for x in h["reservations"] if set(x.get("res") or {}) & {"gpu", "vram"}]
         elif a.get("resource") == "memory":
             h["reservations"] = [x for x in h["reservations"] if x["gb"] > 0]
         h["reservations"] = h["reservations"][:int(a.get("limit", 50))]

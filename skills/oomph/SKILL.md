@@ -149,15 +149,34 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
   about 5 GB: `disk_gb` (`--disk 20G`), and `disk_path` (`--disk 20G@/Volumes/Scratch`) when it
   is not the temporary folder's disk. Write at most that much; delete what you no longer need.
 - **The answer says what happens.** While queued, `waiting_on` names what you wait for (`ram`,
-  `cpu`, `disk:<volume>`); a request waiting for cores holds up nobody's memory. Once granted, an
-  answer may carry `flags` with its advice first: **`over`** (your processes use more cores than
-  granted, or wrote more than the disk space reserved: lower the parallelism or `amend` it) or
-  **`idle`** (the cores have been nearly unused for ten minutes: release them, or `amend` with
-  `cpu_cores: 0`). They are advice; nothing is taken away, but other sessions see them.
+  `cpu`, `disk:<volume>`, `gpu:<card>`, `vram:<card>`); a request waiting for cores holds up
+  nobody's memory. Once granted, an answer may carry `flags` with its advice first: **`over`** (your
+  processes use more cores than granted, or wrote more than the disk space reserved: lower the
+  parallelism or `amend` it) or **`idle`** (the cores have been nearly unused for ten minutes:
+  release them, or `amend` with `cpu_cores: 0`). They are advice; nothing is taken away, but other
+  sessions see them.
 - A busy CPU is not an emergency. Only `tight` and `critical` change what you do, and they are
   about memory and about the disks you write to.
 - Look at `reservation_history` for the `peak` of each resource the last time this purpose ran,
   and shrink or grow accordingly.
+
+**GPUs** (only where `OOMPH resources --json` lists `gpu` under `reservable`; it ships switched off,
+and a request is then refused with how to switch it on: tell the user, don't switch it yourself):
+- Before loading a model, reserve its GPU memory: `gpu_mem_gb` (`--gpu-mem 16G`) is **the model plus
+  half a GB** (CUDA's context), and `gpu_pct` (`--gpu 60`) the share of the GPU it keeps busy. Its
+  host memory (the weights pass through RAM) is the ordinary `gb` in the same call.
+- On a Mac the GPU's memory is the Mac's memory: it is counted as memory, and `run_with.gpu` just
+  confirms the amounts.
+- On Linux with NVIDIA cards the grant names **one card** (`run_with.gpu`: `index`, `uuid`, `name`,
+  `env`), the one with room unless you named one (`gpu_device: "1"`, `--gpu-mem 16G@1`). **Run the
+  job on that card**: set the two variables of `run_with.gpu.env` (`CUDA_DEVICE_ORDER=PCI_BUS_ID
+  CUDA_VISIBLE_DEVICES=1`; inside the job it is then `cuda:0`), or wrap it in `OOMPH run --gpu-mem 16G
+  --pin-gpu -- …`, which sets them. Nothing pins the job for you otherwise.
+- A job that needs two cards makes two reservations, one per card (`--gpu-mem 16G@0`, `--gpu-mem
+  16G@1`). A flag **`elsewhere`** means your processes use another card than the one granted (one
+  you hold no reservation on): pin them. **`over`** means they hold more than granted: amend (`gpu_mem_gb`) or load less. A model
+  served by another account's process (an Ollama or ComfyUI service) is not measured against your
+  grant: reserve what it will load all the same, and expect no `used`, `over` or `elsewhere`.
 
 **3. When you are queued:**
 - Don't start the work, and don't "just start it anyway" because memory looks free —

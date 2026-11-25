@@ -347,36 +347,19 @@ class Meter:
     def _cards(self, out, use, procs):
         """The `gpu` block of a machine with NVIDIA cards (roadmap §11): per card its busy time (the share of
         the last sample period the driver saw a kernel run: the GPU's `util` here as the Mac's busy time is),
-        the memory in use and on the card (`mem_limit_gb`), and the processes on it biggest first (`procs`,
-        names from this table, never from the driver); per process its SM share on all cards (`gpu`)."""
+        the memory in use, free and on the card, and the processes on it biggest first (`procs`, names from
+        this table, never from the driver: oomph_linux.card_sample); per process its SM share on all cards
+        (`gpu`). Only a list nvidia-smi answered is written: a block is every card (1.14's GPU pools)."""
         cards = self._get("gpu_cards")
         if cards is None:
             return
         out["gpu"] = []
         for c in cards:
-            g = {"id": "gpu%d" % c["index"], "name": c["name"], "unified": False, "src": "nvidia-smi"}
-            if c.get("util") is not None:
-                g["util"] = g["now"] = round(c["util"], 1)
-            if c.get("used_mb") is not None:
-                g["mem_gb"] = round(c["used_mb"] / 1024.0, 2)
-            if c.get("total_mb"):
-                g["mem_limit_gb"] = round(c["total_mb"] / 1024.0, 1)
-            if c.get("uuid"):
-                g["uuid"] = c["uuid"]
-            rows = []
+            out["gpu"].append(self.P.card_sample(c, procs))
             for pid, x in (c.get("procs") or {}).items():
-                p = procs.get(pid)
-                e = {"pid": pid, "name": p["name"] if p else None}
-                if x.get("mb") is not None:
-                    e["mb"] = round(x["mb"])
                 if x.get("sm") is not None:
-                    e["util"] = round(x["sm"], 1)
                     u = use.setdefault(pid, {})
                     u["gpu"] = min(100.0, u.get("gpu", 0.0) + x["sm"])
-                rows.append({k: v for k, v in e.items() if v is not None})
-            if rows:
-                g["procs"] = rows
-            out["gpu"].append(g)
 
     GPU_APART, GPU_APART_S = 25.0, 300.0
 
@@ -877,12 +860,12 @@ class LedgerWorker:
         threading.Thread(target=self.loop, name="ledger", daemon=True).start()
         return self
 
-    def offer(self, s, procs, rates=None, writes=None):
+    def offer(self, s, procs, rates=None, writes=None, gpus=None):
         """The newest sample and process table, and the cores each process kept busy ({pid: cores}, when the
-        Meter had an interval) and the MB/s it wrote to disk ({pid: MB/s}): the child charges every grant's
-        cores and disk writes from them (02 §6.3)."""
+        Meter had an interval), the MB/s it wrote to disk ({pid: MB/s}) and its share of the GPU ({pid: %}): the
+        child charges every grant's cores, disk writes and a Mac's GPU share from them (02 §6.3)."""
         with self.cond:
-            self.slot = (s, procs, rates, writes)
+            self.slot = (s, procs, rates, writes, gpus)
             self.cond.notify()
 
     def latest(self, max_age):
@@ -895,23 +878,24 @@ class LedgerWorker:
             with self.cond:
                 while self.slot is None:
                     self.cond.wait()
-                (s, procs, rates, writes), self.slot = self.slot, None
+                (s, procs, rates, writes, gpus), self.slot = self.slot, None
             try:
-                self.run_once(s, procs, rates, writes)
+                self.run_once(s, procs, rates, writes, gpus)
             except Exception as e:
                 self.sig = None
                 self.error(str(e) if isinstance(e, oomph.LedgerError) else repr(e))
                 with self.cond:
                     self.runs += 1
 
-    def run_once(self, s, procs, rates=None, writes=None):
+    def run_once(self, s, procs, rates=None, writes=None, gpus=None):
         sig, now = ledger_signature(), time.time()
         if not self.leases and sig == self.sig and now - self.last_run < self.FORCE_EVERY:
             with self.cond:
                 self.at = now  # still nothing reserved
             return
         self.sig, self.last_run = sig, now
-        leases, err = self.tick(s, procs, rates=rates, **({"writes": writes} if writes else {})) \
+        leases, err = self.tick(s, procs, rates=rates, **dict({"writes": writes} if writes else {},
+                                                              **({"gpus": gpus} if gpus else {}))) \
             if rates is not None else self.tick(s, procs)
         if err:  # e.g. busy: the snapshot still counts
             self.sig = None
@@ -1539,9 +1523,10 @@ class Daemon:
             pools = {"t": s["t"], "cpu": cp}
         rates = {pid: u["cpu"] for pid, u in use.items() if "cpu" in u} if use else None
         writes = {pid: u["w"] for pid, u in use.items() if u.get("w")} if use else None
+        gpus = {pid: u["gpu"] for pid, u in use.items() if u.get("gpu")} if use else None
         self.ledger.offer(dict({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
                                 and k not in TOP_RATES}, **({"pools": pools} if pools else {})),
-                          procs, rates or None, writes or None)
+                          procs, rates or None, writes or None, gpus or None)
         if leases:  # memory sessions have reserved through oomph's ledger (purposes left out where it is a group's)
             s["leases"] = [dict(x, purpose="?", project=None) for x in leases] if ledger_kept_to_group() else leases
         if gone:

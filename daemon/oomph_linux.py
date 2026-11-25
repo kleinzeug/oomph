@@ -1103,12 +1103,16 @@ def _mount_id(mount):
 # and when the caller is root the program runs as nobody (the device files are 0666; nothing else is
 # needed). The logger itself is never root on Linux. A machine without nvidia-smi has no `gpu` block.
 NVIDIA_SMI = "/usr/bin/nvidia-smi"
-NV_QUERY = ["--query-gpu=index,uuid,name,utilization.gpu,memory.total,memory.used", "--format=csv,noheader,nounits"]
+NV_QUERY = ["--query-gpu=index,uuid,name,utilization.gpu,memory.total,memory.used,memory.free,display_active,"
+            "mig.mode.current", "--format=csv,noheader,nounits"]   # 1.14: free memory and the modes, for the pools
+NV_QUERY_OLD = ["--query-gpu=index,uuid,name,utilization.gpu,memory.total,memory.used", "--format=csv,noheader,nounits"]
 NV_PMON = ["pmon", "-c", "1", "-s", "um"]
 NV_APPS = ["--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"]
 NV_RETRY_S = 600         # nvidia-smi missing or failing: asked again after this long
+NV_TIMEOUT_S = 4.0       # one run of nvidia-smi
+NV_HUNG_RETRY_S = 60     # nvidia-smi that did not answer the long question in time (a busy driver): asked again sooner
 NV_PROCS = 16            # processes kept per card
-_nv = {"off_until": 0.0}
+_nv = {"off_until": 0.0, "old_until": 0.0}  # old_until: a driver that did not know a field of NV_QUERY
 
 
 def _nobody():
@@ -1126,10 +1130,11 @@ def _nobody():
     return {"user": uid, "group": gid, "extra_groups": []}
 
 
-def run_capped(cmd, cap, timeout, tail=False):
+def run_capped(cmd, cap, timeout, tail=False, rc=None):
     """stdout of `cmd` (bytes), at most `cap` of them within `timeout` seconds, else None; as nobody
     when this process is root. With `tail`, more than `cap` (or the deadline) keeps the last whole lines
-    within `cap` instead. The child is always reaped."""
+    within `cap` instead. `rc`, a list, gets the child's exit status when it ended by itself within both
+    (a timeout or too much output adds nothing). The child is always reaped."""
     import collections
     import select
     import subprocess
@@ -1163,6 +1168,8 @@ def run_capped(cmd, cap, timeout, tail=False):
                     out.appendleft(drop[n - cap:])
                     n = cap
         p.wait(max(0.01, deadline - time.monotonic()))
+        if rc is not None:
+            rc.append(p.returncode)
         return kept() if p.returncode == 0 or (tail and out) else None
     except (OSError, subprocess.TimeoutExpired):
         return kept() if tail and out else None
@@ -1187,19 +1194,24 @@ def _num_or_none(x):
 _NV_UUID = re.compile(r"GPU-[0-9a-fA-F-]{8,60}")
 
 
-def parse_nvidia_gpus(text):
-    """The cards of `nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.total,memory.used
-    --format=csv,noheader,nounits`: [{index, uuid, name, util (%), total_mb, used_mb}], a figure None
-    where the driver says "[N/A]" or "[Not Supported]". The name is the driver's, cut and cleaned."""
+def parse_nvidia_gpus(text, tail=6):
+    """The cards of `nvidia-smi --query-gpu=<NV_QUERY's fields> --format=csv,noheader,nounits`: [{index, uuid,
+    name, util (%), total_mb, used_mb, and from NV_QUERY's longer form free_mb, display (a desktop on it), mig
+    (MIG mode on)}], a figure None where the driver says "[N/A]" or "[Not Supported]". `tail`: the fields
+    after the name (6 for NV_QUERY, 3 for NV_QUERY_OLD); a name may hold commas. The name is the driver's,
+    cut and cleaned."""
     out = []
     for line in (text or "").splitlines():
         f = [x.strip() for x in line.split(",")]
-        if len(f) < 6 or not f[0].isdigit():
+        if len(f) < 3 + tail or not f[0].isdigit():
             continue
-        num = f[-3:]
-        out.append({"index": int(f[0]), "uuid": f[1] if _NV_UUID.fullmatch(f[1]) else None,
-                    "name": _printable(",".join(f[2:-3]).strip())[:64] or "NVIDIA GPU", "util": _num_or_none(num[0]),
-                    "total_mb": _num_or_none(num[1]), "used_mb": _num_or_none(num[2])})
+        num = f[-tail:]
+        c = {"index": int(f[0]), "uuid": f[1] if _NV_UUID.fullmatch(f[1]) else None,
+             "name": _printable(",".join(f[2:-tail]).strip())[:64] or "NVIDIA GPU", "util": _num_or_none(num[0]),
+             "total_mb": _num_or_none(num[1]), "used_mb": _num_or_none(num[2])}
+        if tail >= 6:
+            c.update(free_mb=_num_or_none(num[3]), display=num[4].lower() == "enabled", mig=num[5].lower() == "enabled")
+        out.append(c)
     return out[:16]
 
 
@@ -1243,24 +1255,37 @@ def parse_nvidia_apps(text):
     return out
 
 
-def _nvsmi(args):
-    raw = run_capped([_p(NVIDIA_SMI)] + args, 256 << 10, 4)
+def _nvsmi(args, rc=None):
+    raw = run_capped([_p(NVIDIA_SMI)] + args, 256 << 10, NV_TIMEOUT_S, rc=rc)
     return raw.decode("utf-8", "replace") if raw is not None else None
 
 
-def gpu_cards():
+def gpu_cards(fresh=False):
     """The NVIDIA cards with what each process uses of them: [{index, uuid, name, util, total_mb,
-    used_mb, procs {pid: {"sm", "mb"}}}], two short runs of nvidia-smi (30 and 100 ms on the Epyc's two
-    RTX 4090). None where there is no nvidia-smi or it lists no card (asked again after NV_RETRY_S)."""
+    used_mb, free_mb, display, mig, procs {pid: {"sm", "mb"}}}], two short runs of nvidia-smi (30 and 100 ms on the Epyc's two
+    RTX 4090). None where there is no nvidia-smi or it lists no card (asked again after NV_RETRY_S). `fresh` (admission,
+    02 §6.5.1): asks now whatever failed before, the long form first, so that one passing failure in a long-lived
+    process (the MCP server) does not refuse GPU requests for NV_RETRY_S. The short form only for a driver that
+    refused the long one (it ended by itself: exit 2, "is not a valid field", or no line it could read): a timeout
+    or another failure says nothing about the fields, and the cards then stay unread rather than lose free memory."""
     now = time.monotonic()
+    if fresh:
+        _nv["off_until"] = _nv["old_until"] = 0.0
     if now < _nv["off_until"]:
         return None
     if not os.access(_p(NVIDIA_SMI), os.X_OK):
         _nv["off_until"] = now + NV_RETRY_S
         return None
-    cards = parse_nvidia_gpus(_nvsmi(NV_QUERY))
+    rc, cards = [0], None
+    if now >= _nv["old_until"]:
+        rc = []
+        cards = parse_nvidia_gpus(_nvsmi(NV_QUERY, rc))
+    if not cards and rc and rc[0] in (0, 2):  # a driver older than a field of the long form refuses it: the short one
+        cards = parse_nvidia_gpus(_nvsmi(NV_QUERY_OLD), 3)
+        if cards:
+            _nv["old_until"] = now + NV_RETRY_S
     if not cards:
-        _nv["off_until"] = now + NV_RETRY_S
+        _nv["off_until"] = now + (NV_RETRY_S if rc else NV_HUNG_RETRY_S)
         return None
     per = parse_nvidia_pmon(_nvsmi(NV_PMON))
     if per is None:  # a driver without pmon: memory per process from the compute apps, no utilisation
@@ -1269,6 +1294,43 @@ def gpu_cards():
     for c in cards:
         c["procs"] = dict(sorted((per.get(c["index"]) or {}).items(), key=lambda kv: -kv[1].get("mb", 0))[:NV_PROCS])
     return cards
+
+
+def card_sample(c, procs):
+    """A card of gpu_cards() as the sample's `gpu` block has it (the logger's and a live read's alike): id
+    "gpu<index>" (nvidia-smi's index: PCI bus order, only a label), uuid (the card's identity), name, busy time,
+    memory used, free and on the card (GB), the driver's own part (`mem_reserved_gb` = total − used − free),
+    `display` and `mig` where on, and the processes on it biggest first (`procs`: pid, name from `procs`,
+    never from the driver, MB, SM share). The roadmap's 02 §6.5.1 pools are made from these."""
+    g = {"id": "gpu%d" % c["index"], "index": c["index"], "name": c["name"], "unified": False, "src": "nvidia-smi"}
+    if c.get("util") is not None:
+        g["util"] = g["now"] = round(c["util"], 1)
+    if c.get("used_mb") is not None:
+        g["mem_gb"] = round(c["used_mb"] / 1024.0, 2)
+    if c.get("total_mb"):
+        g["mem_limit_gb"] = round(c["total_mb"] / 1024.0, 1)
+        g["mem_total_gb"] = round(c["total_mb"] / 1024.0, 2)
+    if c.get("free_mb") is not None:
+        g["mem_free_gb"] = round(c["free_mb"] / 1024.0, 2)
+        if c.get("total_mb") and c.get("used_mb") is not None:
+            g["mem_reserved_gb"] = round(max(0.0, c["total_mb"] - c["used_mb"] - c["free_mb"]) / 1024.0, 2)
+    for k in ("display", "mig"):
+        if c.get(k):
+            g[k] = True
+    if c.get("uuid"):
+        g["uuid"] = c["uuid"]
+    rows = []
+    for pid, x in (c.get("procs") or {}).items():
+        p = procs.get(pid) if procs else None
+        e = {"pid": pid, "name": p["name"] if p else None}
+        if x.get("mb") is not None:
+            e["mb"] = round(x["mb"])
+        if x.get("sm") is not None:
+            e["util"] = round(x["sm"], 1)
+        rows.append({k: v for k, v in e.items() if v is not None})
+    if rows:
+        g["procs"] = rows
+    return g
 
 
 def gpu_available():

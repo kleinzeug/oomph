@@ -189,9 +189,11 @@ def base(root, mem, swaprows=(), pressure=psi(), self_cg="/user.slice/user-1000.
 
 NVIDIA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "nvidia")
 FAKE_SMI = """#!/bin/sh
-# nvidia-smi as recorded (tools/fixtures/nvidia): the answer to each of the three questions oomph asks
+# nvidia-smi as recorded (tools/fixtures/nvidia): the answer to each of the questions oomph asks
 D=$(dirname "$0")/../share/nvidia
 case "$*" in
+  --query-gpu=*memory.free*) [ -f "$D/hung" ] && exec sleep 5
+    [ -f "$D/query-gpu-full.csv" ] && cat "$D/query-gpu-full.csv" || exit 2 ;;
   --query-gpu=*) cat "$D/query-gpu.csv" ;;
   "pmon -c 1 -s um") [ -f "$D/pmon.txt" ] && cat "$D/pmon.txt" || exit 6 ;;
   --query-compute-apps=*) cat "$D/compute-apps.csv" ;;
@@ -200,18 +202,30 @@ esac
 """
 
 
-def nvidia(root, busy=False, pmon=True):
+def nvidia(root, busy=False, pmon=True, old=False, hung=False):
     """nvidia-smi on the machine: a script that prints what the real one printed (tools/fixtures/nvidia);
     `busy`: card 0 at 87 %, the process on it at 85 % of its SMs and a second one on card 1 (the recorded
-    columns, other figures); `pmon` False: a driver without pmon (memory per process from compute apps)."""
+    columns, other figures); `pmon` False: a driver without pmon (memory per process from compute apps);
+    `old`: a driver that refuses the long question of 1.14 (free memory and the modes); `hung`: one that does
+    not answer it in time (a busy driver)."""
     d = os.path.join(root, "usr", "share", "nvidia")
     os.makedirs(d, exist_ok=True)
-    for f in ("query-gpu.csv", "pmon.txt", "compute-apps.csv"):
+    if hung:
+        open(os.path.join(d, "hung"), "w").close()
+    elif os.path.exists(os.path.join(d, "hung")):
+        os.remove(os.path.join(d, "hung"))
+    for f in ("query-gpu.csv", "query-gpu-full.csv", "pmon.txt", "compute-apps.csv"):
         with open(os.path.join(NVIDIA, f)) as src:
             text = src.read()
-        if busy and f == "query-gpu.csv":
-            text = text.replace("RTX 4090, 0, 24564, 396", "RTX 4090, 87, 24564, 18432").replace(
+        if busy and f in ("query-gpu.csv", "query-gpu-full.csv"):
+            text = text.replace("RTX 4090, 0, 24564, 396, 23686", "RTX 4090, 87, 24564, 18432, 5650").replace(
+                "RTX 4090, 0, 24564, 4, 24077", "RTX 4090, 12, 24564, 2052, 22028").replace(
+                "RTX 4090, 0, 24564, 396", "RTX 4090, 87, 24564, 18432").replace(
                 "RTX 4090, 0, 24564, 4", "RTX 4090, 12, 24564, 2052")
+        if f == "query-gpu-full.csv" and old:
+            if os.path.exists(os.path.join(d, f)):
+                os.remove(os.path.join(d, f))
+            continue
         if busy and f == "pmon.txt":
             text = text.replace("    0    48211     C      -      -      -      -      -      -    386",
                                 "    0    48211     C     85     40      -      -      -      -  18000").replace(

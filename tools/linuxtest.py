@@ -619,17 +619,27 @@ def part_logger():
 
     # --- NVIDIA cards through nvidia-smi, as recorded on a machine with two RTX 4090
     nv = linuxfixture.NVIDIA
-    cards = L.parse_nvidia_gpus(open(os.path.join(nv, "query-gpu.csv")).read())
+    cards = L.parse_nvidia_gpus(open(os.path.join(nv, "query-gpu.csv")).read(), 3)
     pm = L.parse_nvidia_pmon(open(os.path.join(nv, "pmon.txt")).read())
     apps = L.parse_nvidia_apps(open(os.path.join(nv, "compute-apps.csv")).read())
     check(len(cards) == 2 and cards[0]["name"] == "NVIDIA GeForce RTX 4090" and cards[0]["total_mb"] == 24564 and
           cards[0]["used_mb"] == 396 and cards[0]["util"] == 0 and pm == {0: {48211: {"mb": 386.0}}} and
           apps == {cards[0]["uuid"]: {48211: 386.0}},
           "nvidia-smi's recorded answers: two cards, 386 MB of process 48211 on card 0, no utilisation measured")
-    check(L.parse_nvidia_gpus("0, GPU-x, A, [N/A], [Not Supported], 7\nnonsense\n")[0]["util"] is None and
+    full = L.parse_nvidia_gpus(open(os.path.join(nv, "query-gpu-full.csv")).read())
+    check([(c["total_mb"], c["used_mb"], c["free_mb"], c["display"], c["mig"]) for c in full] ==
+          [(24564, 396, 23686, False, False), (24564, 4, 24077, False, False)] and full[0]["uuid"] == cards[0]["uuid"],
+          "nvidia-smi's long question (1.14): free memory, display and MIG mode per card")
+    g0 = L.card_sample(dict(full[0], procs={48211: {"mb": 386.0}}), {48211: {"name": "python"}})
+    check(g0["mem_free_gb"] == 23.13 and g0["mem_reserved_gb"] == 0.47 and g0["mem_total_gb"] == 23.99
+          and g0["id"] == "gpu0" and g0["index"] == 0 and g0["procs"] == [{"pid": 48211, "name": "python", "mb": 386}]
+          and "mig" not in g0 and "display" not in g0,
+          "a card as the sample has it: free, the driver's own part, the total, its processes by the table's names")
+    check(L.parse_nvidia_gpus("0, GPU-x, A, [N/A], [Not Supported], 7\nnonsense\n", 3)[0]["util"] is None and
           L.parse_nvidia_pmon("no header\n0 1 C 5 5\n") is None,
           "nvidia-smi's [N/A] is no figure, and output without pmon's header is not read")
-    check(L.gpu_cards()[0]["procs"] == {48211: {"mb": 386.0}}, "gpu_cards() on the recorded machine")
+    gc = L.gpu_cards()
+    check(gc[0]["procs"] == {48211: {"mb": 386.0}} and gc[1]["free_mb"] == 24077, "gpu_cards() on the recorded machine")
 
     # --- CPU, I/O, disks and the cards through the logger's Meter: two readings with work in between
     import oomphd
@@ -662,10 +672,33 @@ def part_logger():
           and use[1610]["gpu"] == 12.0 and _gpu_line(g[0]).startswith("busy 87 % of the time · 18.0 of 24 GB"),
           "NVIDIA per card (busy, memory used of the card's) and per process (memory, SM share, the name from "
           "the process table): %s" % _gpu_line(g[0]))
+    check(g[0]["mem_free_gb"] == round(5650 / 1024.0, 2) and g[1]["mem_free_gb"] == round(22028 / 1024.0, 2),
+          "the logger's card block carries each card's free memory (for 1.14's pools)")
     linuxfixture.nvidia(bz, busy=True, pmon=False)
     L._nv["off_until"] = 0
     c = L.gpu_cards()
     check(c[0]["procs"] == {48211: {"mb": 386.0}}, "a driver without pmon: memory per process from the compute apps")
+    linuxfixture.nvidia(bz, busy=True, old=True)
+    L._nv.update(off_until=0, old_until=0)
+    c = L.gpu_cards()
+    check(c and c[0]["used_mb"] == 18432 and "free_mb" not in c[0] and L._nv["old_until"] > 0,
+          "a driver that refuses the long question: the short one, without free memory (its cards are not reservable)")
+    linuxfixture.nvidia(bz, busy=True, hung=True)
+    L._nv.update(off_until=0, old_until=0)
+    saved_to, L.NV_TIMEOUT_S = L.NV_TIMEOUT_S, 0.5
+    t0 = time.monotonic()
+    c = L.gpu_cards(fresh=True)
+    L.NV_TIMEOUT_S = saved_to
+    check(c is None and L._nv["old_until"] == 0 and 0 < L._nv["off_until"] - time.monotonic() <= L.NV_HUNG_RETRY_S
+          and time.monotonic() - t0 < 3,
+          "a driver that does not answer the long question in time: no cards (try again), not the short form without "
+          "free memory, and asked again after %d s, not %d" % (L.NV_HUNG_RETRY_S, L.NV_RETRY_S))
+    linuxfixture.nvidia(bz, busy=True)
+    L._nv.update(off_until=time.monotonic() + 600, old_until=time.monotonic() + 600)
+    c = L.gpu_cards(fresh=True)
+    check(c and c[0].get("free_mb") == 5650 and L.gpu_cards() is not None,
+          "admission's read (fresh) asks nvidia-smi now, the long question first, whatever failed before")
+    L._nv.update(off_until=0, old_until=0)
     pools, rows = L.disk_pools(L.mounts())
     why = {r["mount"]: (r["cls"], r["why"]) for r in rows}
     check([p["id"] for p in pools] == ["data", "vol:5e1f0c2a-9d3b-4c47-8e21-0a1b2c3d4e5f"] and pools[0]["watch"] and
@@ -766,6 +799,21 @@ def part_logger():
                         "import oomph; sys.exit(oomph.cmd_alert(['--test']))", DAEMON], capture_output=True, text=True,
                        timeout=60, env=env())
     check(r.returncode == 2 and "Linux only" in r.stderr, "oomph alert on a Mac: Linux only")
+    # GPU reservations on the recorded machine (1.14, roadmap 02 §6.5.1): off by default; on, the card with room
+    rc, out, _ = fx_cli("epyc-nvidia", "reserve", "--gpu-mem", "16G", "--for", "a model", "--json")
+    off = json.loads(out or "{}")
+    rc2, out2, err2 = fx_cli("epyc-nvidia", "reserve", "--gpu-mem", "16G", "--for", "a model", "--json",
+                             OOMPH_GPU_RESERVATIONS="1")
+    gon = json.loads(out2 or "{}")
+    rc3, out3, _ = fx_cli("epyc-nvidia", "resources", OOMPH_GPU_RESERVATIONS="1")
+    rc4, out4, _ = fx_cli("epyc-nvidia", "resources")
+    check(rc == 75 and off.get("status") == "refused" and "/etc/oomph/config.json" in off.get("advice", "")
+          and rc2 == 0 and gon.get("status") == "granted" and (gon.get("run_with") or {}).get("gpu", {}).get("index") == 1
+          and gon["run_with"]["gpu"]["env"] == {"CUDA_DEVICE_ORDER": "PCI_BUS_ID", "CUDA_VISIBLE_DEVICES": "1"}
+          and "GB left to reserve · reservable" in out3 and "reservable: off (gpu_reservations)" in out4,
+          "GPU reservations on the recorded Linux machine: refused while switched off (the Linux path in the advice); "
+          "on, 16 GB on card 1 read from nvidia-smi then and there; oomph resources says which (%s)"
+          % (gon.get("advice") or err2[-200:])[:80])
     ev2 = [json.loads(x) for x in open(os.path.join(logs, "events.jsonl"))]
     low = [x for x in ev2 if x["kind"] == "disk_low" and x.get("pool") == "data"]
     check(low and low[0].get("level") == "critical" and "<4>oomph: Disk space low: Only 1 GB free on /." in p.stderr,

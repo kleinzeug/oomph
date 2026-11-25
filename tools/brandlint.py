@@ -34,7 +34,8 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = ("daemon/oomph.py", "daemon/oomphd.py", "daemon/oomph_darwin.py", "daemon/oomph_linux.py", "daemon/oomph_ioreport.py",
       "daemon/oomph_ai.py",
-      "daemon/oomph_upgrade.py", "daemon/oomph_top.py", "daemon/oomph_view.py", "daemon/oomph_net.py", "daemon/oomph_sync.py")
+      "daemon/oomph_upgrade.py", "daemon/oomph_top.py", "daemon/oomph_view.py", "daemon/oomph_net.py", "daemon/oomph_sync.py",
+      "daemon/oomph_gpu.py")
 SWIFT = ("app/oomph.swift",)
 HELP_DOCS = ("daemon/oomph.py", "daemon/oomph_upgrade.py")  # module docstrings printed as help
 SUBCOMMANDS = {"status", "report", "incidents", "incident", "html", "upgrade", "ai-report", "ai-check",
