@@ -259,12 +259,12 @@ class Logs:
         inc = next((i for i in oomph.list_incidents() if i["id"] == iid), None)
         if not inc:
             raise AIError("no incident %r" % iid)
-        p = os.path.join(inc["dir"], "syslog.txt")
-        if not os.path.lexists(p):
-            return {"note": "no syslog.txt for this incident"}
-        try:                            # the logger's file (oomphd's on Linux): never through a link, bounded
-            with oomph.open_log(p) as f:
+        try:  # the logger's file (oomphd's on Linux): through the folders' descriptors, never a link anywhere on the
+            # way (the incident's folder may have been swapped for one since it was listed: 1.14.1), bounded
+            with oomph.open_incident_file(iid, "syslog.txt") as f:
                 lines = f.read(SYSLOG_CAP).splitlines()
+        except FileNotFoundError:
+            return {"note": "no syslog.txt for this incident"}
         except (OSError, ValueError, EOFError):
             return {"note": "syslog.txt of this incident cannot be read"}
         q = (args.get("contains") or "").lower()

@@ -30,6 +30,7 @@ and applies here:
 The thresholds live in P; `level`, `margin` and `oversize_limit` are pure functions of numbers,
 so oomph.py judges a Linux sample with them on any system.
 """
+import errno
 import functools
 import hashlib
 import math
@@ -942,12 +943,49 @@ def _unoctal(s):
     return _OCTAL.sub(lambda m: chr(int(m.group(1), 8)), s)
 
 
+STATVFS_FUSE_S = 2.0        # a FUSE disk's (ntfs-3g, exfat-fuse: fuseblk) statvfs waits on its daemon at most this long
+STATVFS_BACKOFF_S = 60.0    # ... and after it did not answer in time, the mount is not asked again for this long
+_statvfs_stuck = {}         # mount point -> (the thread asked last, not before when it is asked again)
+
+
+def statvfs_bounded(path, fs):
+    """os.statvfs, which for a FUSE file system goes to a daemon in user space: one that hangs would hang the
+    logger with it (1.14.1). So for those it runs in a thread for at most STATVFS_FUSE_S; a mount that did not
+    answer in time is not asked again while that thread still waits, nor for STATVFS_BACKOFF_S after (a slow one
+    that answers in 3 s would otherwise cost every sample the full wait). Raises OSError (ETIMEDOUT)."""
+    if not fs.startswith("fuse"):
+        return os.statvfs(path)
+    import threading
+    t = _statvfs_stuck.get(path)
+    if t is not None:
+        if t[0].is_alive() or time.monotonic() < t[1]:
+            raise OSError(errno.ETIMEDOUT, "statvfs still waiting or slow", path)
+        del _statvfs_stuck[path]
+    box = {}
+
+    def ask():
+        try:
+            box["v"] = os.statvfs(path)
+        except OSError as e:
+            box["e"] = e
+    t = threading.Thread(target=ask, name="statvfs", daemon=True)
+    t.start()
+    t.join(STATVFS_FUSE_S)
+    if t.is_alive():
+        _statvfs_stuck[path] = (t, time.monotonic() + STATVFS_BACKOFF_S)
+        raise OSError(errno.ETIMEDOUT, "statvfs did not answer", path)
+    if "e" in box:
+        raise box["e"]
+    return box["v"]
+
+
 def mounts():
     """Every mount of /proc/self/mountinfo, the last one per mount point (what a path there reaches),
     as the Mac's records: mount, from, fs, flags (MNT_RDONLY when the file system itself is read-only:
     a sandbox's read-only view of a writable disk is not), dev (st_dev of files on it), majmin, and
     total_gb, free_gb (what df shows). statvfs is asked only for / and local disk file systems: a
-    network mount whose server is gone would block it. None when the table cannot be read or has no /."""
+    network mount whose server is gone would block it (a FUSE disk is waited for at most STATVFS_FUSE_S).
+    None when the table cannot be read or has no /."""
     text = read("/proc/self/mountinfo")
     if not text:
         return None
@@ -968,7 +1006,7 @@ def mounts():
     for r in by.values():
         if r["mount"] == "/" or (r["fs"] in LOCAL_FS and (r["from"].startswith("/dev/") or r["fs"] in ("zfs", "btrfs"))):
             try:
-                v = os.statvfs(_p(r["mount"]) if ROOT else r["mount"])
+                v = statvfs_bounded(_p(r["mount"]) if ROOT else r["mount"], r["fs"])
             except OSError:
                 continue
             size, free = v.f_blocks * v.f_frsize, v.f_bavail * v.f_frsize

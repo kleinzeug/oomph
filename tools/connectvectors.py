@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.join(ROOT, "daemon"))
 import oomph_net as net  # noqa: E402
 import oomph_sync as sync  # noqa: E402
 
-GROUPS = ("link", "code", "kind", "ssh_command", "host", "matches", "ago", "message")
+GROUPS = ("link", "code", "kind", "ssh_command", "host", "matches", "ago", "message", "message_shown", "note")
 CLI_GROUPS = ("link", "code", "kind")
 
 
@@ -65,7 +65,44 @@ def cases():
         ("bad_address", "a b", "", None), ("ask", "studio.local", "", None), ("closed", "studio.local", "it closed", None))]
     return {"link": [{"s": s} for s in links], "code": [{"s": s} for s in codes], "kind": [{"s": s} for s in kinds],
             "ssh_command": [{"s": s} for s in ssh], "host": [{"s": s} for s in hosts], "matches": matches, "ago": ago,
-            "message": message}
+            "message": message, "message_shown": [dict(code=c, target=t, detail=d, side=None, v=v) for c, t, d, v in SHOWN],
+            "note": [{"s": s, "v": v} for s, v in NOTES]}
+
+
+# the error box with words from elsewhere in it (ConnectInput.message, then noteText; 1.14.1): a typed or pasted target,
+# a server's own error message as the detail. `v` must show exactly as it came, never as emphasis, code or a link
+SHOWN = [("closed", "studio.local", "**x** `rm -rf` [here](https://evil.example)", "**x** `rm -rf` [here](https://evil.example)"),
+         ("timeout", "**studio**", "", "**studio**"),
+         ("busy", "`studio`.local", "", "`studio`"),
+         ("refused", "_st_udio.local", "", "_st_udio.local"),
+         ("ssh", "**sam**@atlas", "", "ssh **sam**@atlas"),
+         ("closed", "studio.local", "", "Connecting to studio.local failed.")]
+
+
+# a note of the popover with a machine's name, label, version or address put in (ConnectInput.md, noteText; 1.14.1):
+# it reads as it came, never as a link, emphasis or code
+NOTES = [("Forget {}? Its history on this Mac is deleted.", "studio"),
+         ("Forget {}? Its history on this Mac is deleted.", "[click here](https://evil.example/x)"),
+         ("**Here:** {} reports the same machine id.", "https://evil.example"),
+         ("Whoever can sign in to {} can read it.", "sam@evil.example"),
+         ("{} no longer knows this Mac.", "www.evil.example"),
+         ("{}", "**bold** `code` _it_ <b>x</b> \\ \\* # 1. - [x]"),
+         ("{}", "macOS 27.2 · 64 GB · oomph 1.10.2"),
+         ("Paired with {}.", "<https://evil.example>"),
+         ("{} reports it.", "fe80::1%en0"),
+         ("{} reports it.", "mailto:a@b.c")]
+
+
+def note_rules(v):
+    """Each note and shown message holds its words exactly as they came and no link. A list of failures."""
+    bad = []
+    for g in ("note", "message_shown"):
+        for c, a in zip(v["inputs"].get(g) or [], v["expected"].get(g) or []):
+            if not (isinstance(a, list) and len(a) == 2 and a[1] == 0 and c["v"] in a[0]):
+                bad.append("%s %r: %r" % (g, c, a))
+        if len(v["expected"].get(g) or []) != len(v["inputs"].get(g) or []) or not v["inputs"].get(g):
+            bad.append("%s: answers for every case" % g)
+    return bad
 
 
 def cli_answers(v):
@@ -127,9 +164,15 @@ def main(argv):
         got = app_answers(binary, v["inputs"])
         if got is None:
             return 2
-        return 1 if compare(got, v["expected"], GROUPS, "the app") else 0
+        bad = note_rules({"inputs": v["inputs"], "expected": got})
+        for b in bad:
+            print("FAIL  the app, " + b)
+        return 1 if compare(got, v["expected"], GROUPS, "the app") or bad else 0
     v = json.load(open(FILE))
-    return 1 if compare(cli_answers(v["inputs"]), v["expected"], CLI_GROUPS, "the CLI") else 0
+    bad = note_rules(v)
+    for b in bad:
+        print("FAIL  the file, " + b)
+    return 1 if compare(cli_answers(v["inputs"]), v["expected"], CLI_GROUPS, "the CLI") or bad else 0
 
 
 if __name__ == "__main__":

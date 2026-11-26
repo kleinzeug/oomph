@@ -18,12 +18,24 @@ if [ -z "$PFX" ] && ! getent passwd oomphd >/dev/null 2>&1; then
   useradd --system --user-group --no-create-home --home-dir /nonexistent --shell "$NOLOGIN" --comment "oomph logger" oomphd
 fi
 own() {  # own MODE DIR: a folder of the logger's, in a folder of root's (made, or put right). Never one inside a
-  #        folder of the logger's: the account could have put a link there, and root would follow it.
+  #        folder of the logger's: the account could have put a link there, and root would follow it. The mode and
+  #        owner are set through the folder's descriptor, opened without following a link: /var/log is writable by
+  #        the group syslog on Debian and Ubuntu, which could put a link there between a look and a chmod (1.14.1).
   [ ! -L "$2" ] || { echo "oomph: $2 is a symbolic link; not touching it" >&2; exit 1; }
   mkdir -p "$2"
-  chmod "$1" "$2"
-  [ -n "$PFX" ] || chown -h oomphd:oomphd "$2"
+  "$PY" -I -c 'import os, sys
+mode, path, owner = int(sys.argv[1], 8), sys.argv[2], sys.argv[3]
+try:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+except OSError as e:
+    sys.exit("oomph: %s is not a folder (%s); not touching it" % (path, e.strerror))
+if owner:
+    import grp, pwd
+    os.fchown(fd, pwd.getpwnam(owner).pw_uid, grp.getgrnam(owner).gr_gid)
+os.fchmod(fd, mode)' "$1" "$2" "$OWNER" || exit 1
 }
+OWNER=oomphd
+[ -z "$PFX" ] || OWNER=""
 # 2. the folders. The logs and the logger's state are the logger's (what goes inside them, alerts/ too, the
 #    logger makes itself); the ledger is everybody's: made 0777 without the sticky bit (a writer renames its
 #    new file over another account's) and, once it exists, left alone, as on a Mac (H0 rule 4: no installer

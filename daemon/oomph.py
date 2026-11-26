@@ -290,12 +290,13 @@ def _day_range(since, until):
         d += datetime.timedelta(days=1)
 
 
-def open_log(path, cap=None, binary=False):
+def open_log(path, cap=None, binary=False, dir_fd=None):
     """A file of the logger's, opened for reading as text (.gz unpacked; `binary`: as bytes): a regular file only,
     never through a link, never blocking on a FIFO, and with `cap` no bigger than that. On Linux the log folder
     belongs to the logger's account (oomphd), whose files a root reader must not trust (03 §12.3): what it unpacks
-    to is the reader's to bound (_read_lines, load_log_json). Raises OSError."""
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0))
+    to is the reader's to bound (_read_lines, load_log_json). `dir_fd`: `path` is a name in that folder
+    (open_log_dir). Raises OSError."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | getattr(os, "O_NOCTTY", 0), dir_fd=dir_fd)
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or (cap is not None and st.st_size > cap):
@@ -308,9 +309,33 @@ def open_log(path, cap=None, binary=False):
     return raw if binary else io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
 
 
-def load_log_json(path, cap=16 << 20):
+def open_log_dir(path, dir_fd=None):
+    """A folder of the logger's (incidents/, one incident's), opened as a descriptor: never through a link, so
+    what is read through it (open_log's dir_fd) is in that folder whatever the logger's account renames meanwhile
+    (on Linux the log folder is its: 03 §12.3; 1.14.1). Raises OSError (ELOOP or ENOTDIR for a link)."""
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
+
+
+def open_incident_file(iid, name, cap=None, binary=False):
+    """A file of one incident's folder (LOG_DIR/incidents/<iid>/<name>), opened as open_log opens one, through the
+    descriptors of incidents/ and of that folder: no part of the way is a link, whatever the logger's account
+    renamed since list_incidents looked (03 §12.3; 1.14.1). Raises OSError (ENOENT when it has no such file)."""
+    if not isinstance(iid, str) or not iid or "/" in iid or iid.startswith("."):
+        raise OSError(errno.ENOENT, "no such incident", iid)
+    dfd = open_log_dir(os.path.join(LOG_DIR, "incidents"))
+    try:
+        ifd = open_log_dir(iid, dfd)
+    finally:
+        os.close(dfd)
+    try:
+        return open_log(name, cap, binary, dir_fd=ifd)
+    finally:
+        os.close(ifd)
+
+
+def load_log_json(path, cap=16 << 20, dir_fd=None):
     """A JSON file of the logger's (open_log), parsed: at most `cap` bytes, unpacked too."""
-    with open_log(path, cap, binary=True) as f:
+    with open_log(path, cap, binary=True, dir_fd=dir_fd) as f:
         b = f.read(cap + 1)
     if len(b) > cap:
         raise ValueError("%s: larger than %d bytes" % (path, cap))
@@ -2240,22 +2265,32 @@ def list_incidents(quiet=True):
     """Every incident, oldest first; with quiet=False without the quiet ones (Linux: containers at their own
     limit, 03 §5.6), which never count as news."""
     out, d = [], os.path.join(LOG_DIR, "incidents")
-    try:
-        ids = sorted(n for n in os.listdir(d) if not n.startswith("."))
+    try:  # incidents/ itself and each incident's folder only as real folders, read through their descriptors: the
+        # logger's account could have put a link to anywhere there, or swap one in between a look and a read (03 §12.3)
+        dfd = open_log_dir(d)
     except OSError:
-        ids = []
-    for iid in ids:
-        f = os.path.join(d, iid, "incident.json")
-        try:  # only a real folder: the logger's account could have put a link to anywhere there (03 §12.3)
-            if not stat.S_ISDIR(os.lstat(os.path.join(d, iid)).st_mode):
+        return out
+    try:
+        ids = sorted(n for n in os.listdir(dfd) if not n.startswith("."))
+        for iid in ids:
+            try:
+                ifd = open_log_dir(iid, dfd)
+            except OSError:
                 continue
-            inc = load_log_json(f)
-        except Exception:
-            continue
-        if not isinstance(inc, dict) or (not quiet and inc.get("quiet")):
-            continue
-        inc["dir"] = os.path.dirname(f)
-        out.append(inc)
+            try:
+                inc = load_log_json("incident.json", dir_fd=ifd)
+            except Exception:
+                continue
+            finally:
+                os.close(ifd)
+            if not isinstance(inc, dict) or (not quiet and inc.get("quiet")):
+                continue
+            inc["dir"] = os.path.join(d, iid)
+            out.append(inc)
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
     return out
 
 
@@ -3002,7 +3037,10 @@ def checked_verdict(mine=None, s=None):
         pass
     v["resources"] = {k: s[k] for k in ("cpu", "gpu", "io") if k in s}
     if "disks" in s:   # each disk with `pinned`, and a pinned pool with its floors and level (as `resources`)
-        v["resources"]["disks"] = disk_rows(s, pinned)
+        try:           # (a damaged sample's disks are no reason to fail a check, the hook or MCP either; 1.14.1)
+            v["resources"]["disks"] = disk_rows(s, pinned)
+        except Exception:
+            v["resources"]["disks"] = []
     try:
         coordination_verdict(v, coordination(mine if mine is not None else holder_for()["pid"], s))
     except Exception as e:  # the ledger is a bonus; never let it break a check
@@ -3154,7 +3192,7 @@ def disk_rows(s, pinned=frozenset()):
     """The sample's disks, checked field by field, each with `pinned`, and floors and a level for a
     pinned pool that has none of its own."""
     out = []
-    for d in s.get("disks") or []:
+    for d in s.get("disks") if isinstance(s.get("disks"), list) else []:
         if not isinstance(d, dict) or not isinstance(d.get("id"), str) or _n(d.get("free_gb")) is None:
             continue
         d = dict(d, pinned=d["id"] in pinned)
@@ -3712,11 +3750,14 @@ def live_volumes_partial():
     return bool(_VOLS) and _VOLS[0].unsure is True
 
 
-def _statvfs_gb(path):
+def _statvfs_gb(path, fs=None):
     """Free space where `path` is, read now (what df shows), in GB; None if it cannot be read. Admission asks
-    it for the one pool a request names: the mount table can be seconds old (02 §4.4)."""
+    it for the one pool a request names: the mount table can be seconds old (02 §4.4). On Linux a FUSE disk
+    (`fs`, from the mount table; unknown counts as one) is waited for at most oomph_linux.STATVFS_FUSE_S, as the
+    logger waits for it: a hung ntfs-3g must not hang `oomph run --reserve-disk` or a ledger child (1.14.1)."""
+    bounded = getattr(plat(), "statvfs_bounded", None)
     try:
-        v = os.statvfs(path)
+        v = bounded(path, fs if isinstance(fs, str) else "fuse") if bounded else os.statvfs(path)
     except OSError:
         return None
     return round(v.f_bavail * v.f_frsize / float(1 << 30), 1)
@@ -3770,7 +3811,7 @@ def disk_pool_of(path, s):
     if pool is None:
         return None, "%s is on %s, which %s does not record (%s)" % (
             path, term_text(row.get("name") or rec["mount"])[:64], BRAND, row.get("why") or "not a disk"), None
-    free = _statvfs_gb(at)
+    free = _statvfs_gb(at, rec.get("fs"))
     return dict(pool, free_gb=free if free is not None else pool["free_gb"]), None, pools
 
 
@@ -3786,7 +3827,7 @@ def _disk_pool_by_id(s, pid):
     p = next((x for x in pools or () if x["id"] == pid), None)
     if p is None or not isinstance(p.get("mount"), str):
         return s
-    free = _statvfs_gb(p["mount"])
+    free = _statvfs_gb(p["mount"], p.get("fs"))
     return s if free is None else _with_disk(s, dict(p, free_gb=free))
 
 

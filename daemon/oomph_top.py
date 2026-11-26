@@ -385,41 +385,62 @@ def incident_of(inc, iid, d=None):
                 report=report if report and os.path.isfile(report) else None, quiet=inc.get("quiet") is True)
 
 
-def _incident(d, iid, cache=None):
+def _incident(d, iid, cache=None, dfd=None):
     """One incident as the list and its card show it (None: not an incident). `cache` keeps the
-    parsed ones by file identity, so a dashboard that runs all day reads each once."""
-    path = os.path.join(d, iid, "incident.json")
-    key = None
-    if cache is not None:
-        try:
-            st = os.stat(path)
-            key = (st.st_ino, st.st_size, st.st_mtime)
-        except OSError:
-            return None
-        hit = cache.get(iid)
-        if hit and hit[0] == key:
-            return hit[1]
-    out = incident_of(oomph.loads_untrusted(_read(path, INCIDENT_CAP)), iid, d)
+    parsed ones by file identity, so a dashboard that runs all day reads each once. The incident's
+    folder is opened without following a link and its incident.json read through it (`dfd`: the
+    descriptor of `d`, incidents/): on Linux the log folder is the logger's account's, which could
+    put a link to anywhere there for `sudo oomph top` to read (03 §12.3; 1.14.1)."""
+    try:
+        ifd = oomph.open_log_dir(iid if dfd is not None else os.path.join(d, iid), dfd)
+    except OSError:
+        return None
+    try:
+        key = None
+        if cache is not None:
+            try:
+                st = os.stat("incident.json", dir_fd=ifd, follow_symlinks=False)
+                key = (st.st_ino, st.st_size, st.st_mtime)
+            except OSError:
+                return None
+            hit = cache.get(iid)
+            if hit and hit[0] == key:
+                return hit[1]
+        data = oomph.read_bounded("incident.json", INCIDENT_CAP, ifd)
+    finally:
+        os.close(ifd)
+    try:
+        text = data.decode("utf-8", "replace") if data is not None else None
+    except Exception:
+        text = None
+    out = incident_of(oomph.loads_untrusted(text), iid, d)
     if cache is not None:
         cache[iid] = (key, out)
     return out
 
 
 def load_incidents(log_dir, now, cache=None):
-    """The newest incidents (an open one first) and how many started in the last 90 days."""
+    """The newest incidents (an open one first) and how many started in the last 90 days. incidents/
+    only as a real folder (not through a link), read through its descriptor."""
     d = os.path.join(log_dir, "incidents")
     try:
-        ids = sorted((n for n in os.listdir(d) if not n.startswith(".")), reverse=True)
+        dfd = oomph.open_log_dir(d)
     except OSError:
         return [], 0
-    out, n90 = [], 0
-    for iid in ids[:INCIDENTS_SHOWN]:
-        inc = _incident(d, iid, cache)
-        if inc is None or inc.get("quiet"):  # Linux: containers at their own limit are never news (03 §5.6)
-            continue
-        out.append(inc)
-        if inc["start"] >= now - 90 * 86400:
-            n90 += 1
+    try:
+        ids = sorted((n for n in os.listdir(dfd) if not n.startswith(".")), reverse=True)
+        out, n90 = [], 0
+        for iid in ids[:INCIDENTS_SHOWN]:
+            inc = _incident(d, iid, cache, dfd)
+            if inc is None or inc.get("quiet"):  # Linux: containers at their own limit are never news (03 §5.6)
+                continue
+            out.append(inc)
+            if inc["start"] >= now - 90 * 86400:
+                n90 += 1
+    except OSError:
+        return [], 0
+    finally:
+        os.close(dfd)
     if cache is not None:
         for k in [k for k in cache if k not in ids[:INCIDENTS_SHOWN]]:
             del cache[k]
@@ -625,10 +646,11 @@ class Day:
     """One day of samples as the chart needs them: seven typed arrays (14 days are about 2 MB this
     way, against 20 MB as a dict per sample). A plain file (today's) is read on from where the last
     read stopped; a .gz once."""
-    __slots__ = ("sig", "path", "ino", "off", "t", "w", "a", "c", "s", "away", "kills", "ordered", "tmax", "res")
+    __slots__ = ("sig", "path", "ino", "off", "skip", "t", "w", "a", "c", "s", "away", "kills", "ordered", "tmax", "res")
 
     def __init__(self, path, ino, res=False):
         self.path, self.ino, self.off, self.sig = path, ino, 0, None
+        self.skip = False   # `off` stands inside a line being skipped (too long): its rest is skipped next time too
         self.ordered, self.tmax = True, float("-inf")      # so that series() need not look at every sample
         self.t, self.w, self.a, self.c, self.s = (array.array("d") for _ in range(5))
         self.away, self.kills = bytearray(), array.array("l")
@@ -687,14 +709,16 @@ def _read_day(path, old, res=False):
         if d is None:
             d = Day(path, st.st_ino, res)
         try:
-            skip = False
             if d.off == 0 and st.st_size > DAY_CAP:
-                d.off, skip = st.st_size - DAY_CAP, True        # a piece of a line first
+                d.off, d.skip = st.st_size - DAY_CAP, True      # a piece of a line first
             f.seek(d.off)
-            for b, ok in _pieces(f, DAY_CAP, skip):
+            for b, ok in _pieces(f, DAY_CAP, d.skip):
                 if ok and not b.endswith(b"\n"):
                     break                       # a line still being written: read it whole next time
                 d.off += len(b)
+                # a piece of a skipped line that ends where the file ends (the logger, or the account that owns
+                # the folder, is still writing it): its rest is no line of its own on the next call (1.14.1)
+                d.skip = not ok and not b.endswith(b"\n")
                 if ok:
                     d.add(b)
         except (OSError, ValueError):

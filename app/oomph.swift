@@ -1267,13 +1267,17 @@ enum LinuxTab {
 
     /// The oom_kill events of one pixel as one (the hover's line): the kills, those at a limit, the killers and
     /// the names added up; a cgroup count only where an event had one (oomph.calm_event).
+    /// The counts come from another machine's mirror: each is taken as killText takes it (0 to a million) and
+    /// added without overflow (a plain + traps the app on hover with two huge ones; 1.14.1).
     static func merged(_ es: [[String: Any]]) -> [String: Any] {
+        func int(_ x: Any?) -> Int { (x as? NSNumber).map { max(0, min($0.intValue, 1_000_000)) } ?? 0 }
+        func sum(_ a: Int, _ b: Int) -> Int { let r = a.addingReportingOverflow(b); return r.overflow ? Int.max : r.partialValue }
         func add(_ a: inout [String: Int], _ x: Any?) {
-            for (k, v) in ((x as? [String: Any]) ?? [:]).prefix(64) { a[k, default: 0] += (v as? NSNumber)?.intValue ?? 0 }
+            for (k, v) in ((x as? [String: Any]) ?? [:]).prefix(64) { a[k] = sum(a[k] ?? 0, int(v)) }
         }
         var kills = 0, atLimit = 0, by: [String: Int] = [:], top: [String: Int] = [:]
         for e in es {
-            kills += (e["kills"] as? NSNumber)?.intValue ?? 0; atLimit += (e["cgroup"] as? NSNumber)?.intValue ?? 0
+            kills = sum(kills, int(e["kills"])); atLimit = sum(atLimit, int(e["cgroup"]))
             add(&by, e["by"]); add(&top, e["top"])
         }
         var out: [String: Any] = ["kind": "oom_kill", "kills": kills, "by": by, "top": top]
@@ -7163,6 +7167,30 @@ enum ConnectInput {
         return d == 1 ? "yesterday" : "\(d) days ago"
     }
 
+    /// Words that came from elsewhere (a machine's name, label, version or address, an address typed or pasted)
+    /// inside a note's Markdown: every ASCII punctuation mark behind a backslash, so they read as they came and
+    /// are never emphasis, code or a link (1.14.1).
+    static func md(_ s: String) -> String {
+        var out = ""
+        for c in s.unicodeScalars {
+            let v: UInt32 = c.value   // CommonMark's ASCII punctuation: ! to /, : to @, [ to `, { to ~
+            if (33...47).contains(v) || (58...64).contains(v) || (91...96).contains(v) || (123...126).contains(v) {
+                out.unicodeScalars.append("\\")
+            }
+            out.unicodeScalars.append(c)
+        }
+        return out
+    }
+
+    /// A note or an error of the popover: its Markdown (bold, code) with no link in it. The notes have none of
+    /// their own, and an address such as sam@atlas or a name such as www.x.io is linked by the parser even
+    /// escaped (1.14.1).
+    static func noteText(_ s: String) -> AttributedString {
+        var a = (try? AttributedString(markdown: s)) ?? AttributedString(s)
+        a.link = nil
+        return a
+    }
+
     /// A machine's short name: a host name without .local, an address as it is.
     static func shortName(_ host: String) -> String {
         host.hasSuffix(".local") ? String(host.dropLast(6)) : host
@@ -7180,8 +7208,10 @@ enum ConnectInput {
 
     /// The popover's words for what `oomph remote add --json` answered (roadmap 01 §3.7's table). No
     /// message names a release: too old or too new is what the two ends negotiated.
+    /// The host, the short name and a detail that is shown are words from elsewhere (typed, pasted, or a server's
+    /// own error message), escaped like a note's (md): they read as they came, never as emphasis or code (1.14.1).
     static func message(_ code: String, target: String, detail: String = "", side: String? = nil) -> String {
-        let h = host(target), n = shortName(h)
+        let h = md(host(target)), n = md(shortName(host(target)))
         switch code {
         case "refused":
             return "\(h) answered, but sharing is off there. On \(n): + › Share this Mac, or `sudo oomph share on`. This step is kept while you do that."
@@ -7210,7 +7240,7 @@ enum ConnectInput {
         case "busy":
             return "\(n) has as many viewers as it serves at once. Try again in a minute."
         case "ssh":
-            return "ssh could not sign in to \(h) without asking for something, and \(brand) never types a password. Try it in a terminal: ssh \(target)"
+            return "ssh could not sign in to \(h) without asking for something, and \(brand) never types a password. Try it in a terminal: ssh \(md(target))"
         case "identity_changed":
             return "\(h) answered with another key than the one shown: nothing was sent. Try again, and compare the key with `oomph share status` there."
         case "revoked":
@@ -7220,7 +7250,7 @@ enum ConnectInput {
         case "ask":
             return "Nothing was added. The pairing made just now was given back there and its code is used up: get a new one there to try again."
         default:
-            return detail.isEmpty ? "Connecting to \(h) failed." : detail
+            return detail.isEmpty ? "Connecting to \(h) failed." : md(detail)
         }
     }
 }
@@ -7839,8 +7869,9 @@ struct ConnectView: View {
         Text(s).font(.system(size: 13, weight: .semibold)).lineLimit(1).truncationMode(.middle)
     }
 
+    /// A note in Markdown: what came from elsewhere goes in through ConnectInput.md, and no link survives (1.14.1).
     func note(_ s: String) -> some View {
-        Text((try? AttributedString(markdown: s)) ?? AttributedString(s))
+        Text(ConnectInput.noteText(s))
             .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
     }
 
@@ -7850,7 +7881,7 @@ struct ConnectView: View {
                 HStack(alignment: .top, spacing: 6) {
                     Image(systemName: draft.blocked ? "hand.raised.fill" : "exclamationmark.triangle.fill")
                         .font(.system(size: 11)).foregroundStyle(.orange)
-                    Text((try? AttributedString(markdown: e)) ?? AttributedString(e))
+                    Text(ConnectInput.noteText(e))
                         .font(.system(size: 11)).fixedSize(horizontal: false, vertical: true)
                 }
                 HStack {
@@ -7960,7 +7991,7 @@ struct ConnectView: View {
             }
             if draft.forgetting == e.mid {
                 VStack(alignment: .leading, spacing: 6) {
-                    note("Forget \(e.title)? Its history on this Mac is deleted and you'll need a new pairing code to connect again.")
+                    note("Forget \(ConnectInput.md(e.title))? Its history on this Mac is deleted and you'll need a new pairing code to connect again.")
                     HStack {
                         Spacer()
                         Button("Cancel") { draft.forgetting = nil }
@@ -8020,13 +8051,13 @@ struct ConnectView: View {
     }
 
     var codeStep: some View {
-        let n = ConnectInput.shortName(draft.host)
+        let n = ConnectInput.shortName(draft.host), nm = ConnectInput.md(n)
         return VStack(alignment: .leading, spacing: 10) {
             title(draft.host)
             if draft.revoked {
-                note("\(n) no longer knows this Mac: its access was revoked, or sharing was reset there. Pair again with a new code.")
+                note("\(nm) no longer knows this Mac: its access was revoked, or sharing was reset there. Pair again with a new code.")
             }
-            note("Paste the link that Share this Mac, or `sudo oomph share pair`, shows on \(n), or type its pairing code.")
+            note("Paste the link that Share this Mac, or `sudo oomph share pair`, shows on \(nm), or type its pairing code.")
             ConnectField(placeholder: "XXXX-XXXX-XXXX", text: $draft.code, mono: true, size: 17) { store.pair() }
                 .onChange(of: draft.code) { _, new in
                     if let l = ConnectInput.link(new) { draft.code = ConnectInput.showCode(l.code) }
@@ -8058,7 +8089,7 @@ struct ConnectView: View {
                 .font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
                 .padding(6).frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.primary.opacity(0.06), in: RoundedRectangle(cornerRadius: 5))
-            note("Whoever can sign in to \(p.host) as \(p.user) can read what \(brand) logs there; no pairing code is asked.")
+            note("Whoever can sign in to \(ConnectInput.md(p.host)) as \(ConnectInput.md(p.user)) can read what \(brand) logs there; no pairing code is asked.")
             note("It uses your SSH keys or agent and never asks for a password; \(brand) must be installed there.")
             errorBox
             HStack {
@@ -8072,7 +8103,7 @@ struct ConnectView: View {
     var askStep: some View {
         VStack(alignment: .leading, spacing: 10) {
             title("Is this \(draft.askLabel)?")
-            note("\(draft.host) reports the same machine id as \(draft.askLabel), but has a different key or address. That is normal after reinstalling \(brand) or resetting sharing there, and for cloned systems.")
+            note("\(ConnectInput.md(draft.host)) reports the same machine id as \(ConnectInput.md(draft.askLabel)), but has a different key or address. That is normal after reinstalling \(brand) or resetting sharing there, and for cloned systems.")
             HStack {
                 Button("Cancel") { store.answerAsk("") }.keyboardShortcut(.cancelAction)
                 Spacer()
@@ -8091,7 +8122,7 @@ struct ConnectView: View {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
                 title("Paired with \(ConnectInput.shortName(draft.pairedName))")
             }
-            if !draft.pairedAbout.isEmpty { note(draft.pairedAbout) }
+            if !draft.pairedAbout.isEmpty { note(ConnectInput.md(draft.pairedAbout)) }
             if draft.pairedOther {
                 note("It is watched from the terminal for now (`oomph remote sync`, `oomph top`); the app gives it a tab in a later release.")
                 HStack { Spacer(); Button("Done") { store.closeConnect(discard: true) }.keyboardShortcut(.defaultAction) }
@@ -8905,6 +8936,17 @@ func connectVectors(_ path: String) -> Int32 {
     out["message"] = cases("message").map { c in
         ConnectInput.message(str(c, "code"), target: str(c, "target"), detail: str(c, "detail"), side: c["side"] as? String)
     }
+    // a message of the error box with words from elsewhere in its target or detail (1.14.1): as shown, and its links
+    out["message_shown"] = cases("message_shown").map { c -> [Any] in
+        let a = ConnectInput.noteText(ConnectInput.message(str(c, "code"), target: str(c, "target"), detail: str(c, "detail"),
+                                                           side: c["side"] as? String))
+        return [String(a.characters), a.runs.filter { $0.link != nil }.count]
+    }
+    // a note with words from elsewhere put in (1.14.1): the text as shown, and how many links it holds
+    out["note"] = cases("note").map { c -> [Any] in
+        let a = ConnectInput.noteText(str(c).replacingOccurrences(of: "{}", with: ConnectInput.md(str(c, "v"))))
+        return [String(a.characters), a.runs.filter { $0.link != nil }.count]
+    }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)
     FileHandle.standardOutput.write("\n".data(using: .utf8)!)
@@ -8983,6 +9025,11 @@ func linuxVectors(_ path: String) -> Int32 {
         }
         let f = LinuxTab.Facts(zram: (c["zram"] as? Bool) ?? false, swap: (c["swap"] as? Bool) ?? true)
         return [LinuxTab.hoverSeries(f), opt(LinuxTab.availText(pts, ram: num(c["ram"]))), opt(LinuxTab.stallText(pts))]
+    }
+    // the hover's merged line over one pixel's oom_kill events, huge counts from a hostile mirror included (1.14.1)
+    out["merged"] = cases("merged").map { c -> [Any] in
+        let m = LinuxTab.merged((c["es"] as? [[String: Any]]) ?? [])
+        return [LinuxTab.killText(m).0, m["kills"] ?? NSNull(), m["cgroup"] ?? NSNull()]
     }
     out["words"] = [LinuxTab.calloutTitle, LinuxTab.calloutFoot] + LinuxTab.tourNotes
     out["group_name"] = cases("group_name").map { LinuxTab.groupName(($0["name"] as? String) ?? "") }

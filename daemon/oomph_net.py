@@ -78,6 +78,9 @@ PBKDF2_ROUNDS = 200000
 MAX_HANDSHAKES = 4                   # connections still before authentication, at once ...
 MAX_PER_ADDR = 3                     # ... from one address ...
 MAX_VIEWERS = 8                      # ... and authenticated viewers
+ALLOW_MIN = {4: 8, 6: 32}            # `share allow`: the widest range, by IP version (1.14.1)
+ALLOW_V4_IN_V6 = (("2001::/32", "Teredo"), ("2002::/16", "6to4"), ("64:ff9b::/96", "NAT64"),
+                  ("64:ff9b:1::/48", "NAT64"), ("::ffff:0:0/96", "IPv4-mapped"))  # IPv6 ranges that stand for IPv4 hosts
 WRITE_S = 30                         # a peer that does not read for this long is dropped
 CIPHERS = "ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256"
 CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"   # Crockford's base32: 12 of them are 60 bits
@@ -410,7 +413,7 @@ class Server:
     request and returns its response (None for a notification); poll() returns the notifications
     a subscription has due. It keeps no file open between calls."""
 
-    def __init__(self, log_dir=None, ledger_dir=None, now=None, session=None, ai=None):
+    def __init__(self, log_dir=None, ledger_dir=None, now=None, session=None, ai=None, ai_watch=None):
         self.log_dir = log_dir or oomph.LOG_DIR
         self.ledger_dir = ledger_dir or oomph.LEDGER_DIR
         self.fixed_now = now
@@ -419,6 +422,7 @@ class Server:
         self.tail = {}
         self.session = session          # a Session over TLS (pair or auth needed); None over a pipe
         self.ai = ai_allowed() if ai is None else ai
+        self.ai_watch = ai_watch        # over a pipe (SSH): an AiWatch, so `share ai off` reaches the session
         self.cn = self.sn = None        # the nonces of this connection's hello (TLS)
 
     def now(self):
@@ -478,9 +482,10 @@ class Server:
         cn, self.cn = self.cn, None  # one proof per hello, right or wrong
         if cn is None:
             raise RPCError(ERR["unauth"], "say hello first")
-        if not self.session.admit_viewer():  # before the code is looked at: a full house costs no try
-            raise RPCError(ERR["busy"], "too many viewers")
+        # a full house is told only to a proof that holds (Session.pair), and costs it no try
         r = self.session.pair(_b64(p.get("mac"), 32), cn, self.sn, viewer_name(p.get("name")))
+        if r == "busy":
+            raise RPCError(ERR["busy"], "too many viewers")
         if r is None:
             raise RPCError(ERR["pair"], "pairing failed")
         kp, client, token = r
@@ -1011,8 +1016,8 @@ def serve(inp, out, server, idle=IDLE_S, pre_auth=None):
     seconds without a frame, when the process grew by more than RSS_CAP or nears its CPU limit,
     when it is still not authenticated after `pre_auth` seconds, when its pairing was revoked, or
     when sharing was turned off (both looked at once a second, read when clients.json or
-    config.json changed; a change of `ai` is told as a `machine` notification). `inp` and `out` are
-    descriptors or streams."""
+    config.json changed; a change of `ai` is told as a `machine` notification, over SSH too). `inp`
+    and `out` are descriptors or streams."""
     lines = Lines(inp, LINE_PRE)
     out = _stream(out)
     base = _rss()
@@ -1047,6 +1052,12 @@ def serve(inp, out, server, idle=IDLE_S, pre_auth=None):
                         server.ai = ai
                         if server.open:
                             send(_note("machine", {"caps": server.caps()}))
+            elif server.ai_watch is not None:  # over SSH: `share ai on|off` alone (sharing is TCP's)
+                ai = server.ai_watch.changed()
+                if ai is not None and ai != server.ai:
+                    server.ai = ai
+                    if server.open:
+                        send(_note("machine", {"caps": server.caps()}))
             if cpu_spent():
                 send(_note("bye", {"reason": "busy"}))
                 return 0
@@ -1058,7 +1069,7 @@ def serve(inp, out, server, idle=IDLE_S, pre_auth=None):
             for note in notes:
                 send(note)
         wait = max(0.1, idle - (now - quiet_since))
-        if server.subscribed or server.session is not None:
+        if server.subscribed or server.session is not None or server.ai_watch is not None:
             wait = max(0.05, min(wait, 1.0 - (now - looked)))
         if pre_auth is not None and not server.open:
             wait = max(0.05, min(wait, pre_auth - (now - started)))
@@ -1077,7 +1088,7 @@ def serve(inp, out, server, idle=IDLE_S, pre_auth=None):
         if not line.strip():
             continue
         try:
-            req = json.loads(line, parse_constant=oomph._no_constant)
+            req = json.loads(line, parse_constant=oomph._no_constant, parse_int=oomph._parse_int)
         except (ValueError, RecursionError):
             send(_error(None, ERR["parse"], "parse error"))
             continue
@@ -1431,6 +1442,49 @@ def admit(run, conn):
     return len(others) < MAX_HANDSHAKES and sum(1 for c in others if c.get("peer") == conn.info["peer"]) < MAX_PER_ADDR
 
 
+def allow_too_wide(rng):
+    """Why `share allow` refuses a range (an ipaddress network), or None: wider than ALLOW_MIN, or an IPv6 range
+    that stands for IPv4 hosts anywhere (Teredo, 6to4, NAT64, mapped: allow those by their IPv4 range). 1.14.1;
+    the gate still honours such a range written before, and `share status` names it."""
+    if rng.prefixlen < ALLOW_MIN[rng.version]:
+        return "%s is too wide: at most a /%d (%s addresses) per range, e.g. 100.64.0.0/10 for a tailnet" % (
+            rng, ALLOW_MIN[rng.version], "16.7 million" if rng.version == 4 else "2^96")
+    for r, what in ALLOW_V4_IN_V6 if rng.version == 6 else ():
+        if rng.overlaps(ipaddress.ip_network(r)):
+            return "%s is within %s (%s), which stands for IPv4 hosts anywhere: allow their IPv4 range" % (rng, r, what)
+    return None
+
+
+def config_changed(sh, last):
+    """(config.json if it changed since `last`, else None; the stamp to pass next time). A missing file
+    reads as {"on": False}; one that could not be read is looked at again next time."""
+    try:
+        st = os.stat(sh.config_path, follow_symlinks=False)
+        stamp = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
+    except FileNotFoundError:
+        return ({"on": False} if last is not None else None), None
+    except OSError:
+        return None, last
+    if stamp == last:
+        return None, last
+    cfg = sh.config()
+    return cfg or None, (stamp if cfg else "unread")
+
+
+class AiWatch:
+    """`serve --stdio` (over SSH, roadmap 01 §8): whether this machine still lets its viewers send its data to
+    an AI model (`share ai on|off`), looked at as a TLS session looks at it, so that a withdrawal reaches a
+    session already open within a second (it did only at the next connection up to 1.14.0)."""
+
+    def __init__(self, sh=None):
+        self.sh, self.stamp = sh or ShareDir(), "unread"
+
+    def changed(self):
+        """The `ai` switch now if config.json changed since the last look, else None."""
+        cfg, self.stamp = config_changed(self.sh, self.stamp)
+        return None if cfg is None else oomph.switched_on(cfg.get("ai"))
+
+
 class Session:
     """One TLS connection's side of pairing and authentication, over run/."""
 
@@ -1441,8 +1495,10 @@ class Session:
 
     def pair(self, mac, cn, sn, name):
         """(pairing key, client id, token) when the proof matches the active code, else None, after
-        the pause. The code is used up by success; a wrong proof costs one of its tries."""
-        derived = good = False
+        the pause. The code is used up by success; a wrong proof costs one of its tries. "busy" for
+        a right proof while as many viewers read as are served: the code is kept, and only someone
+        who knows it learns that the house is full (1.14.1)."""
+        derived = good = busy = False
         kp = cid = token = None
         now = time.time()
         try:
@@ -1452,7 +1508,9 @@ class Session:
                 kp, good = check_pairing(pr["code"] if usable else new_code(), cn, sn, self.fp, mac)
                 derived = True
                 good = good and usable
-                if good:
+                if good and not self.admit_viewer():
+                    good, busy = False, True
+                elif good:
                     clients = self.run.clients(strict=True)
                     if clients is None:  # never written back as only this one: the others' pairings stay
                         raise OSError("clients.json could not be read")
@@ -1477,6 +1535,8 @@ class Session:
             self.run.summary()
         except OSError:
             pass
+        if busy:
+            return "busy"
         if not good:
             pause()
             return None
@@ -1486,24 +1546,31 @@ class Session:
     def auth(self, cid, mac, cn, sn):
         """True; False for an unknown client or a wrong proof (after the pause), also for a pairing
         revoked meanwhile; "busy" when as many viewers are reading as are served (counted before
-        this connection is one)."""
-        entry = next((c for c in self.run.clients() if c["id"] == cid), None) if cid else None
+        this connection is one). Raises OSError when clients.json is there but cannot be read, or
+        its lock cannot be had: no answer either way (the viewer tries again and keeps its token),
+        never "authenticated" without the look under the lock (1.14.1)."""
+        clients = self.run.clients(strict=True)
+        if clients is None:
+            raise OSError("clients.json could not be read")
+        entry = next((c for c in clients if c["id"] == cid), None) if cid else None
         key = bytes.fromhex(entry["key"]) if entry else os.urandom(32)
         good = hmac.compare_digest(proof(key, b"auth", cn, sn, self.fp), mac or b"\0" * 32) and entry is not None
         if good and not self.admit_viewer():
             return "busy"
-        try:
-            with self.run.lock():
-                clients = self.run.clients()
-                if good and any(c["id"] == cid for c in clients):  # a revoke may have come between
-                    for c in clients:
-                        if c["id"] == cid:
-                            c["last_seen"], c["last_addr"] = time.time(), self.peer
+        with self.run.lock():
+            clients = self.run.clients(strict=True)
+            if clients is None:
+                raise OSError("clients.json could not be read")
+            if good and any(c["id"] == cid for c in clients):  # a revoke may have come between
+                for c in clients:
+                    if c["id"] == cid:
+                        c["last_seen"], c["last_addr"] = time.time(), self.peer
+                try:
                     self.run.write("clients.json", clients)
-                else:
-                    good = False
-        except OSError:
-            pass
+                except OSError:  # (last seen not noted: a full disk; the pairing itself was looked at)
+                    pass
+            else:
+                good = False
         if not good:
             pause()
             return False
@@ -1552,18 +1619,8 @@ class Session:
             return None
         if not self.sh.test and sys.platform == "darwin" and not os.path.lexists(SHARE_PLIST):
             return {"on": False}
-        try:
-            st = os.stat(self.sh.config_path, follow_symlinks=False)
-            stamp = (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            return {"on": False}
-        except OSError:
-            return None
-        if stamp == self.cfg_stamp:
-            return None
-        cfg = self.sh.config()
-        self.cfg_stamp = stamp if cfg else "unread"
-        return cfg or None
+        cfg, self.cfg_stamp = config_changed(self.sh, self.cfg_stamp)
+        return cfg
 
     def unpair(self):
         with self.run.lock():
@@ -1625,6 +1682,30 @@ def make_key(sh, gid):
                 os.unlink(t)
             except OSError:
                 pass
+
+
+def fix_key(sh, gid):
+    """An existing key.pem put right through its descriptor (opened without following a link): root's (the
+    tester's) regular file with one link, group the service's (`gid`, which changes when the account is made
+    again), mode 640. Up to 1.14.0 it was never looked at again, and a changed gid closed every connection
+    without a word (key_ok). Raises ShareError for a key that is not root's own file: nothing is changed then
+    (`share off --forget` makes a new one, and viewers pair again)."""
+    try:
+        fd = os.open(sh.key, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError as e:
+        raise ShareError("%s can't be opened (%s): sudo oomph share off --forget, then share on again" % (
+            sh.key, e.strerror or e))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != sh.owner or st.st_nlink != 1:
+            raise ShareError("%s is not root's own file: sudo oomph share off --forget, then share on again" % sh.key)
+        if not sh.test and st.st_gid != gid:
+            os.fchown(fd, 0, gid)
+        mode = 0o600 if sh.test else 0o640
+        if stat.S_IMODE(st.st_mode) != mode:
+            os.fchmod(fd, mode)
+    finally:
+        os.close(fd)
 
 
 # ------------------------------------------------------------------ the peer gate (roadmap 01 §4.2)
@@ -2405,11 +2486,31 @@ def share_status(sh):
                "left": p.get("left") if isinstance(p.get("left"), int) and 0 <= p["left"] <= PAIR_TRIES else None}
     return {"on": cfg.get("on") is True, "port": cfg.get("port") if isinstance(cfg.get("port"), int) else PORT,
             "networks": [n for n in cfg.get("networks") or [] if isinstance(n, dict)],
-            "allow": [str(a) for a in cfg.get("allow") or []], "any_network": cfg.get("any_network") is True,
+            "allow": [str(a) for a in cfg.get("allow") or []], "allow_too_wide": _too_wide(cfg.get("allow")),
+            "any_network": cfg.get("any_network") is True,
             "ai": oomph.switched_on(cfg.get("ai")), "pairing": pairing, "clients": clients, "reading": reading,
             "more": s.get("more") if isinstance(s.get("more"), int) and 0 <= s["more"] <= 256 else 0,
             "unread": unread, "service": sh.test or sys.platform != "darwin" or os.path.exists(SHARE_PLIST),
             "fp": _public_fp(sh), "host": local_name()}
+
+
+def _too_wide(allow):
+    """The allowed ranges of config.json that `share allow` would refuse now (written before 1.14.1): the gate
+    still lets them in, so `share status` and `share on` name them, with the command that removes them."""
+    out = []
+    for a in allow if isinstance(allow, list) else []:
+        try:
+            if allow_too_wide(ipaddress.ip_network(a, strict=False)):
+                out.append(str(a))
+        except (ValueError, TypeError):
+            continue
+    return out[:16]
+
+
+def _print_too_wide(rngs):
+    for a in rngs:
+        print("%s is allowed, but share allow refuses it now (wider than a /8 or an IPv6 /32, or standing for IPv4 "
+              "hosts). To remove it:\n  sudo oomph share allow %s --remove" % (clean(a, 43), clean(a, 43)))
 
 
 def _public_fp(sh):
@@ -2426,7 +2527,8 @@ def _public_fp(sh):
 
 def print_status(st):
     if not st["on"]:
-        print("Sharing is off. To share this Mac: sudo oomph share on --pair")
+        print("Sharing is off. " + (LINUX_NOTE if sys.platform.startswith("linux") else  # (no share on there: 1.14.1)
+                                    "To share this Mac: sudo oomph share on --pair"))
     elif not st["service"]:
         print("Sharing is on, but its service is not installed (the logger was deactivated): Activate in the "
               "app, or sudo oomph share on, brings it back")
@@ -2437,6 +2539,7 @@ def print_status(st):
             print("  " + _net_line(n))
         if st["allow"]:
             print("Also allowed: " + ", ".join(clean(a, 43) for a in st["allow"]))
+        _print_too_wide(st["allow_too_wide"])
     print("AI analysis of this machine's data by viewers: %s" % ("allowed" if st["ai"] else
                                                                  "not allowed (sudo oomph share ai on)"))
     p = st["pairing"]
@@ -2553,6 +2656,8 @@ def _share(sh, sub, o, pos):
         ensure_dirs(sh, uid, gid)
         if not (os.path.exists(sh.key) and os.path.exists(sh.cert)):
             make_key(sh, gid)
+        else:
+            fix_key(sh, gid)
         cfg = sh.config()
         nets = [n for n in cfg.get("networks") or [] if isinstance(n, dict)]
         added = [n for n in current_networks() if not network_allowed(n, nets)]
@@ -2568,6 +2673,7 @@ def _share(sh, sub, o, pos):
         print("On every network." if cfg["any_network"] else "On these networks:")
         for n in nets if not cfg["any_network"] else []:
             print("  " + _net_line(n))
+        _print_too_wide(_too_wide(cfg["allow"]))
         if not cfg["any_network"] and any(n.get("router") and not n.get("mac") for n in nets):
             print(oomph.wrap("A router's hardware address (?) could not be read: that network is recognised by "
                              "its router's address and subnet alone, which other networks with the same plan "
@@ -2608,6 +2714,9 @@ def _share(sh, sub, o, pos):
         if net.prefixlen == 0:
             raise ShareError("that is every address: oomph share on --any-network means every network, "
                              "and still only neighbours")
+        why = allow_too_wide(net)
+        if why and "--remove" not in o:
+            raise ShareError(why)
         cfg = sh.config()
         allow = [a for a in cfg.get("allow") or [] if a != str(net)]
         if "--remove" not in o:
@@ -2699,6 +2808,6 @@ def cmd_serve(args):
     os.dup2(2, 1)
     os.close(devnull)
     try:
-        return serve(in_fd, out_fd, Server(now=now))
+        return serve(in_fd, out_fd, Server(now=now, ai_watch=AiWatch()))
     except (BrokenPipeError, ConnectionResetError):
         return 0

@@ -39,7 +39,8 @@ sys.path.insert(0, DAEMON)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 GROUPS = ("tiles", "event", "rows", "who", "remedy", "legend", "group_name", "labeled",
-          "legend_help", "capsule", "hover", "words")   # (the last four: L3, 1.13.4)
+          "legend_help", "capsule", "hover", "words",   # (these four: L3, 1.13.4)
+          "merged")                                      # (1.14.1)
 
 # the backend on a recorded machine, in a child: its sample's memory part and its machine block
 MEASURE = r"""
@@ -169,7 +170,29 @@ def cases():
              "user@1000.service/app-gnome-firefox-12345.scope-long", "node"]
     return {"tiles": tiles, "event": [{"e": e} for e in ev], "rows": rows, "who": who, "remedy": remedy, "legend": legend,
             "group_name": [{"name": n} for n in names], "labeled": [{"os": o} for o in ("macos", "linux", "freebsd")],
-            "hover": hover}
+            "hover": hover, "merged": MERGED}
+
+
+# one pixel's oom_kill events as the hover merges them (LinuxTab.merged): ordinary ones, and counts a hostile
+# mirror could send, which must neither trap the app (a plain + did, 1.13.3) nor go negative (1.14.1)
+BIG = 9223372036854775807
+MERGED = [{"es": [{"kind": "oom_kill", "kills": 2, "top": {"java": 2}}, {"kind": "oom_kill", "kills": 1, "top": {"node": 1}}]},
+          {"es": [{"kind": "oom_kill", "kills": 0, "cgroup": 3, "top": {"nginx": 3}}, {"kind": "oom_kill", "kills": 1}]},
+          {"es": [{"kind": "oom_kill", "kills": BIG, "cgroup": BIG, "by": {"oom": BIG}, "top": {"x": BIG}},
+                  {"kind": "oom_kill", "kills": BIG, "cgroup": BIG, "by": {"oom": BIG}, "top": {"x": BIG}}]},
+          {"es": [{"kind": "oom_kill", "kills": -5, "top": {"y": -7}}, {"kind": "oom_kill", "kills": 1e300, "top": {"z": 1e300}}]}]
+
+
+def merged_rules(inp, exp):
+    """The merged line: kills never negative, never past what killText shows (a million), nothing lost."""
+    bad = []
+    for c, a in zip(inp.get("merged") or [], exp.get("merged") or []):
+        if not (isinstance(a, list) and len(a) == 3 and isinstance(a[1], int) and a[1] >= 0 and
+                (a[2] is None or isinstance(a[2], int) and a[2] >= 0) and re.match(r"\d+ killed ", a[0])):
+            bad.append("merged %r: %r" % (c, a))
+    if len(exp.get("merged") or []) != len(inp.get("merged") or []):
+        bad.append("merged: %d answers for %d cases" % (len(exp.get("merged") or []), len(inp.get("merged") or [])))
+    return bad
 
 
 # ---------------------------------------------------------------------------------------------- the rules
@@ -254,6 +277,7 @@ def check_rules(v):
         if ("away" in names) != c["away"]:
             bad.append("legend %r: away %r" % (c, a))
     bad += l3_rules(inp, exp)
+    bad += merged_rules(inp, exp)
     for c, a in zip(inp["labeled"], exp["labeled"]):
         if a != (c["os"] in ("macos", "linux")):
             bad.append("labeled %r: %r" % (c, a))

@@ -149,11 +149,11 @@
    ]
   ],
   "message": [
-   "studio.local answered, but sharing is off there. On studio: + › Share this Mac, or `sudo oomph share on`. This step is kept while you do that.",
-   "studio.local closed the connection right away. Sharing there is limited to the networks it was turned on for: if studio moved, run `sudo oomph share on` there. (It also does this when too many machines knock at once.)",
+   "studio\\.local answered, but sharing is off there. On studio: + › Share this Mac, or `sudo oomph share on`. This step is kept while you do that.",
+   "studio\\.local closed the connection right away. Sharing there is limited to the networks it was turned on for: if studio moved, run `sudo oomph share on` there. (It also does this when too many machines knock at once.)",
    "macOS is not letting oomph reach your local network. Turn oomph on in System Settings › Privacy & Security › Local Network, then try again.",
-   "No answer from 10.0.4.23. Is it awake and on this network?",
-   "Can't find “studoi.local”.",
+   "No answer from 10\\.0\\.4\\.23. Is it awake and on this network?",
+   "Can't find “studoi\\.local”.",
    "Something answers on port 7000 there, but it isn't oomph.",
    "oomph is not installed on atlas. Install it there, then try again.",
    "The oomph on atlas is too old for remote access. Update it there.",
@@ -163,12 +163,80 @@
    "studio's oomph and this app can't talk to each other. Update the older one.",
    "Twelve machines are connected. Disconnect one to add another.",
    "studio has as many viewers as it serves at once. Try again in a minute.",
-   "ssh could not sign in to atlas without asking for something, and oomph never types a password. Try it in a terminal: ssh sam@atlas",
-   "studio.local answered with another key than the one shown: nothing was sent. Try again, and compare the key with `oomph share status` there.",
+   "ssh could not sign in to atlas without asking for something, and oomph never types a password. Try it in a terminal: ssh sam\\@atlas",
+   "studio\\.local answered with another key than the one shown: nothing was sent. Try again, and compare the key with `oomph share status` there.",
    "studio no longer knows this Mac: its access was revoked, or sharing was reset there. Pair again with a new code.",
    "That isn't an address. Type a host name, host:port or user@host, or paste a pairing link.",
    "Nothing was added. The pairing made just now was given back there and its code is used up: get a new one there to try again.",
    "it closed"
+  ],
+  "message_shown": [
+   [
+    "**x** `rm -rf` [here](https://evil.example)",
+    0
+   ],
+   [
+    "No answer from **studio**. Is it awake and on this network?",
+    0
+   ],
+   [
+    "`studio` has as many viewers as it serves at once. Try again in a minute.",
+    0
+   ],
+   [
+    "_st_udio.local answered, but sharing is off there. On _st_udio: + › Share this Mac, or sudo oomph share on. This step is kept while you do that.",
+    0
+   ],
+   [
+    "ssh could not sign in to atlas without asking for something, and oomph never types a password. Try it in a terminal: ssh **sam**@atlas",
+    0
+   ],
+   [
+    "Connecting to studio.local failed.",
+    0
+   ]
+  ],
+  "note": [
+   [
+    "Forget studio? Its history on this Mac is deleted.",
+    0
+   ],
+   [
+    "Forget [click here](https://evil.example/x)? Its history on this Mac is deleted.",
+    0
+   ],
+   [
+    "Here: https://evil.example reports the same machine id.",
+    0
+   ],
+   [
+    "Whoever can sign in to sam@evil.example can read it.",
+    0
+   ],
+   [
+    "www.evil.example no longer knows this Mac.",
+    0
+   ],
+   [
+    "**bold** `code` _it_ <b>x</b> \\ \\* # 1. - [x]",
+    0
+   ],
+   [
+    "macOS 27.2 · 64 GB · oomph 1.10.2",
+    0
+   ],
+   [
+    "Paired with <https://evil.example>.",
+    0
+   ],
+   [
+    "fe80::1%en0 reports it.",
+    0
+   ],
+   [
+    "mailto:a@b.c reports it.",
+    0
+   ]
   ],
   "ssh_command": [
    "ssh -l sam -- atlas oomph serve --stdio",
@@ -755,6 +823,92 @@
     "detail": "it closed",
     "side": null,
     "target": "studio.local"
+   }
+  ],
+  "message_shown": [
+   {
+    "code": "closed",
+    "detail": "**x** `rm -rf` [here](https://evil.example)",
+    "side": null,
+    "target": "studio.local",
+    "v": "**x** `rm -rf` [here](https://evil.example)"
+   },
+   {
+    "code": "timeout",
+    "detail": "",
+    "side": null,
+    "target": "**studio**",
+    "v": "**studio**"
+   },
+   {
+    "code": "busy",
+    "detail": "",
+    "side": null,
+    "target": "`studio`.local",
+    "v": "`studio`"
+   },
+   {
+    "code": "refused",
+    "detail": "",
+    "side": null,
+    "target": "_st_udio.local",
+    "v": "_st_udio.local"
+   },
+   {
+    "code": "ssh",
+    "detail": "",
+    "side": null,
+    "target": "**sam**@atlas",
+    "v": "ssh **sam**@atlas"
+   },
+   {
+    "code": "closed",
+    "detail": "",
+    "side": null,
+    "target": "studio.local",
+    "v": "Connecting to studio.local failed."
+   }
+  ],
+  "note": [
+   {
+    "s": "Forget {}? Its history on this Mac is deleted.",
+    "v": "studio"
+   },
+   {
+    "s": "Forget {}? Its history on this Mac is deleted.",
+    "v": "[click here](https://evil.example/x)"
+   },
+   {
+    "s": "**Here:** {} reports the same machine id.",
+    "v": "https://evil.example"
+   },
+   {
+    "s": "Whoever can sign in to {} can read it.",
+    "v": "sam@evil.example"
+   },
+   {
+    "s": "{} no longer knows this Mac.",
+    "v": "www.evil.example"
+   },
+   {
+    "s": "{}",
+    "v": "**bold** `code` _it_ <b>x</b> \\ \\* # 1. - [x]"
+   },
+   {
+    "s": "{}",
+    "v": "macOS 27.2 · 64 GB · oomph 1.10.2"
+   },
+   {
+    "s": "Paired with {}.",
+    "v": "<https://evil.example>"
+   },
+   {
+    "s": "{} reports it.",
+    "v": "fe80::1%en0"
+   },
+   {
+    "s": "{} reports it.",
+    "v": "mailto:a@b.c"
    }
   ],
   "ssh_command": [

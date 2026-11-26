@@ -707,6 +707,53 @@ def test_hostile_days():
                                                                          "%.0f MB" % o.get("rss_mb", -1)))
 
 
+def test_hostile_resume():
+    """A day file read on where the last read stopped (1.14.1): when it stopped inside a line too long to keep
+    (the logger, or on Linux the account that owns the folder, still writing it), the rest of that line is no
+    line of its own the next time, even if it reads as a sample; the next whole line is read. And the incident
+    list follows no link: incidents/ itself linked elsewhere, or an incident folder linked to one outside, is
+    not read (sudo oomph top on Linux)."""
+    now = NOW
+    d = tempfile.mkdtemp(prefix="oomph-toptest-resume-")
+    try:
+        path = os.path.join(d, "samples-%s.jsonl" % time.strftime("%Y-%m-%d", time.localtime(now)))
+        with open(path, "w") as f:
+            f.write(json.dumps({"t": now - 300, "app_gb": 2.0, "wired_gb": 1.0}) + "\n")
+            f.write("x" * (T.LINE_MAX + 50))                    # a line too long, still being written
+        d1 = T._read_day(path, None)
+        n1 = len(d1.t) if d1 is not None else -1
+        with open(path, "a") as f:                             # its rest reads as a sample; then a real one
+            f.write(json.dumps({"t": now - 150, "app_gb": 7.0, "wired_gb": 1.0}) + "\n")
+            f.write(json.dumps({"t": now - 100, "app_gb": 3.0, "wired_gb": 1.0}) + "\n")
+        d2 = T._read_day(path, d1)
+        got = sorted(d2.t) if d2 is not None else None
+        # incidents: one real, one folder that is a link out, and a log folder whose incidents/ is a link
+        log = os.path.join(d, "log")
+        out = os.path.join(d, "outside", "20250102-000000")
+        os.makedirs(os.path.join(log, "incidents", "20250101-000000"))
+        os.makedirs(out)
+        for where, iid in ((os.path.join(log, "incidents", "20250101-000000"), "20250101-000000"), (out, "20250102-000000")):
+            with open(os.path.join(where, "incident.json"), "w") as f:
+                json.dump({"id": iid, "start": now - 3600, "reasons": [{"desc": "x"}]}, f)
+        os.symlink(out, os.path.join(log, "incidents", "20250102-000000"))
+        shown = [i["id"] for i in T.load_incidents(log, now)[0]]
+        cache = {}
+        T.load_incidents(log, now, cache)
+        shown2 = [i["id"] for i in T.load_incidents(log, now, cache)[0]]
+        linked = os.path.join(d, "linked-log")
+        os.makedirs(linked)
+        os.symlink(os.path.join(d, "outside"), os.path.join(linked, "incidents"))
+        via_link = T.load_incidents(linked, now)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+    check(n1 == 1 and got == [now - 300, now - 100],
+          "history read on inside a line too long to keep: its rest is skipped, not read as a sample; the next line is "
+          "read (%s, then %s)" % (n1, got))
+    check(shown == ["20250101-000000"] and shown2 == shown and via_link == ([], 0),
+          "the incident list follows no link: an incident folder linked out and an incidents/ that is a link are not "
+          "read (%s, %s, %s)" % (shown, shown2, via_link))
+
+
 def test_series():
     """History.series is load_points column by column: days in order, a day out of order, days that
     overlap and a sample in the future (the slow path raised on every typed array up to 1.11.0)."""
@@ -1729,7 +1776,8 @@ def test_viewer(base):
         f.write("#!%s -I\nimport os, sys\nos.execv(%r, [%r, '-I', '-B', %r, 'serve', '--stdio'])\n" % (PY, PY, PY, CLI))
     os.chmod(fake, 0o755)
     env.update(HOME=home, XDG_STATE_HOME=xdg, OOMPH_SSH=fake,   # (top.json is found by the password database's
-               OOMPH_TOP_CONFIG=os.path.join(base, "top.json"))  # home: kept here, never the owner's real one)
+               OOMPH_TOP_CONFIG=os.path.join(base, "top.json"),  # home: kept here, never the owner's real one)
+               OOMPH_TEST="1")                                    # (the stand-in ssh only with OOMPH_TEST)
     env.pop("OOMPH_MACHINES_DIR", None)
     r = subprocess.run([PY, "-I", "-B", CLI, "remote", "add", "sam@studio", "--name", "mac-studio", "--json"],
                        env=env, capture_output=True, text=True, timeout=60)
@@ -1807,7 +1855,7 @@ def test_pty_engine(base):
     with open(fake, "w") as f:
         f.write("#!%s -I\nimport os, sys\nos.execv(%r, [%r, '-I', '-B', %r, 'serve', '--stdio'])\n" % (PY, PY, PY, CLI))
     os.chmod(fake, 0o755)
-    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_SSH=fake)
+    env.update(OOMPH_MACHINES_DIR=mdir, OOMPH_SSH=fake, OOMPH_TEST="1")   # (the stand-in ssh only with OOMPH_TEST)
     r = subprocess.run([PY, "-I", "-B", CLI, "remote", "add", "sam@atlas", "--name", "atlas", "--no-mirror", "--json"],
                        env=env, capture_output=True, text=True, timeout=60)
     try:
@@ -2552,6 +2600,7 @@ def main():
     test_inspect_mouse()
     test_arrays()
     test_hostile_days()
+    test_hostile_resume()
     test_resource_arrays()
     test_tab_ladder()
     test_link_rows()

@@ -635,8 +635,10 @@ def machine_of(m, t0, t1):
 
 
 def _json(line):
+    """A frame from the other machine, or None: no NaN or Infinity, and no integer longer than
+    LIMITS["digits"] (int() of a megabyte of digits takes seconds on Python 3.9; 1.14.1)."""
     try:
-        return json.loads(line, parse_constant=oomph._no_constant)
+        return json.loads(line, parse_constant=oomph._no_constant, parse_int=oomph._parse_int)
     except (ValueError, RecursionError):
         return None
 
@@ -1100,12 +1102,14 @@ def ssh_argv(host, user=None, port=None):
     user's multiplexing, agent and forwardings out of it and notice a dead link within about 15 s,
     the user as -l, `--` before the host, and a constant remote command wrapped in /bin/sh (a csh
     login shell could not parse it) that finds oomph on the PATH, where install.sh puts it or in
-    ~/.local/bin, and exits 127 when there is none."""
+    ~/.local/bin, and exits 127 when there is none. OOMPH_SSH names another ssh only together with
+    OOMPH_TEST=1 (the tests' stand-in; 1.14.1)."""
     remote = ("exec /bin/sh -c 'if command -v %(c)s >/dev/null 2>&1; then o=%(c)s; "
               "elif [ -x /usr/local/bin/%(c)s ]; then o=/usr/local/bin/%(c)s; "
               "elif [ -x \"$HOME/.local/bin/%(c)s\" ]; then o=\"$HOME/.local/bin/%(c)s\"; "
               "else exit 127; fi; exec \"$o\" serve --stdio'" % {"c": oomph.CMD})
-    return ([os.environ.get("OOMPH_SSH") or "/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "RequestTTY=no",
+    ssh = os.environ.get("OOMPH_SSH") if os.environ.get("OOMPH_TEST") == "1" else None
+    return ([ssh or "/usr/bin/ssh", "-T", "-o", "BatchMode=yes", "-o", "RequestTTY=no",
              "-o", "RemoteCommand=none", "-o", "ClearAllForwardings=yes", "-o", "ForwardAgent=no",
              "-o", "ForwardX11=no", "-o", "ControlMaster=no", "-o", "ControlPath=none",
              "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-o", "ConnectTimeout=15"] +
@@ -1432,7 +1436,11 @@ def tls_pair(link, fp, code, name):
     try:
         res = link.call("pair", {"mac": base64.b64encode(mac).decode(), "name": net.viewer_name(name)},
                         timeout=TLS_S + 5)
-    except net.RPCError:
+    except net.RPCError as e:
+        if e.code == net.ERR["busy"]:  # 1.14.1 and later: the code was right and is kept. (A 1.14.0 or older server
+            # says busy before it looks at the code: it may be mistyped, but it is not used up either way.)
+            raise SyncError("busy", "it has as many viewers as it serves at once; the code is not used up: try it "
+                            "again in a minute")
         raise SyncError("pair_failed", "the code was not accepted: mistyped, used, expired or out of tries. Make a "
                         "new one there: sudo oomph share pair")
     smac = net._b64(res.get("mac"), 32) if isinstance(res, dict) else None

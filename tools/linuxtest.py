@@ -271,6 +271,9 @@ def part_fixtures():
     sb = json.loads(r.stdout or "[]")
     check(len(sb) == 3 and ("uid" in (sb[0] or "") or "others" in (sb[0] or "")) and "regular" in (sb[1] or "") and sb[2] is None,
           "doctor names an alert.secret that is not root's alone (another owner, a link): %s" % sb)
+    rc, out, _ = fx_cli("ubuntu-server-idle", "share", "status")
+    check(rc == 0 and "over SSH" in out and "share on" not in out and not MAC_WORDS.search(out),
+          "share status on Linux: watched over SSH, no \"sudo oomph share on\", refused there (1.14.1): %s" % out[:120])
     rc, out, _ = fx_cli("ubuntu-server-idle", "reservations")
     check(rc == 0 and "left to grant" in out and "ledger:" in out and "yours only" in out,
           "reservations: \"available − reserved − margin = left to grant\", and whose ledger")
@@ -916,14 +919,144 @@ def part_logger():
     with open(os.path.join(lk, "incidents", "20250101-000000", "incident.json"), "w") as f:
         json.dump({"id": "20250101-000000", "start": 1}, f)
     os.symlink(os.path.join(TMP, "elsewhere"), os.path.join(lk, "incidents", "20250102-000000"))
+    lk2 = os.path.join(TMP, "linked-logs-2")      # incidents/ itself a link (1.14.1)
+    os.makedirs(lk2)
+    os.symlink(os.path.join(lk, "incidents"), os.path.join(lk2, "incidents"))
     saved_log, oomph.LOG_DIR = oomph.LOG_DIR, lk
     try:
         listed = [i["id"] for i in oomph.list_incidents()]
+        oomph.LOG_DIR = lk2
+        listed2 = [i["id"] for i in oomph.list_incidents()]
     finally:
         oomph.LOG_DIR = saved_log
-    check(got_lines == ['{"a": 1}\n', '{"b": 2}\n'] and listed == ["20250101-000000"],
+    check(got_lines == ['{"a": 1}\n', '{"b": 2}\n'] and listed == ["20250101-000000"] and listed2 == [],
           "the logger's files as root reads them: a line past the limit skipped, the total unpacked bounded, an "
-          "incident folder that is a link not followed (%s, %s)" % (got_lines, listed))
+          "incident folder that is a link not followed, nor an incidents/ that is one (%s, %s, %s)"
+          % (got_lines, listed, listed2))
+
+    # --- `oomph ai`'s syslog tool (root runs it too): the incident's folder swapped for a link between the listing and
+    # the read (the logger's account owns the folder) is not followed to a syslog.txt elsewhere (1.14.1)
+    import oomph_ai
+    sw = os.path.join(TMP, "swap-logs")
+    sw_inc = os.path.join(sw, "incidents", "20250103-000000")
+    os.makedirs(sw_inc)
+    os.makedirs(os.path.join(TMP, "swap-elsewhere"))
+    with open(os.path.join(sw_inc, "incident.json"), "w") as f:
+        json.dump({"id": "20250103-000000", "start": 1}, f)
+    with open(os.path.join(sw_inc, "syslog.txt"), "w") as f:
+        f.write("the incident's own line\n")
+    with open(os.path.join(TMP, "swap-elsewhere", "syslog.txt"), "w") as f:
+        f.write("SECRET from elsewhere\n")
+    real_list = oomph.list_incidents
+
+    def list_then_swap(*a, **k):
+        out = real_list(*a, **k)
+        if os.path.isdir(sw_inc) and not os.path.islink(sw_inc):
+            os.rename(sw_inc, sw_inc + ".moved")
+            os.symlink(os.path.join(TMP, "swap-elsewhere"), sw_inc)
+        return out
+    saved_log, oomph.LOG_DIR = oomph.LOG_DIR, sw
+    try:
+        plain = oomph_ai.Logs(0, time.time()).syslog({"id": "20250103-000000"})
+        oomph.list_incidents = list_then_swap
+        swapped = oomph_ai.Logs(0, time.time()).syslog({"id": "20250103-000000"})
+    finally:
+        oomph.list_incidents, oomph.LOG_DIR = real_list, saved_log
+    check("own line" in json.dumps(plain) and "SECRET" not in json.dumps(swapped) and "cannot be read" in json.dumps(swapped),
+          "the AI's syslog tool reads an incident's syslog.txt through its folder, and not through a link swapped in "
+          "after the listing (%s / %s)" % (json.dumps(plain)[:80], json.dumps(swapped)[:80]))
+
+    # --- linux/system.sh's own(): the mode and owner of a folder of the logger's set through its descriptor, so a
+    # link put there between the look and the chmod (/var/log is the group syslog's on Debian) is refused (1.14.1)
+    src = open(os.path.join(ROOT, "linux", "system.sh")).read()
+    own_fn = src[src.index("own() {"):src.index("\n}\n", src.index("own() {")) + 3]
+    fakebin = os.path.join(TMP, "own-bin")
+    os.makedirs(fakebin)
+    victim = os.path.join(TMP, "own-victim")
+    os.makedirs(victim, 0o700)
+    with open(os.path.join(fakebin, "mkdir"), "w") as f:   # the race, won every time: a link appears at mkdir
+        f.write('#!/bin/sh\nfor a; do last="$a"; done\nln -s "%s" "$last"\n' % victim)
+    os.chmod(os.path.join(fakebin, "mkdir"), 0o755)
+    r = subprocess.run(["/bin/sh", "-c", own_fn + '\nOWNER=""\nown 0755 "$1"\necho reached', "sh",
+                        os.path.join(TMP, "own-target")], capture_output=True, text=True, timeout=30,
+                       env=dict(os.environ, PATH=fakebin + ":/usr/bin:/bin", PY=sys.executable, PFX=TMP))
+    mode = oct(os.stat(victim).st_mode & 0o777)
+    plain = os.path.join(TMP, "own-plain")
+    r2 = subprocess.run(["/bin/sh", "-c", own_fn + '\nOWNER=""\nown 0750 "$1"', "sh", plain], capture_output=True,
+                        text=True, timeout=30, env=dict(os.environ, PY=sys.executable, PFX=TMP))
+    check(r.returncode != 0 and "reached" not in r.stdout and mode == "0o700" and r2.returncode == 0 and
+          oct(os.stat(plain).st_mode & 0o777) == "0o750",
+          "system.sh own(): a folder that became a link after the look is refused, the link's target keeps its mode "
+          "(%s, %s); a real folder gets its mode %s" % (r.returncode, mode, r2.stderr[-200:]))
+
+    # --- a FUSE disk (ntfs-3g: fuseblk) whose daemon does not answer: mounts() leaves it out after a bounded wait,
+    # and does not ask it again while the first question still waits (1.14.1)
+    import threading
+    gate = threading.Event()
+    real_statvfs, real_read = os.statvfs, L.read
+    asked = []
+
+    def slow_statvfs(path, *a):
+        if path.endswith("/media/ada/NTFS"):
+            asked.append(path)
+            gate.wait(30)
+            path = "/"
+        return real_statvfs(path, *a)
+    mi_text = L.read("/proc/self/mountinfo") + "40 26 8:49 / /media/ada/NTFS rw - fuseblk /dev/sdd1 rw\n"
+    saved_to, L.STATVFS_FUSE_S = L.STATVFS_FUSE_S, 0.5
+    os.statvfs = slow_statvfs
+    L.read = lambda p, *a: mi_text if p == "/proc/self/mountinfo" else real_read(p, *a)
+    try:
+        t0 = time.monotonic()
+        m1 = L.mounts()
+        t1 = time.monotonic()
+        m2 = L.mounts()
+        t2 = time.monotonic()
+        gate.set()   # it answers after all (slow, not dead): still not asked again within the back-off
+        key = next(k for k in L._statvfs_stuck if k.endswith("/media/ada/NTFS"))
+        L._statvfs_stuck[key][0].join(5)
+        m3 = L.mounts()
+        t3 = time.monotonic()
+        backoff = [len(asked)]
+        L._statvfs_stuck[key] = (L._statvfs_stuck[key][0], time.monotonic() - 1)
+        m4 = L.mounts()  # the back-off over: asked again, and it answers now
+        backoff.append(len(asked))
+    finally:
+        os.statvfs, L.read, L.STATVFS_FUSE_S = real_statvfs, real_read, saved_to
+        gate.set()
+        for k in [k for k in L._statvfs_stuck if k.endswith("/media/ada/NTFS")]:
+            del L._statvfs_stuck[k]
+    check(m1 is not None and m2 is not None and m3 is not None and "/media/ada/NTFS" not in [
+          r["mount"] for r in m1 + m2 + m3] and t1 - t0 < 3 and t2 - t1 < 0.3 and t3 - t2 < 5 and backoff[0] == 1,
+          "a FUSE disk that does not answer statvfs: left out after %.1f s, not asked again while it waits (%.2f s), "
+          "nor for a while after it answered late (asked %d time(s))" % (t1 - t0, t2 - t1, backoff[0]))
+    check(m4 is not None and backoff[1] == 2 and "/media/ada/NTFS" in [r["mount"] for r in m4],
+          "… and asked again once the back-off is over (%s)" % backoff)
+
+    # --- admission's statvfs (oomph._statvfs_gb: `oomph run --reserve-disk`, a ledger child) is bounded the same way
+    # on Linux for a FUSE disk (1.14.1)
+    gate2 = threading.Event()
+
+    def hung_statvfs(path, *a):
+        if path.endswith("/media/ada/NTFS2"):
+            gate2.wait(30)
+            path = "/"
+        return real_statvfs(path, *a)
+    saved_plat, oomph._plat = oomph._plat, L
+    saved_to, L.STATVFS_FUSE_S = L.STATVFS_FUSE_S, 0.5
+    os.statvfs = hung_statvfs
+    try:
+        t0 = time.monotonic()
+        gb = oomph._statvfs_gb("/media/ada/NTFS2", "fuseblk")
+        t1 = time.monotonic()
+        root_gb = oomph._statvfs_gb("/", "ext4")
+    finally:
+        os.statvfs, L.STATVFS_FUSE_S, oomph._plat = real_statvfs, saved_to, saved_plat
+        gate2.set()
+        L._statvfs_stuck.pop("/media/ada/NTFS2", None)
+    check(gb is None and t1 - t0 < 3 and isinstance(root_gb, float),
+          "admission's free-space read of a FUSE disk that hangs gives up after %.1f s; / is read as before (%s)"
+          % (t1 - t0, root_gb))
 
     # --- the alert runner stops before a hook that could outlast the unit, and goes on where it stopped
     slow = os.path.join(TMP, "alert-slow.d")
@@ -1209,9 +1342,9 @@ def part_system():
     r = subprocess.run([os.path.join(ROOT, "linux", "uninstall.sh"), "--system", "--purge"], capture_output=True,
                        text=True, timeout=60, env=e)
     left = [os.path.join(dp, f) for dp, dn, fn in os.walk(pfx) for f in fn + dn]
-    check(r.returncode == 0 and not left or set(left) <= {os.path.join(pfx, x) for x in (
+    check(r.returncode == 0 and (not left or set(left) <= {os.path.join(pfx, x) for x in (
         "usr", "usr/bin", "usr/local", "usr/local/bin", "usr/local/libexec", "etc", "etc/systemd", "etc/systemd/system",
-        "var", "var/lib", "var/log")}, "linux/uninstall.sh --system --purge leaves nothing of oomph%s"
+        "var", "var/lib", "var/log")}), "linux/uninstall.sh --system --purge leaves nothing of oomph%s"
           % ("" if r.returncode == 0 else ": " + r.stderr[-200:]))
 
 

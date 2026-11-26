@@ -5,6 +5,7 @@ Samples the real system into a temporary log directory, feeds the daemon a synth
 jetsam storm, checks that an incident opens and closes with a report, and runs every
 CLI command against the result. Run: /usr/bin/python3 -I tools/selftest.py
 """
+import ast
 import gzip
 import io
 import json
@@ -3869,6 +3870,21 @@ check(r.returncode == 0 and ((lc.get("psi") or {}).get("limit") or {}).get("some
       (lc.get("linux") or {}).get("zram_disk_gb") == 0.0,
       "the stall at a container's limit and the linux block cross serve, ingest and the mirror")
 shutil.rmtree(os.path.dirname(lfx), ignore_errors=True)
+
+# 1.14.1, hardening: a sample whose disks are not a list fails no check, hook or MCP call; the renders' fixture
+# never draws this Mac's own resources switch
+hv, herr = None, ""
+try:
+    hs = dict(oomph.sample(with_procs=False))
+    hv = [oomph.checked_verdict(s=dict(hs, disks=x)) for x in (5, "x", {"a": 1}, [None, 3, {"id": 1}])]
+except Exception as e:
+    herr = repr(e)
+check(hv is not None and all(isinstance(v.get("level"), str) and v["resources"].get("disks") == [] for v in hv),
+      "check with a sample whose disks are a number, a text, an object or junk: a verdict, no disks, no exception %s" % herr)
+rd = next((ast.literal_eval(x.split("=", 1)[1].split("#")[0].strip())
+           for x in open(os.path.join(ROOT, "tools", "renderfixture.py"), encoding="utf-8") if x.startswith("DEFAULTS =")), [])
+check(all(k in rd and rd[rd.index(k) + 1] == "NO" for k in ("-aiOn", "-machinesUI", "-resourcesUI")),
+      "renderfixture pins the app's switches off (-aiOn, -machinesUI, -resourcesUI NO): never this Mac's own settings")
 
 # remote machines (1.10.0): the peer gate, pairing and tokens, TLS, the share commands, remote over TCP and ssh,
 # the engine (tools/sharetest.py, a file of its own)

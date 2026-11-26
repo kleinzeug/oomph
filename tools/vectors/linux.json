@@ -304,6 +304,28 @@
     "Red line: an incident starts — high memory pressure, apps killed for memory, or a stall. Each one is listed under Incidents with its report."
    ]
   ],
+  "merged": [
+   [
+    "3 killed by the OOM killer: java ×2, node",
+    3,
+    null
+   ],
+   [
+    "1 killed by the OOM killer (+3 at their limit): nginx ×3",
+    1,
+    3
+   ],
+   [
+    "1000000 killed by the OOM killer (+1000000 at their limit): x ×1000000",
+    2000000,
+    2000000
+   ],
+   [
+    "1000000 killed by the OOM killer: z ×1000000",
+    1000000,
+    null
+   ]
+  ],
   "remedy": [
    [
     "No readings",
@@ -1994,6 +2016,86 @@
      "t": 1795180000.0,
      "wired_gb": 2.5
     }
+   }
+  ],
+  "merged": [
+   {
+    "es": [
+     {
+      "kills": 2,
+      "kind": "oom_kill",
+      "top": {
+       "java": 2
+      }
+     },
+     {
+      "kills": 1,
+      "kind": "oom_kill",
+      "top": {
+       "node": 1
+      }
+     }
+    ]
+   },
+   {
+    "es": [
+     {
+      "cgroup": 3,
+      "kills": 0,
+      "kind": "oom_kill",
+      "top": {
+       "nginx": 3
+      }
+     },
+     {
+      "kills": 1,
+      "kind": "oom_kill"
+     }
+    ]
+   },
+   {
+    "es": [
+     {
+      "by": {
+       "oom": 9223372036854775807
+      },
+      "cgroup": 9223372036854775807,
+      "kills": 9223372036854775807,
+      "kind": "oom_kill",
+      "top": {
+       "x": 9223372036854775807
+      }
+     },
+     {
+      "by": {
+       "oom": 9223372036854775807
+      },
+      "cgroup": 9223372036854775807,
+      "kills": 9223372036854775807,
+      "kind": "oom_kill",
+      "top": {
+       "x": 9223372036854775807
+      }
+     }
+    ]
+   },
+   {
+    "es": [
+     {
+      "kills": -5,
+      "kind": "oom_kill",
+      "top": {
+       "y": -7
+      }
+     },
+     {
+      "kills": 1e+300,
+      "kind": "oom_kill",
+      "top": {
+       "z": 1e+300
+      }
+     }
+    ]
    }
   ],
   "remedy": [

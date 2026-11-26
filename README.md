@@ -639,10 +639,11 @@ How it works, briefly. Sharing is a second, optional service (`local.oomph.share
 launchd starts once per connection as a role account of its own, `_oomph`, never as root and
 never inside the logger; it only reads what every user of that Mac can read in its logs.
 Before a byte is read, a peer must be on the same network (one that sharing was turned on
-for; `share allow CIDR` adds a routed range such as a tailnet). Then TLS with the Mac's own
-key, which the viewer pins at pairing; the pairing code is never sent, both sides prove they
-know it, so a machine in between cannot pair. Each viewer keeps a token in a file only it can
-read (`~/Library/Application Support/oomph/machines/secrets.json`) and its mirror of the other
+for; `share allow CIDR` adds a routed range such as a tailnet, at most a /8, or a /32 for
+IPv6). Then TLS with the Mac's own key, which the viewer pins at pairing; the pairing code is
+never sent, both sides prove they know it, so a machine in between cannot pair. Each viewer
+keeps a token in a file only it can read
+(`~/Library/Application Support/oomph/machines/secrets.json`) and its mirror of the other
 machine next to it, in the same layout as `/Library/Logs/oomph`. A laptop is best watched over
 `ssh`: that opens no port of ours.
 

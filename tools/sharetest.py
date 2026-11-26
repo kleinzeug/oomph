@@ -13,6 +13,7 @@ import atexit
 import base64
 import contextlib
 import errno
+import fcntl
 import hashlib
 import io
 import json
@@ -126,6 +127,14 @@ def run_root():
     import grp
     check(st.st_uid == 0 and grp.getgrgid(st.st_gid).gr_name == net.ROLE and stat.S_IMODE(st.st_mode) == 0o640,
           "key.pem is root:%s 640" % net.ROLE)
+    kp = os.path.join(net.SHARE_DIRS["darwin"], "key.pem")   # (1.14.1) another group, as after the account is made again
+    os.chown(kp, 0, 0)
+    os.chmod(kp, 0o600)
+    r = root("share", "on")
+    st = os.stat(kp)
+    check(r.returncode == 0 and st.st_uid == 0 and grp.getgrgid(st.st_gid).gr_name == net.ROLE and
+          stat.S_IMODE(st.st_mode) == 0o640, "share on over a key of another group puts it back to root:%s 640 (%s)"
+          % (net.ROLE, r.stderr.strip()[-200:]))
     run = os.stat(os.path.join(net.SHARE_DIRS["darwin"], "run"))
     check(run.st_uid == __import__("pwd").getpwnam(net.ROLE).pw_uid, "run/ is the service account's")
     out = subprocess.run(["/bin/launchctl", "print", "system/" + net.LABEL], capture_output=True, text=True).stdout
@@ -718,7 +727,34 @@ def main():
           not ses.auth("c-00000000", good, cn, sn) and not ses.auth(cid, None, cn, sn),
           "auth: the right proof passes; a replayed one (old nonces), an unknown client and no proof fail")
     check(not ses.revoked(), "a pairing that stands is not revoked")
+    # 1.14.1: auth fails closed. clients.json there but unreadable, or its lock held past the wait: no answer (the
+    # viewer tries again and keeps its token), never authenticated without the look under the lock
+
+    def auth_frame(run):
+        srv = net.Server(now=NOW, session=net.Session(run, fp, "x"))
+        h = srv.handle({"jsonrpc": "2.0", "id": 1, "method": "hello",
+                        "params": {"proto": [1, 1], "nonce": base64.b64encode(os.urandom(16)).decode()}})
+        c, n = srv.cn, base64.b64decode(h["result"]["nonce"])
+        r = srv.handle({"jsonrpc": "2.0", "id": 2, "method": "auth",
+                        "params": {"client": cid, "mac": base64.b64encode(net.proof(key, b"auth", c, n, fp)).decode()}})
+        return (r.get("error") or {}).get("code"), srv.open
     kept = rd.read("clients.json")
+    with open(os.path.join(rd.path, "clients.json"), "wb") as f:
+        f.write(b"[" + b" " * (1 << 20) + b"]")
+    unread = auth_frame(rd)
+    rd.write("clients.json", kept)
+    held = os.open(os.path.join(rd.path, "lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(held, fcntl.LOCK_EX)
+    rd.lock = lambda wait=0.3: net.RunDir.lock(rd, wait)
+    try:
+        locked = auth_frame(rd)
+    finally:
+        del rd.lock
+        os.close(held)
+    after = auth_frame(rd)
+    check(unread == (-32603, False) and locked == (-32603, False) and after == (None, True),
+          "auth with the right proof while clients.json can't be read, or its lock is held: no answer, not "
+          "authenticated (%s, %s); then it passes (%s)" % (unread, locked, after))
     with open(os.path.join(rd.path, "clients.json"), "wb") as f:
         f.write(b"[" + b" " * (1 << 20) + b"]")   # there, but past what is read: no answer
     unreadable = ses.revoked() or ses.revoked()
@@ -741,12 +777,39 @@ def main():
     psrv.handle({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"proto": [1, 1], "nonce": base64.b64encode(os.urandom(16)).decode()}})
     rdv.write("pairing.json", {"code": "AAAABBBBCCCC", "expires": time.time() + 600, "left": 5})
     pr = psrv.handle({"jsonrpc": "2.0", "id": 2, "method": "pair", "params": {"mac": base64.b64encode(os.urandom(32)).decode()}})
+    left_wrong = (rdv.pairing() or {}).get("left")
+    psrv = net.Server(now=NOW, session=net.Session(rdv, fp, "x"))
+    h = psrv.handle({"jsonrpc": "2.0", "id": 1, "method": "hello", "params": {"proto": [1, 1], "nonce": base64.b64encode(os.urandom(16)).decode()}})
+    pcn, psn = psrv.cn, base64.b64decode(h["result"]["nonce"])
+    pmac = net.proof(net.pair_key("AAAABBBBCCCC", psn, pcn), b"client", pcn, psn, fp)
+    pr2 = psrv.handle({"jsonrpc": "2.0", "id": 2, "method": "pair", "params": {"mac": base64.b64encode(pmac).decode()}})
     for q in readers:
         q.kill()
         q.wait()
     mine.close()
-    check(full == "busy" and full_state == "handshake" and pr["error"]["code"] == net.ERR["busy"] and rdv.pairing()["left"] == 5,
-          "a full house: auth says busy without counting itself a viewer; pairing says busy and costs the code no try")
+    check(full == "busy" and full_state == "handshake", "a full house: auth says busy without counting itself a viewer")
+    check(pr["error"]["code"] == net.ERR["pair"] and left_wrong == 4 and pr2["error"]["code"] == net.ERR["busy"] and
+          (rdv.pairing() or {}).get("left") == 4 and len(rdv.clients()) == 1,
+          "a full house at pairing (1.14.1): a wrong proof hears only \"pairing failed\" and costs a try, as always; "
+          "the right one hears busy and keeps the code (%s %s, %s)" % (pr["error"]["code"], left_wrong,
+                                                                       pr2.get("error")))
+
+    class BusyLink:  # a server that answers the proof with busy: 1.14.1's after a right code, 1.14.0's before any look
+        cn = os.urandom(16)
+
+        def hello_raw(self):
+            return {"nonce": base64.b64encode(os.urandom(16)).decode(), "auth": ["pair"]}, None, None
+
+        def call(self, method, params, timeout=None):
+            raise net.RPCError(net.ERR["busy"], "too many viewers")
+    try:
+        sync.tls_pair(BusyLink(), fp, "AAAABBBBCCCC", "x")
+        busy_said = None
+    except sync.SyncError as e:
+        busy_said = (e.code, e.detail)
+    check(busy_said is not None and busy_said[0] == "busy" and "not used up" in busy_said[1] and
+          "still good" not in busy_said[1], "a viewer told busy at pairing hears its code is not used up, never that it "
+          "is right (an older server says busy before it looks at the code): %s" % (busy_said,))
     if os.geteuid() != 0:
         rdv.write("1.json", {"pid": 1, "peer": "10.0.0.3", "state": "authenticated"}, 0o644, "conn")
         check(not any(c.get("pid") == 1 for c in rdv.conns()) and "1.json" not in rdv.names("conn"),
@@ -871,6 +934,109 @@ def main():
                                  capture_output=True, text=True).stdout and "oomph" in
           subprocess.run(["/usr/bin/openssl", "x509", "-noout", "-subject", "-in", os.path.join(share, "cert.pem")],
                          capture_output=True, text=True).stdout, "the key is nobody else's; the certificate says CN=oomph")
+    # 1.14.1: share on puts an existing key right (its group and mode, by descriptor), and refuses one that is a link
+    kp = os.path.join(share, "key.pem")
+
+    def test_share():
+        os.environ["OOMPH_SHARE_DIR"] = share
+        try:
+            return net.ShareDir()
+        finally:
+            os.environ.pop("OOMPH_SHARE_DIR", None)
+    os.chmod(kp, 0o644)
+    bad_before = test_share().key_ok()
+    r = cli("share", "on", env=env)
+    fixed = r.returncode == 0 and stat.S_IMODE(os.stat(kp).st_mode) == 0o600 and test_share().key_ok()
+    os.rename(kp, kp + ".real")
+    os.symlink(kp + ".real", kp)
+    r2 = cli("share", "on", env=env)
+    os.unlink(kp)
+    os.rename(kp + ".real", kp)
+    check(not bad_before and fixed and r2.returncode == 1 and "key.pem" in r2.stderr and os.path.islink(kp) is False,
+          "share on over a key whose mode went wrong puts it right (serve refused it without a word); a key that is a "
+          "link is refused, nothing changed (%s)" % (r.stderr + r2.stderr).strip()[-200:])
+    allow = []
+    for rng in ("10.0.0.0/7", "10.0.0.0/8", "fd00::/31", "fd00::/32"):
+        allow.append(cli("share", "allow", rng, env=env).returncode)
+    allowed = test_share().config().get("allow")
+    for rng in ("10.0.0.0/8", "fd00::/32"):
+        cli("share", "allow", rng, "--remove", env=env)
+    check(allow == [1, 0, 1, 0] and allowed == ["10.0.0.0/8", "fd00::/32"],
+          "share allow takes a range up to a /8 (IPv4) or a /32 (IPv6), and refuses a wider one (%s, %s)" % (allow, allowed))
+    v4in6 = [cli("share", "allow", rng, env=env).returncode
+             for rng in ("2001::/32", "2001:0:abcd::/48", "2002:c0a8::/32", "64:ff9b::/96", "::ffff:10.0.0.0/104")]
+    check(v4in6 == [1, 1, 1, 1, 1] and test_share().config().get("allow") == [],
+          "share allow refuses an IPv6 range that stands for IPv4 hosts anywhere (Teredo, 6to4, NAT64, mapped): %s" % v4in6)
+    shc = test_share()
+    shc.write_config(dict(shc.config(), allow=["10.0.0.0/6", "2001:0:abcd::/48", "100.64.0.0/10"]))
+    st_txt = cli("share", "status", env=env).stdout
+    st_js = json.loads(cli("share", "status", "--json", env=env).stdout)
+    removed = cli("share", "allow", "10.0.0.0/6", "--remove", env=env).returncode
+    shc.write_config(dict(shc.config(), allow=[]))
+    check(st_js.get("allow_too_wide") == ["10.0.0.0/6", "2001:0:abcd::/48"] and
+          "share allow 10.0.0.0/6 --remove" in st_txt and "share allow 100.64.0.0/10 --remove" not in st_txt and
+          removed == 0, "a range allowed before 1.14.1 that is too wide now: share status names it and how to remove it "
+                        "(%s), and --remove takes it (%s)" % (st_js.get("allow_too_wide"), removed))
+    saved_test = os.environ.pop("OOMPH_TEST", None)
+    os.environ["OOMPH_SSH"] = "/tmp/not-ssh"
+    try:
+        plain = sync.ssh_argv("atlas")[0]
+        os.environ["OOMPH_TEST"] = "1"
+        stand_in = sync.ssh_argv("atlas")[0]
+    finally:
+        os.environ.pop("OOMPH_SSH", None)
+        if saved_test is not None:
+            os.environ["OOMPH_TEST"] = saved_test
+    check(plain == "/usr/bin/ssh" and stand_in == "/tmp/not-ssh", "OOMPH_SSH names another ssh only with OOMPH_TEST=1")
+    t0 = time.monotonic()
+    huge = sync._json('{"jsonrpc": "2.0", "id": 1, "result": {"n": %s}}' % ("9" * 4000))
+    check(huge is None and time.monotonic() - t0 < 0.5 and sync._json('{"n": 123456789012345678901234567890}') == {
+          "n": 123456789012345678901234567890}, "a frame with an integer of 4,000 digits is no frame, at once (%.2f s); "
+          "30 digits still read" % (time.monotonic() - t0))
+    # over SSH (serve --stdio), `share ai on` and `off` reach a session already open, as over TLS
+    q = subprocess.Popen([PY, "-I", "-B", OOMPH, "serve", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, env=dict(os.environ, **env))
+    q2 = subprocess.Popen([PY, "-I", "-B", OOMPH, "serve", "--stdio"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, env=dict(os.environ, **env))  # no subscription (remote add)
+    seen = []
+
+    def note_caps(secs, proc=None):
+        proc = proc or q
+        end = time.monotonic() + secs
+        while time.monotonic() < end:
+            if select.select([proc.stdout], [], [], max(0.0, end - time.monotonic()))[0]:
+                line = proc.stdout.readline()
+                if not line:
+                    return None
+                m = json.loads(line)
+                seen.append(m.get("method") or m.get("id"))
+                if m.get("method") == "machine":
+                    return m["params"]["caps"]
+        return None
+    try:
+        q.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"hello","params":{"proto":[1,1]}}\n'
+                      b'{"jsonrpc":"2.0","id":2,"method":"subscribe","params":{"streams":["samples"]}}\n')
+        q.stdin.flush()
+        q2.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"hello","params":{"proto":[1,1]}}\n')
+        q2.stdin.flush()
+        if select.select([q2.stdout], [], [], 20)[0]:  # its answer read now: no later line waits unseen in the buffer
+            q2.stdout.readline()
+        time.sleep(1.2)
+        cli("share", "ai", "on", env=env)
+        on = note_caps(5)
+        on2 = note_caps(3, q2)
+        cli("share", "ai", "off", env=env)
+        off = note_caps(5)
+        off2 = note_caps(3, q2)
+    finally:
+        for x in (q, q2):
+            x.kill()
+            x.wait()
+    check(on is not None and "ai" in on and off is not None and "ai" not in off,
+          "over SSH, share ai on and off reach a session that is already open as a `machine` notification (%s, %s)"
+          % (on, off))
+    check(on2 is not None and "ai" in on2 and off2 is not None and "ai" not in off2,
+          "… also one with no subscription (it looks once a second, not only when a frame comes): %s, %s" % (on2, off2))
     for bad_id in ["x'; touch /tmp/p; '", "$(id)", "c-1234567", "c-1234567g", "studio"]:
         r = cli("share", "revoke", bad_id, env=env)
         if r.returncode != 2 or bad_id in r.stderr or bad_id in r.stdout:
