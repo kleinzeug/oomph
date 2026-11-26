@@ -27,8 +27,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="oomph-quotatest-")
 os.environ.update(OOMPH_DIR=os.path.join(TMP, "log"), OOMPH_LEDGER_DIR=os.path.join(TMP, "ledger"),
                   OOMPH_STATE_DIR=os.path.join(TMP, "state"), TMPDIR=os.path.join(TMP, "tmp"))
-for k in ("OOMPH_NET_RESERVATIONS", "OOMPH_GPU_RESERVATIONS", "XDG_RUNTIME_DIR"):
-    os.environ.pop(k, None)
+os.environ.pop("XDG_RUNTIME_DIR", None)
+for k in ("OOMPH_NET_RESERVATIONS", "OOMPH_GPU_RESERVATIONS"):
+    os.environ[k] = "0"   # off whatever the root-owned config.json says (an owner trying the switch by hand, D-N19)
 for d in ("log", "tmp"):
     os.makedirs(os.path.join(TMP, d))
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
@@ -358,6 +359,20 @@ try:
     check(u1["status"] == "granted" and u1["run_with"].get("net_unmanaged") and part(u1["id"]).get("unmanaged")
           and u2["status"] == "queued" and u2.get("waiting_on") == ["net.quota"],
           "a metered network without a figure: 5 GB granted unmanaged (no rate); 3 GB more waits on net.quota (2 left)")
+    nc_on = T.net_coordination(sample(), [], time.time()) or {}
+    rs_on = json.loads(cli(oomph.cmd_resources, ["--json"])[1])
+    os.environ["OOMPH_NET_RESERVATIONS"] = "0"
+    nc_off = T.net_coordination(sample(), [], time.time()) or {}
+    rs_off = json.loads(cli(oomph.cmd_resources, ["--json"])[1])
+    os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+    check(nc_on.get("reservable") is True and "net" in rs_on["reservable"]
+          and (rs_on.get("network") or {}).get("reservable") is True and nc_on.get("down") is None
+          and nc_off.get("reservable") is False and nc_off.get("reservable_off") == "net_reservations"
+          and "net" not in rs_off["reservable"]
+          and (rs_off.get("network") or {}).get("reservable_off") == "net_reservations",
+          "a metered network without a figure is reservable (its volumes, against the cap) while net_reservations is "
+          "on: coordination and `oomph resources --json` list net; off, reservable_off (%s | %s)"
+          % (rs_on["reservable"], rs_off["reservable"]))
     clear()
 
     # a volume weighs net.quota only on a metered network: elsewhere it neither waits behind nor holds up anyone's
@@ -456,7 +471,7 @@ try:
           and "GB can be reserved" in out_s and "the logger" not in out_s and "LAN" not in out_s
           and rc_j == 0 and mj.get("low") is True and mj.get("used") == 18.2 and mj.get("counted") is True,
           "oomph net: a quota line (left, from when, the rule, what can be reserved); --json with `metered`")
-    del os.environ["OOMPH_NET_RESERVATIONS"]   # switched off (the default): the cap is shown, no reservable GB
+    os.environ["OOMPH_NET_RESERVATIONS"] = "0"   # switched off (the default): the cap is shown, no reservable GB
     rc_o, out_o, _ = cli(T.cmd_net, [])
     out_o = " ".join(out_o.split())
     mjo = json.loads(cli(T.cmd_net, ["--json"])[1]).get("metered") or {}

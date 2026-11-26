@@ -1005,8 +1005,22 @@ try:
         hot = [{"net": dict(cur["net"], down_mbps=x)} for x in (280.0, 290.0, 300.0)]
         sth = T.stale(T.read_networks()["networks"][HK], hot, HK)
         sat = [{"net": dict(cur["net"], down_mbps=x)} for x in (260.0, 270.0, 275.0)]
+        real_platform, real_nq, stale_cmds, unk = sys.platform, T.NQ, {}, {}
+        try:   # the command it names: a speed test on a Mac, a figure by hand elsewhere (no networkQuality): one rule
+            for plat_name, nq in (("darwin", sys.executable), ("darwin-11", os.path.join(TMP, "no-networkQuality")),
+                                  ("linux", sys.executable)):
+                sys.platform, T.NQ = plat_name.split("-")[0], nq
+                stale_cmds[plat_name] = T.stale_text(sth)
+                unk[plat_name] = T._unmanaged_note("unknown", "net").rpartition(": ")[2]
+        finally:
+            sys.platform, T.NQ = real_platform, real_nq
+        by_hand = "seen 290 Mbit/s, more than the 250 set: measure the line again, then oomph net set DOWN/UP"
+        check(stale_cmds == {"darwin": "seen 290 Mbit/s, more than the 250 set: oomph net test", "darwin-11": by_hand,
+                             "linux": by_hand}
+              and unk == {"darwin": "oomph net test", "darwin-11": "oomph net set DOWN/UP", "linux": "oomph net set DOWN/UP"},
+              "the stale hint and a grant's note on an unknown line name oomph net test on a Mac with networkQuality, "
+              "oomph net set on Linux and on a Mac without it (can_net_test) (%s, %s)" % (stale_cmds, unk))
         check(sth == {"dir": "down", "seen": 290.0, "cap": 250.0, "source": "set"} and
-              T.stale_text(sth) == "seen 290 Mbit/s, more than the 250 set: oomph net test" and
               T.stale(T.read_networks()["networks"][HK], sat, HK) is None and
               "seen 290" in T.resource_line(cur, samples=hot)[1] and "net test" not in T.resource_line(cur, samples=hot)[1]
               and T.stale_text(sth, cmd=False) == "seen 290 Mbit/s, more than the 250 set",

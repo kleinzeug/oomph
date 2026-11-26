@@ -23,18 +23,20 @@
 for agents and scripts (work without the daemon too — they measure live):
   oomph check [--json] [--measure]  verdict ok / tight / critical + advice; exit 0 / 1 / 2; a line per resource
                                     (--measure: without the logger, read CPU and GPU for a quarter second)
-  oomph resources [--json]          this machine's memory, cores, GPU and disks; which can be reserved here
+  oomph resources [--json]          this machine's memory, cores, GPU, disks and network; which can be reserved here
   oomph ps [--cpu | --gpu | --io | --memory | --net] [-n 10] [--json]
                                     the biggest consumers of one resource now
-  oomph net [test [--yes] | set DOWN/UP | name LABEL | list | forget NETWORK]   this network's internet line:
-                                    its figure (tested on a Mac, set by hand), traffic now (oomph net --help)
+  oomph net [test [--yes] | set DOWN/UP | name LABEL | metered --cap 20G/month | list | forget NETWORK]
+                                    this network's internet line: its figure (tested on a Mac, set by hand), traffic
+                                    now, the busiest, a data cap (oomph net --help)
   oomph volumes [--all] [--json]    the disks the logger records (--all: also those it ignores, and why)
   oomph volumes watch|unwatch|hide|unhide PATH   pin a listed disk: its free space counts in your checks
   oomph session [--json] [--pid N]  memory of the Claude session this runs in (its whole process tree)
   oomph wait [--timeout 10m] [--free 4G]   block until memory is ok again; exit 1 on timeout
   oomph status --json               the latest full sample
 
-coordinating memory, cores and disk space between sessions (a shared first-come-first-served ledger):
+coordinating memory, cores, disk space and the internet line between sessions (a shared first-come-first-served
+ledger):
   oomph run [--reserve 6G] [--cpu 4..12] [--disk 20G[@PATH]] [--for "what"] [--wait 30m] -- <cmd…>   wait for a
                                     grant, run, release; records the peak; {cpu} in the command is the cores granted
   oomph reserve [6G] [--cpu 8] [--disk 20G[@PATH]] --for "what" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]
@@ -43,6 +45,10 @@ coordinating memory, cores and disk space between sessions (a shared first-come-
   oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--ttl 20m] [--for "what"] [--json]   change one: shrinking applies at
                                     once; growing a grant only if it fits now with nobody queued (else refused:
                                     reserve the extra separately); --ttl counts from now; exit 0 ok, 75 refused
+  --net 40G --net-up 5G --net-rate 200M[/20M]   with reserve, run and amend: the internet line (GB to download or
+                                    upload; Mbit/s down/up, 100M..200M a range); switched off until
+                                    "net_reservations": true or OOMPH_NET_RESERVATIONS=1; run hands the rate to curl,
+                                    wget, rsync and aria2c, {net} and OOMPH_NET_LIMIT
   oomph release <id | all>          give a reservation back (all = this session's)
   oomph reservations [--json]       who holds / waits for how much, and past peaks
   oomph reservations --history [--last 24h] [--json]   past reservations (14 days are kept): spans, edits,
@@ -3534,7 +3540,8 @@ def cmd_resources(args):
     more = [x for x in (("cores", " --cpu 8") if "cpu" in r["reservable"] else None,
                         ("disk space", " --disk 20G") if "disk" in r["reservable"] else None,
                         ("a GPU", " --gpu-mem 16G") if "gpu" in r["reservable"] else None,
-                        ("the network", " --net-rate 100M") if "net" in r["reservable"] else None) if x]
+                        ("the network", " --net-rate 100M" if (r["network"] or {}).get("room") else " --net 5G")
+                        if "net" in r["reservable"] else None) if x]   # a metered line without a figure: a volume
     print(wrap("Memory%s can be reserved with this version: `oomph reserve 6G%s --for \"what\"`." % (
         "".join((" and " if i == len(more) - 1 else ", ") + x[0] for i, x in enumerate(more)),
         "".join(x[1] for x in more)), w, "  "))
@@ -7052,6 +7059,9 @@ def coordination_verdict(v, c):
     return v
 
 
+FLAG_WORD = {"cpu": "CPU", "net": "the download", "net_up": "the upload"}   # a flagged part in a brief's words
+
+
 def _fmt_brief(b, purpose_w=22):
     """A reservation as one row: id, state, size, purpose (cut at the end), project (cut in the
     middle, 10), what it uses or how long it waits. 78 columns with the default budget."""
@@ -7068,7 +7078,7 @@ def _fmt_brief(b, purpose_w=22):
                     if b["state"] == "granted" else "waiting %.0f min" % max(0.0, b["waiting_min"]))
     flags = b.get("flags") if isinstance(b.get("flags"), dict) else {}
     if flags:  # over / idle (02 §6.3), said first: "over on CPU, …"
-        tail = ", ".join("%s on %s" % (f, "CPU" if k == "cpu" else k) for k, f in sorted(flags.items())) + ", " + tail
+        tail = ", ".join("%s on %s" % (f, FLAG_WORD.get(k, k)) for k, f in sorted(flags.items())) + ", " + tail
     size = "%5.1fG" % b["gb"] if b["gb"] > 0 or not cores else "%6s" % "-"
     return "%-5s %-7s %s  %-*s %-10s %s" % (b["id"], b["state"], size, purpose_w, cut_end(b["purpose"], purpose_w),
                                            cut_middle(b.get("project") or "", 10), tail)

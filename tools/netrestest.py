@@ -25,7 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TMP = tempfile.mkdtemp(prefix="oomph-netrestest-")
 os.environ.update(OOMPH_DIR=TMP, OOMPH_LEDGER_DIR=os.path.join(TMP, "ledger"), OOMPH_STATE_DIR=os.path.join(TMP, "state"))
 for k in ("OOMPH_NET_RESERVATIONS", "OOMPH_GPU_RESERVATIONS"):
-    os.environ.pop(k, None)
+    os.environ[k] = "0"   # off whatever the root-owned config.json says (an owner trying the switch by hand, D-N19)
 sys.path.insert(0, os.path.join(ROOT, "daemon"))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import oomph  # noqa: E402
@@ -67,7 +67,7 @@ def on(v=True):
     if v:
         os.environ["OOMPH_NET_RESERVATIONS"] = "1"
     else:
-        os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+        os.environ["OOMPH_NET_RESERVATIONS"] = "0"
 
 
 def setnet(key, down, up):
@@ -647,6 +647,9 @@ try:
     check(sl[0].get("net") == 150 and sl[0].get("net_moved") == 12.3 and "network" not in sl[0]
           and "↓150 Mbit/s 12.3/40G, ↑20 Mbit/s" in oomph._fmt_brief(dict(br, for_min=3)),
           "a sample's leases carry the line's numbers, never the network; a reservation row says them")
+    fl = oomph._fmt_brief(dict(br, for_min=3, flags={"net": "over", "net_up": "idle"}))
+    check("over on the download, idle on the upload, " in fl and "on net" not in fl,
+          "a reservation row names a flagged part of the line in words (%s)" % fl)
 finally:
     for x in sleepers:
         x.kill()

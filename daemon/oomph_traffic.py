@@ -1328,12 +1328,20 @@ def stale(entry, samples, network=None):
     return None
 
 
+def can_net_test():
+    """Whether `oomph net test` can run here (a Mac with networkQuality, macOS 12 or later): the one rule for every
+    hint that names it (stale, not tested, no network stored, a capacity unknown); elsewhere they name net set."""
+    return sys.platform == "darwin" and os.access(NQ, os.X_OK)
+
+
 def stale_text(st, cmd=True):
     """`seen 940 Mbit/s, more than the 500 tested: oomph net test` (upload: `seen 60 Mbit/s up, …`); without `cmd`
-    (the lines agents read: check, status, resources) no command: a speed test is a person's to start."""
+    (the lines agents read: check, status, resources) no command: a speed test is a person's to start. Off a Mac
+    (no networkQuality: can_net_test) the command is `oomph net set DOWN/UP`."""
+    how = ": oomph net test" if can_net_test() else ": measure the line again, then oomph net set DOWN/UP"
     return "seen %s Mbit/s%s, more than the %s %s%s" % (
         _mb(st["seen"]), "" if st["dir"] == "down" else " up", _mb(st["cap"]),
-        "set" if st.get("source") == "set" else "tested", ": oomph net test" if cmd else "") if st else ""
+        "set" if st.get("source") == "set" else "tested", how if cmd else "") if st else ""
 
 
 def _mb(x):
@@ -1399,7 +1407,8 @@ def network_info(s, nets=None, samples=None, coord=None):
     network is measured. `room`: [down, up] Mbit/s that can still be reserved (`coord`: coordination's answer, whose
     `net` it is; {}: the pools less the grants the ledger holds, read without its lock; null without a pool, without
     `coord`, or where coordination failed, {"error": …}: room is never counted without the grants), `reservable` while
-    net_reservations is on and a pool exists (`reservable_off` the switch where it is off, a metered network's too);
+    net_reservations is on and a pool exists or the network is metered (a metered network's volumes are reserved
+    against its cap without a figure too, unmanaged), `reservable_off` the switch where it is off;
     `metered` on a metered network (N3, D-N13): {"left_gb" (cap − used), "resets" (the local date), "cap_gb",
     "used_gb", "period", "low" (under 10 % left: the one network state that warns), "lan" (true where totals only were
     counted: used_gb may hold the LAN's traffic), "available_gb" (what can still be reserved, with `coord`, while
@@ -1683,7 +1692,7 @@ def _net_list(nets_r, js):
         return 0
     w = max(80, term_width())
     if not nets_r["networks"]:
-        print("no network stored yet (%s)" % ("oomph net test" if sys.platform == "darwin" else
+        print("no network stored yet (%s)" % ("oomph net test" if can_net_test() else
                                                "oomph net set DOWN/UP"))
     for k, e in sorted(nets_r["networks"].items(), key=lambda kv: (kv[1].get("label") or "~", kv[0])):
         print(wrap("%s %-12s %s" % ("*" if k == here else " ", cut_end(term_text(e.get("label") or "–"), 12), k),
@@ -1728,7 +1737,7 @@ def _net_show(nets, js):
         head += " · through a VPN (%s)" % term_text(block.get("tun") or "?")
     print(wrap(head, w, "", 2))
     fig = _figure_text(e)
-    print(wrap(fig or "not tested: %s" % ("oomph net test" if sys.platform == "darwin" else
+    print(wrap(fig or "not tested: %s" % ("oomph net test" if can_net_test() else
                                           "measure with a tool you trust, then oomph net set DOWN/UP"),
                w, "  %-6s " % "line", 9))
     if _num(block.get("down_mbps")):
@@ -2215,8 +2224,8 @@ def _unmanaged_note(why, k):
         return "this line is too slow to share: the %spart is not limited" % d
     if why == "offline":
         return "this machine is offline: the network part is not limited"
-    return "this network's %scapacity is unknown: %s" % (d, "oomph net set DOWN/UP" if getattr(plat(), "OS", "") == "linux"
-                                                         else "oomph net test")
+    return "this network's %scapacity is unknown: %s" % (d, "oomph net test" if can_net_test() else
+                                                         "oomph net set DOWN/UP")
 
 
 def net_request(s, kw, now):
@@ -2914,12 +2923,13 @@ def amend_net(L, r, kw, now):
 def net_coordination(s, leases, now):
     """`coordination`'s network (reservations, resources, memory_check): this network by its public id and label, and
     per direction with a figure its pool (cap, margin, reserved, available, idle); `reservable` while
-    net_reservations is on and a pool exists. None where the sample names no network."""
+    net_reservations is on and a pool exists or the network is metered (a volume is charged against the cap, with or
+    without a figure). None where the sample names no network."""
     nv = net_view(s, leases, now)
     if not nv["known"]:
         return None
     out = {"id": public_id(nv["network"]), "label": (nv["entry"] or {}).get("label"),
-           "reservable": bool(nv["pools"]) and net_reservations_on()}
+           "reservable": bool(nv["pools"] or nv.get("quota")) and net_reservations_on()}
     if not out["reservable"] and (nv["pools"] or nv.get("quota")) and not net_reservations_on():
         out["reservable_off"] = "net_reservations"   # a metered network's volume too (net.quota)
     for _, pid, fig, _ in NET_DIRS:

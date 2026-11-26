@@ -28,7 +28,18 @@ process next to this checkout's, on one ledger directory, in both directions:
      it refuses it with exit 2; before that (1.8.1 to 1.8.4 read `--cpu 8 6G` as 8 GB) `oomph resources` does
      not exist, so the skill's first-line guard keeps an agent at memory only. No CLI before 1.12.0 lists
      anything but memory as reservable; 1.12.0 not disk. A CLI that knows the flags (and this one) reads each
-     example as the skill means it.
+     example as the skill means it. The examples of "The internet line" (`--net 40G`, `--net-rate 200M`, …),
+     a block of their own: every CLI from 1.8.5 to 1.14 refuses them with exit 2 and reaches no acquire (never
+     a volume read as memory); this one refuses them with 75 while net_reservations is off (set "0", whatever
+     the root-owned config.json says) and hands their numbers on with it on.
+  NR network reservations (NET N2, 1.15): a ledger with a granted, an unmanaged and a queued `net` part read
+     and written by 1.14.0 (the tag) and by this code; 1.14 cannot weigh the queued one and waits behind it, the
+     next refresh here lets memory pass it; old readers read the records with net_gb, this one's end record
+     carries the network.
+  NQ metered networks (NET N3, 1.15): a request waiting on net.quota under 1.14.0 and this code; older
+     capsules and verdicts read a sample whose pools hold net.quota.
+  N  samples with internet traffic (`net`, `net_names`, `top_net`) read by older readers: their summary
+     (report, incidents) and the slim and full samples they send to another machine leave the new blocks out.
   C  1.8.1's own files: this code reads them, makes a memory vector of an old lease without
      writing one, and writes back what 1.8.1 writes plus `agent` (D11) and, from 1.9.4 (L1), `user`
      and the holder's uid (03 §6.5); 1.8.1 reads that back.
@@ -741,7 +752,7 @@ try:
           "NR this code's end record carries net, net_gb, net_up_gb and the network (%s)" % (rec[-1:] or "none"))
 finally:
     new._sample_override = saved_n
-    os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+    os.environ["OOMPH_NET_RESERVATIONS"] = "0"
     new.release("all", ME)
     if b14 is not None:
         del b14
@@ -805,7 +816,7 @@ try:
           "NQ this checkout's capsule says the quota under 10 %% (%s)" % nc)
 finally:
     new._sample_override = saved_q
-    os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+    os.environ["OOMPH_NET_RESERVATIONS"] = "0"
     new.release("all", ME)
     if b14 is not None:
         del b14
@@ -824,6 +835,18 @@ CMDS = ([["reserve"] + o.split() + ["--for", "x"] for o in opts] + [["reserve", 
                                                                      for o in opts]
         + [["amend", "r1"] + o.split() for o in opts if "@" not in o] + [["amend", "r1", "--cpu", "0"]]
         + [shlex.split(x) for x in runs])
+# the internet line's examples (1.15, a block of their own): an older CLI refuses every one with exit 2 and reaches no
+# acquire (never a volume read as memory); this one hands their numbers on with net_reservations on, and refuses them
+# before anything is written with it off (exit 75)
+nsec = SKILL[SKILL.index("**The internet line**"):]
+nsec = nsec[:nsec.index("\n\n")]
+nspans = re.findall(r"`([^`]+)`", nsec)
+nopts = sorted({x for x in nspans if re.match(r"--net(-up|-rate)? \S+$", x)})
+nruns = [x.replace("OOMPH ", "", 1).replace("\u2026", "true") for x in nspans if x.startswith("OOMPH run ") and "--net" in x]
+check(any(o.startswith("--net ") for o in nopts) and any(o.startswith("--net-rate") for o in nopts) and nruns,
+      "S the skill's section on the internet line has its examples (%s; %s)" % (", ".join(nopts), "; ".join(nruns)))
+NET_CMDS = [["reserve"] + o.split() + ["--for", "x"] for o in nopts] + [shlex.split(x) for x in nruns]
+NET_KW = ("net_gb", "net_up_gb", "net_mbps", "net_min_mbps", "net_up_mbps", "net_up_min_mbps")
 
 
 def drive(m, argv):
@@ -903,6 +926,33 @@ for tag in tags + ["this checkout"]:
     check(not bad, "S %s: %s" % (tag, "every example of the skill is %s" % (
         "read as meant" if v >= (1, 12, 1) else "refused with exit 2 where it names an unknown flag, read as meant "
         "otherwise" if v >= (1, 8, 5) else "behind the guard (no `oomph resources`)") if not bad else "; ".join(bad[:4])))
+    if v >= (1, 8, 5):
+        bad = []
+        saved_env = os.environ.get("OOMPH_NET_RESERVATIONS")
+        os.environ["OOMPH_NET_RESERVATIONS"] = "0"   # off whatever the root-owned config.json says (D-N19)
+        try:
+            for argv in NET_CMDS:
+                rc, calls, _ = drive(m, argv)
+                if m is not new and (rc != 2 or calls):
+                    bad.append("%s → %s %s (should refuse it, exit 2)" % (" ".join(argv), rc, calls[:1]))
+                elif m is new and (rc != 75 or calls):
+                    bad.append("%s → %s %s with the switch off (should refuse it, exit 75)" % (" ".join(argv), rc,
+                                                                                               calls[:1]))
+                if m is new:
+                    os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+                    try:
+                        rc, calls, _ = drive(m, argv)
+                    finally:
+                        os.environ["OOMPH_NET_RESERVATIONS"] = "0"
+                    if not (rc in (0, 75) and len(calls) == 1 and any(k in calls[0][1] for k in NET_KW)
+                            and calls[0][0][0] == 0):
+                        bad.append("%s → %s %s with the switch on" % (" ".join(argv), rc, calls[:1]))
+        finally:
+            if saved_env is not None:
+                os.environ["OOMPH_NET_RESERVATIONS"] = saved_env
+        check(not bad, "S %s: the skill's network examples are %s" % (
+            tag, ("handed on with net_reservations on, refused (75) with it off" if m is new else
+                  "refused with exit 2, no volume read as memory") if not bad else "; ".join(bad[:4])))
     if m is not new:
         del m
         gc.collect()

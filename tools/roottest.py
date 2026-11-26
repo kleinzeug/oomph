@@ -329,7 +329,7 @@ if hasattr(P_, "net_route"):
         ans_ = d.ledger.network(60) or {}
         os.environ["OOMPH_NET_RESERVATIONS"] = "1"   # N2: the switch reaches root's child; it weighs the line there
         rr_ = cli("reserve", "--net", "4G", "--for", "root's pull", "--json")
-        os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+        os.environ["OOMPH_NET_RESERVATIONS"] = "0"
         try:
             rj_ = json.loads(rr_[1])
         except ValueError:
@@ -340,23 +340,23 @@ if hasattr(P_, "net_route"):
     check(not eg_.get("if") or (rr_[0] == 0 and 47 <= ((rj_.get("granted") or {}).get("net_mbps") or 0) <= 93),
           "net: `oomph reserve --net 4G` as root, the switch on for the command: granted in its child, half of the "
           "187.5 Mbit/s the line shares at most, as much of it as is idle (%s)"
-          % [rr_[0], rj_.get("granted"), rj_.get("advice", "")[:80], rr_[2][-200:]])
+          % [rr_[0], rj_.get("granted"), rj_.get("advice", "")[:80], rr_[2][-200:].replace(net_id, "<key>")])
     nst = os.lstat(os.path.join(p, "networks.json")) if os.path.lexists(os.path.join(p, "networks.json")) else None
     nb_ = s.get("net") or {}
     check(rn_[0] == 0 and nst and stat.S_IMODE(nst.st_mode) == 0o666 and (not REAL or not USER or nst.st_uid == USER),
           "net: `oomph net set` as root writes networks.json 0666 through a child as uid %s (%s)"
-          % (nst and nst.st_uid, [rn_[0], rn_[2][-200:]]))
+          % (nst and nst.st_uid, [rn_[0], rn_[2][-200:].replace(net_id, "<key>")]))
     check(not eg_.get("if") or (nb_.get("if") == eg_["if"] and dt < 2 and ans_.get("key") == net_id and
                                 (ans_.get("entry") or {}).get("down") == 250.0),
           "net: the sample's net block on %s, and the logger's child names this network's entry (%s)" % (
-              eg_.get("if"), [nb_.get("src"), ans_.get("key"), round(dt, 2)]))
+              eg_.get("if"), [nb_.get("src"), ans_.get("key") == net_id, round(dt, 2)]))   # never the key: a log
     if eg_.get("if"):  # N2: the line's pools from the child's answer (root never opens networks.json)
         pl_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json"))).get("pools") or {}
         check((pl_.get("net.down") or {}).get("cap") == 250.0 and pl_["net.down"].get("margin") == 62.5
               and (pl_.get("net.up") or {}).get("cap") == 40.0 and pl_["net.up"].get("margin") == 12.0
               and pl_["net.down"].get("network") == net_id,
               "net: current.json's pools net.down and net.up from the child's answer about this network (%s)"
-              % pl_.get("net.down"))
+              % {k: v for k, v in (pl_.get("net.down") or {}).items() if k != "network"})
     if eg_.get("if"):  # N3: net.quota from the child's answer; the day counters in the logger's own folder, 0644
         q_ = (json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json"))).get("pools") or {}).get("net.quota")
         ndp = os.path.join(os.environ["OOMPH_DIR"], "netdays.json")
@@ -367,7 +367,9 @@ if hasattr(P_, "net_route"):
               and nds and stat.S_IMODE(nds.st_mode) == 0o644 and (not REAL or nds.st_uid == 0)
               and net_id in (ndv.get("days") or {}),
               "net: `oomph net metered` reaches current.json's net.quota through the child; the logger keeps its day "
-              "counters in netdays.json in its own folder, 0644 (%s, %s, %s)" % (q_, nds and oct(nds.st_mode), rm_[2][-200:]))
+              "counters in netdays.json in its own folder, 0644 (%s, %s, %s)" % (
+                  {k: v for k, v in (q_ or {}).items() if k not in ("network", "label")}, nds and oct(nds.st_mode),
+                  rm_[2][-200:].replace(net_id, "<key>")))
     if not REAL and os.path.exists(nfx) and eg_.get("if"):
         cur_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json")))
         check(nb_.get("src") == "flows" and [x.get("pid") for x in cur_.get("top_net") or []] == [os.getpid()] and
@@ -397,7 +399,8 @@ if hasattr(P_, "net_route"):
         print("info  " + msg)
         if os.environ.get("GITHUB_ACTIONS"):   # in the run's summary, until the logger's choice follows it (12.19)
             print("::notice title=nettop as nobody (NET N1)::" + msg.replace("\n", " "))
-        check(nb_.get("if") == eg_.get("if"), "net: a real sample has the net block (%s)" % nb_)
+        check(nb_.get("if") == eg_.get("if"), "net: a real sample has the net block (%s)"
+              % {k: v for k, v in nb_.items() if k != "network"})   # the router's MAC stays out of CI's log
         # the network's identity: macOS 26/27 hides the neighbour caches from anyone but root (arp: "no entry"), so
         # the logger reads them as root; whether root sees the gateway's MAC decides rmac: or gw: (12.6)
         if eg_.get("gw"):
