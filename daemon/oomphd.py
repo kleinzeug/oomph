@@ -852,6 +852,7 @@ class LedgerWorker:
         self.tick = tick or oomph.ledger_tick
         self.cond = threading.Condition()
         self.slot = None
+        self.answer = {}  # what else the child said: "network", this network's entry of networks.json (NET, 1.15)
         self.leases, self.at = [], 0.0  # the last snapshot, and when it arrived
         self.sig, self.last_run, self.runs = None, 0.0, 0  # runs: children run so far, answered or not
         self.last_err, self.suppressed = 0.0, 0
@@ -860,13 +861,21 @@ class LedgerWorker:
         threading.Thread(target=self.loop, name="ledger", daemon=True).start()
         return self
 
-    def offer(self, s, procs, rates=None, writes=None, gpus=None):
+    def offer(self, s, procs, rates=None, writes=None, gpus=None, nets=None, net=None):
         """The newest sample and process table, and the cores each process kept busy ({pid: cores}, when the
         Meter had an interval), the MB/s it wrote to disk ({pid: MB/s}) and its share of the GPU ({pid: %}): the
-        child charges every grant's cores, disk writes and a Mac's GPU share from them (02 §6.3)."""
+        child charges every grant's cores, disk writes and a Mac's GPU share from them (02 §6.3). `nets`: the
+        internet bytes each process moved this interval ({pid: [in, out]}); `net`: the network the logger is on
+        ({network, gw, subnet, dt, complete}), whose entry of networks.json the child answers with (12.7)."""
         with self.cond:
-            self.slot = (s, procs, rates, writes, gpus)
+            self.slot = (s, procs, rates, writes, gpus, nets, net)
             self.cond.notify()
+
+    def network(self, max_age):
+        """The child's last answer about the network it was asked about ({asked, key, entry} or None), unless older
+        than `max_age` s."""
+        with self.cond:
+            return self.answer.get("network") if time.time() - self.at <= max_age else None
 
     def latest(self, max_age):
         """The last snapshot, unless it is older than `max_age` seconds."""
@@ -878,30 +887,33 @@ class LedgerWorker:
             with self.cond:
                 while self.slot is None:
                     self.cond.wait()
-                (s, procs, rates, writes, gpus), self.slot = self.slot, None
+                (s, procs, rates, writes, gpus, nets, net), self.slot = self.slot, None
             try:
-                self.run_once(s, procs, rates, writes, gpus)
+                self.run_once(s, procs, rates, writes, gpus, nets, net)
             except Exception as e:
                 self.sig = None
                 self.error(str(e) if isinstance(e, oomph.LedgerError) else repr(e))
                 with self.cond:
                     self.runs += 1
+                    self.answer = {}  # an answer about the network before a move must not outlive a failed run
 
-    def run_once(self, s, procs, rates=None, writes=None, gpus=None):
-        sig, now = ledger_signature(), time.time()
+    def run_once(self, s, procs, rates=None, writes=None, gpus=None, nets=None, net=None):
+        sig, now = (ledger_signature(),) + ((oomph._T().networks_signature(), net.get("network")) if net else ()), time.time()
         if not self.leases and sig == self.sig and now - self.last_run < self.FORCE_EVERY:
             with self.cond:
-                self.at = now  # still nothing reserved
+                self.at = now  # still nothing reserved, the same networks.json and network
             return
         self.sig, self.last_run = sig, now
+        more = dict({"nets": nets} if nets else {}, **({"net": net, "answer": {}} if net else {}))
         leases, err = self.tick(s, procs, rates=rates, **dict({"writes": writes} if writes else {},
-                                                              **({"gpus": gpus} if gpus else {}))) \
-            if rates is not None else self.tick(s, procs)
+                                                              **({"gpus": gpus} if gpus else {}), **more)) \
+            if rates is not None else self.tick(s, procs, **more)
         if err:  # e.g. busy: the snapshot still counts
             self.sig = None
             self.error(err)
         with self.cond:
             self.leases, self.at = leases, time.time()
+            self.answer = more.get("answer") or {}
             self.runs += 1
 
     def error(self, msg):
@@ -980,6 +992,8 @@ class Daemon:
         self.storms = []           # cgroups whose OOMs repeat (name, ooms, cgroup), from the watcher's thread
         self.quiet = None          # the open quiet incident (03 §5.6): containers at their own limit
         self.alert_t = 0.0         # when the newest alert record was written
+        self.net = None            # internet traffic (NET, 1.15): oomph_traffic.Sampler, made at the first sample
+        self.net_err = False       # the network's reading failed: said once per start
 
     # -- events
     def event(self, kind, **kw):
@@ -1163,6 +1177,25 @@ class Daemon:
         except Exception as e:
             self.soft_error("disks", repr(e))
         return blocks, use
+
+    def network(self, P, procs, gap):
+        """The sample's net block, the internet bytes per pid this interval and the interval (12.4, 12.5); a
+        failure costs the block, never the sample. The key networks.json keeps this network under (the child's last
+        answer about this identity: the rmac entry of a gw: identity's gateway and subnet) is taken over."""
+        try:
+            if self.net is None:
+                self.net = oomph._T().Sampler(P)
+            ans = self.ledger.network(4 * INTERVAL)
+            if ans:  # only an answer about the identity it holds now (after a move it asks about another)
+                self.net.adopt(ans.get("key"), ans.get("asked"), ans.get("entry"))
+            return self.net.read(procs, gap=bool(gap))
+        except Exception as e:  # noqa: B902
+            if self.net is not None:
+                self.net.traffic.reset()
+            if not self.net_err:
+                self.net_err = True
+                self.event("daemon_error", where="net", error=repr(e)[:300])
+            return None, {}, None
 
     # -- notifications
     def notify(self, title, msg, **kw):
@@ -1487,6 +1520,7 @@ class Daemon:
         self.prev_t, self.prev_up = t, up
         blocks, use = self.resources(P, procs, sysm.get("ram_gb"), bool(gap), up)
         top, groups, sessions, session_of = _summarize(procs, use)
+        net, nets, net_dt = self.network(P, procs, gap) if hasattr(P, "net_route") else (None, {}, None)
 
         s = {"t": round(t, 1), "iso": now_iso(t), "hot": self.hot, "os": P.OS}
         if gap:
@@ -1510,6 +1544,12 @@ class Daemon:
         names = cpu_names(procs, use)
         if names:
             s["cpu_names"] = names
+        T = oomph._T() if net is not None else None
+        if net is not None:  # internet traffic (NET, 1.15): measured on every logger that can, the remote addresses dropped
+            s["net"] = net
+            names = T.by_name(nets, procs, net_dt) if net_dt else []
+            if names:
+                s["net_names"] = names
         # Retire reservations of sessions that died or expired, close to when it happened, and
         # copy the live ones into the sample. The shared ledger directory is world-writable, so
         # the daemon never opens anything in it: its thread hands the work to an unprivileged
@@ -1524,9 +1564,12 @@ class Daemon:
         rates = {pid: u["cpu"] for pid, u in use.items() if "cpu" in u} if use else None
         writes = {pid: u["w"] for pid, u in use.items() if u.get("w")} if use else None
         gpus = {pid: u["gpu"] for pid, u in use.items() if u.get("gpu")} if use else None
-        self.ledger.offer(dict({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names")
+        net_in = {"network": net["network"], "gw": self.net.ident.tup[1], "subnet": self.net.ident.tup[2],
+                  "dt": round(net_dt, 2) if net_dt else None, "complete": net.get("src") == "flows"} \
+            if net and net.get("network") and self.net else None
+        self.ledger.offer(dict({k: v for k, v in s.items() if k not in ("top", "groups", "claude", "cpu_names", "net_names")
                                 and k not in TOP_RATES}, **({"pools": pools} if pools else {})),
-                          procs, rates or None, writes or None, gpus or None)
+                          procs, rates or None, writes or None, gpus or None, nets or None, net_in)
         if leases:  # memory sessions have reserved through oomph's ledger (purposes left out where it is a group's)
             s["leases"] = [dict(x, purpose="?", project=None) for x in leases] if ledger_kept_to_group() else leases
         if gone:
@@ -1540,6 +1583,10 @@ class Daemon:
         cur = dict(s)
         if pools:
             cur["pools"] = pools
+        if net_dt and nets:  # who moves the most now (`oomph ps --net`): current.json only, like pools
+            tn = T.top_net(nets, procs, net_dt, session_of, P.group_key)
+            if tn:
+                cur["top_net"] = tn
         if self.machine is None:
             try:
                 self.machine = P.machine()
@@ -1559,6 +1606,8 @@ class Daemon:
         self.beat()
         if self.full is not None or self.full_off:
             cur["daemon"]["ioreport"] = self.full.status() if self.full is not None else self.full_off
+        if self.net is not None and self.net.status:  # nettop took too long or listed too much: totals only for now
+            cur["daemon"]["net"] = self.net.status
         write_atomic(os.path.join(LOG_DIR, "current.json"), json.dumps(cur))
         return s
 

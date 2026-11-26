@@ -770,5 +770,35 @@ for tag in tags + ["this checkout"]:
         del m
         gc.collect()
 
+# --- N: samples with internet traffic (NET, 1.15) read by older readers: their summary (report, incidents), the slim
+# and full samples they send to another machine. The new blocks are additive: an old reader keeps working and leaves
+# them out (an unknown object never travels from an old slim_sample).
+NET = {"if": "en16", "vpn": False, "network": "rmac:00:00:5e:00:53:03", "src": "flows", "flows": 40, "down_mbps": 212.4,
+       "up_mbps": 8.1, "lan_mbps": 0.1, "in_gb": 41.2, "out_gb": 3.1}
+NS = [dict(SAMPLE, t=NOW - 300 + 30 * i, iso="2026-11-26T03:%02d:00+01:00" % i, swap_used_gb=0.0, net=dict(NET),
+           net_names=[{"name": "curl", "down": 195.4, "up": 0.2, "n": 1}],
+           top_net=[{"pid": ME, "name": "curl", "uid": 501, "down": 195.4, "up": 0.2}]) for i in range(4)]
+bad = []
+for tag in tags + ["this checkout"]:
+    m = new if tag == "this checkout" else old_module(tag)
+    if m is None:
+        continue
+    try:
+        sm = m.summarize(list(NS), [])
+        sl = m.slim_sample(dict(NS[0])) if hasattr(m, "slim_sample") else {}
+        fu = m.full_sample(dict(NS[0])) if hasattr(m, "full_sample") else {}
+        if sm.get("samples") != 4 or (m is not new and ("net" in sl or "net_names" in fu or "top_net" in fu)):
+            bad.append("%s: %s" % (tag, [sm.get("samples"), sorted(sl)[:3]]))
+        if m is new and not (sm.get("max_net_down_mbps") == 212.4 and sl.get("net", {}).get("down_mbps") == 212.4
+                             and "in_gb" not in sl["net"]):
+            bad.append("this checkout: %s" % [sm.get("max_net_down_mbps"), sl.get("net")])
+    except Exception as e:  # noqa: B902
+        bad.append("%s raised %r" % (tag, e))
+    if m is not new:
+        del m
+        gc.collect()
+check(not bad, "N: samples with net, net_names and top_net are summarized by every reader from 1.8.1 on; old slim and "
+      "full samples leave them out, this one sends the rates and never the day's GB %s" % bad[:3])
+
 print("ledger compatibility: %s" % ("all %s" % "ok" if not failures else "%d FAILED" % len(failures)))
 sys.exit(1 if failures else 0)

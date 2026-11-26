@@ -181,10 +181,21 @@ samples with and without it (older samples have none).
   start or a gap. Top processes, groups and sessions carry `cpu`, `gpu` and `w` likewise.
 - `cpu_names` (5, 1.9.9): the busiest process names over the whole process table, each
   `{name, cpu, n}` with its processes' cores added up and counted (fourteen `yes` are one row).
+- `net` (1.15, internet traffic) — `if` (the physical interface; `null` offline), `vpn`,
+  `tun`, `network` (the key: `rmac:<router MAC>` or `gw:<gateway>/<prefix>`), `src` (`flows`:
+  per connection, LAN told apart; `if`: the interface's totals, the LAN included), `flows`,
+  `down_mbps`, `up_mbps`, `lan_mbps`, and the day's `in_gb`/`out_gb` (`day_src` `if` when
+  totals went into them). No remote address is ever kept. `net_names` (5): the busiest names,
+  `{name, down, up, n}` in Mbit/s. `current.json` adds `top_net` (8, `oomph ps --net`) and
+  `daemon.net` (why the sample is totals only: "too many connections", "nettop failed").
 
 On the wire (`serve`, mirrors), slim samples carry the numbers of `cpu`, `gpu` and `io`; the
 top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb` exceeds
 16 times the RAM, which a disk's size does). The full current sample adds the GPU's name.
+Of `net`, slim samples carry `src`, `vpn` and the three rates; the full current sample adds
+`if`, `tun`, `flows`, `net_names`, `top_net` and `daemon.net`. The key never travels (an answer
+to a model's provider names the network by a salted hash), nor do the day's `in_gb`/`out_gb`
+(the same `*_gb` check), so mirrored history has no `net_names` and no day's volume.
 
 ## Events
 

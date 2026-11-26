@@ -114,7 +114,7 @@ inst -d -m 755 "$LIBEXEC" "$PFX/usr/local/bin" "$PFX/Library/Logs/oomph"
 NEW=$(mktemp -d "$LIBEXEC/.oomph-new.XXXXXX")
 trap 'rm -rf "$NEW"' EXIT
 inst -m 755 "$SRC/oomphd.py" "$SRC/oomph.py" "$SRC/oomph_darwin.py" "$SRC/oomph_linux.py" "$SRC/oomph_ioreport.py" "$SRC/oomph_ai.py" "$SRC/oomph_upgrade.py" \
-  "$SRC/oomph_top.py" "$SRC/oomph_view.py" "$SRC/oomph_net.py" "$SRC/oomph_sync.py" "$SRC/oomph_gpu.py" "$NEW/"
+  "$SRC/oomph_top.py" "$SRC/oomph_view.py" "$SRC/oomph_net.py" "$SRC/oomph_sync.py" "$SRC/oomph_gpu.py" "$SRC/oomph_traffic.py" "$NEW/"
 # from a git checkout: stamp the version like build-app.sh does (the app bundle is stamped already)
 if [ -x "$HERE/tools/version.sh" ]; then
   VER=$(gitver); COMMIT=$(gitver --commit)

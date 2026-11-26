@@ -35,7 +35,7 @@ jobs:
           bash -n build-app.sh install.sh uninstall.sh tools/spike_role_account.sh
           sh -n linux/install.sh linux/uninstall.sh linux/system.sh
           plutil -lint app/Info.plist daemon/local.oomph.daemon.plist
-          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py daemon/oomph_gpu.py tools/selftest.py tools/nettest.py tools/gputest.py tools/sharetest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/connectvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/renderfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py tools/linuxvectors.py
+          /usr/bin/python3 -I -m py_compile daemon/oomphd.py daemon/oomph.py daemon/oomph_darwin.py daemon/oomph_linux.py daemon/oomph_ioreport.py daemon/oomph_ai.py daemon/oomph_upgrade.py daemon/oomph_top.py daemon/oomph_view.py daemon/oomph_net.py daemon/oomph_sync.py daemon/oomph_gpu.py daemon/oomph_traffic.py tools/selftest.py tools/nettest.py tools/gputest.py tools/traffictest.py tools/sharetest.py tools/roottest.py tools/brandlint.py tools/chartvectors.py tools/connectvectors.py tools/topfixture.py tools/toptest.py tools/fixtureplat.py tools/mirrorfixture.py tools/renderfixture.py tools/ledgercompat.py tools/linuxtest.py tools/linuxfixture.py tools/linuxvectors.py
           sh -n tools/version.sh && echo "version: $(tools/version.sh)"
           /usr/bin/python3 -I -B tools/brandlint.py   # the product's name (BRAND) apart from the command and paths
 
@@ -238,7 +238,7 @@ jobs:
           grep -q "^VERSION = \"$version\"" "$APP/Contents/Resources/oomph.py" || { echo "::error::bundled CLI not stamped"; exit 1; }
 
           # Activate/Deactivate run these from the bundle.
-          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_linux.py oomph_ioreport.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py oomph_gpu.py local.oomph.daemon.plist; do
+          for f in install.sh uninstall.sh oomphd.py oomph.py oomph_darwin.py oomph_linux.py oomph_ioreport.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py oomph_gpu.py oomph_traffic.py local.oomph.daemon.plist; do
             test -f "$APP/Contents/Resources/$f" || { echo "::error::$f missing from bundle"; exit 1; }
           done
           test -x "$APP/Contents/Resources/install.sh" || { echo "::error::install.sh not executable"; exit 1; }
@@ -314,7 +314,7 @@ jobs:
 
       - name: Import without macOS, doctor
         run: |
-          python3 -I -B -c 'import sys; sys.path.insert(0, "daemon"); import oomph, oomphd, oomph_top, oomph_view, oomph_ai, oomph_upgrade, oomph_net, oomph_sync; oomph._G(); assert "ctypes" not in sys.modules and "oomph_darwin" not in sys.modules; print("imported", oomph.VERSION, oomph.LOG_DIR, oomph.LEDGER_DIR)'
+          python3 -I -B -c 'import sys; sys.path.insert(0, "daemon"); import oomph, oomphd, oomph_top, oomph_view, oomph_ai, oomph_upgrade, oomph_net, oomph_sync; oomph._G(); oomph._T(); assert "ctypes" not in sys.modules and "oomph_darwin" not in sys.modules; print("imported", oomph.VERSION, oomph.LOG_DIR, oomph.LEDGER_DIR)'
           set +e; python3 -I -B daemon/oomph.py doctor; rc=$?; set -e
           echo "doctor exit $rc"; test "$rc" = 0 || test "$rc" = 1   # it measures Linux now: 2 would be "cannot work here"
           python3 -I -B daemon/oomph.py check || test $? -le 2

@@ -33,6 +33,14 @@ turn them into the sample's cpu, gpu, io and disks blocks, roadmap 02 §4):
   mounts()                 [{mount, from, fs, flags, dev, total_gb, free_gb}]
   mount_key(rec)           volume_facts(dev)           disk_pools(recs, facts)
 
+Optional, from 1.15 (internet traffic, NET-concept §12; oomph_traffic turns them into the sample's net block):
+  NET_FLOWS                "nettop": what net_flows hands over
+  net_route()              the egress: {if (physical), tun, gw, subnet, onlink [cidr]}, or None offline
+  net_bytes(ifname)        (bytes in, bytes out) of an interface, 64-bit
+  net_flows(tun=None)      (nettop's output or None, why: None, "timeout", "cap", "missing"); with a tunnel, its rows too
+  router_mac(gw, ifname)   the IPv4 gateway's MAC from the ARP cache;  router_mac6(ifname) the IPv6 router's
+  host_secret()            the hardware UUID, never sent: the salt of a network's public id
+
 The ctypes libraries load when this module is imported, so only code that measures imports it:
 the hook and `oomph serve` never do. Nothing here opens anything in the shared ledger folder, and
 nothing here loads IOReport: only oomph_ioreport.py does, in a process of its own that never runs as root.
@@ -285,13 +293,35 @@ def uptime_s():
 # ------------------------------------------------------------------ more resources (roadmap 02 §4)
 # Each returns plain data, or None where the reading is not available; the logger turns readings into
 # rates (oomphd.Meter) and never fails a sample over one of them. Nothing here needs root.
-def run_capped(cmd, cap, timeout):
+def _nobody():
+    """subprocess arguments that make a child of root nobody, with no other groups (nothing runs as root that does
+    not have to, as on Linux); none for anyone else. Resolved here, in the parent: a lookup in the forked child of a
+    threaded process can deadlock on a lock another thread held."""
+    if os.geteuid() != 0:
+        return {}
+    import pwd
+    try:
+        pw = pwd.getpwnam("nobody")
+        uid, gid = pw.pw_uid, pw.pw_gid
+    except KeyError:
+        uid = gid = 4294967294   # macOS's nobody, -2
+    return {"user": uid, "group": gid, "extra_groups": []}
+
+
+def run_capped(cmd, cap, timeout, why=None, as_nobody=False, strict=False):
     """stdout of `cmd`, at most `cap` bytes within `timeout` seconds, else None: what the system hands
-    the root logger is read with a cap and a deadline (02 §10.5), and the child is always reaped."""
+    the root logger is read with a cap and a deadline (02 §10.5), and the child is always reaped. `why`, a
+    list, gets "missing", "timeout", "cap" or (`strict`) "exit N" when the answer is None. `as_nobody`: as nobody when
+    this process is root (route and scutil need no privilege; arp and ndp do: current macOS hides the neighbour caches'
+    entries from anyone else, and its own addresses' MACs read 2:0:0:0:0:0). `strict`: a child that did not exit 0 answers
+    None (nettop's partial output would read as a complete sample)."""
+    why = why if why is not None else []
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                             cwd="/", env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"})
+                             cwd="/", env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
+                             **(_nobody() if as_nobody else {}))
     except OSError:
+        why.append("missing")
         return None
     out, n, deadline = [], 0, time.monotonic() + timeout
     fd = p.stdout.fileno()
@@ -299,17 +329,26 @@ def run_capped(cmd, cap, timeout):
         while True:
             left = deadline - time.monotonic()
             if left <= 0 or not select.select([fd], [], [], left)[0]:
+                why.append("timeout")
                 return None
             b = os.read(fd, 1 << 16)
             if not b:
                 break
             n += len(b)
             if n > cap:
+                why.append("cap")
                 return None
             out.append(b)
         p.wait(max(0.01, deadline - time.monotonic()))
+        if strict and p.returncode != 0:
+            why.append("exit %d" % p.returncode)
+            return None
         return b"".join(out)
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        why.append("timeout")
+        return None
+    except OSError:
+        why.append("missing")
         return None
     finally:
         if p.returncode is None:
@@ -706,6 +745,235 @@ def disk_pools(recs, facts):
     return pools + list(listed.values()), rows
 
 
+# ------------------------------------------------------------------ internet traffic (NET, 1.15; NET-concept §12.1)
+# No packet is sent: the routing table, the ARP and neighbour caches, the interface's counters and nettop's list of
+# live connections are read. What the programs print is untrusted input: fixed argument lists, a deadline, a cap;
+# oomph_traffic parses it with limits on rows, lines and numbers.
+NET_FLOWS = "nettop"
+NETTOP = ["/usr/bin/nice", "-n", "10", "/usr/bin/nettop", "-L", "1", "-x", "-n", "-t", "external",
+          "-J", "interface,state,bytes_in,bytes_out"]   # -n: no reverse DNS, so the logger causes no traffic
+# `-t external` leaves out utun (seen on macOS 27: its rows are listed only without -t): under a VPN every interface
+# is listed, and the parser keeps the physical interface's and the tunnel's rows by name (loopback's are dropped).
+# Loopback's rows cost time too (nettop is quadratic in its rows): `-t undefined` lists the utuns, but nettop 27
+# takes it with no other type, so leaving loopback out would take two runs; a backoff says so in daemon.net instead
+NETTOP_ALL = [x for i, x in enumerate(NETTOP) if x != "-t" and (i == 0 or NETTOP[i - 1] != "-t")]
+NETTOP_CAP, NETTOP_TIMEOUT = 4 << 20, 3.0   # nettop's cost grows with the square of the flows it shows (mac-5)
+_TUNNEL = re.compile(r"(utun|ipsec|ppp)\d{1,4}\Z")
+_IFNAME = re.compile(r"[a-z][a-z0-9]{0,14}\Z")
+_V4 = re.compile(r"\d{1,3}(?:\.\d{1,3}){3}\Z")
+
+
+def _kv(out):
+    """`route get`'s `   key: value` lines as a dict."""
+    d = {}
+    for line in (out or b"").decode("utf-8", "replace").splitlines()[:64]:
+        k, sep, v = line.strip().partition(": ")
+        if sep and k and len(v) <= 64:
+            d.setdefault(k, v.strip())
+    return d
+
+
+def _route(*args):
+    return _kv(run_capped(["/sbin/route", "-n", "get"] + list(args), 64 << 10, 2.0, as_nobody=True))
+
+
+def _physical():
+    """The first Ethernet-like interface (en*) in scutil --nwi's IPv4 list: what a VPN runs over."""
+    out = (run_capped(["/usr/sbin/scutil", "--nwi"], 64 << 10, 2.0, as_nobody=True) or b"").decode("utf-8", "replace")
+    v4 = out.split("IPv4 network interface information", 1)[-1].split("IPv6 network interface information", 1)[0]
+    for line in v4.splitlines():
+        m = re.match(r"\s+(en\d{1,4}) :", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def net_route():
+    """The egress (12.1): `route -n get 1.1.1.1` (a table lookup, no packet) names the interface and the gateway;
+    a utun, ipsec or ppp interface is a VPN, and then the physical interface is the first en* of scutil --nwi's IPv4
+    list (route -n get default would miss a VPN with split routes; system utuns exist without one, mac-7). With
+    the interface's addresses (getifaddrs): its IPv4 subnet and every prefix on it, for LAN or internet. Without an
+    IPv4 route, the IPv6 route's interface (gw None)."""
+    d, v6 = _route("1.1.1.1"), []
+    if not d.get("interface"):   # IPv6 only (or NAT64 without CLAT): online all the same; no IPv4 gateway, the
+        d, v6 = _route("-inet6", "2606:4700:4700::1111"), ["-inet6"]   # identity from the IPv6 router (router_mac6)
+    ifn = d.get("interface")
+    if not ifn or not _IFNAME.match(ifn):
+        return None
+    tun = None
+    if _TUNNEL.match(ifn):
+        tun, ifn = ifn, _physical()
+        if not ifn:
+            return None
+        d = _route(*v6 + ["-ifscope", ifn, "default"])
+    gw = d.get("gateway")
+    gw = gw if gw and _V4.match(gw) else None
+    addrs = if_addrs().get(ifn, [])
+    v4 = [a for a in addrs if ":" not in a]
+    return {"if": ifn, "tun": tun, "gw": gw, "subnet": _net_of(v4[0]) if v4 else None,
+            "onlink": [_net_of(a) for a in addrs if not a.startswith("fe80:")]}
+
+
+def _net_of(cidr):
+    """`192.168.178.42/24` → `192.168.178.0/24`."""
+    import ipaddress
+    try:
+        return str(ipaddress.ip_interface(cidr).network)
+    except ValueError:
+        return None
+
+
+class _Sockaddr(ctypes.Structure):
+    _fields_ = [("sa_len", ctypes.c_uint8), ("sa_family", ctypes.c_uint8), ("sa_data", ctypes.c_uint8 * 14)]
+
+
+class _Ifaddrs(ctypes.Structure):
+    pass
+
+
+_Ifaddrs._fields_ = [("ifa_next", ctypes.POINTER(_Ifaddrs)), ("ifa_name", ctypes.c_char_p), ("ifa_flags", ctypes.c_uint),
+                     ("ifa_addr", ctypes.POINTER(_Sockaddr)), ("ifa_netmask", ctypes.POINTER(_Sockaddr)),
+                     ("ifa_dstaddr", ctypes.POINTER(_Sockaddr)), ("ifa_data", ctypes.c_void_p)]
+_libc.getifaddrs.argtypes = [ctypes.POINTER(ctypes.POINTER(_Ifaddrs))]
+_libc.freeifaddrs.argtypes = [ctypes.POINTER(_Ifaddrs)]
+
+
+def _sa_bytes(p, n):
+    """The first `n` bytes of a sockaddr, as far as its own length says (a netmask's may be shorter), zero-padded."""
+    if not p or p.contents.sa_len < 2:
+        return None
+    return ctypes.string_at(p, min(p.contents.sa_len, n)).ljust(n, b"\0")
+
+
+def if_addrs():
+    """{interface: ["addr/prefixlen", …]} of every IPv4 and IPv6 address (getifaddrs; read anew each time: a
+    delegated IPv6 prefix changes, mac-8)."""
+    head = ctypes.POINTER(_Ifaddrs)()
+    if _libc.getifaddrs(ctypes.byref(head)) != 0:
+        return {}
+    out = {}
+    try:
+        p, n = head, 0
+        while p and n < 1024:
+            n += 1
+            a = p.contents
+            fam = a.ifa_addr.contents.sa_family if a.ifa_addr else None
+            if fam in (socket.AF_INET, socket.AF_INET6) and a.ifa_name:
+                v6 = fam == socket.AF_INET6
+                raw, mask = _sa_bytes(a.ifa_addr, 24 if v6 else 8), _sa_bytes(a.ifa_netmask, 24 if v6 else 8)
+                if raw is None:
+                    p = a.ifa_next
+                    continue
+                addr = raw[8:24] if v6 else raw[4:8]
+                bits = sum(bin(b).count("1") for b in (mask[8:24] if v6 else mask[4:8])) if mask else (128 if v6 else 32)
+                name = a.ifa_name.decode("utf-8", "replace")[:16]
+                out.setdefault(name, []).append("%s/%d" % (socket.inet_ntop(fam, addr), bits))
+            p = a.ifa_next
+    finally:
+        _libc.freeifaddrs(head)
+    return out
+
+
+CTL_NET, PF_ROUTE, NET_RT_IFLIST2, RTM_IFINFO2 = 4, 17, 6, 0x12
+
+
+def net_bytes(ifname):
+    """(bytes in, bytes out) of an interface, 64-bit (sysctl NET_RT_IFLIST2: if_msghdr2 + if_data64; getifaddrs'
+    counters are 32-bit and wrap every 34 s at 1 Gbit/s), or None."""
+    mib = (ctypes.c_int * 6)(CTL_NET, PF_ROUTE, 0, 0, NET_RT_IFLIST2, 0)
+    sz = ctypes.c_size_t(0)
+    if _libc.sysctl(mib, 6, None, ctypes.byref(sz), None, ctypes.c_size_t(0)) != 0 or not 0 < sz.value <= 16 << 20:
+        return None
+    buf = ctypes.create_string_buffer(sz.value + 8192)
+    sz.value = len(buf)
+    if _libc.sysctl(mib, 6, buf, ctypes.byref(sz), None, ctypes.c_size_t(0)) != 0:
+        return None
+    try:
+        index = socket.if_nametoindex(ifname)
+    except OSError:
+        return None
+    raw, off = buf.raw[:sz.value], 0
+    while off + 4 <= len(raw):
+        msglen, _, typ = struct.unpack_from("<HBB", raw, off)
+        if msglen < 4:
+            break
+        if typ == RTM_IFINFO2 and off + 32 + 80 <= len(raw) and struct.unpack_from("<H", raw, off + 12)[0] == index:
+            return struct.unpack_from("<QQ", raw, off + 32 + 64)   # if_data64's ifi_ibytes, ifi_obytes
+        off += msglen
+    return None
+
+
+def net_flows(tun=None):
+    """(nettop's CSV or None, why it is missing: "timeout", "cap", "missing", "exit N"); with `tun` (a VPN's interface) of every
+    interface, since -t external leaves the tunnel out. A test may hand over a recorded one with
+    OOMPH_NETTOP_FIXTURE, never to a process whose real user is root."""
+    fx = os.environ.get("OOMPH_NETTOP_FIXTURE")
+    if fx and os.getuid() != 0:
+        try:
+            with open(fx, "rb") as f:
+                data = f.read(NETTOP_CAP + 1)
+            return (data, None) if len(data) <= NETTOP_CAP else (None, "cap")
+        except OSError:
+            return None, "missing"
+    why = []
+    out = run_capped(NETTOP_ALL if tun else NETTOP, NETTOP_CAP, NETTOP_TIMEOUT, why, strict=True)
+    return (out, None) if out is not None else (None, why[0] if why else "missing")
+
+
+def router_mac(gw, ifname):
+    """The MAC the ARP cache holds for the gateway on that interface (`arp -n`; no packet is sent), or None. As the
+    logger's root: macOS 26/27 shows anyone else no entry ("no entry" while route lists the gateway's LLINFO route),
+    and every network would then be the gw: of its gateway and subnet. arp reads a kernel table and opens nothing in a
+    shared folder (fixed argv, LC_ALL=C, cwd /, capped)."""
+    if not (gw and _V4.match(gw) and ifname and _IFNAME.match(ifname)):
+        return None
+    out = (run_capped(["/usr/sbin/arp", "-n", gw], 64 << 10, 2.0) or b"").decode("utf-8", "replace")
+    for line in out.splitlines()[:32]:
+        m = re.match(r"\S+ \(([\d.]+)\) at (\S+) on (\S+)", line)
+        if m and m.group(1) == gw and m.group(3) == ifname:
+            return m.group(2)
+    return None
+
+
+def _v6(x):
+    """An IPv6 address without its %scope, normalised, or None."""
+    import ipaddress
+    try:
+        return ipaddress.IPv6Address(str(x or "").partition("%")[0])
+    except ValueError:
+        return None
+
+
+def router_mac6(ifname):
+    """The MAC of the IPv6 default router on that interface (`route -n get -inet6 -ifscope X default` names it, the
+    neighbour cache, `ndp -an`, holds its MAC), or None. Not any router: a HomePod or Apple TV (a Thread border
+    router) and a mesh repeater send router advertisements on the LAN too. ndp as the logger's root, as arp."""
+    if not (ifname and _IFNAME.match(ifname)):
+        return None
+    gw = _v6(_route("-inet6", "-ifscope", ifname, "default").get("gateway"))
+    if gw is None:
+        return None
+    out = (run_capped(["/usr/sbin/ndp", "-an"], 1 << 20, 2.0) or b"").decode("utf-8", "replace")
+    for line in out.splitlines()[1:4096]:
+        t = line.split()
+        if len(t) >= 3 and t[2] == ifname and ":" in t[1] and _v6(t[0]) == gw:
+            return t[1]
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def host_secret():
+    """This Mac's hardware UUID (gethostuuid, IOPlatformUUID's value) as hex, or None: the salt of a network's public
+    id (oomph_traffic.public_id). It never leaves the machine; machine.id is a hash of it, not it."""
+    buf, wait = ctypes.create_string_buffer(16), (ctypes.c_long * 2)(5, 0)
+    try:
+        if _libc.gethostuuid(buf, wait) == 0 and buf.raw.strip(b"\0"):
+            return buf.raw.hex()
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
 # ------------------------------------------------------------------ the machine
 @functools.lru_cache(maxsize=1)
 def _machine_static():
@@ -732,6 +1000,7 @@ def machine(all_procs=None):
     m["measures"] = {"memory": True, "pressure": "kernel", "kills": "log", "presence": "desktop",
                      "footprint": "phys_footprint", "unowned": True, "scope": "host",
                      "cpu": "ticks", "gpu": "registry", "disks": "getfsstat", "io": "rusage", "thermal": "notify",
+                     "net": "nettop",
                      "all_procs": os.geteuid() == 0 if all_procs is None else bool(all_procs)}
     return m
 

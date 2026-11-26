@@ -308,9 +308,10 @@ oomph incident latest --html    # open the latest incident's report
 oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
 oomph top                       # the popup's dashboard, full screen in the terminal (see below)
 oomph doctor                    # what works here and what to fix: logger, versions, ledger, Claude setup (--json)
-oomph ps --cpu                  # the busiest processes now (--gpu, --io: writing to disk, --memory)
+oomph ps --cpu                  # the busiest processes now (--gpu, --io: writing to disk, --memory, --net: internet)
+oomph net                       # this network, its line's figure and the internet traffic now (test, set, name, list)
 oomph volumes --all             # the disks oomph records, and the ones it ignores and why
-oomph resources                 # memory, cores, GPU and disks of this Mac, and which can be reserved
+oomph resources                 # memory, cores, GPU, disks and the network of this Mac, and which can be reserved
 ```
 
 An HTML report (`html`, `incident … --html`, `ai-report`) goes to the file named with `-o`, else, from
@@ -477,8 +478,8 @@ What a session gets:
 
 | | |
 |---|---|
-| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations, then a line each for CPU, GPU and disks; exit code 0 / 1 / 2; `--json`; `--measure` reads CPU and GPU for a quarter second when the logger is off |
-| `oomph resources` | this Mac's memory, cores, GPU and disks, and which of them can be reserved (memory; on a Mac from 1.12.0 cores and from 1.12.1 disk space), with what is reserved and left |
+| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations, then a line each for CPU, GPU, disks and, from 1.15, the network (internet traffic now against the line's stored figure; `--json`: a `network` object); exit code 0 / 1 / 2; `--json`; `--measure` reads CPU and GPU for a quarter second when the logger is off |
+| `oomph resources` | this Mac's memory, cores, GPU, disks and, from 1.15, the network (internet traffic now against the line's stored figure; `--json`: a `network` object), and which of them can be reserved (memory; on a Mac from 1.12.0 cores and from 1.12.1 disk space), with what is reserved and left |
 | `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
 | `oomph run --cpu 4..12 -- make -j{cpu}` | the same for cores: `{cpu}` becomes the number granted, which also goes to `OOMPH_CPU_CORES` and, where not already set, to `MAKEFLAGS`, `CARGO_BUILD_JOBS`, `GOMAXPROCS` and friends |
 | `oomph run --disk 30G@/Volumes/Scratch -- ./fetch-dataset.sh` | the same for disk space on a volume: any path on it names it (default: the temporary folder's disk); the grant goes to `OOMPH_DISK_GB` |
@@ -488,8 +489,8 @@ What a session gets:
 | `oomph reservations --history --last 3d` | every reservation of the last 14 days, also of sessions that are gone: span, size changes, reserved vs. peak, how it ended |
 | `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
 | `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
-| `oomph status --json` | the full latest sample |
-| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident`. A server that outlives an update takes the installed new version at its next request, once the new code has passed a self-check, when the install is root's (a Mac, or Linux's system mode; a Linux user install is restarted with its session); the session keeps the tools it was shown at its start |
+| `oomph status --json` | the full latest sample; from 1.15 with the internet traffic, the network named by its label or a hash of its identity, never the router's MAC |
+| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` (from 1.15 `memory_check` and `memory_status` also answer with a `network` object). A server that outlives an update takes the installed new version at its next request, once the new code has passed a self-check, when the install is root's (a Mac, or Linux's system mode; a Linux user install is restarted with its session); the session keeps the tools it was shown at its start |
 | `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
@@ -760,7 +761,13 @@ The logs contain process names and working directories — never command-line ar
 or file contents — and are readable by every user on the Mac. From 1.9.1 they also hold
 how much CPU, GPU time and disk writing each process used, and the names and mount points
 of the disks oomph records (a volume's name can say something: `oomph volumes hide` keeps it
-out of your own lists, not out of the logs). No telemetry. oomph does not talk to the
+out of your own lists, not out of the logs). From 1.15 they also hold how much each process
+moved to and from the internet (never with whom: remote addresses are not kept) and the
+network's identity: its router's MAC address, or its gateway and subnet. That identity stays
+on the Mac: what goes to a watching machine leaves it out, and the answers to Claude (MCP,
+`oomph check --json`, `oomph status --json`, and `oomph net`'s text) name the network by its
+label or by a hash of it; only `oomph net list` and the `--json` answers of `oomph net` show
+the key itself, for your own tools. No telemetry. oomph does not talk to the
 network unless you ask it to: when you turn on the AI analysis with Claude or OpenAI, which
 sends figures, process names, project paths and the names and mount points of recorded disks
 from the logs to that provider for each AI report (Ollama keeps it local); when you check for
@@ -786,6 +793,8 @@ daemon/oomph_gpu.py               GPU reservations (1.14): the NVIDIA pools per 
                                   request or lease has a GPU part
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
+daemon/oomph_traffic.py           internet traffic (1.15): parsing nettop and ss, the deltas, the network's identity,
+                                  networks.json and `oomph net`; loaded only where a network is shown
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)
 daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer
 daemon/local.oomph.daemon.plist   the LaunchDaemon job

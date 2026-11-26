@@ -24,7 +24,10 @@ for agents and scripts (work without the daemon too — they measure live):
   oomph check [--json] [--measure]  verdict ok / tight / critical + advice; exit 0 / 1 / 2; a line per resource
                                     (--measure: without the logger, read CPU and GPU for a quarter second)
   oomph resources [--json]          this machine's memory, cores, GPU and disks; which can be reserved here
-  oomph ps [--cpu | --gpu | --io | --memory] [-n 10] [--json]   the biggest consumers of one resource now
+  oomph ps [--cpu | --gpu | --io | --memory | --net] [-n 10] [--json]
+                                    the biggest consumers of one resource now
+  oomph net [test [--yes] | set DOWN/UP | name LABEL | list | forget NETWORK]   this network's internet line:
+                                    its figure (tested on a Mac, set by hand), traffic now (oomph net --help)
   oomph volumes [--all] [--json]    the disks the logger records (--all: also those it ignores, and why)
   oomph volumes watch|unwatch|hide|unhide PATH   pin a listed disk: its free space counts in your checks
   oomph session [--json] [--pid N]  memory of the Claude session this runs in (its whole process tree)
@@ -418,9 +421,10 @@ SAMPLE_KEYS = dict(
                            "wired_gb", "compressed_gb", "compressor_logical_gb", "cached_gb", "free_gb",
                            "swap_total_gb", "swap_used_gb", "swapfiles", "swapins", "swapouts", "disk_free_gb",
                            "procs_gb", "unowned_gb", "jetsam_kills", "away", "incident", "cpu", "gpu", "io",
-                           "psi", "scope", "cgroup_kills", "killed")]  # the last four: Linux (03 §6.1), as 01 asked
+                           "psi", "scope", "cgroup_kills", "killed", "net")]  # cgroup_kills, killed: Linux (03 §6.1)
     + [(k, "drop") for k in ("top", "groups", "claude", "gone", "leases", "top_cpu", "top_gpu", "top_io", "disks",
-                             "linux", "cpu_names", "pools")]  # pools: this machine's admission (02 §5.2), not the wire's
+                             "linux", "cpu_names", "pools", "net_names", "top_net")]  # pools: this machine's admission
+                                                                                     # (02 §5.2), not the wire's
     + [("daemon", "full")])
 SLIM_STR = 64        # characters of a string in a slim sample
 AWAY_KEYS = ("idle_s", "display_on", "locked", "sleep_preventers")
@@ -434,11 +438,17 @@ SLIM_BLOCKS = {"cpu": (None, ("n", "p", "e", "busy", "user", "sys", "p_busy", "e
                "gpu": (4, ("id", "util", "active", "now", "src", "mem_gb", "mem_alloc_gb")),
                "psi": (None, ("mem_some", "mem_full", "mem_some60", "mem_full60", "cpu_some", "io_some", "io_full")),
                "scope": (None, ("kind", "limit_gb", "by", "host_ram_gb", "host_avail_gb", "host_pressure")),
-               "killed": (3, ("name", "mb", "by"))}
+               "killed": (3, ("name", "mb", "by")),
+               # internet traffic (NET, 1.15): the rates only. The day's GB stay home: every mirror up to 1.14 refuses
+               # a whole row with a *_gb above 16 times the machine's RAM (oomph_sync.gb_ok), which a day's downloads
+               # pass on a small machine
+               "net": (None, ("src", "vpn", "down_mbps", "up_mbps", "lan_mbps"))}
 # ... and in the full current sample with what names and describes them
 # A Linux machine's own figures that its tab's tiles read (1.13.3, 03 §3.9): what is available, the kernel's swap and
 # zram's size (the zram tile), in the current sample only
 FULL_BLOCKS = {"gpu": (4, SLIM_BLOCKS["gpu"][1] + ("name", "unified", "mem_limit_gb", "mem_limit_est")),
+               # not the network's key: a router's MAC places a household on a map (its BSSID's neighbour)
+               "net": (None, SLIM_BLOCKS["net"][1] + ("if", "tun", "flows")),
                "linux": (None, ("avail_gb", "kswap_total_gb", "kswap_free_gb", "zram_disk_gb"))}
 # The full current sample is rebuilt from these fields only, each list capped (CONTEXT §3.2).
 FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "pn", "s", "cpu", "gpu", "w")),
@@ -450,8 +460,10 @@ FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "p
               "top_cpu": (8, ("pid", "name", "g", "s", "cpu")),
               "top_gpu": (5, ("pid", "name", "g", "s", "gpu")),
               "top_io": (5, ("pid", "name", "g", "s", "w")),
-              "cpu_names": (5, ("name", "cpu", "n"))}
-FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root", "all_procs")
+              "cpu_names": (5, ("name", "cpu", "n")),
+              "net_names": (5, ("name", "down", "up", "n")),
+              "top_net": (8, ("pid", "name", "g", "s", "uid", "down", "up"))}
+FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root", "all_procs", "net")
 FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
 
 
@@ -711,6 +723,8 @@ class _Summary:
         self.cpu_n = self.gpu_mem = None
         self.free = {}       # pool id -> lowest free GB
         self.writers = {}    # process name -> [peak MB/s written, when]
+        self.net = {}        # "down" / "up" -> (peak Mbit/s of internet traffic, sample) (NET, 1.15); "if_down" /
+        #                      "if_up": the same from totals-only samples (src "if"), whose figure holds the LAN too
 
     def add(self, s):
         self.n += 1
@@ -758,6 +772,11 @@ class _Summary:
         for p in disk_pools_of(s):
             if p["id"] in self.free or len(self.free) < 32:      # (bounded: a mirror's odd ids add no more)
                 self.free[p["id"]] = _less(self.free.get(p["id"]), p["free_gb"])
+        nb = s.get("net") if isinstance(s.get("net"), dict) else None
+        for d in ("down", "up") if nb else ():
+            v, k = nb.get(d + "_mbps"), d if nb.get("src") == "flows" else "if_" + d
+            if _fin(v) and v >= 0 and (k not in self.net or v > self.net[k][0]):
+                self.net[k] = (v, s)
         for w in s.get("top_io") or () if isinstance(s.get("top_io"), list) else ():
             if isinstance(w, dict) and _fin(w.get("w")) and isinstance(w.get("name"), str):
                 k = w["name"][:64]
@@ -857,6 +876,10 @@ class _Summary:
         if self.writers:
             out["writers"] = [{"name": k, "peak_mb_s": v[0], "at": _hm(v[1])}
                               for k, v in sorted(self.writers.items(), key=lambda kv: -kv[1][0])[:8]]
+        for k, (v, x) in self.net.items():  # internet traffic: the peaks per direction, and who moved most then
+            out["max_net_%s_mbps" % k], out["max_net_%s_at" % k] = v, x["iso"]
+            if not k.startswith("if_"):
+                out["names_net_%s_at_peak" % k] = _rows(x.get("net_names"), 3, ("name", "down", "up", "n"))
         return out
 
 
@@ -1990,7 +2013,7 @@ def cmd_status():
     res = resource_lines(c, *volume_prefs(), io=True)
     if not c.get("disks"):  # a logger before 1.9.1
         line("disk", "%.0f GB free" % c["disk_free_gb"])
-    for label, text in res if logger_measures(c) else ():
+    for label, text in res + network_lines(c) if logger_measures(c) else ():
         line(label, text)
     line("you", "idle %ss · display %s · %s · sleep held by %s" % (
         a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
@@ -2034,7 +2057,7 @@ def _status_linux(c, d, age, alive, line, w):
     for label, text in status_lines_linux(c):
         if label != "disk" or not c.get("disks"):
             line(label, text)
-    for label, text in resource_lines(c, *volume_prefs(), io=True):
+    for label, text in resource_lines(c, *volume_prefs(), io=True) + network_lines(c):
         line(label, text)
     if c.get("jetsam_kills") or c.get("cgroup_kills"):
         names = ", ".join(term_text(k.get("name"))[:30] for k in c.get("killed") or () if isinstance(k, dict))
@@ -2233,6 +2256,8 @@ def resource_summary_lines(summ, names=None):
     if summ.get("writers"):
         out.append("writing to disk, peak: " + ", ".join("%s %.1f MB/s at %s" % (r["name"], r["peak_mb_s"], r["at"][:5])
                                                           for r in summ["writers"][:3]))
+    if any(summ.get("max_net_%s_mbps" % k) is not None for k in ("down", "up", "if_down", "if_up")):
+        out.append(_T().report_line(summ))  # internet traffic (NET, 1.15)
     return out
 
 
@@ -2987,9 +3012,37 @@ def find_session(pid=None):
     }
 
 
-def checked_verdict(mine=None, s=None):
+def network_lines(s):
+    """[("net", text)] for check, status and resources (oomph_traffic), never a reason for them to fail."""
+    try:
+        return [_T().resource_line(s)]
+    except Exception:  # noqa: B902
+        return []
+
+
+def network_info(s):
+    """The `network` object of check --json, memory_check and memory_status (oomph_traffic), or None."""
+    try:
+        return _T().network_info(s)
+    except Exception:  # noqa: B902
+        return None
+
+
+def public_sample(s):
+    """The sample for an answer that leaves the machine (status --json, memory_status): the network's key hashed
+    (oomph_traffic.public_id); unchanged where there is none."""
+    if not isinstance(s, dict) or not isinstance(s.get("net"), dict) or "network" not in s["net"]:
+        return s
+    try:
+        return _T().public_sample(s)
+    except Exception:  # noqa: B902
+        return dict(s, net={k: v for k, v in s["net"].items() if k != "network"})
+
+
+def checked_verdict(mine=None, s=None, network=False):
     """verdict() plus what other sessions have reserved or are waiting for, and the disks this user
-    pinned (`resources`: the sample's CPU, GPU, disk and I/O blocks, for the caller to show)."""
+    pinned (`resources`: the sample's CPU, GPU, disk and I/O blocks, for the caller to show); with `network`
+    the network object (not for the hook, which stays silent about the network: D-N20)."""
     s = s or (_sample_override() if _sample_override else sample(with_procs=False))
     v = verdict(s)
     try:
@@ -3007,6 +3060,8 @@ def checked_verdict(mine=None, s=None):
         coordination_verdict(v, coordination(mine if mine is not None else holder_for()["pid"], s))
     except Exception as e:  # the ledger is a bonus; never let it break a check
         v["coordination"] = {"error": repr(e)}
+    if network:
+        v["network"] = network_info(s)
     return v
 
 
@@ -3014,11 +3069,11 @@ def cmd_check(args):
     """The verdict, and a line per resource. A plain check never waits: without the logger the CPU
     and GPU are not measured unless --measure takes a quarter-second reading."""
     s = resource_sample(measure="--measure" in args)
-    v = checked_verdict(s=s)
+    v = checked_verdict(s=s, network="--json" in args)
     if "--json" in args:
         print(json.dumps(v))
     else:
-        print(verdict_line(v, lines=resource_lines(s, *volume_prefs())))
+        print(verdict_line(v, lines=resource_lines(s, *volume_prefs()) + network_lines(s)))
     return v["exit_code"]
 
 
@@ -3075,7 +3130,7 @@ def cmd_wait(args):
 
 
 def cmd_status_json():
-    print(json.dumps(sample()))
+    print(json.dumps(public_sample(sample())))
     return 0
 
 
@@ -3301,24 +3356,26 @@ def resource_lines(s, pinned=frozenset(), hidden=frozenset(), io=False):
 
 PS_KINDS = {"--cpu": ("top_cpu", "cpu", "CORES", "%7.2f"), "--gpu": ("top_gpu", "gpu", "% GPU", "%7.1f"),
             "--io": ("top_io", "w", "MB/s W", "%7.2f"), "--memory": ("top", "mb", "MB", "%7d")}
-PS_USAGE = "usage: oomph ps [--cpu | --gpu | --io | --memory] [-n 10] [--json]"
+PS_USAGE = "usage: oomph ps [--cpu | --gpu | --io | --memory | --net] [-n 10] [--json]"
 
 
 def cmd_ps(args):
     """The biggest consumers of one resource now: from the logger's latest sample, else (logging off)
     from a half-second reading of what this user may see."""
     try:
-        opts, _ = _strict(args, takes=("-n",), flags=tuple(PS_KINDS) + ("--json",), npos=0)
+        opts, _ = _strict(args, takes=("-n",), flags=tuple(PS_KINDS) + ("--net", "--json"), npos=0)
         n = int(opts.get("-n", 10))
         if not 1 <= n <= 100:
             raise ValueError
     except (UsageError, ValueError) as e:
         print("oomph ps: %s\n%s" % (e if isinstance(e, UsageError) else "-n takes 1 to 100", PS_USAGE), file=sys.stderr)
         return 2
-    kinds = [k for k in PS_KINDS if k in opts]
+    kinds = [k for k in tuple(PS_KINDS) + ("--net",) if k in opts]
     if len(kinds) > 1:
         print("oomph ps: one resource at a time\n" + PS_USAGE, file=sys.stderr)
         return 2
+    if kinds == ["--net"]:
+        return _T().cmd_ps_net(n, "--json" in opts)
     key, field, head, fmt = PS_KINDS[kinds[0] if kinds else "--cpu"]
     s, note = _daemon_sample(), None
     if s is None or key != "top" and not logger_measures(s):  # no logger, or one older than 1.9.1
@@ -3396,6 +3453,7 @@ def cmd_resources(args):
     except Exception:  # the ledger is a bonus here too
         c = None
     r = _resources(s, c)
+    r["network"] = network_info(s)
     if "--json" in opts:
         print(json.dumps(r, allow_nan=False))
         return 0
@@ -3420,6 +3478,8 @@ def cmd_resources(args):
             text += _G()._gpu_line(gl.pop(0))
         elif label in ("cpu", "gpu") and not text.startswith("not measured"):
             text += " · not reservable yet" if label == "gpu" or not cpu.get("reservable") else " · reservable"
+        line(label, text)
+    for label, text in network_lines(s):
         line(label, text)
     more = [x for x in (("cores", " --cpu 8") if "cpu" in r["reservable"] else None,
                         ("disk space", " --disk 20G") if "disk" in r["reservable"] else None,
@@ -3857,6 +3917,22 @@ def _G():
     return _GPU_MOD[0]
 
 
+# ----- internet traffic (NET, 1.15; roadmap NET-concept §12): the code is oomph_traffic.py's, loaded by what measures
+# or shows the network (_T): the logger, `oomph net`, `ps --net`, check, status, resources and the MCP answers.
+_TRAFFIC_MOD = []
+
+
+def _T():
+    """oomph_traffic, bound to this module as oomph_gpu is (_G): imported at its first use."""
+    if not _TRAFFIC_MOD:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        sys.modules["oomph_traffic_host"] = sys.modules[__name__]
+        import oomph_traffic
+        _TRAFFIC_MOD.append(oomph_traffic)
+    return _TRAFFIC_MOD[0]
+
+
 def _gpu_parts(r):
     """A lease's GPU parts (oomph_gpu._gpu_parts), or None at once for a lease without one."""
     res = r.get("res") if isinstance(r.get("res"), dict) else None
@@ -3954,6 +4030,7 @@ LIMITS = {                   # the one table of limits for what is read from the
     "digits": 30,            # an integer longer than this is not JSON oomph wrote (int() is quadratic)
     "keys": 256,             # keys per JSON object
     "depth": 32,             # nesting (newer Pythons parse far deeper than the recursion limit)
+    "networks": 64 << 10,    # networks.json (NET, 1.15): bytes; a bigger one is treated as absent
 }
 LOCK_WAIT_S = 5.0            # interactive callers: a holder keeps the lock for milliseconds, so 5 s
                              # only runs out when it is stuck or hostile, yet survives a swapped-out
@@ -5817,6 +5894,9 @@ def _cmd_ledger_call(name):
         print("oomph: _ledger-call refuses to run as root", file=sys.stderr)
         return 1
     fn = _LEDGER_CALLS.get(name)
+    if fn is None and name in ("read_networks", "networks_edit"):  # registered when oomph_traffic is imported
+        _T()
+        fn = _LEDGER_CALLS.get(name)
     if fn is None:
         print("oomph: _ledger-call: no ledger operation %r" % name, file=sys.stderr)
         return 2
@@ -6652,7 +6732,7 @@ def refresh_ledger(s, procs, rated=False):
 PROC_KEYS = ("pid", "ppid", "uid", "name", "start", "fp", "rss", "path")  # what the ledger's child is told of a process
 
 
-def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None, gpus=None):
+def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None, gpus=None, nets=None, net=None, answer=None):
     """The daemon's ledger work for one sample: refresh_ledger, then the snapshot of live
     reservations for the sample, both in a child — as nobody when the daemon is root (root
     never opens anything in the shared directory, to read or to write), as the same user when
@@ -6662,8 +6742,17 @@ def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None, gpus=
     `rates`: the cores each process kept busy over the last interval ({pid: cores}, the logger's
     Meter); given, the child's input is of version 2 (02 §5.2) and it charges every grant's cores,
     with `writes` ({pid: MB/s written to disk}) every disk grant's writes, and with `gpus` ({pid: % of the
-    GPU}) a Mac's GPU grants (an NVIDIA card's are charged from the sample's list of its processes)."""
+    GPU}) a Mac's GPU grants (an NVIDIA card's are charged from the sample's list of its processes). `nets` ({pid:
+    [bytes in, out]}): each process's `ni`/`no`; `net`: the child names this network's networks.json entry, checked
+    again into `answer["network"]` (NET 12.7)."""
     rows = [{k: p[k] for k in PROC_KEYS if k in p} for p in procs.values()]
+    for x in rows if nets else ():
+        b = nets.get(x["pid"])
+        if b and _num(b[0], 0, 2 ** 63) and _num(b[1], 0, 2 ** 63):
+            if b[0]:
+                x["ni"] = int(b[0])
+            if b[1]:
+                x["no"] = int(b[1])
     if rates is not None:
         for x in rows:
             c, w, g = rates.get(x["pid"]), (writes or {}).get(x["pid"]), (gpus or {}).get(x["pid"])
@@ -6673,14 +6762,16 @@ def ledger_tick(s, procs, timeout=TICK_TIMEOUT_S, rates=None, writes=None, gpus=
                 x["w"] = round(w, 3)
             if _num(g, 0, 1e4) and g > 0:
                 x["gpu"] = round(g, 2)
-    payload = json.dumps(dict({"s": s, "procs": rows}, **({"v": 2} if rates is not None else {})),
-                         default=str).encode()
+    payload = json.dumps(dict({"s": s, "procs": rows}, **({"v": 2} if rates is not None else {}),
+                              **({"net": net} if net else {})), default=str).encode()
     rc, out, err = run_bounded([PY, "-I", "-B", os.path.realpath(__file__), "_ledger-refresh"], payload,
                                LIMITS["tick"], timeout, **_drop_to("nobody", "nobody"))
     d = loads_untrusted(out)
     if rc != 0 or not isinstance(d, dict):
         raise LedgerError("ledger refresh failed: %s" % (err.strip().splitlines() or ["exit status %s" % rc])[-1][:300])
     e = d.get("error")
+    if answer is not None and net:
+        answer["network"] = _T().answer_entry(d.get("network"))
     return sample_leases(d.get("leases")), (e[:300] if isinstance(e, str) else None)
 
 
@@ -6702,6 +6793,11 @@ def _cmd_ledger_refresh():
     except Exception as e:  # the snapshot is still worth having
         out["error"] = "%s: %s" % (type(e).__name__, e) if not isinstance(e, LedgerError) else str(e)
     out["leases"] = sample_leases(ledger_snapshot(procs))
+    if isinstance(d.get("net"), dict):  # which entry of networks.json is the logger's network (root never opens it)
+        try:
+            out["network"] = _T().child_entry(d["net"])
+        except Exception:  # noqa: B902  the snapshot is worth more
+            out["network"] = None
     sys.stdout.write(json.dumps(out))
     return 0
 
@@ -7295,7 +7391,8 @@ def cmd_hook(args):
 MCP_TOOLS = [
     {"name": "memory_check",
      "description": "Verdict on this Mac's memory right now: level ok / tight / critical, the reasons, free physical "
-                    "memory, pressure, swap and free disk, plus advice on what to do. Call it before memory-heavy "
+                    "memory, pressure, swap and free disk, plus advice on what to do, and `network`: internet "
+                    "traffic now against the line's stored figure. Call it before memory-heavy "
                     "work (builds, test suites, containers, parallel jobs, sub-agents) and periodically in long runs.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "reserve_memory",
@@ -7381,7 +7478,7 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "memory_status",
      "description": "The full latest sample: system memory breakdown, swap, disk, idle state, top processes, top apps "
-                    "and all Claude sessions.",
+                    "and all Claude sessions, and `network`: internet traffic now against the line's stored figure.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "wait_for_memory",
      "description": "Block until memory is back to ok (and optionally at least min_free_gb free), polling every 5 s, "
@@ -7460,7 +7557,7 @@ def _mcp_args(name, a):
 def _mcp_call(name, a):
     _mcp_args(name, a)
     if name == "memory_check":
-        return checked_verdict()
+        return checked_verdict(network=True)
     if name == "reserve_memory":
         ttl = min(max(int(a.get("ttl_min", 30)), 1), 480) * 60
         cpu = parse_cores(a["cpu_cores"])[0] if a.get("cpu_cores") else None
@@ -7505,7 +7602,9 @@ def _mcp_call(name, a):
     if name == "my_session":
         return find_session() or {"error": "this MCP server is not running under a Claude Code session"}
     if name == "memory_status":
-        return sample()
+        s = sample()
+        s["network"] = network_info(s)
+        return public_sample(s)
     if name == "wait_for_memory":
         ok, v, waited = wait_for_memory(min(int(a.get("timeout_s", 120)), 300), float(a.get("min_free_gb", 0)), quiet=True)
         return {"recovered": ok, "waited_s": waited, "verdict": v}
@@ -7916,6 +8015,10 @@ def doctor():
             None if cfg else "sudo chown root %s; sudo chmod 644 %s" % (CONFIG_FILE, CONFIG_FILE))
     if mac:
         add(*_doctor_gpu(c if fresh else None, kick))
+    try:
+        add(*_T().doctor_line(c if fresh else None))
+    except Exception as e:  # noqa: B902
+        add("network", "warn", "measuring failed: %s" % repr(e)[:200])
 
     if root:  # the Claude setup is the user's own: their files, read as them
         add("claude", "note", "not checked as root", "oomph doctor without sudo checks your Claude setup")
@@ -8326,6 +8429,8 @@ def _main(argv):
         return cmd_ps(rest)
     if c == "volumes":
         return cmd_volumes(rest)
+    if c == "net":
+        return _T().cmd_net(rest)
     if c == "session":
         return cmd_session(rest)
     if c == "wait":

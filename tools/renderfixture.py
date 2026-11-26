@@ -55,7 +55,7 @@ DEAD_PID = 99999999  # above every system's pid limit: kill(pid, 0) says ESRCH
 # machines switch on
 STATES = [("", []), ("log", []), ("blend:0.5", []), ("hover:300", []), ("hoverlog:300", ["--dark"]),
           ("rhover:420:30", []), ("", ["--dark"]), ("", ["-machinesUI", "YES"])]
-DEFAULTS = ["-aiOn", "NO", "-machinesUI", "NO", "-openedAgo", "0"]  # never this Mac's own settings
+DEFAULTS = ["-aiOn", "NO", "-machinesUI", "NO", "-resourcesUI", "NO", "-openedAgo", "0"]  # never this Mac's own settings
 ON = ["-machinesUI", "YES"]
 SEEN = ON + ["-lastSeenIncident", "99999999-999999"]  # This Mac has nothing new to say: the remembered tab opens
 STUDIO, AIR = "m-7f3a9c1e5b2d4a68", "m-4e5f607182930415"

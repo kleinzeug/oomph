@@ -1366,6 +1366,24 @@ def part_linux():
                   lim / (1 << 30), out.strip()[:0] or (v.get("scope") or {})))
     else:
         print("info  not in a limited container: the cgroup-scope check runs in the CI's 2 GB container")
+    # internet traffic (NET, 1.15), a live reading as a user: with ss one's own processes only (other users' sockets
+    # have no pid for a user), without ss (the CI's containers) the interface's totals alone, as doctor says
+    rc, out, err = cli("ps", "--net", "--json")
+    pj = json.loads(out) if rc == 0 and out.startswith("{") else {}
+    rc2, out2, _ = cli("net", "--json")
+    nj = json.loads(out2) if rc2 == 0 and out2.startswith("{") else {}
+    rows = pj.get("rows") or []
+    if L.ss_path():
+        check(rc == 0 and pj.get("source") == "live" and all(r.get("uid") == os.getuid() for r in rows) and
+              rc2 == 0 and nj.get("if"), "oomph ps --net and oomph net, live with ss: %d of this user's processes named, "
+              "the interface %s (%s)" % (len(rows), nj.get("if"), err[-200:]))
+    else:
+        rc3, out3, _ = cli("doctor", "--json")
+        dn = {c["id"]: c for c in (json.loads(out3) if out3.startswith("{") else {}).get("checks", [])}.get("network", {})
+        check(rc == 0 and pj.get("src") == "if" and not rows and rc2 == 0 and
+              (not nj.get("if") or (nj.get("now") or {}).get("src") == "if") and dn.get("level") == "note" and
+              "totals only" in dn.get("text", ""), "without ss (iproute2): oomph ps --net and oomph net read the "
+              "interface's totals alone, and doctor says so (%s, %s)" % (pj.get("src"), dn.get("text")))
     rc, out, err = cli("top", "--once", "--size", "80x24", "--glyphs", "ascii", timeout=120)
     check(rc == 0 and len(out.split("\n")[:-1]) == 24, "oomph top --once on Linux: one 80x24 frame from the live source%s"
           % ("" if rc == 0 else ": " + err[-300:]))
@@ -1614,6 +1632,11 @@ def _service_checks(sh, as_user, user):
     check(d.get("user") == "oomphd" and ms.get("kills") == "journal" and d.get("root") is False and cur.get("os") == "linux"
           and isinstance(cur.get("cpu"), dict) and isinstance(cur.get("disks"), list),
           "current.json: the logger as oomphd, kills from the journal, cpu and disks recorded (%s)" % ms.get("kills"))
+    nb = cur.get("net") if isinstance(cur.get("net"), dict) else {}
+    check(nb.get("if") not in (None, "lo") and nb.get("src") == "if" and ms.get("net") == "proc-net-dev",
+          "current.json: the logger in its own network namespace (PrivateNetwork, no netlink) reads the host's internet "
+          "totals from /proc/1/net, no process named (%s, %s)" % ({k: nb.get(k) for k in ("if", "src", "down_mbps")},
+                                                                   ms.get("net")))
     # a kill at a cgroup's own limit, named
     t0 = time.time()
     r = sh(["systemd-run", "--scope", "-q", "-p", "MemoryMax=64M", "-p", "MemorySwapMax=0", "python3", "-c", KILL_ME])
