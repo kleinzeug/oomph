@@ -30,8 +30,9 @@ process next to this checkout's, on one ledger directory, in both directions:
      anything but memory as reservable; 1.12.0 not disk. A CLI that knows the flags (and this one) reads each
      example as the skill means it. The examples of "The internet line" (`--net 40G`, `--net-rate 200M`, …),
      a block of their own: every CLI from 1.8.5 to 1.14 refuses them with exit 2 and reaches no acquire (never
-     a volume read as memory); this one refuses them with 75 while net_reservations is off (set "0", whatever
-     the root-owned config.json says) and hands their numbers on with it on.
+     a volume read as memory); this one, and every tag from 1.15.0 on, refuses them with 75 while
+     net_reservations is off (set "0", whatever the root-owned config.json says) and hands their numbers on
+     with it on.
   NR network reservations (NET N2, 1.15): a ledger with a granted, an unmanaged and a queued `net` part read
      and written by 1.14.0 (the tag) and by this code; 1.14 cannot weigh the queued one and waits behind it, the
      next refresh here lets memory pass it; old readers read the records with net_gb, this one's end record
@@ -39,7 +40,8 @@ process next to this checkout's, on one ledger directory, in both directions:
   NQ metered networks (NET N3, 1.15): a request waiting on net.quota under 1.14.0 and this code; older
      capsules and verdicts read a sample whose pools hold net.quota.
   N  samples with internet traffic (`net`, `net_names`, `top_net`) read by older readers: their summary
-     (report, incidents) and the slim and full samples they send to another machine leave the new blocks out.
+     (report, incidents) and the slim and full samples they send to another machine leave the new blocks out;
+     this one and every tag from 1.15.0 on send the rates, never the day's GB.
   C  1.8.1's own files: this code reads them, makes a memory vector of an old lease without
      writing one, and writes back what 1.8.1 writes plus `agent` (D11) and, from 1.9.4 (L1), `user`
      and the holder's uid (03 §6.5); 1.8.1 reads that back.
@@ -98,8 +100,40 @@ def old_module(tag="v1.8.1"):
     open(path, "wb").write(src)
     spec = importlib.util.spec_from_file_location("oomph_" + tag[1:].replace(".", "_"), path)
     m = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = m   # what looks itself up (sys.modules[__name__], 1.15.0's _T) finds this copy
     spec.loader.exec_module(m)
+    for helper, loader in (("oomph_traffic", "_T"), ("oomph_gpu", "_G")):
+        if callable(getattr(m, loader, None)):
+            setattr(m, loader, _tag_helper(m, tag, d, helper))
     return m
+
+
+def _tag_helper(m, tag, d, helper):
+    """The tag's own copy of a helper module that binds to its host at import (oomph_traffic, oomph_gpu), bound to m
+    and loaded at its first use as the tag loads it, instead of the copy this checkout already imported."""
+    cache = []
+
+    def load():
+        if not cache:
+            src = subprocess.run(["git", "-C", ROOT, "show", "%s:daemon/%s.py" % (tag, helper)], capture_output=True,
+                                 timeout=30).stdout
+            path = os.path.join(d, helper + ".py")
+            open(path, "wb").write(src)
+            key = helper + "_host"
+            saved = sys.modules.get(key)
+            sys.modules[key] = m
+            try:
+                spec = importlib.util.spec_from_file_location("%s_%s" % (helper, tag[1:].replace(".", "_")), path)
+                h = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(h)
+            finally:
+                if saved is None:
+                    sys.modules.pop(key, None)
+                else:
+                    sys.modules[key] = saved
+            cache.append(h)
+        return cache[0]
+    return load
 
 
 old = old_module()
@@ -930,15 +964,16 @@ for tag in tags + ["this checkout"]:
         bad = []
         saved_env = os.environ.get("OOMPH_NET_RESERVATIONS")
         os.environ["OOMPH_NET_RESERVATIONS"] = "0"   # off whatever the root-owned config.json says (D-N19)
+        knows_net = v >= (1, 15, 0)   # this checkout, and every tag from 1.15.0 on, knows the network flags
         try:
             for argv in NET_CMDS:
                 rc, calls, _ = drive(m, argv)
-                if m is not new and (rc != 2 or calls):
+                if not knows_net and (rc != 2 or calls):
                     bad.append("%s → %s %s (should refuse it, exit 2)" % (" ".join(argv), rc, calls[:1]))
-                elif m is new and (rc != 75 or calls):
+                elif knows_net and (rc != 75 or calls):
                     bad.append("%s → %s %s with the switch off (should refuse it, exit 75)" % (" ".join(argv), rc,
                                                                                                calls[:1]))
-                if m is new:
+                if knows_net:
                     os.environ["OOMPH_NET_RESERVATIONS"] = "1"
                     try:
                         rc, calls, _ = drive(m, argv)
@@ -951,15 +986,17 @@ for tag in tags + ["this checkout"]:
             if saved_env is not None:
                 os.environ["OOMPH_NET_RESERVATIONS"] = saved_env
         check(not bad, "S %s: the skill's network examples are %s" % (
-            tag, ("handed on with net_reservations on, refused (75) with it off" if m is new else
+            tag, ("handed on with net_reservations on, refused (75) with it off" if knows_net else
                   "refused with exit 2, no volume read as memory") if not bad else "; ".join(bad[:4])))
     if m is not new:
+        sys.modules.pop(m.__name__, None)   # old_module registered it: without this the tag's module stays loaded
         del m
         gc.collect()
 
 # --- N: samples with internet traffic (NET, 1.15) read by older readers: their summary (report, incidents), the slim
 # and full samples they send to another machine. The new blocks are additive: an old reader keeps working and leaves
-# them out (an unknown object never travels from an old slim_sample).
+# them out (an unknown object never travels from an old slim_sample). From 1.15.0 on (this checkout and its tags) a
+# reader sends the rates.
 NET = {"if": "en16", "vpn": False, "network": "rmac:00:00:5e:00:53:03", "src": "flows", "flows": 40, "down_mbps": 212.4,
        "up_mbps": 8.1, "lan_mbps": 0.1, "in_gb": 41.2, "out_gb": 3.1}
 NS = [dict(SAMPLE, t=NOW - 300 + 30 * i, iso="2026-11-26T03:%02d:00+01:00" % i, swap_used_gb=0.0, net=dict(NET),
@@ -970,18 +1007,20 @@ for tag in tags + ["this checkout"]:
     m = new if tag == "this checkout" else old_module(tag)
     if m is None:
         continue
+    knows_net = m is new or ver(tag) >= (1, 15, 0)   # every reader from 1.15.0 on sends the rates
     try:
         sm = m.summarize(list(NS), [])
         sl = m.slim_sample(dict(NS[0])) if hasattr(m, "slim_sample") else {}
         fu = m.full_sample(dict(NS[0])) if hasattr(m, "full_sample") else {}
-        if sm.get("samples") != 4 or (m is not new and ("net" in sl or "net_names" in fu or "top_net" in fu)):
+        if sm.get("samples") != 4 or (not knows_net and ("net" in sl or "net_names" in fu or "top_net" in fu)):
             bad.append("%s: %s" % (tag, [sm.get("samples"), sorted(sl)[:3]]))
-        if m is new and not (sm.get("max_net_down_mbps") == 212.4 and sl.get("net", {}).get("down_mbps") == 212.4
-                             and "in_gb" not in sl["net"]):
-            bad.append("this checkout: %s" % [sm.get("max_net_down_mbps"), sl.get("net")])
+        if knows_net and not (sm.get("max_net_down_mbps") == 212.4 and sl.get("net", {}).get("down_mbps") == 212.4
+                              and "in_gb" not in sl["net"]):
+            bad.append("%s: %s" % (tag, [sm.get("max_net_down_mbps"), sl.get("net")]))
     except Exception as e:  # noqa: B902
         bad.append("%s raised %r" % (tag, e))
     if m is not new:
+        sys.modules.pop(m.__name__, None)   # old_module registered it: without this the tag's module stays loaded
         del m
         gc.collect()
 check(not bad, "N: samples with net, net_names and top_net are summarized by every reader from 1.8.1 on; old slim and "
