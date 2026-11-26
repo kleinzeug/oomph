@@ -774,10 +774,11 @@ def _waiting_ids(o, default):
 
 def waited_resource(pool_id):
     """The resource of a pool id in `waiting_on` (02 §6.4): ram and mem, and "critical" (memory is critical), are
-    memory; cpu; gpu and vram; disk:<id> is disk."""
+    memory; cpu; gpu and vram; net.down and net.up the network (NET 1.15: no tile of its own yet, so no band says it);
+    disk:<id> is disk."""
     i = str(pool_id)
     return "memory" if i in ("ram", "mem", "critical") else "cpu" if i == "cpu" else \
-        "gpu" if i.startswith(("gpu", "vram")) else "disk"
+        "gpu" if i.startswith(("gpu", "vram")) else "net" if i.startswith("net.") else "disk"
 
 
 def holds(r, k, pool=None):

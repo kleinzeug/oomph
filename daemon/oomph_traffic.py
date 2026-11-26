@@ -11,7 +11,10 @@ by WIRE_X, or the connections' own sum where that is more (12.4).
 The backends run the programs and read the counters (oomph_darwin, oomph_linux: net_route, net_bytes, net_flows,
 router_mac, router_mac6); this module parses what they hand over as untrusted input (fixed limits on rows, line
 length and numbers), keeps the deltas between samples, picks the network's identity, reads and writes networks.json
-under the ledger lock, and answers `oomph net`, `oomph ps --net` and the network line of the other commands.
+under the ledger lock, and answers `oomph net`, `oomph ps --net` and the network line of the other commands. From N2
+(12.8–12.14) it also holds the reservations' part: the pools net.down and net.up, the leases' `net` and `net_up`
+parts (admission, a network that changes under a grant, what grants use, over, idle and the ETA), the logger's pools
+in current.json, the flags of reserve, run and amend, the MCP arguments and what `oomph run` hands a job.
 
 A part of oomph.py, kept apart so that what never meets the network (oomph top, the hook) does not compile or hold
 it: oomph._T() imports it and it reads oomph's names as its own (bound once, below). Standard library only."""
@@ -1040,21 +1043,29 @@ def public_id(key):
 
 
 def public_sample(s):
-    """A sample as an answer that leaves the machine: its net block's network as public_id (a copy; current.json
-    itself keeps the key for the commands that read it here)."""
-    n = net_block(s)
-    if n is None or "network" not in n:
+    """A sample as an answer that leaves the machine: the network of its net block and of its pools net.down and
+    net.up as public_id (a copy; current.json itself keeps the key for the commands that read it here)."""
+    n, pools = net_block(s), s.get("pools") if isinstance(s, dict) else None
+    hashed = {pid: dict(P, network=public_id(P["network"])) for pid, P in (pools or {}).items()
+              if isinstance(P, dict) and "network" in P} if isinstance(pools, dict) else {}
+    if (n is None or "network" not in n) and not hashed:
         return s
     out = dict(s)
-    out["net"] = dict(n, network=public_id(n.get("network")))
+    if n is not None and "network" in n:
+        out["net"] = dict(n, network=public_id(n.get("network")))
+    if hashed:
+        out["pools"] = dict(pools, **hashed)
     return out
 
 
-def network_info(s, nets=None, samples=None):
+def network_info(s, nets=None, samples=None, coord=None):
     """The `network` object of memory_check, memory_status and `oomph check --json` (12.13), or None where no
-    network is measured. `room` (N2) and `metered` (N3) are null until those parts exist. `id` is public_id: these
-    answers go to a model's provider (`oomph net --json` has the key itself). `src` "if": totals, the LAN's
-    traffic included."""
+    network is measured. `room`: [down, up] Mbit/s that can still be reserved (`coord`: coordination's answer, whose
+    `net` it is; {}: the pools less the grants the ledger holds, read without its lock; null without a pool, without
+    `coord`, or where coordination failed, {"error": …}: room is never counted without the grants), `reservable` while
+    net_reservations is on and a pool exists (`reservable_off` the switch where it is off); `metered`
+    (N3) is null until that part exists. `id` is public_id: these answers go to a model's provider (`oomph net
+    --json` has the key itself). `src` "if": totals, the LAN's traffic included."""
     b = net_block(s)
     if b is None:
         return None
@@ -1066,9 +1077,15 @@ def network_info(s, nets=None, samples=None):
     k, e = lookup(nets, b)
     cap = [e.get("down"), e.get("up")] if e and (e.get("down") or e.get("up")) else None
     st = stale(e, samples if samples is not None else recent_samples(), b.get("network"))
-    return {"id": public_id(k), "label": (e or {}).get("label"), "if": b.get("if"), "down_mbps": b.get("down_mbps"),
-            "up_mbps": b.get("up_mbps"), "cap": cap, "room": None, "vpn": bool(b.get("vpn")), "metered": None,
-            "stale": bool(st), "src": b.get("src")}
+    c = coord.get("net") if isinstance(coord, dict) else None
+    if coord == {}:   # no coordination asked for (memory_status): the pools less
+        c = net_coordination(s, _H._quietly_leases(), time.time())   # the grants as the ledger has them (no lock)
+    c = c or {}
+    room = [(c.get(d) or {}).get("available") for d in ("down", "up")] if c.get("down") or c.get("up") else None
+    return dict({"id": public_id(k), "label": (e or {}).get("label"), "if": b.get("if"), "down_mbps": b.get("down_mbps"),
+                 "up_mbps": b.get("up_mbps"), "cap": cap, "room": room, "vpn": bool(b.get("vpn")), "metered": None,
+                 "stale": bool(st), "src": b.get("src"), "reservable": bool(c.get("reservable"))},
+                **({"reservable_off": c["reservable_off"]} if c.get("reservable_off") else {}))
 
 
 def resource_line(s, nets=None, samples=None):
@@ -1524,3 +1541,1062 @@ def doctor_line(c=None):
         return ("network", "ok", "ss per TCP socket (other users' processes as root only) and /proc/net/dev" + logger)
     return ("network", "note", "totals only: ss (iproute2) is missing, so no process is named" + logger,
             "install iproute2 for the internet traffic per process")
+
+
+# ------------------------------------------------------------------ reservations (N2; 12.8–12.14)
+# Two rate parts per lease, like cores (02 §6.1): `res.net` (download, pool net.down) and `res.net_up` (upload,
+# net.up), each with what it asked and its minimum (Mbit/s of payload), what it got, used and peaked at, and a
+# volume it means to move (`gb`) with what it moved and an ETA. The pools exist only while this network has a
+# figure (D-N3); elsewhere a part is granted unmanaged (D-N14): no rate, the volume still counted. New parts only
+# while net_reservations is on (D-N16); evaluating, measuring, ending and showing them always run.
+NET_DIRS = (("net", "net.down", "down", "down_mbps"), ("net_up", "net.up", "up", "up_mbps"))
+NET_LINE_MIN = 1.0       # Mbit/s a line has to share (figure − margin) at least: a slower one is too slow to share
+NET_BUSY_X, NET_BUSY_N = 0.9, 3   # a pool reads busy after this many samples in a row at this share of its figure
+NET_AVG_S = 60.0         # an ETA is taken at the mean `used` of about this long (a moving average)
+_NET_MEASURED = ("used", "peak", "avg", "eta", "vol_t") + ADVICE_FIELDS   # a part's figures, not its request
+_NET_KW = ("net_gb", "net_up_gb", "net_mbps", "net_min_mbps", "net_up_mbps", "net_up_min_mbps")
+
+
+def net_margin(d, cap):
+    """What the household keeps of the line (D-N6, a fixed rule like the cores'): max(10, 25 %) of the download,
+    max(5, 30 %) of the upload (calls die on the uplink first), one decimal."""
+    return round(max(10.0, 0.25 * cap) if d == "down" else max(5.0, 0.30 * cap), 1)
+
+
+def net_switch_text(plain=None):
+    """The refusal of a network part while the switch is off (12.11): why, and how to switch it on (for everyone, for
+    one command); `plain` as gpu_switch_text's."""
+    head = ("Network reservations are switched off on this machine (%s 1.15 ships them off until they have been tried "
+            "on real lines). To switch them on for everyone" % BRAND)
+    tail = "For one command: `OOMPH_NET_RESERVATIONS=1 oomph reserve …`. Memory, cores and disk can be reserved as usual."
+    if os.path.lexists(CONFIG_FILE):
+        how, lead, paste = "add \"net_reservations\": true to %s (with sudo)" % CONFIG_FILE, \
+            ", add \"net_reservations\": true to this file (with sudo):", CONFIG_FILE
+    else:
+        paste = "sudo mkdir -p \"%s\"; echo '{\"net_reservations\": true}' | sudo tee \"%s\"" % (
+            os.path.dirname(CONFIG_FILE), CONFIG_FILE)
+        how, lead = paste, ", run:"
+    if plain is None:
+        return "%s: %s. %s" % (head, how, tail)
+    return "%s\n    %s\n%s" % (wrap(head + lead, first=plain), paste, wrap(tail, first="  "))
+
+
+# --- what commands take (12.12)
+_RATE_SPLIT = re.compile(r"/(?![sS](?:/|\Z))")   # DOWN/UP, never the slash of "Mbit/s"
+
+
+def parse_rate_range(x):
+    """`200M` (elastic: from half of it), `100M..200M`, `200M..200M` (exactly that): (ask, min); ValueError."""
+    lo, sep, hi = str(x).strip().partition("..")
+    if not sep:
+        a = _cn(parse_rate(lo))
+        return a, _cn(elastic_min(a))
+    lv, hv = _cn(parse_rate(lo)), _cn(parse_rate(hi))
+    if lv > hv:
+        raise ValueError("%s: the lowest rate comes first (e.g. 100M..200M)" % x)
+    return hv, lv
+
+
+def parse_net_rate(x):
+    """--net-rate's DOWN[/UP], each a rate or a range (`100M..200M/10M..20M`, `/20M`: upload only):
+    ((ask, min) or None, (ask, min) or None); ValueError with the reason."""
+    s = str(x).strip()
+    parts = _RATE_SPLIT.split(s)
+    if len(parts) > 2:
+        raise ValueError("not a rate: %s (DOWN/UP in Mbit/s, e.g. 200M or 200M/20M)" % s)
+    d = parse_rate_range(parts[0]) if parts[0].strip() else None
+    u = parse_rate_range(parts[1]) if len(parts) == 2 and parts[1].strip() else None
+    if d is None and u is None:
+        raise ValueError("not a rate: %s (DOWN/UP in Mbit/s, e.g. 200M or 200M/20M)" % s)
+    return d, u
+
+
+def net_opts(o, zero=False):
+    """reserve's, run's and amend's network flags as reserve()'s keywords (net_gb, net_up_gb, net_mbps, net_min_mbps,
+    net_up_mbps, net_up_min_mbps): {} without one; UsageError with the reason. `zero` (amend): `--net 0` and
+    `--net-up 0` drop that direction's part."""
+    out = {}
+    for flag, k in (("--net", "net_gb"), ("--net-up", "net_up_gb")):
+        if flag in o:
+            v = str(o[flag]).strip()
+            try:
+                out[k] = 0.0 if zero and re.fullmatch(r"0+(\.0*)?(g|gb)?", v, re.I) else parse_volume(v)
+            except ValueError as e:
+                raise UsageError("%s %s: %s" % (flag, v, e))
+    if "--net-rate" in o:
+        try:
+            d, u = parse_net_rate(o["--net-rate"])
+        except ValueError as e:
+            raise UsageError("--net-rate %s: %s" % (o["--net-rate"], e))
+        if d:
+            out.update(net_mbps=d[0], net_min_mbps=d[1])
+        if u:
+            out.update(net_up_mbps=u[0], net_up_min_mbps=u[1])
+    for flag, gb, mb in (("--net", "net_gb", "net_mbps"), ("--net-up", "net_up_gb", "net_up_mbps")):
+        if out.get(gb) == 0 and mb in out:
+            raise UsageError("%s 0 drops that part: it takes no rate with it (leave out --net-rate's %s)" % (
+                flag, "upload" if mb == "net_up_mbps" else "download"))
+    return out
+
+
+def net_mcp_args(name, a):
+    """The MCP tools' network arguments (12.12): numbers only (a string is refused with the parser's words), a rate
+    1 to 100 000 Mbit/s, a volume 0.01 to 1 000 000 GB (update_reservation: 0 drops that direction's part), a
+    minimum only with its rate and not above it."""
+    for k in _NET_KW:
+        x = a.get(k)
+        if x is None:
+            continue
+        rate = k.endswith("mbps")
+        if isinstance(x, str):
+            try:
+                (parse_rate if rate else parse_volume)(x)
+                why = "takes a number (%s), not a string" % ("Mbit/s" if rate else "GB")
+            except ValueError as e:
+                why = "takes a number: %s" % e
+            raise ToolArgError("%s: %s %s" % (name, k, why))
+        if not _num(x, -1e15, 1e15):
+            raise ToolArgError("%s: %s takes a number, not %r" % (name, k, x))
+        if not ((name == "update_reservation" and k in ("net_gb", "net_up_gb") and x == 0) or
+                ((RATE_MIN <= round(x, 1) <= RATE_MAX) if rate else (VOL_MIN <= round(x, 3) <= VOL_MAX))):
+            raise ToolArgError("%s: %s takes %s, not %r" % (name, k, "1 to 100000 (Mbit/s)" if rate else
+                                                             "0.01 to 1000000 (GB)", x))
+    for lo, hi in (("net_min_mbps", "net_mbps"), ("net_up_min_mbps", "net_up_mbps")):
+        if a.get(lo) is not None and (a.get(hi) is None or a[lo] > a[hi]):
+            raise ToolArgError("%s: %s comes with %s, and is not above it" % (name, lo, hi))
+
+
+def net_kw(a):
+    """The MCP arguments as reserve()'s and amend()'s keywords: rates to one decimal, volumes to three."""
+    return {k: (_cn(round(float(a[k]), 1)) if k.endswith("mbps") else round(float(a[k]), 3))
+            for k in _NET_KW if a.get(k) is not None}
+
+
+# --- the parts of a lease, and the network as admission sees it (12.8–12.10)
+def _part(r, k):
+    """A lease's network part `k` ("net" or "net_up") as it is, or None."""
+    res = r.get("res") if ledger_version(r) >= 2 and isinstance(r.get("res"), dict) else {}
+    x = res.get(k)
+    return x if isinstance(x, dict) else None
+
+
+def net_parts(r):
+    """A lease's network parts (12.9): {"net": part or None, "net_up": part or None}; None without one; False when
+    a part is not one this code reads (it then cannot weigh the lease, 02 §9.3): a managed part needs what it asked
+    (1 to 100 000 Mbit/s) and a minimum not above it; an unmanaged one a volume or a rate."""
+    res = r.get("res") if ledger_version(r) >= 2 and isinstance(r.get("res"), dict) else {}
+    if "net" not in res and "net_up" not in res:
+        return None
+    out = {}
+    for k, _, _, _ in NET_DIRS:
+        x = res.get(k)
+        if x is None:
+            out[k] = None
+            continue
+        if not isinstance(x, dict) or ("unmanaged" in x and not isinstance(x["unmanaged"], bool)):
+            return False
+        if "ask" in x and not (_num(x["ask"], RATE_MIN, RATE_MAX) and _num(x.get("min", x["ask"]), 0.1, x["ask"])):
+            return False
+        if "gb" in x and not _num(x["gb"], VOL_MIN, VOL_MAX):
+            return False
+        if "ask" not in x and not (x.get("unmanaged") is True and "gb" in x):
+            return False
+        out[k] = x
+    return out
+
+
+def net_need(r):
+    """What a lease asks of the network's pools (lease_need): {pool id: (least, wanted)} of its managed parts."""
+    np_ = net_parts(r) or {}
+    out = {}
+    for k, pid, _, _ in NET_DIRS:
+        x = np_.get(k)
+        if x and not x.get("unmanaged") and "ask" in x:
+            out[pid] = (x.get("min", x["ask"]), x["ask"])
+    return out
+
+
+def net_inputs(s, live=True):
+    """The sample with the network it is on: as it is when it has a net block (the logger's, or one handed in), else,
+    with `live`, read now without a window (the egress and the router's identity: no traffic, a few ms);
+    {"if": None} where this system measures no network or is offline."""
+    if net_block(s) is not None or not live:
+        return s
+    try:
+        eg, k = _ident_live()
+    except Exception:  # noqa: B902  (an unsupported backend, a failing route: no network to reserve)
+        eg, k = None, None
+    if not eg:
+        return dict(s, net={"if": None})
+    if k:
+        try:
+            k = resolve(read_networks()["networks"], k, eg.get("gw"), eg.get("subnet"))
+        except LedgerError:
+            pass
+    return dict(s, net=dict({"if": eg["if"], "vpn": bool(eg.get("tun")), "src": "id"}, **({"network": k} if k else {})))
+
+
+def net_view(s, leases, now, nets=None):
+    """The network as admission sees it (12.8): {"known": the sample names the network (or says it is offline),
+    "network": the key networks.json keeps it under, "entry", "pools": {net.down, net.up: {cap, margin, reserved,
+    room, others, idle, busy}} for each direction with a figure the household can share, "why": {pool id: why it
+    has none: "unknown", "slow", "offline"}}. `room` = cap − margin − Σ got of grants here; `others` the logger's
+    smoothed figure from current.json's pools while fresh, else the sample's rate less what grants use (each at
+    most what it got), else None (no logger: idle = room)."""
+    b = net_block(s)
+    out = {"known": b is not None, "network": None, "entry": None, "pools": {}, "why": {}}
+    if b is None:
+        return out
+    key = b.get("network") if b.get("if") else None
+    if key:
+        if nets is None:
+            try:
+                nets = read_networks()["networks"]
+            except LedgerError:
+                nets = {}
+        key = resolve(nets, key)
+        out.update(network=key, entry=nets.get(key))
+    sp = s.get("pools") if isinstance(s.get("pools"), dict) else {}
+    fresh = _t(sp.get("t")) and abs(now - sp["t"]) <= POOLS_MAX_AGE_S
+    for k, pid, fig, rk in NET_DIRS:
+        cap = (out["entry"] or {}).get(fig)
+        if not key or not _num(cap, FIG_MIN, FIG_MAX):
+            out["why"][pid] = "offline" if not b.get("if") else "unknown"
+            continue
+        margin = net_margin(fig, cap)
+        if cap - margin < NET_LINE_MIN:
+            out["why"][pid] = "slow"
+            continue
+        grants = [x for x in (_part(r, k) for r in leases if r["state"] == "granted")
+                  if x and not x.get("unmanaged") and _num(x.get("got")) and x.get("network") == key]
+        reserved = sum(x["got"] for x in grants)
+        P = sp.get(pid) if fresh and isinstance(sp.get(pid), dict) and sp[pid].get("network") in (key, b.get("network")) \
+            else {}
+        if _num(P.get("others"), 0, FIG_MAX):
+            others = P["others"]
+        elif _num(b.get(rk), 0, 1e6):
+            others = max(0.0, b[rk] - sum(min(x["used"] if _num(x.get("used")) else 0.0, x["got"]) for x in grants))
+        else:
+            others = None
+        room = cap - margin - reserved
+        out["pools"][pid] = {"cap": cap, "margin": margin, "reserved": reserved, "room": room, "others": others,
+                             "idle": None if others is None else room - others, "busy": b.get(rk)}
+    return out
+
+
+def _half_line(P):
+    """What a volume without a rate asks (12.10): half of what the line can share, whole Mbit/s (two pulls run side
+    by side, a third waits), and at least half of that."""
+    a = max(1, int(math.floor((P["cap"] - P["margin"]) / 2.0 + 1e-9)))
+    return a, max(1, elastic_min(a))
+
+
+def _unmanaged_note(why, k):
+    """Why a part runs without a rate here (D-N14), and what makes it a managed one."""
+    d = "" if k == "net" else "upload "
+    if why == "slow":
+        return "this line is too slow to share: the %spart is not limited" % d
+    if why == "offline":
+        return "this machine is offline: the network part is not limited"
+    return "this network's %scapacity is unknown: %s" % (d, "oomph net set DOWN/UP" if getattr(plat(), "OS", "") == "linux"
+                                                         else "oomph net test")
+
+
+def net_request(s, kw, now):
+    """A new request's network parts (12.10) on the network `s` names (net_inputs): ({k: part}, refusal or None).
+    A rate asks for itself, its minimum half of it unless named; a volume alone asks for half of what the line can
+    share; on a network without a figure (offline, or too slow to share) a part is unmanaged from the start.
+    Refused: a minimum above what the line can share at all (it could never be granted)."""
+    nv = net_view(s, [], now)
+    parts = {}
+    for k, pid, fig, _ in NET_DIRS:
+        up = k == "net_up"
+        gb, ask, lo = kw.get(k + "_gb"), kw.get("net_up_mbps" if up else "net_mbps"), \
+            kw.get("net_up_min_mbps" if up else "net_min_mbps")
+        if gb is None and ask is None:
+            continue
+        part, P = ({"gb": round(float(gb), 3)} if gb else {}), nv["pools"].get(pid)
+        if ask is not None:
+            ask = _cn(round(float(ask), 1))
+            lo = _cn(elastic_min(ask)) if lo is None else _cn(min(round(float(lo), 1), ask))
+            part.update(ask=ask, min=lo)
+            share = P["cap"] - P["margin"] if P else None
+            if share is not None and lo > share + 1e-9:
+                return None, ("Can't reserve %s Mbit/s %s: this line has %s Mbit/s to share (%s of its %s are kept "
+                              "for the household), so %s can never be granted. Ask for less, or for a range that "
+                              "starts lower (--net-rate %s%s..%s)." % (
+                                  cores_text(lo), "up" if up else "down", "%g" % round(share, 1),
+                                  "%g" % P["margin"], "%g" % P["cap"],
+                                  "%s..%s" % (cores_text(lo), cores_text(ask)) if lo < ask else "%sM" % cores_text(ask),
+                                  "/" if up else "", cores_text(max(1, int(share // 2))), cores_text(ask)))
+        elif P:
+            a, m = _half_line(P)
+            part.update(ask=a, min=m, auto=True)
+        if not P and nv["known"]:
+            part["unmanaged"] = True
+        if nv["network"]:
+            part["network"] = nv["network"]
+        parts[k] = part
+    return parts, None
+
+
+def net_prepare(r, nv):
+    """A queued lease's parts as this network has them, before it is weighed: managed where a pool is (a volume alone
+    then asks for half this line: `auto`, asked again on each new network), unmanaged where none is; `network` where
+    they were weighed last. As they are while nothing says which network this is, and while this machine is offline
+    (a sample without egress, a laptop waking or roaming, says nothing about the next network: a managed part keeps
+    waiting, never starts unmanaged, D-N12). Returns the pools it is short of (net_fit)."""
+    if not nv["known"] or nv["network"] is None and set(nv["why"].values()) == {"offline"}:
+        return net_fit(r, nv)
+    for k, pid, _, _ in NET_DIRS:
+        x = _part(r, k)
+        if x is None:
+            continue
+        P = nv["pools"].get(pid)
+        if P and (x.get("unmanaged") or "ask" not in x or x.get("auto") and x.get("network") != nv["network"]):
+            x.pop("unmanaged", None)
+            if "ask" not in x or x.get("auto"):
+                x["ask"], x["min"] = _half_line(P)
+                x["auto"] = True
+        elif not P and not x.get("unmanaged"):
+            x["unmanaged"] = True
+        if nv["network"]:
+            x["network"] = nv["network"]
+        else:
+            x.pop("network", None)
+    return net_fit(r, nv)
+
+
+def net_fit(r, nv):
+    """The pools a queued lease's managed parts are short of (12.10): what can still be reserved there must cover
+    its minimum; while no evaluation names the network, it waits for one that does."""
+    short = set()
+    for pid, (lo, _) in net_need(r).items():
+        P = nv["pools"].get(pid)
+        if P is None or P["room"] < lo - 1e-9:
+            short.add(pid)
+    return short
+
+
+def _clean(x, drop=()):
+    """A part's request alone: without what was measured of it (and the fields in `drop`)."""
+    return {f: v for f, v in x.items() if f not in _NET_MEASURED and f not in drop}
+
+
+def net_grant(r, nv, now):
+    """Grants a request's network parts here (12.10): each between its minimum and what it asked, as much as is idle
+    (all it asked, as far as room goes, while nothing says how busy the line is), whole Mbit/s unless a fraction was
+    asked; a part without a pool here unmanaged. The pools shrink. Returns the notes."""
+    notes = []
+    for k, pid, fig, _ in NET_DIRS:
+        x = _part(r, k)
+        if x is None:
+            continue
+        P = nv["pools"].get(pid)
+        where = {"network": nv["network"]} if nv["network"] else {}
+        if x.get("unmanaged") or not P:
+            r["res"][k] = dict(_clean(x, ("got", "network")), unmanaged=True, **where)
+            notes.append(_unmanaged_note(nv["why"].get(pid), k))
+            continue
+        lo, hi = x.get("min", x["ask"]), x["ask"]
+        top = min(hi, P["room"])
+        got = _cn(max(lo, _cores(top if P["idle"] is None else min(max(0.0, P["idle"]), top), hi)))
+        if got < hi:
+            notes.append(("the line is busy with traffic that holds no reservation (%s of %s Mbit/s %s): granted %s of "
+                          "the %s Mbit/s asked" % (_mb(P["others"]), _mb(P["cap"]), fig, cores_text(got), cores_text(hi)))
+                         if P["idle"] is not None and P["idle"] < top else
+                         ("other reservations hold %s of the %s Mbit/s %s that can be reserved: granted %s of the %s asked"
+                          % (cores_text(_cn(round(P["reserved"], 1))), _mb(P["cap"] - P["margin"]), fig, cores_text(got),
+                             cores_text(hi))))
+        if P["others"] is None:
+            notes.append("the line's load is not measured right now")
+        part = dict(_clean(x, ("unmanaged",)), got=got, **where)
+        if _num(part.get("gb")):
+            part["eta"] = round(now + max(0.0, part["gb"] - (part.get("moved") or 0.0)) * 8000.0 / got)
+        r["res"][k] = part
+        P["room"] -= got
+        P["reserved"] += got
+        if P["idle"] is not None:
+            P["idle"] -= got
+    return list(dict.fromkeys(notes))
+
+
+def net_rehome(L, nv, now):
+    """Network parts of grants made on another network (a laptop moved, §11 Q1): at the first evaluation that names
+    this network they are granted again here, in grant order, each what it had (what it asked, while unmanaged) as far
+    as the room left goes, with no minimum (a running job never waits) but at least 1 Mbit/s (a limit of 0 reads as
+    none: the pool is then over-committed, and the note says the line is fully reserved); on a network without a
+    figure they are unmanaged. Volumes and what was moved stay; a note says it."""
+    key = nv["network"]
+    if not nv["known"] or key is None:
+        return
+    for r in sorted((r for r in L["leases"] if r["state"] == "granted" and net_parts(r)), key=lambda r: r["granted"]):
+        notes = []
+        for k, pid, fig, _ in NET_DIRS:
+            x = _part(r, k)
+            if x is None or x.get("network") == key:
+                continue
+            P = nv["pools"].get(pid)
+            base = _clean(x, ("got", "unmanaged", "network"))
+            if P:
+                was = x["got"] if not x.get("unmanaged") and _num(x.get("got")) else x.get("ask") or _half_line(P)[0]
+                full = P["room"] < 1 - 1e-9
+                got = _cn(max(1, _cores(max(0.0, min(was, P["room"])), was)))
+                if "ask" not in base:
+                    base["ask"], base["min"] = got, _cn(elastic_min(got))
+                r["res"][k] = dict(base, got=got, network=key)
+                P["room"] -= got
+                P["reserved"] += got
+                if P["idle"] is not None:
+                    P["idle"] -= got
+                notes.append("network changed: now %s Mbit/s %s%s" % (cores_text(got), fig, " (the line is fully "
+                                                                               "reserved: the least a limit takes)"
+                                                                               if full else ""))
+            else:
+                r["res"][k] = dict(base, unmanaged=True, network=key)
+                notes.append("network changed: " + _unmanaged_note(nv["why"].get(pid), k))
+        if notes:
+            r["note"] = "; ".join(dict.fromkeys(notes))
+
+
+def _trees(procs, children, r):
+    """The pids of a lease's watched trees (12.4): its holder's or job's (`watch`), watch_also, watch_names."""
+    roots = [r.get("watch")] + [w["pid"] for w in r.get("watch_also") or () if isinstance(w, dict) and _pid(w.get("pid"))]
+    names = set(r.get("watch_names") or ())
+    if names:
+        roots += [p for p, x in procs.items() if x.get("name") in names]
+    stack, seen = [x for x in roots if x is not None], set()
+    while stack:
+        x = stack.pop()
+        if x in seen or x not in procs:
+            continue
+        seen.add(x)
+        stack.extend(children.get(x, []))
+    return seen
+
+
+def _vol_flag(x, now):
+    """`over` once a part moved more than its volume (12.10), since it first did (`vol_t`): advice, never enforced."""
+    if _num(x.get("gb")) and _num(x.get("moved")) and x["moved"] > x["gb"] + 0.0005:
+        if not _t(x.get("vol_t")):
+            x["vol_t"] = round(now, 1)
+        if x.get("flag") != "over":
+            x["flag"], x["over_t"] = "over", x["vol_t"]
+    else:
+        x.pop("vol_t", None)
+
+
+def _eta(x, now):
+    """When a part's volume will have moved (12.10): what is left at the mean of the last minute's `used` when it is
+    1 Mbit/s or more, else at what it got; none without a volume, or once it has moved."""
+    left = (x["gb"] - (x.get("moved") or 0.0)) if _num(x.get("gb")) else 0.0
+    r = x["avg"] if _num(x.get("avg"), 1, 1e6) else x.get("got") if _num(x.get("got"), 0.1, 1e6) else None
+    if left > 0 and r:
+        x["eta"] = round(now + left * 8000.0 / r)
+    else:
+        x.pop("eta", None)
+
+
+def charge_net(L, s, procs, children, now, tick):
+    """What each network grant uses and has moved (12.4, 12.10), from the logger's internet bytes per process this
+    interval (procs' `ni`, `no`) over its interval (`tick`: {dt, complete}): only the logger's child has them. Grants
+    watching the same processes share their bytes in grant order, as memory and cores do (§4.1): each part takes of
+    what is left of its trees' bytes at most what it got, and one that no later grant's part that way shares a
+    process with (or an unmanaged one, which got no rate) takes all that is left, so what a holder moves beyond its
+    grant shows in its own `used`, and Σ used never exceeds what the connections moved, nor those the line. Agents
+    share a tree as a rule: reserve watches the session's root, so every reservation of one session and its
+    subagents watches the same processes. `over` (more than 1.25 × got twice in a row, or more than its volume),
+    `idle` and the ETA.
+
+    Where the logger names no process (`complete` false: the Linux system service, which sees no connection's owner,
+    or nettop backing off) the line's totals are shared out instead (N1 decision A): the managed parts in grant order,
+    each at most what it got, then what is left in equal shares to the unmanaged ones. Those totals are the
+    interface's: they include the LAN's traffic and other users' (a NAS copy, an rsync to the next machine), so in this
+    mode `used`, `moved` and the ETA are estimates, shown as such; no grant is called idle for lack of per-process
+    figures, and none newly `over` its volume (one already over it stays so; the rate's `over` stays: it is at most
+    what it got there)."""
+    dt = tick.get("dt") if isinstance(tick, dict) else None
+    b = net_block(s) or {}
+    if not _num(dt, 0.5, MAX_DT_S) or not b.get("if"):
+        return
+    rs = sorted((r for r in L["leases"] if r["state"] == "granted" and net_parts(r)), key=lambda r: r["granted"])
+    full = tick.get("complete") is True
+    left = {k: b[rk] if _num(b.get(rk), 0, 1e6) else 0.0 for k, _, _, rk in NET_DIRS}
+    if full:   # bytes of each watched process this interval not yet taken by a grant, per direction
+        trees = [_trees(procs, children, r) for r in rs]
+        every = set().union(*trees)
+        rem = {k: {p: float(procs[p][f]) if _int(procs[p].get(f), 0, 2 ** 63) else 0.0 for p in every}
+               for k, f in (("net", "ni"), ("net_up", "no"))}
+    rows = []   # (part, used, managed) in grant order
+    for i, r in enumerate(rs):
+        for k, _, _, _ in NET_DIRS:
+            x = _part(r, k)
+            if x is None:
+                continue
+            managed = not x.get("unmanaged") and _num(x.get("got"))
+            if full:
+                pids = trees[i]
+                later = pids & set().union(*(trees[j] for j in range(i + 1, len(rs)) if _part(rs[j], k) is not None))
+                want = sum(rem[k][p] for p in pids)
+                take = min(want, x["got"] * dt * 125000.0) if managed and later else want
+                took = take
+                for p in sorted(pids, key=lambda p: (p in later, p)):   # first what no later grant shares
+                    if take <= 0:
+                        break
+                    d = min(rem[k][p], take)
+                    rem[k][p] -= d
+                    take -= d
+                rows.append((k, x, took * 8.0 / dt / 1e6, managed))
+            elif managed:
+                u = min(x["got"], max(0.0, left[k]))
+                left[k] -= u
+                rows.append((k, x, u, True))
+            else:
+                rows.append((k, x, None, False))   # its share of what the managed parts left, below
+    if not full:
+        n = {k: sum(1 for kk, _, u, _ in rows if kk == k and u is None) for k, _, _, _ in NET_DIRS}
+        rows = [(k, x, max(0.0, left[k]) / n[k] if u is None else u, m) for k, x, u, m in rows]
+    for k, x, u, managed in rows:
+        x["used"] = round(u, 2)
+        x["peak"] = round(max(x["peak"] if _num(x.get("peak")) else 0.0, u), 2)
+        x["moved"] = round((x["moved"] if _num(x.get("moved")) else 0.0) + u * dt / 8000.0, 4)
+        a = min(1.0, dt / NET_AVG_S)
+        x["avg"] = round(u if not _num(x.get("avg")) else x["avg"] + a * (u - x["avg"]), 2)
+        if managed:
+            vol = not full and x.get("flag") == "over" and _t(x.get("vol_t"))   # over its volume: kept from totals
+            _rate_flag(x, u, now)
+            if vol and x.get("flag") != "over":
+                x["flag"], x["over_t"] = "over", x["vol_t"]
+            if not full:   # shared out from the totals: never idle for lack of per-process figures
+                x.pop("low_t", None)
+                if x.get("flag") == "idle":
+                    x.pop("flag")
+        if full:
+            _vol_flag(x, now)
+        _eta(x, now)
+        _rated(x, now)
+
+
+def net_state(nv):
+    """The ledger state's network numbers (_available, coordination): per direction its figure, margin, what is
+    reserved, what can still be reserved and what of that is idle."""
+    out = {}
+    for _, pid, fig, _ in NET_DIRS:
+        P = nv["pools"].get(pid)
+        if P:
+            out.update({"net_%s_cap" % fig: P["cap"], "net_%s_margin" % fig: P["margin"],
+                        "net_%s_reserved" % fig: round(P["reserved"], 1), "net_%s_available" % fig: round(P["room"], 1)})
+            if P["idle"] is not None:
+                out["net_%s_idle" % fig] = round(P["idle"], 1)
+    return out
+
+
+# --- what holders and readers are told (12.10, 12.13)
+def limit_bps(mbps):
+    """A rate in Mbit/s as a limiter takes it: integer bytes per second (curl, wget and aria2c read M as MiB)."""
+    return int(round(mbps * 125000))
+
+
+def _dur(sec):
+    """A duration in minutes, or hours and minutes from two hours on."""
+    m = max(1, int(round(sec / 60.0)))
+    return "%d min" % m if m < 120 else "%d h %d min" % divmod(m, 60) if m % 60 else "%d h" % (m // 60)
+
+
+def net_status(r, out, now):
+    """_status's network parts: `asked`; for a grant `granted`, run_with's net_mbps, limit, net_up_mbps, up_limit
+    (integer bytes per second) and eta_s, and the advice's first sentence (returned). An unmanaged part hands on no
+    rate: run_with says 0 (no limit) and net_unmanaged."""
+    np_ = net_parts(r) or {}
+    a = out.setdefault("asked", {})
+    for k, _, _, _ in NET_DIRS:
+        x, p = np_.get(k), "net_" if k == "net" else "net_up_"
+        if not x:
+            continue
+        a.update((p + f, x[g]) for f, g in (("mbps", "ask"), ("min_mbps", "min"), ("gb", "gb")) if _num(x.get(g)))
+        if x.get("unmanaged"):
+            a[p + "unmanaged"] = True
+    if r["state"] != "granted":
+        return ""
+    g, rw, say, eta = out.setdefault("granted", {}), out.setdefault("run_with", {}), [], []
+    for k, _, fig, _ in NET_DIRS:
+        x = np_.get(k)
+        if not x:
+            continue
+        lim = "limit" if k == "net" else "up_limit"
+        mb = "net_mbps" if k == "net" else "net_up_mbps"
+        if x.get("unmanaged") or not _num(x.get("got")):
+            rw.update({mb: 0, lim: 0, "net_unmanaged": True})
+            continue
+        g[mb] = rw[mb] = x["got"]
+        rw[lim] = limit_bps(x["got"])
+        say.append("%s Mbit/s%s" % (cores_text(x["got"]), "" if k == "net" else " up"))
+        if _num(x.get("gb")):
+            left = max(0.0, x["gb"] - (x.get("moved") or 0.0))
+            avg = x.get("avg") if _num(x.get("avg"), 1, 1e6) and _num(x.get("moved"), 0.0005) else None
+            secs = left * 8000.0 / (avg or x["got"])
+            if k == "net" or "eta_s" not in rw:
+                rw["eta_s"] = int(round(secs))
+            eta.append(("%s GB%s moved, more than reserved" % (_gbv(x["moved"]), "" if k == "net" else " up"))
+                       if left <= 0 else
+                       ("%s GB%s at %s Mbit/s ≈ %s" % (_gbv(x["gb"]), "" if k == "net" else " up", cores_text(x["got"]),
+                                                       _dur(secs))) if avg is None else
+                       ("%s of %s GB%s moved, ≈ %s left at %s Mbit/s" % (_gbv(x["moved"]), _gbv(x["gb"]),
+                                                                         "" if k == "net" else " up", _dur(secs), _mb(avg))))
+    if not say:
+        return "No rate is handed on: this network's capacity is unknown, so the transfer is not limited (the volume " \
+            "is still counted). " if rw.get("net_unmanaged") else ""
+    first = rw.get("limit") or rw.get("up_limit")
+    text = "Run at %s (curl --limit-rate %d; oomph run adds it)%s. " % (
+        " and ".join(say), first, ": " + ", ".join(eta) if eta else "")
+    if rw.get("eta_s") and r.get("expires") and now + rw["eta_s"] > r["expires"]:
+        text += "That is longer than the reservation lives: extend it (--ttl), or use oomph run. "
+    return text
+
+
+def _gbv(x):
+    """GB as people read them: 0.15, 4, 39.8."""
+    return "%g" % round(x, 2) if x < 10 else "%g" % round(x, 1)
+
+
+def net_wait_text(r, waiting, st):
+    """Why a request waits for the network, for its advice (it waits for net.down or net.up)."""
+    for k, pid, fig, _ in NET_DIRS:
+        x = _part(r, k)
+        if not x or pid not in waiting:
+            continue
+        room = st.get("net_%s_available" % fig)
+        if not _num(room):
+            return "the network is not measured right now: it is weighed once it is"
+        lo, ask = x.get("min", x.get("ask")), x.get("ask")
+        if _num(lo) and room < lo:
+            return "you asked for %s %s Mbit/s %s, and %g can be reserved now while other reservations hold %g" % (
+                "exactly" if lo >= ask else "at least", cores_text(lo), fig, round(max(0.0, room), 1),
+                round(st.get("net_%s_reserved" % fig) or 0, 1))
+    return "an earlier request waits for the network"
+
+
+def net_brief(r, b):
+    """A reservation row's network parts (_brief; never the network's key): `net`, `net_up` (Mbit/s granted, or asked
+    while queued; none unmanaged), their `_used`, and the volumes `_gb` with what was `_moved`."""
+    granted = r["state"] == "granted"
+    for k, _, _, _ in NET_DIRS:
+        x = _part(r, k)
+        if not x:
+            continue
+        a = x.get("got") if granted else x.get("ask")
+        if not x.get("unmanaged") and _num(a):
+            b[k] = a
+        if granted and _num(x.get("used")):
+            b[k + "_used"] = x["used"]
+        for f, g in (("_gb", "gb"), ("_moved", "moved")):
+            if _num(x.get(g)):
+                b[k + f] = x[g]
+
+
+def net_brief_text(b):
+    """A reservation row's network part (_fmt_brief): "↓150 Mbit/s 12.3/40G, ↑20 Mbit/s, "."""
+    out = []
+    for k, arrow in (("net", "↓"), ("net_up", "↑")):
+        if not any(_num(b.get(k + f)) for f in ("", "_gb")):
+            continue
+        rate = "%s Mbit/s" % cores_text(b[k]) if _num(b.get(k)) else "unmanaged"
+        vol = (" %s/%sG" % (_gbv(b.get(k + "_moved") or 0.0), _gbv(b[k + "_gb"]))) if _num(b.get(k + "_gb")) else ""
+        out.append("%s%s%s, " % (arrow, rate, vol))
+    return "".join(out)
+
+
+def net_flag_text(r, k, f, t, now):
+    """The words for a holder about its network part's `over` / `idle` (flag_advice), a sentence and a space."""
+    x = _part(r, k) or {}
+    d = "" if k == "net" else " up"
+    flag = "--net" if k == "net" else "--net-up"
+    if f == "over" and _num(x.get("gb")) and _num(x.get("moved")) and x["moved"] > x["gb"]:
+        return "Moved %s GB%s, more than the %s GB reserved: grow the volume (`oomph amend %s %s %sG`). " % (
+            _gbv(x["moved"]), d, _gbv(x["gb"]), r["id"], flag, _gbv(max(x["moved"] * 1.25, x["gb"] + 1)))
+    if f == "over" and _num(x.get("got")):
+        return ("Your processes move %s Mbit/s%s, more than the %s granted: limit the tool (curl --limit-rate %d), or "
+                "amend the reservation (`oomph amend %s --net-rate %s%sM`). " % (
+                    _mb(x["used"]) if _num(x.get("used")) else "more", d, cores_text(x["got"]), limit_bps(x["got"]),
+                    r["id"], "/" if k == "net_up" else "", cores_text(_cn(math.ceil(x.get("used") or x["got"])))))
+    if f == "idle" and _num(x.get("got")):
+        return "Your %s Mbit/s%s of the line have been nearly idle%s: release them, or drop them (`oomph amend %s %s 0`). " % (
+            cores_text(x["got"]), d, " for %d min" % round((now - t) / 60) if _t(t) else "", r["id"], flag)
+    return ""
+
+
+def net_rec_text(h, short=False):
+    """A finished reservation's network parts in words (its record's res and peak): "150 Mbit/s down, 39.8 of 40 GB
+    moved"; `short`: "150Md 40Gn". Empty without one."""
+    res = h.get("res") if isinstance(h.get("res"), dict) else {}
+    pk = h.get("peak") if isinstance(h.get("peak"), dict) else {}
+    out = []
+    for k, fig in (("net", "down"), ("net_up", "up")):
+        rate, gb, mv = res.get(k), res.get(k + "_gb"), pk.get(k + "_gb")
+        if not any(_num(x) for x in (rate, gb, mv)):
+            continue
+        if short:
+            out.append("".join(x for x in ("%sM%s" % (cores_text(rate), fig[0]) if _num(rate) else "",
+                                           "%sG%s" % (_gbv(gb), "n" if k == "net" else "u") if _num(gb) else "") if x)
+                       or "%sG%s" % (_gbv(mv), "n" if k == "net" else "u"))
+        else:
+            out.append(", ".join(x for x in (
+                "%s Mbit/s %s" % (cores_text(rate), fig) if _num(rate) else "the network %s, unmanaged" % fig,
+                "%s of %s GB moved" % (_gbv(mv or 0.0), _gbv(gb)) if _num(gb) else
+                "%s GB moved" % _gbv(mv) if _num(mv) else "") if x))
+    return (" " if short else ", ").join(out)
+
+
+def run_env(st, out):
+    """oomph run's network environment (12.14), replacing inherited values: OOMPH_NET_MBPS, OOMPH_NET_UP_MBPS,
+    OOMPH_NET_LIMIT, OOMPH_NET_UP_LIMIT (integer bytes per second; 0: no limit, an unmanaged grant), OOMPH_NET_GB,
+    OOMPH_NET_UP_GB."""
+    rw, a = st.get("run_with") or {}, st.get("asked") or {}
+    if any(k.startswith("net_") for k in list(rw) + list(a)):   # a grant with a network part: none inherited
+        for e in ("OOMPH_NET_MBPS", "OOMPH_NET_LIMIT", "OOMPH_NET_GB", "OOMPH_NET_UP_MBPS", "OOMPH_NET_UP_LIMIT",
+                  "OOMPH_NET_UP_GB"):
+            out.pop(e, None)
+    for mb, lim, gb, e1, e2, e3 in (("net_mbps", "limit", "net_gb", "OOMPH_NET_MBPS", "OOMPH_NET_LIMIT", "OOMPH_NET_GB"),
+                                    ("net_up_mbps", "up_limit", "net_up_gb", "OOMPH_NET_UP_MBPS", "OOMPH_NET_UP_LIMIT",
+                                     "OOMPH_NET_UP_GB")):
+        if _num(rw.get(mb), 0, RATE_MAX) and _int(rw.get(lim), 0, 2 ** 40):
+            out[e1], out[e2] = cores_text(rw[mb]), str(rw[lim])
+        if _num(a.get(gb), VOL_MIN, VOL_MAX):
+            out[e3] = "%g" % a[gb]
+
+
+LIMITERS = {   # oomph run's limiter flags (12.14): tool → (flag, value as one argument (`=`), unit, flags that count as set)
+    "curl": ("--limit-rate", False, "B", ()),
+    "wget": ("--limit-rate", True, "B", ()),
+    "rsync": ("--bwlimit", True, "KiB", ()),
+    "aria2c": ("--max-overall-download-limit", True, "B", ("--max-download-limit",)),
+}
+
+
+def run_argv(cmd, st):
+    """oomph run's command with the network grant handed on (12.14): `{net}` (Mbit/s, integer) and `{net_limit}`
+    (bytes per second) replaced in the argument vector (0 for an unmanaged grant), and for curl, wget, rsync and
+    aria2c as the command's first word (never through env, sudo, sh -c, xargs, nice or time) their limiter flag right
+    after it, unless an argument sets it already. The down rate, the up rate where the grant has only that. Returns
+    (argv, [what was added])."""
+    rw = st.get("run_with") or {}
+    mb = rw.get("net_mbps") if "net_mbps" in rw else rw.get("net_up_mbps")
+    lim = rw.get("limit") if "net_mbps" in rw else rw.get("up_limit")
+    if not (_num(mb, 0, RATE_MAX) and _int(lim, 0, 2 ** 40)):
+        return list(cmd), []
+    out = [c.replace("{net_limit}", str(lim)).replace("{net}", str(int(math.floor(mb)))) for c in cmd]
+    tool = LIMITERS.get(os.path.basename(out[0])) if out else None
+    if not tool or lim <= 0:
+        return out, []
+    flag, eq, unit, also = tool
+    if any(a == f or a.startswith(f + "=") for a in out[1:] for f in (flag,) + also):
+        return out, []
+    v = str(max(1, lim // 1024)) if unit == "KiB" else str(lim)
+    add = [flag + "=" + v] if eq else [flag, v]
+    return out[:1] + add + out[1:], ["%s (%s Mbit/s)" % (" ".join(add), cores_text(mb))]
+
+
+# --- the logger's pools (12.5, 12.8)
+def pool_blocks(block, ans, leases, prev):
+    """current.json's `pools` net.down and net.up while this network has a figure the household can share: `network`,
+    `cap` and `margin` (from the ledger child's answer `ans` about this very network: root never opens
+    networks.json), `reserved` (Σ granted Mbit/s, from the ledger's snapshot), `busy` (this sample's rate) and
+    `others`, what holds no grant (busy less what each grant uses, at most what it got), smoothed as ½ old + ½ new
+    and begun anew on another network; `level` "busy" after NET_BUSY_N samples at NET_BUSY_X of the figure (the
+    tile's flag; never critical). `prev` ({} at first) keeps what the next sample smooths with. {} without a figure."""
+    key = block.get("network") if isinstance(block, dict) and block.get("if") else None
+    e = ans.get("entry") if isinstance(ans, dict) and key and key in (ans.get("asked"), ans.get("key")) else None
+    if prev.get("network") not in (None, key, (ans or {}).get("key")):
+        prev.clear()
+    prev["network"] = key
+    out = {}
+    for k, pid, fig, rk in NET_DIRS:
+        cap = (e or {}).get(fig)
+        if not _num(cap, FIG_MIN, FIG_MAX) or cap - net_margin(fig, cap) < NET_LINE_MIN:
+            prev.pop(pid, None)
+            continue
+        got = [(min(max(float(x[k]), 0.0), cap), min(max(float(x.get(k + "_used") or 0), 0.0), cap)) for x in leases or ()
+               if isinstance(x, dict) and x.get("state") == "granted" and _num(x.get(k))]
+        P = {"network": (ans or {}).get("key") or key, "cap": cap, "margin": net_margin(fig, cap),
+             "reserved": round(sum(g for g, _ in got), 1)}
+        busy = block.get(rk)
+        was = prev.get(pid) or (None, 0)
+        if _num(busy, 0, 1e6):
+            measured = max(0.0, busy - sum(min(u, g) for g, u in got))
+            others = measured if was[0] is None else 0.5 * was[0] + 0.5 * measured
+            n = was[1] + 1 if busy >= NET_BUSY_X * cap else 0
+            P.update(busy=round(busy, 2), others=round(others, 2))
+            if n >= NET_BUSY_N:
+                P["level"] = "busy"
+            prev[pid] = (others, n)
+        out[pid] = P
+    return out
+
+
+def amend_net(L, r, kw, now):
+    """amend's network parts (02 §6.4's rules, part by part; NET 12.10): (change, refusal). A volume is advice and
+    always applied (`net_gb` 0 drops that direction's part); a rate shrinks at once, and grows a grant only if the
+    extra can be reserved now and nobody waits for that pool (an unmanaged part holds no rate: it takes the new one
+    as its request); a queued request takes the new range, a bigger one at the back of the line. A lease without
+    that direction's part does not take one: it is reserved separately. With net_reservations off a part may shrink
+    or be dropped, not grow."""
+    change, np_, st = {}, net_parts(r) or {}, L.get("state", {})
+    granted, on = r["state"] == "granted", net_reservations_on()
+    for k, pid, fig, _ in NET_DIRS:
+        up = k == "net_up"
+        gb, ask, lo = kw.get(k + "_gb"), kw.get("net_up_mbps" if up else "net_mbps"), \
+            kw.get("net_up_min_mbps" if up else "net_min_mbps")
+        if gb is None and ask is None:
+            continue
+        x, flag = np_.get(k), "--net-up" if up else "--net"
+        if gb == 0 and ask is not None:
+            return None, ("%s 0 drops the %s part, so a rate for it (--net-rate %s%sM) means nothing: drop the part, "
+                          "or change its rate." % (flag, "upload" if up else "download", "/" if up else "",
+                                                   cores_text(ask)))
+        if x is None:
+            if gb == 0 and ask is None:
+                continue
+            return None, ("%s holds no %s part, and it cannot take one now: reserve it separately (`oomph reserve "
+                          "%s%s --for \"…\"`)." % (r["id"], "upload" if up else "download",
+                                                   "%s %sG" % (flag, _gbv(gb)) if gb else "",
+                                                   " --net-rate %s%sM" % ("/" if up else "", cores_text(ask))
+                                                   if ask is not None else ""))
+        if gb == 0:
+            res = r.get("res") or {}
+            if not ("ram" in res or _cpu_of(r) or _disk_of(r) or _gpu_parts(r) or
+                    np_.get("net_up" if k == "net" else "net")):
+                return None, "%s holds nothing but this: release it instead (release_memory / `oomph release %s`)." % (
+                    r["id"], r["id"])
+            del res[k]
+            change[k] = [x.get("got", x.get("ask")) if granted else x.get("ask"), 0]
+            continue
+        if ask is not None:
+            managed = not x.get("unmanaged")
+            was = x["got"] if granted and managed and _num(x.get("got")) else x.get("ask")
+            lo = _cn(elastic_min(ask)) if lo is None else _cn(min(lo, ask))
+            if (was is None or ask > was) and not on:
+                return None, net_switch_text()
+            if granted and managed and ask > was:
+                room = st.get("net_%s_available" % fig)
+                waiting = [q for q in L["leases"] if q["state"] == "queued" and (pid in lease_need(q) or not weighable(q))]
+                if waiting or not _num(room) or ask - was > room + 1e-9:
+                    return None, ("Can't grow %s's %s rate from %s to %s Mbit/s now: %s. Keep it, and reserve the extra "
+                                  "separately (`oomph reserve --net-rate %s%sM --for \"…\"`): it queues fairly." % (
+                                      r["id"], "upload" if up else "download", cores_text(was), cores_text(ask),
+                                      "%d request(s) for the line are queued and come first" % len(waiting) if waiting
+                                      else "only %g Mbit/s more can be reserved" % round(max(0.0, room or 0.0), 1),
+                                      "/" if up else "", cores_text(_cn(round(ask - was, 1)))))
+            x.update(ask=ask, min=min(lo, ask))
+            x.pop("auto", None)   # a rate of its own now, not half the line
+            if granted and managed:
+                x["got"] = ask
+                for f in ADVICE_FIELDS:
+                    x.pop(f, None)
+            elif not granted and was is not None and ask > was and r in L["leases"]:   # a bigger request: at the back
+                L["leases"].remove(r)
+                L["leases"].append(r)
+                change["requeued"] = True
+            change[k] = [was, ask]
+        if gb:
+            if gb > (x.get("gb") or 0) and not on:
+                return None, net_switch_text()
+            change[k + "_gb"] = [x.get("gb"), gb]
+            x["gb"] = gb
+        if granted:
+            _vol_flag(x, now)
+            _eta(x, now)
+    return change, None
+
+
+def net_coordination(s, leases, now):
+    """`coordination`'s network (reservations, resources, memory_check): this network by its public id and label, and
+    per direction with a figure its pool (cap, margin, reserved, available, idle); `reservable` while
+    net_reservations is on and a pool exists. None where the sample names no network."""
+    nv = net_view(s, leases, now)
+    if not nv["known"]:
+        return None
+    out = {"id": public_id(nv["network"]), "label": (nv["entry"] or {}).get("label"),
+           "reservable": bool(nv["pools"]) and net_reservations_on()}
+    if not out["reservable"] and nv["pools"] and not net_reservations_on():
+        out["reservable_off"] = "net_reservations"
+    for _, pid, fig, _ in NET_DIRS:
+        P = nv["pools"].get(pid)
+        out[fig] = None if P is None else dict({"cap": P["cap"], "margin": P["margin"], "reserved": round(P["reserved"], 1),
+                                                "available": round(max(0.0, P["room"]), 1)},
+                                               **({"idle": round(max(0.0, P["idle"]), 1)} if P["idle"] is not None else {}))
+        if P is None:
+            out[fig + "_why"] = nv["why"].get(pid)
+    return out
+
+
+def public_record(h):
+    """A history record or span as it leaves the machine: its network's key (net_network) as public_id."""
+    res = h.get("res") if isinstance(h, dict) and isinstance(h.get("res"), dict) else None
+    if not res or "net_network" not in res:
+        return h
+    return dict(h, res=dict(res, net_network=public_id(res["net_network"])))
+
+
+# --- oomph.py's hooks (kept here: what never meets the network, oomph top above all, compiles none of it)
+def net_begin(L, s, procs, now, tick):
+    """_evaluate's network part before admission (12.8–12.10): the network the sample names (read before the lock by
+    _decide_inputs; none named: nothing is known, nothing re-weighed), its pools, grants made on another network
+    granted again here, and with `tick` ({dt, complete}: the logger's child) what every network grant used. Returns
+    the view admission goes on with."""
+    nv = net_view(s, L["leases"], now)
+    net_rehome(L, nv, now)
+    if isinstance(tick, dict):
+        charge_net(L, s, procs, _children(procs), now, tick)
+    return nv
+
+
+def net_check(net, ticket=None, gb=0):
+    """reserve()'s and amend()'s network keywords (12.10, 12.11): (the given ones, a new request's parts are asked
+    for, the refusal while the switch is off or None)."""
+    net = {k: x for k, x in net.items() if x is not None}
+    if set(net) - set(_NET_KW):
+        raise TypeError("unexpected keyword arguments %s" % sorted(set(net) - set(_NET_KW)))
+    new = not ticket and bool(net)
+    off = {"status": "refused", "gb": gb, "advice": net_switch_text(), "switch": "net_reservations"} \
+        if new and not net_reservations_on() else None
+    return net, new, off
+
+
+def record_net(k, x, amounts, peak):
+    """_record_vector's network part (12.9): a rate only where one was granted, the volume, what was moved, where."""
+    if x.get("unmanaged") is True:
+        amounts.pop(k, None)
+    if _num(x.get("gb")):
+        amounts[k + "_gb"] = x["gb"]
+    if _num(x.get("moved")):
+        peak[k + "_gb"] = round(x["moved"], 3)
+    if isinstance(x.get("network"), str):
+        amounts["net_network"] = x["network"]
+
+
+def net_flags(r):
+    """advice_flags' network part: {"net" / "net_up": (over or idle, since)}."""
+    out = {}
+    for k, part in (net_parts(r) or {}).items():
+        if part and part.get("flag") in ("over", "idle"):
+            t = part.get("over_t") if part["flag"] == "over" else part.get("low_t")
+            out[k] = (part["flag"], t if _t(t) else None)
+    return out
+
+
+def net_flag_advice(r, flags, now):
+    """flag_advice's network part: a sentence per flagged direction (net_flag_text)."""
+    return "".join(net_flag_text(r, k, flags[k][0], flags[k][1], now) for k in ("net", "net_up") if k in flags)
+
+
+def net_available(st, out):
+    """_available's network part: Mbit/s that can still be reserved each way, and of them idle."""
+    for d in ("down", "up"):
+        for k, f in (("net_%s_mbps", "net_%s_available"), ("net_%s_idle_mbps", "net_%s_idle")):
+            if _num(st.get(f % d)):
+                out[k % d] = max(0.0, st[f % d])
+
+
+def net_refused(out, net, refused):
+    """amend's refusal: what was asked of the network, and which switch refused it."""
+    out.update(("requested_" + k, x) for k, x in net.items())
+    if refused.startswith("Network reservations are switched off"):
+        out["switch"] = "net_reservations"
+
+
+def coord_net(leases, s, now):
+    """coordination's `net` (12.13): the sample's network (read before the lock, or a given sample's: check and the
+    hook read nothing more)."""
+    return net_coordination(s, leases, now)
+
+
+def resources_tail(r):
+    """The end of `oomph resources`' network line: what is left to reserve, or that the switch is off."""
+    nw = r.get("network") or {}
+    if nw.get("reservable") and nw.get("room"):
+        return " · %s Mbit/s left to reserve" % "/".join("%g" % x if _num(x) else "-" for x in nw["room"])
+    return " · reservable: off (net_reservations)" if nw.get("reservable_off") else ""
+
+
+def status_tail(c):
+    """The end of `oomph status`' network line (12.13): what can still be reserved each way, from the logger's pools
+    in current.json (cap − margin − reserved: status reads no ledger), or that the switch is off; nothing while
+    this network has no pool (no figure, too slow, offline)."""
+    sp = c.get("pools") if isinstance(c.get("pools"), dict) else {}
+    room = [round(max(0.0, P["cap"] - P["margin"] - (P["reserved"] if _num(P.get("reserved"), 0, FIG_MAX) else 0.0)), 1)
+            if isinstance(P, dict) and _num(P.get("cap"), FIG_MIN, FIG_MAX) and _num(P.get("margin"), 0, FIG_MAX) else None
+            for P in (sp.get(pid) for _, pid, _, _ in NET_DIRS)]
+    if all(x is None for x in room):
+        return ""
+    return resources_tail({"network": {"reservable": True, "room": room} if net_reservations_on() else
+                                      {"reservable_off": "net_reservations"}})
+
+
+def change_text(k, v):
+    """amend's change of a network part in words."""
+    if k in ("net", "net_up"):
+        return "%s → %s Mbit/s %s" % (cores_text(v[0]) if _num(v[0]) else "-", cores_text(v[1]),
+                                      "down" if k == "net" else "up")
+    return "%s → %sG to move%s" % ("%gG" % v[0] if _num(v[0]) else "-", "%g" % v[1], "" if k == "net_gb" else " up")
+
+
+def net_off(as_json):
+    """A command with a network flag while net_reservations is off (12.11): refused before anything is written, 75."""
+    st = {"status": "refused", "advice": net_switch_text(), "switch": "net_reservations"}
+    print(json.dumps(st) if as_json else net_switch_text("oomph: REFUSED — "))
+    return 75
+
+
+def run_end(st, h, held):
+    """oomph run's end line, the network's parts (12.14): the rate granted, and what moved at what mean rate."""
+    rw, out = st.get("run_with") or {}, []
+    for k, mb, arrow in (("net", "net_mbps", "↓"), ("net_up", "net_up_mbps", "↑")):
+        mv = (h.get("peak") or {}).get(k + "_gb")
+        if mb in rw or _num(mv):
+            out.append("%s %s%s" % (arrow, "%s Mbit/s" % cores_text(rw[mb]) if rw.get(mb) else "unmanaged",
+                                    ", %s GB at %s Mbit/s" % ("%g" % round(mv, 2), _mb(mv * 8000.0 / held))
+                                    if _num(mv) else ""))
+    return out
+
+
+MCP_NET = {   # the MCP tools' network arguments (12.13), merged into oomph.MCP_TOOLS at their first use (mcp_merge)
+    "reserve_memory": {
+        "net_gb": {"type": "number", "exclusiveMinimum": 0, "description": "GB the work will download (granted half "
+                                                                          "the line's shareable rate unless net_mbps)"},
+        "net_up_gb": {"type": "number", "exclusiveMinimum": 0, "description": "GB the work will upload"},
+        "net_mbps": {"type": "number", "minimum": 1, "description": "download rate in Mbit/s (granted half to all of "
+                                                                    "it; run with run_with.net_mbps)"},
+        "net_min_mbps": {"type": "number", "minimum": 1, "description": "the least download rate to start with (equal "
+                                                                        "to net_mbps: exactly that, or wait)"},
+        "net_up_mbps": {"type": "number", "minimum": 1, "description": "upload rate in Mbit/s"},
+        "net_up_min_mbps": {"type": "number", "minimum": 1, "description": "the least upload rate to start with"}},
+    "update_reservation": {
+        "net_gb": {"type": "number", "minimum": 0, "description": "new download volume in GB (0 drops the download "
+                                                                  "part)"},
+        "net_up_gb": {"type": "number", "minimum": 0, "description": "new upload volume in GB (0 drops the upload part)"},
+        "net_mbps": {"type": "number", "minimum": 1, "description": "new download rate in Mbit/s"},
+        "net_min_mbps": {"type": "number", "minimum": 1, "description": "the least download rate (a queued request)"},
+        "net_up_mbps": {"type": "number", "minimum": 1, "description": "new upload rate in Mbit/s"},
+        "net_up_min_mbps": {"type": "number", "minimum": 1, "description": "the least upload rate (a queued request)"}}}
+MCP_NET_WORDS = (" Before moving a lot through the internet (model weights, images, datasets: more than about 2 GB), "
+                 "only where `oomph resources` lists net as reservable, net_gb (and net_up_gb for an upload), or a "
+                 "rate (net_mbps): run the transfer at run_with.net_mbps (run_with.limit is bytes per second, e.g. "
+                 "curl --limit-rate), so the household keeps its line.")
+
+
+def mcp_merge(tools):
+    """The network's arguments in the MCP tools (once): reserve_memory's and update_reservation's properties, the
+    words of reserve_memory, and `net` among reservation_history's resources."""
+    for t in tools:
+        props = t["inputSchema"].get("properties", {})
+        if t["name"] in MCP_NET and "net_gb" not in props:
+            items = list(props.items())
+            at = next((i for i, (k, _) in enumerate(items) if k == "purpose"), len(items))
+            props.clear()
+            props.update(items[:at] + list(MCP_NET[t["name"]].items()) + items[at:])
+            if t["name"] == "reserve_memory":
+                t["description"] += MCP_NET_WORDS
+        res = props.get("resource")
+        if t["name"] == "reservation_history" and isinstance(res, dict) and "net" not in res.get("enum", ()):
+            res["enum"] = list(res["enum"]) + ["net"]
+    return tools

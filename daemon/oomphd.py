@@ -993,6 +993,8 @@ class Daemon:
         self.quiet = None          # the open quiet incident (03 §5.6): containers at their own limit
         self.alert_t = 0.0         # when the newest alert record was written
         self.net = None            # internet traffic (NET, 1.15): oomph_traffic.Sampler, made at the first sample
+        self.net_prev = {}         # the line's pools as the last sample smoothed them (others, busy samples)
+        self.net_pools_said = False  # making them failed: said once per start
         self.net_err = False       # the network's reading failed: said once per start
 
     # -- events
@@ -1561,6 +1563,17 @@ class Daemon:
         if cp is not None:  # what only the logger knows well, for admission (02 §5.2): current.json only
             self.cpu_others = cp.get("others", self.cpu_others)
             pools = {"t": s["t"], "cpu": cp}
+        if net is not None:  # the line each way (NET 12.8), while this network has a figure: what admission needs
+            try:
+                npools = T.pool_blocks(net, self.ledger.network(4 * INTERVAL), leases, self.net_prev)
+            except Exception as e:  # costs the pools, never the sample; said once per start
+                npools = None
+                self.net_prev.clear()
+                if not self.net_pools_said:
+                    self.event("daemon_error", where="net pools", error=repr(e)[:300])
+                self.net_pools_said = True
+            if npools:
+                pools = dict(pools or {"t": s["t"]}, **npools)
         rates = {pid: u["cpu"] for pid, u in use.items() if "cpu" in u} if use else None
         writes = {pid: u["w"] for pid, u in use.items() if u.get("w")} if use else None
         gpus = {pid: u["gpu"] for pid, u in use.items() if u.get("gpu")} if use else None

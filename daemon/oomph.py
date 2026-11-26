@@ -2013,7 +2013,7 @@ def cmd_status():
     res = resource_lines(c, *volume_prefs(), io=True)
     if not c.get("disks"):  # a logger before 1.9.1
         line("disk", "%.0f GB free" % c["disk_free_gb"])
-    for label, text in res + network_lines(c) if logger_measures(c) else ():
+    for label, text in res + network_lines(c, True) if logger_measures(c) else ():
         line(label, text)
     line("you", "idle %ss · display %s · %s · sleep held by %s" % (
         a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
@@ -2057,7 +2057,7 @@ def _status_linux(c, d, age, alive, line, w):
     for label, text in status_lines_linux(c):
         if label != "disk" or not c.get("disks"):
             line(label, text)
-    for label, text in resource_lines(c, *volume_prefs(), io=True) + network_lines(c):
+    for label, text in resource_lines(c, *volume_prefs(), io=True) + network_lines(c, True):
         line(label, text)
     if c.get("jetsam_kills") or c.get("cgroup_kills"):
         names = ", ".join(term_text(k.get("name"))[:30] for k in c.get("killed") or () if isinstance(k, dict))
@@ -3012,18 +3012,21 @@ def find_session(pid=None):
     }
 
 
-def network_lines(s):
-    """[("net", text)] for check, status and resources (oomph_traffic), never a reason for them to fail."""
+def network_lines(s, status=False):
+    """[("net", text)] for check, status and resources (oomph_traffic), never a reason for them to fail; with
+    `status`, the end `oomph status` gives it: what can still be reserved of the line (NET 12.13)."""
     try:
-        return [_T().resource_line(s)]
+        label, text = _T().resource_line(s)
+        return [(label, text + (_T().status_tail(s) if status else ""))]
     except Exception:  # noqa: B902
         return []
 
 
-def network_info(s):
-    """The `network` object of check --json, memory_check and memory_status (oomph_traffic), or None."""
+def network_info(s, c=None):
+    """The `network` object of check --json, memory_check and memory_status (oomph_traffic), or None; with `c`
+    (coordination's answer) what can still be reserved of the line (NET 12.13)."""
     try:
-        return _T().network_info(s)
+        return _T().network_info(s, coord=c)
     except Exception:  # noqa: B902
         return None
 
@@ -3031,12 +3034,18 @@ def network_info(s):
 def public_sample(s):
     """The sample for an answer that leaves the machine (status --json, memory_status): the network's key hashed
     (oomph_traffic.public_id); unchanged where there is none."""
-    if not isinstance(s, dict) or not isinstance(s.get("net"), dict) or "network" not in s["net"]:
+    pools = s.get("pools") if isinstance(s, dict) else None
+    keyed = [pid for pid, P in pools.items() if isinstance(P, dict) and "network" in P] if isinstance(pools, dict) else []
+    if not isinstance(s, dict) or not keyed and not (isinstance(s.get("net"), dict) and "network" in s["net"]):
         return s
     try:
         return _T().public_sample(s)
-    except Exception:  # noqa: B902
-        return dict(s, net={k: v for k, v in s["net"].items() if k != "network"})
+    except Exception:  # noqa: B902  (the key dropped rather than sent)
+        out = dict(s, pools=dict(pools, **{pid: {k: v for k, v in pools[pid].items() if k != "network"}
+                                           for pid in keyed})) if keyed else dict(s)
+        if isinstance(s.get("net"), dict):
+            out["net"] = {k: v for k, v in s["net"].items() if k != "network"}
+        return out
 
 
 def checked_verdict(mine=None, s=None, network=False):
@@ -3061,7 +3070,7 @@ def checked_verdict(mine=None, s=None, network=False):
     except Exception as e:  # the ledger is a bonus; never let it break a check
         v["coordination"] = {"error": repr(e)}
     if network:
-        v["network"] = network_info(s)
+        v["network"] = network_info(s, v.get("coordination"))
     return v
 
 
@@ -3453,7 +3462,8 @@ def cmd_resources(args):
     except Exception:  # the ledger is a bonus here too
         c = None
     r = _resources(s, c)
-    r["network"] = network_info(s)
+    r["network"] = network_info(s, c if c is not None else {"error": "the ledger could not be read"})  # room: null
+    r["reservable"] += ["net"] if (r["network"] or {}).get("reservable") else []  # the line (NET 12.13)
     if "--json" in opts:
         print(json.dumps(r, allow_nan=False))
         return 0
@@ -3480,10 +3490,11 @@ def cmd_resources(args):
             text += " · not reservable yet" if label == "gpu" or not cpu.get("reservable") else " · reservable"
         line(label, text)
     for label, text in network_lines(s):
-        line(label, text)
+        line(label, text + (_T().resources_tail(r) if r.get("network") else ""))
     more = [x for x in (("cores", " --cpu 8") if "cpu" in r["reservable"] else None,
                         ("disk space", " --disk 20G") if "disk" in r["reservable"] else None,
-                        ("a GPU", " --gpu-mem 16G") if "gpu" in r["reservable"] else None) if x]
+                        ("a GPU", " --gpu-mem 16G") if "gpu" in r["reservable"] else None,
+                        ("the network", " --net-rate 100M") if "net" in r["reservable"] else None) if x]
     print(wrap("Memory%s can be reserved with this version: `oomph reserve 6G%s --for \"what\"`." % (
         "".join((" and " if i == len(more) - 1 else ", ") + x[0] for i, x in enumerate(more)),
         "".join(x[1] for x in more)), w, "  "))
@@ -3939,6 +3950,19 @@ def _gpu_parts(r):
     return _G()._gpu_parts(r) if res and ("gpu" in res or "vram" in res) else None
 
 
+def _net_parts(r):
+    """A lease's network parts (oomph_traffic.net_parts), or None at once for a lease without one."""
+    res = r.get("res") if isinstance(r.get("res"), dict) else None
+    return _T().net_parts(r) if res and ("net" in res or "net_up" in res) else None
+
+
+def net_reservations_on(config=None):
+    """Are new network parts allowed here (NET 12.11)? "net_reservations" in the root-owned configuration file, or
+    OOMPH_NET_RESERVATIONS=1; read per request; off by default in 1.15, until they have been tried on real lines. It
+    gates only new or growing network parts: measuring, evaluating, ending and showing them always run."""
+    return switched_on(setting("net_reservations", config=config))
+
+
 def gpu_reservations_on(config=None):
     """Are new GPU parts allowed here (02 §6.5.1)? "gpu_reservations" in the root-owned configuration file, or
     OOMPH_GPU_RESERVATIONS=1 (tests, one command, a per-user Linux install without root); read per request. Off by
@@ -4347,20 +4371,24 @@ def _segments(x):
 #     says about itself);
 #   lease: `v` (2 when a vector-aware writer created it: set once, never added later), `res` {ram,
 #     cpu, gpu, vram, disk, mem: {ask, min, got, used, peak, tree, w, dev, pool, unified, and from 1.12.3 the
-#     advice `flag` "over" | "idle" with its counters over_n, over_t, low_t}} (gb and
+#     advice `flag` "over" | "idle" with its counters over_n, over_t, low_t}; from 1.15 net and net_up: the line
+#     each way, Mbit/s, with gb, moved, avg, eta, vol_t, network and unmanaged (NET 12.9)} (gb and
 #     used_gb / peak_gb / baseline_gb stay as the memory mirrors 1.8 readers read; gb is 0 for a
 #     lease without memory), `res_granted` (the time a vector-aware evaluator granted it: a v2
 #     lease granted without it was granted by old code), `waiting_on` and `hold` (pool ids),
 #     `base` and `last` (counters), `segments[].res` (amounts), `watch_also` [{pid, start}] and `watch_names` (more trees
 #     charged to it), `holder.uid`, `holder.ns` (the holder's pid namespace: absent = the
 #     reader's), `user` (the account's name), `scope` ("host" or a cgroup), `agent` {key, slot};
-#   history record: `event` "grant", `res` {resource: amount, "disk_pool"} and `peak` {resource:
-#     amount}, `v`, `agent`, `user`, `note`, outcomes "refused" and "volume_gone".
-LEASE_RES = ("ram", "cpu", "gpu", "vram", "disk", "mem")  # a v2 lease's resources (02 §6.2)
-SEG_RES = ("ram", "cpu", "disk", "gpu", "vram")           # the amounts a segment of a lease's span keeps
+#   history record: `event` "grant", `res` {resource: amount, "disk_pool", "gpu_dev", and from 1.15 net_gb,
+#     net_up_gb and "net_network"} and `peak` {resource: amount; net_gb, net_up_gb: GB moved}, `v`, `agent`, `user`,
+#     `note`, outcomes "refused" and "volume_gone".
+LEASE_RES = ("ram", "cpu", "gpu", "vram", "disk", "mem", "net", "net_up")  # a v2 lease's resources (02 §6.2; net, net_up:
+                                                                         # NET 12.9, 1.15)
+SEG_RES = ("ram", "cpu", "disk", "gpu", "vram", "net", "net_up")  # the amounts a segment of a lease's span keeps
 _RES_NAME = re.compile(r"[a-z][a-z0-9_]{0,15}")  # a resource this code does not know: carried through, never used
 RES_MAX = 16                              # resources in one `res`, known ones first
-_RES_NUMS = ("ask", "min", "got", "used", "peak", "tree", "w", "else_gb", "base")
+_RES_NUMS = ("ask", "min", "got", "used", "peak", "tree", "w", "else_gb", "base", "gb", "moved", "avg")
+_REC_IDS = ("disk_pool", "gpu_dev", "net_network")  # the ids a history record's `res` carries besides its amounts
 _COUNTERS = ("t", "cpu_s", "gpu_s", "w_gb", "free_gb", "gpu_mem_gb")
 _ID = re.compile(r"[\x21-\x7e]{1,80}")    # pool and device ids: compared as strings, never opened
 _AGENT = re.compile(r"[0-9a-f]{8}")
@@ -4385,10 +4413,10 @@ def _str(n, pat=None):
 
 
 def _res_names(x):
-    """The resources of a `res` this code keeps: the six it knows, then up to RES_MAX in all of
+    """The resources of a `res` this code keeps: those it knows (LEASE_RES), then up to RES_MAX in all of
     those a later writer may add (a lowercase name), which are carried through and never counted."""
     known = [k for k in LEASE_RES if k in x]
-    return known + [k for k in x if k not in LEASE_RES and k not in ("disk_pool", "gpu_dev") and isinstance(k, str)
+    return known + [k for k in x if k not in LEASE_RES and k not in _REC_IDS and isinstance(k, str)
                     and _RES_NAME.fullmatch(k)][:RES_MAX - len(known)]
 
 
@@ -4417,10 +4445,15 @@ def _res(x):
         for f, n in (("name", 64), ("else_dev", 8)):  # the card's name and, for `elsewhere`, where the job is
             if f in o and not (isinstance(o[f], str) and 0 < len(o[f]) <= n and o[f].isprintable()):
                 del o[f]
-        if "unified" in o and not isinstance(o["unified"], bool):
-            del o["unified"]
+        for f in ("unified", "unmanaged", "auto"):  # unmanaged, auto (NET 1.15): a network part granted without a
+            # rate; one whose rate is half the line, asked again on each network
+            if f in o and not isinstance(o[f], bool):
+                del o[f]
+        if "network" in o and not _str(80, _ID)(o["network"]):  # a network's key (NET 12.9): compared, never opened
+            del o["network"]
         for f, ok in (("flag", lambda v: v in ADVICE_FLAGS), ("over_n", lambda v: _int(v, 0, 10 ** 6)),
-                      ("over_t", _t), ("low_t", _t), ("rate_t", _t), ("missing", _t), ("mseen", _t)):
+                      ("over_t", _t), ("low_t", _t), ("rate_t", _t), ("missing", _t), ("mseen", _t), ("eta", _t),
+                      ("vol_t", _t)):
             if f in o and not ok(o[f]):
                 del o[f]
         out[k] = o
@@ -4433,10 +4466,9 @@ def _rec_amounts(x, extra=False):
     if not isinstance(x, dict):
         return None
     out = {k: x[k] for k in _res_names(x) if _num(x.get(k), 0, 1e6)}
-    if extra and _str(80, _ID)(x.get("disk_pool")):
-        out["disk_pool"] = x["disk_pool"]
-    if extra and _str(64, _ID)(x.get("gpu_dev")):  # the card a GPU grant was on (1.14): gpu1, or a UUID
-        out["gpu_dev"] = x["gpu_dev"]
+    for f, n in (("disk_pool", 80), ("gpu_dev", 64), ("net_network", 80)) if extra else ():  # its pool, the card a
+        if _str(n, _ID)(x.get(f)):  # GPU grant was on (1.14: gpu1, or a UUID), its network's key (1.15)
+            out[f] = x[f]
     return out or None
 
 
@@ -4640,6 +4672,8 @@ def lease_need(r):
         for p in _G()._gpu_pools(gp):
             x = gp["gpu"] if p.startswith("gpu:") else gp["vram"]
             need[p] = (x["ask"], x["ask"])
+    if _net_parts(r):  # the line, each way (net.down, net.up: its minimum to what it asked; NET 12.10)
+        need.update(_T().net_need(r))
     return need
 
 
@@ -4669,6 +4703,8 @@ def _record_vector(r):
             amounts["disk_pool"] = x["pool"]
         if k in ("gpu", "vram") and isinstance(x.get("uuid"), str):  # the NVIDIA card it was on (a Mac has one GPU)
             amounts["gpu_dev"] = x["uuid"]
+        if k in ("net", "net_up"):  # NET 12.9: a rate where one was granted, the volume, what was moved, where
+            _T().record_net(k, x, amounts, peak)
     if amounts:
         out["res"] = amounts
     if peak:
@@ -5257,7 +5293,7 @@ def _advice_stale(L, now):
     now. Every evaluation runs this, so the next `oomph` call or status poll clears it for every reader."""
     for r in L["leases"]:
         res = r.get("res") if isinstance(r.get("res"), dict) else {}
-        for k in ("cpu", "disk", "vram"):
+        for k in ("cpu", "disk", "vram", "net", "net_up"):
             part = res.get(k)
             if isinstance(part, dict) and any(f in part for f in ADVICE_FIELDS) and not (
                     _t(part.get("rate_t")) and -60 <= now - part["rate_t"] <= ADVICE_STALE_S):
@@ -5277,6 +5313,8 @@ def advice_flags(r):
         if part and part.get("flag") in ADVICE_FLAGS:
             t = part.get("over_t") if part["flag"] in ("over", "elsewhere") else part.get("low_t")
             out[k] = (part["flag"], t if _t(t) else None)
+    if _net_parts(r):  # the line each way (NET 12.10): over its rate or volume, idle
+        out.update(_T().net_flags(r))
     return out
 
 
@@ -5299,6 +5337,8 @@ def flag_advice(r, flags, now):
                    "writing more. " % (_gb(d["w"]) if _num(d.get("w")) else "More", _disk_name(d), _gb(d["got"]), r["id"]))
     if "vram" in flags:
         out.append(_G()._gpu_flag_text(r, flags["vram"][0]))
+    if "net" in flags or "net_up" in flags:
+        out.append(_T().net_flag_advice(r, flags, now))
     return "".join(out)
 
 
@@ -5437,13 +5477,15 @@ def cpu_pool(s, leases, now):
             "idle": None if others is None else room - others}
 
 
-POOLS = frozenset(("ram", "cpu", "disk:*", "gpu:*", "vram:*"))   # every pool this code weighs (<kind>:*: every one)
-KNOWN_RES = frozenset(("ram", "cpu", "disk", "mem", "gpu", "vram"))  # the parts of a `res` it knows (mem: the mirror)
+POOLS = frozenset(("ram", "cpu", "disk:*", "gpu:*", "vram:*", "net.down", "net.up"))  # every pool this code weighs
+                                                                                    # (<kind>:*: every one)
+KNOWN_RES = frozenset(("ram", "cpu", "disk", "mem", "gpu", "vram", "net", "net_up"))  # the parts of a `res` it knows
+                                                                                      # (mem: the mirror)
 
 
 def _rate(p):
-    """Does pool `p` saturate rather than run out (02 §6.1): the cores, and a GPU's share."""
-    return p == "cpu" or p.startswith("gpu:")
+    """Does pool `p` saturate rather than run out (02 §6.1): the cores, a GPU's share, the internet line each way."""
+    return p == "cpu" or p.startswith("gpu:") or p in ("net.down", "net.up")
 
 
 def _blocks(p, blocked):
@@ -5471,9 +5513,9 @@ def weighable(r):
         return True
     res = r.get("res") or {}
     if not set(res) <= KNOWN_RES or ("cpu" in res and _cpu_of(r) is None) or ("disk" in res and _disk_of(r) is None) \
-            or _gpu_parts(r) is False:
+            or _gpu_parts(r) is False or _net_parts(r) is False:
         return False
-    return bool(lease_need(r))
+    return bool(lease_need(r)) or bool(_net_parts(r))  # a network part granted unmanaged asks no pool (NET 12.10)
 
 
 def _waits(r, waiting, hold):
@@ -5483,7 +5525,7 @@ def _waits(r, waiting, hold):
         r["waiting_on"], r["hold"] = sorted(waiting), sorted(hold)
 
 
-def _evaluate(L, s, procs, now, rated=False):
+def _evaluate(L, s, procs, now, rated=False, net=None):
     """Drop dead, expired and abandoned entries, put back in the queue what older code granted of a
     vector lease, account for what grants already use, then grant queued requests in arrival order,
     pool by pool (02 §6.4).
@@ -5500,7 +5542,9 @@ def _evaluate(L, s, procs, now, rated=False):
     shortages. With memory alone this is today's strict first come, first served. A request of another
     scope (a cgroup, 03 §7.3) is granted only by a process in it, and does not hold the line here.
     `rated`: the process table carries the logger's rates (the logger's child), so each grant's cores
-    and disk writes are charged. Reservations on a pool that is gone end first (_volumes_gone)."""
+    and disk writes are charged. Reservations on a pool that is gone end first (_volumes_gone).
+    With a network part in the ledger the line each way is two rate pools (oomph_traffic.net_begin: `net` the
+    logger's interval); the network is the sample's (_decide_inputs reads it before the lock: never inside it)."""
     keep = []
     bid = _boot_id()
     if bid and L.get("boot") and L["boot"] != bid:  # written before the last boot: no holder is alive
@@ -5533,6 +5577,8 @@ def _evaluate(L, s, procs, now, rated=False):
     anygpu = any(_gpu_parts(r) for r in L["leases"])  # oomph_gpu is loaded only then (_G)
     if anygpu:
         _G()._gpus_gone(L, s, now)
+    T = _T() if any(_net_parts(r) for r in L["leases"]) else None  # the line (NET 12.8–12.10), only then
+    nv = T.net_begin(L, s, procs, now, net) if T else None
 
     # Memory a grant's processes have added since it was granted counts against the grant, so
     # it isn't counted twice (once as used, once as reserved). Grants watching the same process
@@ -5582,11 +5628,12 @@ def _evaluate(L, s, procs, now, rated=False):
         if not weighable(r):  # a later writer's: it holds the line, its waiting_on and hold as they are
             blocked |= POOLS
             continue
+        nshort = T.net_prepare(r, nv) if nv is not None and _net_parts(r) else ()  # managed here or unmanaged
         need = lease_need(r)
         if v["level"] == "critical":  # nothing new starts: anything new adds load
             _waits(r, {"critical"}, r.get("hold") or ())
             continue
-        short, note = set(), None
+        short, note = set(nshort), None
         if "ram" in need and r["gb"] > avail:
             alone = "ram" not in blocked and v["level"] == "ok" and \
                 not any(x["state"] == "granted" and "ram" in lease_need(x) for x in L["leases"])
@@ -5671,6 +5718,8 @@ def _evaluate(L, s, procs, now, rated=False):
                 d["reserved"] += dk["ask"]
             if gp:  # on its card, which each part keeps
                 _G()._gpu_grant(r, gp, gkey, gview, now, procs, children)
+            if nv is not None and _net_parts(r):  # elastic on this network's line, or unmanaged (NET 12.10)
+                notes += T.net_grant(r, nv, now)
             segs = r.get("segments")
             if segs:
                 segs[-1]["res"] = {k: x.get("got", x.get("ask")) for k, x in res.items() if k in SEG_RES
@@ -5699,6 +5748,8 @@ def _evaluate(L, s, procs, now, rated=False):
            for k, c in sorted(gview.items(), key=lambda kc: kc[1]["index"])[:GPU_STATE_MAX] if c["reservable"]}
     if gst:  # and on each GPU (by card: share, and an NVIDIA card's memory), when known
         L["state"]["gpu"] = gst
+    if nv is not None:  # and on the line each way, while this network has a figure
+        L["state"].update(T.net_state(nv))
 
 
 # ----- root callers: the ledger operation runs in a child as the invoking user (H0)
@@ -5860,6 +5911,8 @@ def _call_as_user(name, args, kw, inputs):
     d = {"args": [_enc(a) for a in args], "kw": {k: _enc(v) for k, v in kw.items()}}
     if gpu_reservations_on():  # the switch as root's command has it (the child's environment is a minimal one)
         d["gpu_reservations"] = True
+    if net_reservations_on():  # and the network's (NET 12.11)
+        d["net_reservations"] = True
     if inputs:
         s, procs, _ = _decide_inputs()
         d["s"], d["procs"] = s, list(procs.values())
@@ -5905,6 +5958,8 @@ def _cmd_ledger_call(name):
         _given = (d["s"], {p["pid"]: p for p in d["procs"]})
     if d.get("gpu_reservations") is True:  # OOMPH_GPU_RESERVATIONS=1 on root's command: for this operation too
         os.environ["OOMPH_GPU_RESERVATIONS"] = "1"
+    if d.get("net_reservations") is True:  # OOMPH_NET_RESERVATIONS=1 likewise
+        os.environ["OOMPH_NET_RESERVATIONS"] = "1"
     try:
         out = {"ok": fn(*[_dec(a) for a in d["args"]], **{k: _dec(v) for k, v in d["kw"].items()})}
     except LedgerBusy as e:
@@ -5918,10 +5973,27 @@ def _cmd_ledger_call(name):
 
 
 def _decide_inputs(s=None):
+    """The sample (a given one as it is), the process table and now; where the caller hands in no sample and a lease
+    has a network part, the network this machine is on is read now (_net_now), before any ledger lock is taken."""
+    own = s is None
     if _given:  # an unprivileged child: root measured them
-        return s or _given[0], _given[1], time.time()
-    s = s or (_sample_override() if _sample_override else _with_pools(live_sample(with_procs=False)))
-    return s, plat().collect_procs(), time.time()
+        s, procs = s or _given[0], _given[1]
+    else:
+        s = s or (_sample_override() if _sample_override else _with_pools(live_sample(with_procs=False)))
+        procs = plat().collect_procs()
+    return (_net_now(s) if own else s), procs, time.time()
+
+
+def _net_now(s, anyway=False):
+    """The sample with the network it is on (oomph_traffic.net_inputs: the egress and the router's identity, a few ms
+    up to route's and arp's timeouts, and networks.json) where it names none and a lease has a network part (or
+    `anyway`): read before the ledger's lock, never while it is held (NET 12.8). Never as root, which opens nothing
+    in the shared folders: root's caller hands its sample to the child (_call_as_user), which reads it there."""
+    if isinstance(s.get("net"), dict) or os.geteuid() == 0:
+        return s
+    if anyway or any(_net_parts(r) for r in _quietly_leases()):
+        return _T().net_inputs(s)
+    return s
 
 
 def _with_pools(s):
@@ -5931,7 +6003,8 @@ def _with_pools(s):
     GPU grants use, and what says a reserved card is gone); else as it is."""
     d = _daemon_sample()
     if d:
-        s.update((k, d[k]) for k in ("pools", "cpu") if isinstance(d.get(k), dict) and k not in s)
+        s.update((k, d[k]) for k in ("pools", "cpu", "net") if isinstance(d.get(k), dict) and k not in s)  # net: the
+        # network it is on and the line's rates (NET 12.10)
         if isinstance(d.get("gpu"), list) and "gpu" not in s:  # its GPUs (every NVIDIA card: what says one is gone)
             s["gpu"] = d["gpu"]
         if isinstance(d.get("disks"), list) and "disks" not in s:
@@ -5963,6 +6036,8 @@ def _brief(r, now):
                 b[f + "_used"] = x["used"]
             if isinstance(x.get("dev"), str) and _GPU_DEV.fullmatch(x["dev"]):
                 b["gpu_dev"] = x["dev"]
+    if _net_parts(r):  # the line each way: Mbit/s, what they use, the volumes and what was moved (never the network)
+        _T().net_brief(r, b)
     if r["state"] == "granted":
         b.update(used_gb=r.get("used_gb", 0), for_min=round((now - r["granted"]) / 60, 1))
         if c and _num(c.get("used")):
@@ -5992,6 +6067,8 @@ def _available(st):
         out["gpu"] = {k: dict({"dev": v.get("dev")}, pct=max(0.0, v.get("pct", 0.0)),
                               **({"mem_gb": max(0.0, v["gb"])} if "gb" in v else {}))
                       for k, v in st["gpu"].items()}
+    if "net_down_available" in st or "net_up_available" in st:  # the line each way (NET 12.10)
+        _T().net_available(st, out)
     return out
 
 
@@ -6008,10 +6085,11 @@ def _status(L, rid, now):
                 "advice": "This reservation no longer exists (%s). Request a new one if you still need it."
                           % (h["outcome"] if h else "unknown id")}
     nm, c, dk, need, gp = no_memory(r), _cpu_of(r), _disk_of(r), lease_need(r), _gpu_parts(r) or None
+    np_ = _net_parts(r) or None
     out = {"status": r["state"], "id": r["id"], "gb": 0.0 if nm else r["gb"], "purpose": r["purpose"],
            "available_gb": st.get("available_gb"), "reserved_gb": st.get("reserved_gb"),
            "free_gb": st.get("free_gb"), "level": st.get("level")}
-    if c or dk or gp:  # a vector request: what it asked, and what can be had (02 §7.2)
+    if c or dk or gp or np_:  # a vector request: what it asked, and what can be had (02 §7.2)
         out["asked"] = {} if nm else {"ram_gb": r["gb"]}
         if c:
             out["asked"].update(cpu_cores=_cn(c["ask"]), cpu_min=_cn(need["cpu"][0]))
@@ -6021,18 +6099,19 @@ def _status(L, rid, now):
             out["asked"].update((k, x) for k, x in (("gpu_pct", (gp["gpu"] or {}).get("ask")), ("gpu_device", gp["key"]),
                                                     ("gpu_mem_gb", (gp["vram"] or {}).get("ask"))) if x is not None)
         out["available"] = _available(st)
-    heavy = "heavy" if c or dk or gp else "memory-heavy"
+    heavy = "heavy" if c or dk or gp or np_ else "memory-heavy"
+    nrun = _T().net_status(r, out, now) if np_ else ""  # asked; granted, run_with and the first words (NET 12.10)
     if r["state"] == "granted":
         out["expires_in_min"] = round((r["expires"] - now) / 60, 1) if r.get("expires") else None
         if r.get("note"):
             out["note"] = r["note"]
         run = ""
-        if (c and _num(c.get("got"))) or (dk and _num(dk.get("got"))):
-            out["granted"] = {} if nm else {"ram_gb": r["gb"]}
+        if (c and _num(c.get("got"))) or (dk and _num(dk.get("got"))) or np_:
+            out["granted"] = dict(out.get("granted") or {}, **({} if nm else {"ram_gb": r["gb"]}))
         if c and _num(c.get("got")):
             got = _cn(c["got"])
             out["granted"]["cpu_cores"] = got
-            out["run_with"] = {"cpu_cores": got}
+            out.setdefault("run_with", {})["cpu_cores"] = got
             run = "Run with %s cores (-j%d): you asked for %s%s. " % (
                 cores_text(got), max(1, int(got)), cores_text(c["ask"]),
                 "" if got >= c["ask"] else ", and %s are what can be had now" % cores_text(got))
@@ -6044,7 +6123,7 @@ def _status(L, rid, now):
             gw, run = _G()._gpu_run_with(gp, out["granted"]), _G()._gpu_run_text(gp) + run
             out.setdefault("run_with", {})["gpu"] = gw
         out["advice"] = ("%sGranted: start the work now. Release it (release_memory / `oomph release %s`) as soon as the "
-                         "%s part is over%s." % (run, r["id"], heavy, "" if not r.get("expires") else
+                         "%s part is over%s." % (run + nrun, r["id"], heavy, "" if not r.get("expires") else
                                                  "; it expires in %d min unless extended" % round((r["expires"] - now) / 60)))
         fl = advice_flags(r)
         if fl:  # over / idle (02 §6.3): what the grant's own processes do, said first; nothing is revoked
@@ -6058,7 +6137,7 @@ def _status(L, rid, now):
         out["ahead"] = [_brief(x, now) for x in L["leases"]
                         if (x["state"] == "granted" and _meets(lease_need(x), need)) or x in before]
         waiting = r.get("waiting_on") if isinstance(r.get("waiting_on"), list) else ["ram"]
-        if c or dk or gp:
+        if c or dk or gp or np_:
             out["waiting_on"] = waiting
         room = st.get("cpu_available")
         why = ["memory is critical"] if st.get("level") == "critical" or "critical" in waiting else []
@@ -6073,6 +6152,8 @@ def _status(L, rid, now):
         gw = [p for p in waiting if p.startswith(("gpu:", "vram:"))]
         if not why and gp and gw:
             why.append(_G()._gpu_wait_text(gp, gw, st))
+        if not why and np_ and set(waiting) & {"net.down", "net.up"}:
+            why.append(_T().net_wait_text(r, waiting, st))
         if not why and dk and "disk:" + dk["pool"] in waiting:
             left = (st.get("disk") or {}).get(dk["pool"])
             why.append(("%s is not mounted%s" % (_disk_name(dk), ", and this ends in %d min unless it comes back" % max(
@@ -6203,19 +6284,22 @@ def _refuse_disk(s, gb, pool, why):
 
 @_unprivileged(inputs=True)
 def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder", cpu=None, cpu_min=None,
-            disk=None, disk_path=None, gpu=None, vram=None, gpu_device=None):
+            disk=None, disk_path=None, gpu=None, vram=None, gpu_device=None, **net):
     """Request (or re-poll with `ticket`) a reservation of `gb` of memory and, with `cpu`, cores: between
     `cpu_min` (default half, rounded up) and `cpu`; with `disk`, that many GB of space on the volume
     `disk_path` is on (default the temporary folder's), named by the pool's id when the request is made, so
     the reservation follows the volume, not the path (02 §7.1); with `gpu` a share of a GPU (%) and with `vram`
     GB of its memory (02 §6.5.1): on a Mac unified memory, charged against RAM; on Linux on one NVIDIA card,
     `gpu_device` (an index or a UUID prefix, resolved to the card's UUID now) or any card with room, which the
-    grant names. GPU parts only while gpu_reservations is on. A request with cores, disk or a GPU is a lease of
-    version 2 (02 §6.2); one for memory alone keeps the shape every older reader writes. Returns its status
-    dict."""
+    grant names. GPU parts only while gpu_reservations is on; `net` (net_gb, net_mbps, … NET 12.10) only while
+    net_reservations is. A request with cores, disk, a GPU or the network is a lease of version 2 (02 §6.2); one for
+    memory alone keeps the shape every older reader writes. Returns its status dict."""
     gpu_new = not ticket and (gpu is not None or vram is not None or gpu_device is not None)
     if gpu_new and not gpu_reservations_on():  # switched off (1.14): refused before anything is read or written
         return {"status": "refused", "gb": gb, "advice": _G().gpu_switch_text(), "switch": "gpu_reservations"}
+    net, net_new, off = _T().net_check(net, ticket, gb) if net else ({}, False, None)  # off: switched off (1.15)
+    if off:
+        return off
     s, procs, now = _decide_inputs()
     if cpu is not None:
         cpu = _cn(round(float(cpu), 1))
@@ -6239,6 +6323,10 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
         vram = None if vram is None else round(float(vram), 2)
         gpu = None if gpu is None else _cn(round(float(gpu), 1))
         gcard, why_gpu, gnote = _G()._gpu_request(s, vram, gpu_device, gpu)
+    nparts = why_net = None
+    if net_new or (tl is not None and _net_parts(tl)):  # the network this machine is on now (NET 12.10)
+        s = _T().net_inputs(s)
+        nparts, why_net = _T().net_request(s, net, now) if net_new else (None, None)
     unified = 0.0 if not gpu_new or why_gpu or vram is None or (gcard or {}).get("nvidia", True) else vram
     with Ledger() as L:
         r = next((x for x in L["leases"] if x["id"] == ticket), None) if ticket else None
@@ -6251,8 +6339,10 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                 why = _refuse_disk(s, disk, dpool, why_disk)
             if why is None and gpu_new:
                 why = why_gpu
+            why = why or why_net
             whole = gb + unified  # a Mac's GPU memory is memory (02 §6.2)
-            if why or (gb <= 0 and cpu is None and disk is None and not gpu_new) or gb < 0 or (ram and whole > 0.9 * ram):
+            if why or (gb <= 0 and cpu is None and disk is None and not gpu_new and not net_new) or gb < 0 or \
+                    (ram and whole > 0.9 * ram):
                 return {"status": "refused", "gb": gb,
                         "advice": why or "Can't reserve %.1f GB%s %s. Split the work or lower its parallelism."
                                          % (whole, " (memory and GPU memory)" if unified else "", _on_ram(s))}
@@ -6264,7 +6354,7 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                  "ttl": None if ttl_s is None else min(max(60, ttl_s), MAX_TTL_S),
                  "requested": round(now, 1), "seen": round(now, 1),
                  "segments": [{"t": round(now, 1), "gb": mirror}]}
-            if cpu is not None or disk is not None or gpu_new:  # a vector (02 §6.2): `v` once, at creation
+            if cpu is not None or disk is not None or gpu_new or net_new:  # a vector (02 §6.2): `v` once, at creation
                 r["v"] = 2
                 r["res"] = {}
                 if cpu is not None:
@@ -6274,12 +6364,15 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
                                         "name": notify_text(dpool.get("name") or dpool["id"], 64)}
                 if gpu_new:  # its card: the one it named (an NVIDIA card's UUID), a Mac's gpu0, or none yet
                     r["res"].update(_G()._gpu_asked(gcard, gpu, vram))
+                if net_new:  # the line each way: a rate, a volume, or both; unmanaged on a network without a figure
+                    r["res"].update(nparts)
                 if gb > 0:
                     r["res"].update(ram={"ask": round(gb, 2)})
                 if whole > 0:
                     r["res"]["mem"] = {"got": mirror}
                 r["segments"][0]["res"] = dict({"ram": round(gb, 2)} if gb > 0 else {},
-                                               **{k: x["ask"] for k, x in r["res"].items() if k in SEG_RES and k != "ram"})
+                                               **{k: x["ask"] for k, x in r["res"].items() if k in SEG_RES and k != "ram"
+                                                  and _num(x.get("ask"))})
             r["key"] = _key(r)
             r["user"] = _whoami()  # who asked (03 §6.5): shown once several accounts hold reservations
             r["holder"]["uid"] = os.getuid()
@@ -6295,7 +6388,8 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
             if seen is None or not weighable(seen):
                 L["seq"] -= 1
                 return {"status": "refused", "gb": gb, "advice": "Can't make this reservation: %s could not record it in "
-                        "a form it can weigh. Ask for memory, cores, disk space or a GPU in plain amounts." % BRAND}
+                        "a form it can weigh. Ask for memory, cores, disk space, a GPU or the network in plain amounts."
+                        % BRAND}
             L["leases"].append(r)
         else:
             r["seen"] = round(now, 1)
@@ -6312,11 +6406,12 @@ def reserve(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, ticket=None, watch="holder
 
 
 def acquire(gb, purpose, holder, ttl_s=DEFAULT_TTL_S, wait_s=0, ticket=None, watch="holder", progress=None,
-            cpu=None, cpu_min=None, disk=None, disk_path=None, gpu=None, vram=None, gpu_device=None):
+            cpu=None, cpu_min=None, disk=None, disk_path=None, gpu=None, vram=None, gpu_device=None, **net):
     kw = {"cpu": cpu, "cpu_min": cpu_min} if cpu is not None else {}
     if disk is not None:
         kw.update(disk=disk, disk_path=disk_path)
     kw.update((k, x) for k, x in (("gpu", gpu), ("vram", vram), ("gpu_device", gpu_device)) if x is not None)
+    kw.update((k, x) for k, x in net.items() if x is not None)  # the network (NET 12.10): net_gb, net_mbps, …
     st = reserve(gb, purpose, holder, ttl_s, ticket, watch, **kw)
     t0 = time.time()
     while st["status"] == "queued" and time.time() - t0 < wait_s:
@@ -6339,7 +6434,7 @@ def release(rid, holder_pid=None, outcome="released"):
             _retire(L, r, outcome if r["state"] == "granted" else "cancelled", now)
         L["leases"] = [r for r in L["leases"] if r not in gone]
         _evaluate(L, s, procs, now)  # hand the memory to whoever is next
-        return {"released": [h for h in L["history"] if h["id"] in {g["id"] for g in gone}],
+        return {"released": _public_recs([h for h in L["history"] if h["id"] in {g["id"] for g in gone}]),  # NET §8
                 "available_gb": L["state"]["available_gb"],
                 "next_granted": [r["id"] for r in L["leases"] if r["state"] == "granted" and r.get("granted") == round(now, 1)]}
 
@@ -6423,7 +6518,7 @@ def _amend_disk(L, r, disk):
 
 
 @_unprivileged(inputs=True)
-def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=None, gpu=None, vram=None):
+def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=None, gpu=None, vram=None, **net):
     """Change a reservation in place: its size, its cores, its disk space (on the volume it has), its time
     to live (from now) or its purpose. Shrinking applies at once and hands the room to whoever waits.
     Growing a grant applies only when the extra would be granted to a new request right now (it fits,
@@ -6432,7 +6527,9 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
     several resources can drop all but one (0). Every applied change is written to the history log, and
     a new size starts a new segment of the reservation's span. A GPU part (`gpu` %, `vram` GB, 02 §6.5.1) stays
     on its card; while gpu_reservations is off, one may shrink or be dropped, not be added or grow. On a Mac,
-    `gb` is the memory besides the GPU's (which the gb mirror also carries)."""
+    `gb` is the memory besides the GPU's (which the gb mirror also carries). The network's parts (`net`, as reserve's:
+    oomph_traffic.amend_net, NET 12.10)."""
+    net = _T().net_check(net, "amend")[0] if net else {}
     s, procs, now = _decide_inputs()
     if cpu is not None:
         cpu = _cn(round(float(cpu), 1))
@@ -6456,9 +6553,11 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
         ram = s.get("ram_gb") or 0
         change, refused = {}, None
         gp = _gpu_parts(r) or None
-        vec = _cpu_of(r) is not None or _disk_of(r) is not None or gp is not None
+        np_ = _net_parts(r) or {}
+        vec = _cpu_of(r) is not None or _disk_of(r) is not None or gp is not None or bool(np_)
         rest = (_cpu_of(r) is not None and cpu != 0) or (_disk_of(r) is not None and disk != 0) or \
-            bool(gp and ((gp["gpu"] and gpu != 0) or (gp["vram"] and vram != 0)))  # kept besides memory
+            bool(gp and ((gp["gpu"] and gpu != 0) or (gp["vram"] and vram != 0))) or \
+            any(np_.get(k) and net.get(k + "_gb") != 0 for k in ("net", "net_up"))  # kept besides memory
         before, order = json.loads(json.dumps(r)), list(L["leases"])  # all or nothing: restored when refused
         if (gpu or vram) and not gpu_reservations_on() and _G()._gpu_grows(r, gp, gpu, vram):
             refused = _G().gpu_switch_text()  # switched off: a GPU part may not be added or grow
@@ -6523,12 +6622,17 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
                         change["requeued"] = True
                 if refused and set(change) & {"gb", "cpu", "disk", "gpu"}:
                     refused += " Nothing was changed."
+        if refused is None and net:  # the line each way (NET 12.10)
+            ch, refused = _T().amend_net(L, r, net, now)
+            if refused and change:
+                refused += " Nothing was changed."
+            change.update(ch or {})
         if refused:
             r.clear()
             r.update(before)
             L["leases"][:] = order
             change = {}
-        if set(change) & {"gb", "cpu", "disk", "gpu", "vram"}:
+        if set(change) & {"gb", "cpu", "disk", "gpu", "vram", "net", "net_up"}:
             seg = {"t": round(now, 1), "gb": r["gb"]}
             if vec:
                 seg["res"] = {k: x.get("got", x.get("ask")) for k, x in r["res"].items()
@@ -6571,6 +6675,8 @@ def amend(rid, gb=None, ttl_s=None, purpose=None, cpu=None, cpu_min=None, disk=N
                     out[k] = a
             if refused.startswith("GPU reservations are switched off"):
                 out["switch"] = "gpu_reservations"
+            if net:
+                _T().net_refused(out, net, refused)
         else:
             out["changed"] = change
         return out
@@ -6604,6 +6710,8 @@ def coordination(mine=None, s=None):
     if not given and not isinstance(s.get("gpu"), list) and any(  # NVIDIA grants: what they use, read now
             (_gpu_parts(r) or {}).get("nvidia") for r in _quietly_leases()):
         s = _G()._with_gpus(s)
+    if not given and net_reservations_on():  # the line is reservable: the network it is on, before the lock
+        s = _net_now(s, anyway=True)
     with Ledger() as L:
         _evaluate(L, s, procs, now)
         st = L["state"]
@@ -6617,16 +6725,23 @@ def coordination(mine=None, s=None):
         disk = {k: {"name": d["name"], "free": d["free"], "margin": round(d["margin"], 1), "level": d["level"],
                     "reserved": round(d["reserved"], 1), "available": round(max(0.0, d["left"]), 1)}
                 for k, d in disk_view(s, L["leases"])[0].items()} if disk_reservable() else {}
+        net = _T().coord_net(L["leases"], s, now) if any(_net_parts(r) for r in L["leases"]) or (
+            not given and net_reservations_on()) else None  # the line (NET 12.13); check and the hook: grants only
         return {
             "free_gb": st["free_gb"], "margin_gb": st["margin_gb"], "reserved_gb": st["reserved_gb"],
             "available_gb": st["available_gb"], "grantable_gb": st["available_gb"], "ledger": ledger_info(),
             "reserved_by_others_gb": round(others_out, 1),
             "available_to_me_gb": round(st["free_gb"] - others_out - st["margin_gb"], 1),
-            "cpu": cpu, "disk": disk, "gpu": st.get("gpu") or {},
+            "cpu": cpu, "disk": disk, "gpu": st.get("gpu") or {}, "net": net,
             "others": [_brief(r, now) for r in others], "mine": [_brief(r, now) for r in own],
-            "history": [dict(h, project=os.path.basename(h.get("project") or "") or None)
-                        for h in L["history"][-15:]][::-1],
+            "history": _public_recs([dict(h, project=os.path.basename(h.get("project") or "") or None)
+                                     for h in L["history"][-15:]][::-1]),
         }
+
+
+def _public_recs(recs):
+    """Records as they leave the machine: a network's key as its public id (NET §8; oomph_traffic only for one)."""
+    return [_T().public_record(h) for h in recs] if any("net_network" in (h.get("res") or {}) for h in recs) else recs
 
 
 def _span(rec, now):
@@ -6669,6 +6784,7 @@ def reservation_history(since_s=24 * 3600, limit=50):
         last.pop(_key(r), None)
     done = [x for x in last.values() if x.get("ended")]
     spans = [_span(r, now) for r in live] + sorted((_span(x, now) for x in done), key=lambda x: x["ended"], reverse=True)
+    spans = _public_recs(spans)
     return {"since": datetime.datetime.fromtimestamp(now - since_s).astimezone().isoformat(timespec="seconds"),
             "active": len(live), "finished": len(done), "reservations": spans[:limit],
             "log": _history_path()}
@@ -6719,14 +6835,14 @@ def ledger_view(since=None):
 
 
 @_unprivileged()
-def refresh_ledger(s, procs, rated=False):
+def refresh_ledger(s, procs, rated=False, net=None):
     """The daemon's tick: retire leases whose holder died or that expired, close to when it
     happened, and keep the usage figures current (with `rated`, the cores too: the process table
-    carries the logger's CPU rates). Skips the lock when nothing is reserved."""
+    carries the logger's CPU rates; `net`: the network grants', NET 12.4). Skips the lock when nothing is reserved."""
     if not read_ledger()["leases"]:
         return
     with Ledger() as L:
-        _evaluate(L, s, procs, time.time(), rated=rated)
+        _evaluate(L, s, procs, time.time(), rated=rated, net=net)  # the logger's sample: never a reading as nobody
 
 
 PROC_KEYS = ("pid", "ppid", "uid", "name", "start", "fp", "rss", "path")  # what the ledger's child is told of a process
@@ -6789,7 +6905,9 @@ def _cmd_ledger_refresh():
         fd = _ledger_dir()  # readers see a directory replaced by a link as empty; the daemon should hear of it
         if fd is not None:
             os.close(fd)
-        refresh_ledger(d["s"], procs, rated=d.get("v") == 2)
+        tick = d.get("net") if isinstance(d.get("net"), dict) else None  # this interval's internet bytes (ni, no)
+        refresh_ledger(d["s"], procs, rated=d.get("v") == 2,
+                       net={"dt": tick.get("dt"), "complete": tick.get("complete") is True} if tick else None)
     except Exception as e:  # the snapshot is still worth having
         out["error"] = "%s: %s" % (type(e).__name__, e) if not isinstance(e, LedgerError) else str(e)
     out["leases"] = sample_leases(ledger_snapshot(procs))
@@ -6837,7 +6955,8 @@ def ledger_snapshot(procs=None):
 
 
 SAMPLE_LEASE_NUMS = ("used_gb", "for_min", "expires_in_min", "waiting_min", "cpu", "cpu_used", "disk", "disk_used",
-                     "gpu", "gpu_used", "vram", "vram_used")
+                     "gpu", "gpu_used", "vram", "vram_used", "net", "net_used", "net_gb", "net_moved", "net_up",
+                     "net_up_used", "net_up_gb", "net_up_moved")
 
 
 def sample_leases(x):
@@ -6893,6 +7012,8 @@ def _fmt_brief(b, purpose_w=22):
                                     " (%sG used)" % _gb(b["disk_used"]) if _num(b.get("disk_used")) else "")
     if _num(b.get("gpu")) or _num(b.get("vram")):  # a GPU's memory and share, on which card
         cores += _G()._gpu_brief_text(b)
+    if any(_num(b.get(k)) for k in ("net", "net_gb", "net_up", "net_up_gb")):  # the line each way (NET 1.15)
+        cores += _T().net_brief_text(b)
     tail = cores + ((("using %.1fG, " % b.get("used_gb", 0)) if b["gb"] > 0 else "") + "%.0f min" % max(0.0, b["for_min"])
                     if b["state"] == "granted" else "waiting %.0f min" % max(0.0, b["waiting_min"]))
     flags = b.get("flags") if isinstance(b.get("flags"), dict) else {}
@@ -6955,13 +7076,15 @@ def _usage_error(cmd, e, text):
 
 
 RESERVE_USAGE = ("usage: oomph reserve [size, e.g. 6G] [--cpu 8 | --cpu 4..8 | --cpu 8..8] [--disk 20G[@PATH]] "
-                 "[--gpu 60[@CARD]] [--gpu-mem 16G[@CARD]] --for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
+                 "[--gpu 60[@CARD]] [--gpu-mem 16G[@CARD]] [--net 40G] [--net-up 5G] [--net-rate 200M[/20M]] "
+                 "--for \"what\" [--wait 10m] [--ttl 30m] [--ticket rN] [--json]")
 RELEASE_USAGE = "usage: oomph release <id | all>   (all = every reservation held by this session)"
-AMEND_USAGE = ("usage: oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--gpu 40] [--gpu-mem 12G] [--ttl 20m] "
-               "[--for \"what\"] [--json]")
+AMEND_USAGE = ("usage: oomph amend <id> [--gb 3G] [--cpu 6] [--disk 30G] [--gpu 40] [--gpu-mem 12G] [--net 50G] "
+               "[--net-up 5G] [--net-rate 150M[/20M]] [--ttl 20m] [--for \"what\"] [--json]   (--net 0: drop it)")
 RUN_USAGE = ("usage: oomph run [--reserve 6G] [--cpu 4..12] [--disk 20G[@PATH]] [--gpu 60[@CARD]] [--gpu-mem 16G[@CARD]] "
-             "[--pin-gpu] [--for \"what\"] [--wait 30m] -- <command> [args…]   ({cpu} in the command is the number of "
-             "cores granted)")
+             "[--pin-gpu] [--net 40G] [--net-up 5G] [--net-rate 200M[/20M]] [--for \"what\"] [--wait 30m] -- <command> "
+             "[args…]   ({cpu} in the command is the number of cores granted, {net} the Mbit/s and {net_limit} the "
+             "bytes per second)")
 
 
 def _cpu_opt(o):
@@ -6995,16 +7118,26 @@ def _gpu_rec(h, short=False):
     return _G()._gpu_rec_text(h, short) if set(h.get("res") or {}) & {"gpu", "vram"} else ""
 
 
+NET_FLAGS = ("--net", "--net-up", "--net-rate")  # the network's flags of reserve, run and amend (NET 12.12)
+
+
+def _net_rec(h, short=False):
+    """A finished reservation's network parts in words (oomph_traffic.net_rec_text), "" at once without one."""
+    res = h.get("res") if isinstance(h.get("res"), dict) else {}
+    return _T().net_rec_text(h, short) if set(res) & {"net", "net_up", "net_gb", "net_up_gb"} else ""
+
+
 def cmd_reserve(args):
     try:
-        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu", "--disk", "--gpu", "--gpu-mem"),
-                         ("--json", "--help", "-h"))
+        o, pos = _strict(args, ("--for", "--wait", "--ttl", "--ticket", "--pid", "--cpu", "--disk", "--gpu", "--gpu-mem")
+                         + NET_FLAGS, ("--json", "--help", "-h"))
         ticket = o.get("--ticket")
         cpu, cpu_min = _cpu_opt(o)
         disk, disk_path = _disk_opt(o)
         gpu, vram, card = _G()._gpu_opts(o) if {"--gpu", "--gpu-mem"} & set(o) else (None, None, None)
+        net = _T().net_opts(o) if set(NET_FLAGS) & set(o) else {}
         if "--help" in o or "-h" in o or (not pos and not ticket and cpu is None and disk is None and gpu is None
-                                          and vram is None):
+                                          and vram is None and not net):
             print(RESERVE_USAGE)
             return 2
         gb = _size(pos[0]) if pos else 0
@@ -7015,11 +7148,14 @@ def cmd_reserve(args):
         return _usage_error("reserve", e, RESERVE_USAGE)
     if (gpu is not None or vram is not None) and not ticket and not gpu_reservations_on():
         return _G()._gpu_off(o, "--json" in o)
+    if net and not ticket and not net_reservations_on():
+        return _T().net_off("--json" in o)
     holder = holder_for(int(pid) if pid is not None else None)
     st = acquire(gb, o.get("--for", "unspecified"), holder, parse_dur(o.get("--ttl", "30m")),
                  parse_dur(o.get("--wait", "0s")), ticket, cpu=cpu, cpu_min=cpu_min, disk=disk,
                  disk_path=os.path.abspath(disk_path) if disk_path else None,
-                 **({"gpu": gpu, "vram": vram, "gpu_device": card} if gpu is not None or vram is not None else {}))
+                 **dict({"gpu": gpu, "vram": vram, "gpu_device": card} if gpu is not None or vram is not None else {},
+                        **net))
     if "--json" in o:
         print(json.dumps(st))
     else:
@@ -7051,19 +7187,21 @@ def cmd_release(args):
         dk, dpeak = (h.get("res") or {}).get("disk"), (h.get("peak") or {}).get("disk")
         uv = _unified_rec_gb(h)  # a Mac's GPU memory is in gb too: said once, as GPU memory
         mem = "%.1fG, peak %.1fG" % (max(0.0, h["gb"] - uv), h["peak_gb"]) \
-            if ("ram" in (h.get("res") or {}) and h["gb"] - uv > 0.005) or not (_num(cpu) or _num(dk) or _gpu_rec(h)) \
+            if ("ram" in (h.get("res") or {}) and h["gb"] - uv > 0.005) or not (_num(cpu) or _num(dk) or _gpu_rec(h)
+                                                                                      or _net_rec(h)) \
             else ""
         cores = "%s cores%s" % (cores_text(cpu), ", peak %.1f busy" % peak if _num(peak) else "") if _num(cpu) else ""
         disk = "%sG of disk%s" % (_gb(dk), ", %sG used" % _gb(dpeak) if _num(dpeak) else "") if _num(dk) else ""
         print("oomph: released %s (%s) — reserved %s, held %ds" % (
-            h["id"], h["purpose"], " and ".join(x for x in (mem, cores, disk, _gpu_rec(h)) if x), h["held_s"]))
+            h["id"], h["purpose"], " and ".join(x for x in (mem, cores, disk, _gpu_rec(h), _net_rec(h)) if x),
+            h["held_s"]))
     if res["next_granted"]:
         print("oomph: now granted to " + ", ".join(res["next_granted"]))
     return 0
 
 
 def cmd_amend(args):
-    opts = ("--gb", "--ttl", "--for", "--cpu", "--disk", "--gpu", "--gpu-mem")
+    opts = ("--gb", "--ttl", "--for", "--cpu", "--disk", "--gpu", "--gpu-mem") + NET_FLAGS
     try:
         o, pos = _strict(args, opts, ("--json", "--help", "-h"))
         if not pos or not any(k in o for k in opts) or "--help" in o or "-h" in o:
@@ -7077,11 +7215,12 @@ def cmd_amend(args):
         gpu, vram, card = _G()._gpu_opts(o, zero=True) if {"--gpu", "--gpu-mem"} & set(o) else (None, None, None)  # 0 drops it
         if card:
             raise UsageError("a reservation stays on its card; give the new amount alone")
+        net = _T().net_opts(o, zero=True) if set(NET_FLAGS) & set(o) else {}  # --net 0 drops that direction's part
     except UsageError as e:
         return _usage_error("amend", e, AMEND_USAGE)
     rid = pos[0]
     st = amend(rid, gb, parse_dur(o["--ttl"]) if "--ttl" in o else None, o.get("--for"), cpu=cpu, cpu_min=cpu_min,
-               disk=disk, **{k: x for k, x in (("gpu", gpu), ("vram", vram)) if x is not None})
+               disk=disk, **dict({k: x for k, x in (("gpu", gpu), ("vram", vram)) if x is not None}, **net))
     if "--json" in o:
         print(json.dumps(st))
     else:
@@ -7091,6 +7230,7 @@ def cmd_amend(args):
                          ("%sG → %sG of disk" % tuple(_gb(x) for x in v)) if k == "disk" else
                          ("%s → %s %% of the GPU" % tuple(cores_text(x) for x in v)) if k == "gpu" else
                          ("%sG → %sG of GPU memory" % tuple(_gb(x) for x in v)) if k == "vram" else
+                         _T().change_text(k, v) if k.startswith("net") else
                          ("expires in %.0f min" % v[1]) if k == "expires_in_min" else
                          ("ttl %.0f min" % v) if k == "ttl_min" else
                          ("for \"%s\"" % v[1]) if k == "purpose" else "back of the queue"
@@ -7117,6 +7257,9 @@ def cmd_reservation_history(args):
         g = _gpu_rec(x, short=True)
         if g:  # and a GPU
             gbs = g if not x["gb"] and not set(x["res"]) & {"cpu", "disk"} else gbs + " " + g
+        n = _net_rec(x, short=True)
+        if n:  # and the network
+            gbs = n if not x["gb"] and not set(x["res"]) & {"cpu", "disk", "gpu", "vram"} else gbs + " " + n
         print("  %-6s %s–%-5s %-13s peak %4.1fG  %-26s %-14s %s" % (
             x["id"], when, end, gbs, x["peak_gb"], x["purpose"][:26], (x["project"] or "")[:14], x["outcome"]))
     return 0
@@ -7151,7 +7294,7 @@ def cmd_reservations(args):
             print("  %-5s %5.1fG → %4.1fG  %-20s %-10s %-11s held %s%s" % (
                 h["id"], h["gb"], h["peak_gb"], cut_end(h["purpose"], 20), cut_middle(h.get("project") or "", 10),
                 h["outcome"], "%dm%02ds" % divmod(h["held_s"], 60),
-                "  " + _gpu_rec(h, short=True) if _gpu_rec(h, short=True) else ""))
+                "".join("  " + t for t in (_gpu_rec(h, short=True), _net_rec(h, short=True)) if t)))
     return 0
 
 
@@ -7169,6 +7312,8 @@ def run_env(st, env, pin=False):
     out = dict(env, OOMPH_RESERVATION=st["id"])
     if isinstance((st.get("run_with") or {}).get("gpu"), dict):
         _G()._gpu_env(st["run_with"]["gpu"], out, pin)
+    if set(st.get("run_with") or {}) & {"net_mbps", "net_up_mbps"}:  # the line (NET 12.14): rates, limits, volumes
+        _T().run_env(st, out)
     if st.get("gb"):
         out["OOMPH_RAM_GB"] = "%g" % st["gb"]
     dk = (st.get("granted") or {}).get("disk_gb")
@@ -7184,25 +7329,31 @@ def run_env(st, env, pin=False):
     return out
 
 
-def run_argv(cmd, st):
+def run_argv(cmd, st, added=None):
     """The command with every `{cpu}` replaced by the number of cores granted (in the argument vector itself,
-    never through a shell); unchanged without cores."""
+    never through a shell); with a network grant `{net}` and `{net_limit}` too, and a known tool's limiter flag
+    where the command sets none (oomph_traffic.run_argv: what it added goes to `added`); unchanged without either."""
     got = (st.get("run_with") or {}).get("cpu_cores")
-    if not _num(got, 0.1, CPU_MAX):
-        return list(cmd)
-    jobs = str(max(1, int(got)))
-    return [c.replace("{cpu}", jobs) for c in cmd]
+    out = list(cmd)
+    if _num(got, 0.1, CPU_MAX):
+        jobs = str(max(1, int(got)))
+        out = [c.replace("{cpu}", jobs) for c in out]
+    if set(st.get("run_with") or {}) & {"net_mbps", "net_up_mbps"}:
+        out, more = _T().run_argv(out, st)
+        if added is not None:
+            added.extend(more)
+    return out
 
 
 def cmd_run(args):
     if "--" not in args or not any(k in args[:args.index("--")] for k in ("--reserve", "--cpu", "--disk", "--gpu",
-                                                                            "--gpu-mem", "--pin-gpu")):
+                                                                            "--gpu-mem", "--pin-gpu") + NET_FLAGS):
         print(RUN_USAGE)
         return 2
     i = args.index("--")
     cmd = args[i + 1:]
     try:
-        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu", "--disk", "--gpu", "--gpu-mem"),
+        opts, _ = _strict(args[:i], ("--reserve", "--for", "--wait", "--cpu", "--disk", "--gpu", "--gpu-mem") + NET_FLAGS,
                           ("--pin-gpu",), npos=0)
         gb = _size(opts["--reserve"]) if "--reserve" in opts else 0
         cpu, cpu_min = _cpu_opt(opts)
@@ -7212,6 +7363,7 @@ def cmd_run(args):
         off = (pin or gpu is not None or vram is not None) and not gpu_reservations_on()  # 02 §6.5.1: the switch first
         if pin and gpu is None and vram is None and not off:
             raise UsageError("--pin-gpu comes with --gpu or --gpu-mem: it runs the job on the card granted")
+        net = _T().net_opts(opts) if set(NET_FLAGS) & set(opts) else {}
     except UsageError as e:
         return _usage_error("run", e, RUN_USAGE)
     if not cmd:
@@ -7219,6 +7371,9 @@ def cmd_run(args):
         return 2
     if off:
         sys.stderr.write(_G().gpu_switch_text("oomph: not started — ") + "\n")
+        return 75
+    if net and not net_reservations_on():  # NET 12.11: the switch first, before anything is written
+        sys.stderr.write(_T().net_switch_text("oomph: not started — ") + "\n")
         return 75
     import signal
     purpose = opts.get("--for") or " ".join(os.path.basename(c) if j == 0 else c for j, c in enumerate(cmd[:3]))
@@ -7231,7 +7386,8 @@ def cmd_run(args):
     want = " and ".join(([("%.1fG" % gb)] if gb else []) + (["%s cores" % cores_text(cpu_min if cpu_min == cpu else cpu)]
                                                            if cpu else []) + (["%sG of disk" % _gb(disk)] if disk else [])
                         + (["%sG of GPU memory" % _gb(vram)] if vram else []) + (["%s %% of a GPU" % cores_text(gpu)]
-                                                                                 if gpu else []))
+                                                                                 if gpu else [])
+                        + (["the network"] if net else []))
 
     def progress(st):
         if time.time() - last[0] >= 30:
@@ -7245,7 +7401,8 @@ def cmd_run(args):
 
     st = acquire(gb, purpose, me, None, wait_s, watch=None, progress=progress, cpu=cpu, cpu_min=cpu_min, disk=disk,
                  disk_path=os.path.abspath(disk_path) if disk_path else None,
-                 **({"gpu": gpu, "vram": vram, "gpu_device": card} if gpu is not None or vram is not None else {}))
+                 **dict({"gpu": gpu, "vram": vram, "gpu_device": card} if gpu is not None or vram is not None else {},
+                        **net))
     if st["status"] != "granted":
         if st["status"] == "queued":
             _quietly(release, st["id"])
@@ -7256,9 +7413,13 @@ def cmd_run(args):
         sys.stderr.write("oomph: note — %s\n" % st["note"])
     if (st.get("run_with") or {}).get("gpu"):  # where the job may run (02 §6.5.1): said once; pinned only when asked
         _G()._gpu_run_note(st, pin)
+    added = []
+    argv = run_argv(cmd, st, added)
+    for x in added:  # a limiter flag handed to curl, wget, rsync or aria2c (NET 12.14), said once
+        sys.stderr.write("oomph: added %s\n" % x)
     t0 = time.time()
     try:
-        child = subprocess.Popen(run_argv(cmd, st), env=run_env(st, os.environ, pin))
+        child = subprocess.Popen(argv, env=run_env(st, os.environ, pin))
     except OSError as e:
         _quietly(release, st["id"])
         sys.stderr.write("oomph run: %s\n" % e)
@@ -7290,6 +7451,7 @@ def cmd_run(args):
         parts.append("%sG of GPU memory%s" % (_gb(vram), ", peak %sG" % _gb(vpeak) if _num(vpeak) else ""))
     if gpu:
         parts.append("%s %% of the GPU" % cores_text(gpu))
+    parts += _T().run_end(st, h, max(1.0, time.time() - t0)) if net else []  # the line: granted, moved (NET 12.14)
     sys.stderr.write("oomph: %s — %s, %ds\n" % (st["id"], ", ".join(parts), time.time() - t0))
     return rc if rc >= 0 else 128 - rc
 
@@ -7498,6 +7660,17 @@ MCP_TOOLS = [
 ]
 
 
+def _mcp_tools():
+    """MCP_TOOLS with the network's arguments (oomph_traffic.mcp_merge, NET 12.13), merged at their first use; as they
+    are where that module cannot be loaded (a copy of oomph.py alone): the tools without the network."""
+    if not any("net_gb" in t["inputSchema"].get("properties", {}) for t in MCP_TOOLS):
+        try:
+            _T().mcp_merge(MCP_TOOLS)
+        except Exception:  # noqa: B902
+            pass
+    return MCP_TOOLS
+
+
 class ToolArgError(ValueError):
     """A tool call's arguments don't fit its schema; the caller gets an error result saying so."""
 
@@ -7510,7 +7683,7 @@ def _mcp_args(name, a):
     or, where the schema closes it (the reservation tools), one it doesn't know. A client written
     for a newer oomph that sends `cpu` is told so instead of having its request read as memory
     alone. A re-poll with {gb, ticket} and no purpose keeps working as it always has."""
-    tool = next((t for t in MCP_TOOLS if t["name"] == name), None)
+    tool = next((t for t in _mcp_tools() if t["name"] == name), None)
     if tool is None:
         raise KeyError(name)
     if not isinstance(a, dict):
@@ -7528,11 +7701,15 @@ def _mcp_args(name, a):
             raise ToolArgError("%s: %s takes a number from 0 up, not %r" % (name, k, a[k]))
     if any(a.get(k) is not None for k in ("gpu_pct", "gpu_mem_gb", "gpu_device")):
         _G()._gpu_mcp_args(name, a)
+    if any(k.startswith("net_") and a[k] is not None for k in a):  # numbers only, else the parser's words (12.12)
+        _T().net_mcp_args(name, a)
     if a.get("disk_gb") and round(float(a["disk_gb"]), 2) < DISK_MIN_GB:  # 0.004 would be kept as none
         raise ToolArgError("%s: disk_gb takes at least %g (GB), not %r" % (name, DISK_MIN_GB, a["disk_gb"]))
     if name == "reserve_memory":
-        if not (a.get("gb") or a.get("cpu_cores") or a.get("disk_gb") or a.get("gpu_pct") or a.get("gpu_mem_gb")):
-            raise ToolArgError("reserve_memory needs gb, cpu_cores, disk_gb, gpu_pct or gpu_mem_gb (or several)")
+        if not (a.get("gb") or a.get("cpu_cores") or a.get("disk_gb") or a.get("gpu_pct") or a.get("gpu_mem_gb")
+                or any(a[k] for k in a if k.startswith("net_"))):
+            raise ToolArgError("reserve_memory needs gb, cpu_cores, disk_gb, gpu_pct, gpu_mem_gb, net_gb, net_mbps, "
+                               "net_up_gb or net_up_mbps (or several)")
         if a.get("disk_path") is not None and not (a.get("disk_gb") and isinstance(a["disk_path"], str)
                                                    and 0 < len(a["disk_path"]) <= 4096 and "\0" not in a["disk_path"]):
             raise ToolArgError("reserve_memory: disk_path is a path on the disk, and comes with disk_gb")
@@ -7565,11 +7742,12 @@ def _mcp_call(name, a):
         gpu = {k: x for k, x in (("gpu", round(float(a["gpu_pct"]), 1) if a.get("gpu_pct") else None),
                                  ("vram", round(float(a["gpu_mem_gb"]), 2) if a.get("gpu_mem_gb") else None),
                                  ("gpu_device", a.get("gpu_device"))) if x is not None}
+        net = _T().net_kw(a) if any(k.startswith("net_") for k in a) else {}
         return acquire(float(a.get("gb") or 0), str(a.get("purpose", "unspecified")), holder_for(), ttl,
                        min(max(int(a.get("wait_s", 120)), 0), 300), a.get("ticket"), cpu=cpu,
                        cpu_min=round(float(a["cpu_min"]), 1) if cpu and a.get("cpu_min") is not None else None,
                        disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") else None,
-                       disk_path=os.path.abspath(os.path.expanduser(path)) if path else None, **gpu)
+                       disk_path=os.path.abspath(os.path.expanduser(path)) if path else None, **dict(gpu, **net))
     if name == "release_memory":
         rid = str(a.get("id", ""))
         return release(rid, holder_for()["pid"] if rid == "all" else None)
@@ -7580,9 +7758,11 @@ def _mcp_call(name, a):
                      cpu=(parse_cores(a["cpu_cores"])[0] if a["cpu_cores"] else 0.0)
                      if a.get("cpu_cores") is not None else None,
                      disk=round(float(a["disk_gb"]), 2) if a.get("disk_gb") is not None else None,
-                     **{k: x for k, x in (("gpu", round(float(a["gpu_pct"]), 1) if a.get("gpu_pct") is not None else None),
-                                          ("vram", round(float(a["gpu_mem_gb"]), 2) if a.get("gpu_mem_gb") is not None
-                                           else None)) if x is not None})
+                     **dict({k: x for k, x in (("gpu", round(float(a["gpu_pct"]), 1) if a.get("gpu_pct") is not None
+                                                else None),
+                                               ("vram", round(float(a["gpu_mem_gb"]), 2) if a.get("gpu_mem_gb") is not None
+                                                else None)) if x is not None},
+                            **(_T().net_kw(a) if any(k.startswith("net_") for k in a) else {})))
     if name == "reservations":
         return coordination(holder_for()["pid"])
     if name == "reservation_history":
@@ -7595,6 +7775,9 @@ def _mcp_call(name, a):
             h["reservations"] = [x for x in h["reservations"] if "disk" in (x.get("res") or {})]
         elif a.get("resource") == "gpu":
             h["reservations"] = [x for x in h["reservations"] if set(x.get("res") or {}) & {"gpu", "vram"}]
+        elif a.get("resource") == "net":
+            h["reservations"] = [x for x in h["reservations"] if set(x.get("res") or {}) & {"net", "net_up", "net_gb",
+                                                                                            "net_up_gb"}]
         elif a.get("resource") == "memory":
             h["reservations"] = [x for x in h["reservations"] if x["gb"] > 0]
         h["reservations"] = h["reservations"][:int(a.get("limit", 50))]
@@ -7603,7 +7786,7 @@ def _mcp_call(name, a):
         return find_session() or {"error": "this MCP server is not running under a Claude Code session"}
     if name == "memory_status":
         s = sample()
-        s["network"] = network_info(s)
+        s["network"] = network_info(s, {})   # room from the pools less the ledger's grants (NET 12.13)
         return public_sample(s)
     if name == "wait_for_memory":
         ok, v, waited = wait_for_memory(min(int(a.get("timeout_s", 120)), 300), float(a.get("min_free_gb", 0)), quiet=True)
@@ -7672,7 +7855,7 @@ def _mcp_answer(req):
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            result = {"tools": _here_words(MCP_TOOLS)}
+            result = {"tools": _here_words(_mcp_tools())}
         elif method == "tools/call":
             try:
                 data = _mcp_call(params.get("name"), params.get("arguments") or {})

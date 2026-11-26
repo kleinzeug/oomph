@@ -326,7 +326,20 @@ if hasattr(P_, "net_route"):
         grow(11 * 10 ** 6)
         s, dt, ran = tick()
         ans_ = d.ledger.network(60) or {}
+        os.environ["OOMPH_NET_RESERVATIONS"] = "1"   # N2: the switch reaches root's child; it weighs the line there
+        rr_ = cli("reserve", "--net", "4G", "--for", "root's pull", "--json")
+        os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+        try:
+            rj_ = json.loads(rr_[1])
+        except ValueError:
+            rj_ = {}
+        if rj_.get("id"):
+            cli("release", rj_["id"])
     os.environ.pop("OOMPH_NETTOP_FIXTURE", None)
+    check(not eg_.get("if") or (rr_[0] == 0 and 47 <= ((rj_.get("granted") or {}).get("net_mbps") or 0) <= 93),
+          "net: `oomph reserve --net 4G` as root, the switch on for the command: granted in its child, half of the "
+          "187.5 Mbit/s the line shares at most, as much of it as is idle (%s)"
+          % [rr_[0], rj_.get("granted"), rj_.get("advice", "")[:80], rr_[2][-200:]])
     nst = os.lstat(os.path.join(p, "networks.json")) if os.path.lexists(os.path.join(p, "networks.json")) else None
     nb_ = s.get("net") or {}
     check(rn_[0] == 0 and nst and stat.S_IMODE(nst.st_mode) == 0o666 and (not REAL or not USER or nst.st_uid == USER),
@@ -336,6 +349,13 @@ if hasattr(P_, "net_route"):
                                 (ans_.get("entry") or {}).get("down") == 250.0),
           "net: the sample's net block on %s, and the logger's child names this network's entry (%s)" % (
               eg_.get("if"), [nb_.get("src"), ans_.get("key"), round(dt, 2)]))
+    if eg_.get("if"):  # N2: the line's pools from the child's answer (root never opens networks.json)
+        pl_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json"))).get("pools") or {}
+        check((pl_.get("net.down") or {}).get("cap") == 250.0 and pl_["net.down"].get("margin") == 62.5
+              and (pl_.get("net.up") or {}).get("cap") == 40.0 and pl_["net.up"].get("margin") == 12.0
+              and pl_["net.down"].get("network") == net_id,
+              "net: current.json's pools net.down and net.up from the child's answer about this network (%s)"
+              % pl_.get("net.down"))
     if not REAL and os.path.exists(nfx) and eg_.get("if"):
         cur_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json")))
         check(nb_.get("src") == "flows" and [x.get("pid") for x in cur_.get("top_net") or []] == [os.getpid()] and

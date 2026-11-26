@@ -579,8 +579,10 @@ struct Reservation: Identifiable {
         return d.isFinite && d > 0 && d < 1e11 ? d : nil
     }
     /// The resource of a pool id in `waiting_on` (02 §6.4): ram, mem and "critical" are memory's; cpu; gpu, vram; disk:<id>.
-    static func waited(_ id: String) -> Resource {
-        id == "ram" || id == "mem" || id == "critical" ? .memory : id == "cpu" ? .cpu
+    /// nil for the network's pools (net.down, net.up: NET 1.15, no tile of its own yet), never taken for disk.
+    static func waited(_ id: String) -> Resource? {
+        if id.hasPrefix("net.") { return nil }
+        return id == "ram" || id == "mem" || id == "critical" ? .memory : id == "cpu" ? .cpu
             : id.hasPrefix("gpu") || id.hasPrefix("vram") ? .gpu : .disk
     }
 
@@ -591,7 +593,7 @@ struct Reservation: Identifiable {
         func waits(_ deflt: [String]) {
             guard !isGranted && open else { return }
             let w = ((o["waiting_on"] as? [Any]) ?? []).prefix(16).compactMap { $0 as? String }
-            let got = Set((w.isEmpty ? deflt : w).map(Reservation.waited))
+            let got = Set((w.isEmpty ? deflt : w).compactMap(Reservation.waited))
             waitingFor = Resource.allCases.filter { got.contains($0) }
         }
         guard let res = o["res"] as? [String: Any] else { waits(["ram"]); return }
@@ -1048,7 +1050,7 @@ struct Tile {
         var out: [Resource: Int] = [:]
         for l in leases where (l["state"] as? String) == "queued" {
             let ids = ((l["waiting_on"] as? [Any]) ?? []).map { "\($0)" }
-            let got = Set((ids.isEmpty ? ["ram"] : ids).map(Reservation.waited))  // "critical": memory's
+            let got = Set((ids.isEmpty ? ["ram"] : ids).compactMap(Reservation.waited))  // "critical": memory's
             for r in got { out[r, default: 0] += 1 }
         }
         return out

@@ -3836,6 +3836,18 @@ for line in r.stdout.splitlines():
 check(r.returncode == 0, "internet traffic (tools/traffictest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                          + r.stderr[-400:]))
 
+# network reservations (NET step N2, 1.15): the pools net.down and net.up, elastic grants, unmanaged ones, the switch
+# net_reservations, the network changing under a grant, over and idle, oomph run's limiter flags (tools/netrestest.py)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "netrestest.py")], capture_output=True,
+                   text=True, timeout=300, env={k: v for k, v in os.environ.items()
+                                                if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR",
+                                                             "OOMPH_NET_RESERVATIONS")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("   netres: " + line)
+check(r.returncode == 0, "network reservations (tools/netrestest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                            + r.stderr[-400:]))
+
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,
                    timeout=600, env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR")})

@@ -674,6 +674,79 @@ check(agent_is(lease(raw(d), st["id"])["agent"], new.agent_key(SES, START - 50))
       and "agent" not in lease(raw(d), st["id"])["holder"],
       "D a reservation made by `oomph run` inside a session has the session's agent key")
 
+# ======================================= NR: network reservations (NET N2, 1.15): `net` and `net_up` parts of a lease,
+# granted, unmanaged and queued, and their records, under 1.8.1, 1.9.1 and 1.14.0 (12.9: old code carries the parts
+# through its own writes; 1.14 cannot weigh a queued net request and waits behind it; the next refresh here lets
+# memory pass it; old readers read the records with net_gb and drop net_network)
+d = use("nr")
+KEYN = "rmac:00:00:5e:00:53:03"
+put(d, "networks.json", json.dumps({"v": 1, "networks": {KEYN: {"down": 194.0, "up": 48.0, "source": "set",
+                                                                "set_by": "x", "set": round(NOW - 60)}}}))
+NSAMPLE = dict(SAMPLE, net={"if": "en0", "network": KEYN, "src": "flows", "down_mbps": 10.0, "up_mbps": 1.0})
+saved_n = new._sample_override
+os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+new._sample_override = lambda: dict(NSAMPLE)
+b14 = old_module("v1.14.0")
+try:
+    for tag, m in (("1.8.1", old), ("1.9.1", mid), ("1.14.0", b14)):
+        if m is None:
+            print("skip  NR %s on a ledger with network parts: tag v%s is not in this clone" % (tag, tag))
+            continue
+        m.LEDGER_DIR = d
+        if m is not old:
+            m._plat = Procs
+        m._sample_override = lambda: dict(SAMPLE)
+        new.release("all", ME)
+        g = new.reserve(0, "a pull", HOLDER, net_gb=40, net_up_gb=5)
+        new._sample_override = lambda: dict(NSAMPLE, net=dict(NSAMPLE["net"], network="gw:192.0.2.1/24"))
+        u = new.reserve(0, "unmanaged", HOLDER, net_gb=4)
+        new._sample_override = lambda: dict(NSAMPLE)
+        w = new.reserve(0, "waits", HOLDER, net_mbps=145, net_min_mbps=145)
+        L0 = raw(d)
+        st = quietly(m.reserve, 0.5, "a %s client" % tag, HOLDER)
+        L1 = raw(d)
+        bad = [(x["id"], k) for x in (g, u, w) for k in ("res", "v")
+               if (lease(L0, x["id"]) or {}).get(k) != (lease(L1, x["id"]) or {}).get(k)]
+        check(g.get("status") == "granted" and u.get("status") == "granted" and w.get("status") == "queued"
+              and isinstance(st, dict) and not bad and (lease(L1, g["id"]) or {}).get("state") == "granted",
+              "NR %s on a ledger with a granted, an unmanaged and a queued network request keeps their res and v (%s)"
+              % (tag, bad or (st.get("status") if isinstance(st, dict) else repr(st))))
+        if m is b14:
+            check(st.get("status") == "queued" and lease(L1, w["id"])["state"] == "queued",
+                  "NR 1.14.0 cannot weigh the network request that waits, so its own memory request waits behind it")
+            new.refresh_ledger(dict(NSAMPLE), Procs.collect_procs())
+            again = m.reserve(0.5, "a 1.14.0 client", HOLDER, ticket=st["id"])
+            check(again.get("status") == "granted" and lease(raw(d), w["id"])["state"] == "queued"
+                  and lease(raw(d), g["id"])["res"]["net"]["got"] == 72,
+                  "NR the next refresh here grants it (memory passes a request waiting for the line); the network "
+                  "request still waits, the grant keeps its 72 Mbit/s (%s)" % again.get("status"))
+        else:
+            new.refresh_ledger(dict(NSAMPLE), Procs.collect_procs())
+            x = lease(raw(d), w["id"])
+            check(x and x["state"] == "queued" and not x.get("res_granted") and lease(raw(d), g["id"])["state"] == "granted",
+                  "NR after %s, the network request is queued again here (granted by its gb, it was told nothing), "
+                  "the grant keeps its line" % tag)
+        new.release("all", ME)
+        hist = quietly(m.reservation_history)
+        recs = [x for x in (hist.get("reservations") if isinstance(hist, dict) else []) if x.get("id") == g["id"]]
+        if m is b14:
+            ok = recs and recs[0].get("res", {}).get("net_gb") == 40 and recs[0]["res"].get("net") == 72 \
+                and "net_network" not in recs[0]["res"]
+        else:
+            ok = bool(recs)
+        check(isinstance(hist, dict) and ok, "NR %s reads the history with network records (net_gb%s)" % (
+            tag, ", net_network dropped" if m is b14 else "") + ("" if ok else " %s" % (recs or hist)))
+    rec = [x for x in log(d) if x.get("event") == "end" and (x.get("res") or {}).get("net_gb") == 40]
+    check(rec and rec[-1]["res"].get("net_network") == KEYN and rec[-1]["res"].get("net_up_gb") == 5,
+          "NR this code's end record carries net, net_gb, net_up_gb and the network (%s)" % (rec[-1:] or "none"))
+finally:
+    new._sample_override = saved_n
+    os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+    new.release("all", ME)
+    if b14 is not None:
+        del b14
+        gc.collect()
+
 # --- S: the skill's vector syntax against older CLIs (roadmap 4.7: "the new skill's commands against a frozen CLI")
 SKILL = open(os.path.join(ROOT, "skills", "oomph", "SKILL.md"), encoding="utf-8").read()
 sec = SKILL[SKILL.index("**Reserving several resources**"):]

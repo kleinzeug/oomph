@@ -2214,9 +2214,12 @@ def test_budget(base):
         p.close()
     print("      budget: start, 12 s idle, quit: %.2f s of CPU in all, peak resident %.1f MB, %d bytes written "
           "while idle" % (cpu, rss, quiet))
-    check(rc == 0 and quiet == 0 and 0 <= cpu < 2.0 and 0 < rss < 56,
+    # From the checkout oomph.py is compiled from source (the peak is mostly its syntax tree); 1.15's network code
+    # took a Mac from 55.2-56.0 MB to 56.1-56.7 (3.9), so the cap is 58: what it guards against is the 1.12.2 kind of
+    # regression, the dashboard left running in the compiling process (18 MB more). An install keeps --minute's 40 MB.
+    check(rc == 0 and quiet == 0 and 0 <= cpu < 2.0 and 0 < rss < 58,
           "budget: a quiet dashboard writes nothing (%d bytes in 11 s) and stays small (%.2f s CPU with start-up, "
-          "%.0f MB peak from the checkout, under 56 MB with or without bytecode; --minute holds the 40 MB of an "
+          "%.0f MB peak from the checkout, under 58 MB with or without bytecode; --minute holds the 40 MB of an "
           "install)" % (quiet, cpu, rss))
 
 
