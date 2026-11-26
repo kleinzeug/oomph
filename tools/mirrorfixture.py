@@ -10,6 +10,8 @@ into DIR/source, mirrors it through a pipe with the real `oomph remote sync --on
 DIR/mirror, and then sets the scene:
 
     live      the link is up (status.json: live, written just now by a process that exists)
+    network   live, of topfixture's "network" machine (NET N4, 1.15): its line's rates in every sample, its
+              figures and busiest names in the current one (what a remote tab's Network tile reads)
     offline   the link dropped 40 minutes ago; an earlier drop left 2 hours not received
     fetching  just paired: the last 6 hours are in, the lists are still being fetched
 
@@ -52,11 +54,11 @@ import oomph_sync as sync  # noqa: E402
 
 
 
-def moved(fx, until):
-    """topfixture's default machine, every time moved by the same amount so that it ends at
-    `until`, with the fields a real logger writes and the machine block."""
+def moved(fx, until, scenario="default"):
+    """topfixture's default machine (or another scenario: "network"), every time moved by the same amount so that it
+    ends at `until`, with the fields a real logger writes and the machine block."""
     src = os.path.join(fx, "tf")
-    log, led = topfixture.write_fixture(src, "default")
+    log, led = topfixture.write_fixture(src, scenario)
     dt = round(until - topfixture.NOW)
     out_log, out_led = os.path.join(fx, "log"), os.path.join(fx, "ledger")
     os.makedirs(os.path.join(out_log, "incidents"))
@@ -89,6 +91,8 @@ def moved(fx, until):
                 f.write(text)
     cur = json.load(open(os.path.join(log, "current.json")))
     cur.update(t=cur["t"] + dt, ram_gb=64.0, os="macos", free_pct=58, swapfiles=0, cached_gb=4.0, free_gb=1.0)
+    if isinstance(cur.get("pools"), dict) and isinstance(cur["pools"].get("t"), (int, float)):
+        cur["pools"]["t"] += dt
     cur["daemon"].update(started=cur["t"] - 86400 * 3, machine={
         "id": "m-7f3a9c1e5b2d4a68", "name": "studio", "os": "macos", "arch": "arm64", "os_version": "macOS 27.2",
         "kernel": "27.2.0", "kind": "desktop", "cpus": 16, "virt": "none", "measures": {"memory": True}})
@@ -129,7 +133,7 @@ def main(argv):
         print(__doc__.strip())
         return 2
     out, scene = argv[0], (argv[1] if len(argv) > 1 else "offline")
-    if scene not in ("live", "offline", "fetching", "machines", "recents", "linux") or \
+    if scene not in ("live", "offline", "fetching", "machines", "recents", "linux", "network") or \
             scene == "linux" and argv[2:] and argv[2] not in LINUX_VARIANTS:
         print(__doc__.strip())
         return 2
@@ -141,7 +145,7 @@ def main(argv):
     drop = now - 40 * 60 if scene == "offline" else now
     src, mir = os.path.join(out, "source"), os.path.join(out, "mirror")
     shutil.rmtree(out, ignore_errors=True)
-    moved(src, drop - 20)
+    moved(src, drop - 20, "network" if scene == "network" else "default")
     env = dict(os.environ, OOMPH_DIR=os.path.join(src, "log"), OOMPH_LEDGER_DIR=os.path.join(src, "ledger"))
     os.environ.update(OOMPH_DIR=env["OOMPH_DIR"], OOMPH_LEDGER_DIR=env["OOMPH_LEDGER_DIR"])
     serve = [sys.executable, "-I", "-B", os.path.join(ROOT, "daemon", "oomph.py"), "serve", "--stdio", "--now", repr(drop)]
@@ -162,7 +166,7 @@ def main(argv):
         cov.remove(a, b)
         status.update(state="offline", was=None, since=drop, last_contact=drop, error="timeout",
                       detail="no answer", attempt=7, next_try=now + 40, updated=now, pid=None)
-    elif scene == "live":
+    elif scene in ("live", "network"):
         status.update(state="live", was=None, since=now - 3600, last_contact=now, error=None, updated=now + 120, pid=1)
     else:
         keep = now - 6 * 3600

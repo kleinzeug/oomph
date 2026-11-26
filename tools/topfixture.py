@@ -42,7 +42,7 @@ def _within(t, spans):
     return any(a <= t < b for a, b in spans)
 
 
-def synth(seed=1120, until=NOW, start=None, crisis=False, res=False):
+def synth(seed=1120, until=NOW, start=None, crisis=False, res=False, net=False):
     """A week of samples every 30 s: working hours, nights asleep, a leak on Monday, a build that
     swaps and gets processes killed on Thursday, pressure critical for a moment on Friday. With
     `res`, also the other resources (1.9.1's blocks, from their own random numbers, so the memory
@@ -60,6 +60,7 @@ def synth(seed=1120, until=NOW, start=None, crisis=False, res=False):
              (T(20, 12, 5), T(20, 12, 40))]
     pts, t = [], start or T(13, 8, 20)
     rres = random.Random(seed + 7)
+    rnet = random.Random(seed + 11)
     app, comp, burst_until, burst, slept = 8.0, 6.5, 0, 0.0, False
     while t <= until:
         if _within(t, asleep):
@@ -107,6 +108,8 @@ def synth(seed=1120, until=NOW, start=None, crisis=False, res=False):
                     "away": {"idle_s": idle, "display_on": idle == 0, "locked": False}})
         if res:
             pts[-1].update(resource_blocks(t, work, extra, rres))
+        if net:
+            pts[-1].update(net_blocks(t, work, rnet))
         t += 30
     return pts
 
@@ -129,6 +132,27 @@ def resource_blocks(t, work, extra, rng):
                      "mem_limit_gb": 27.0}],
             "disks": [{"id": "data", "name": "Data", "free_gb": round(free, 1), "total_gb": 995.0,
                        "roles": ["home", "swap", "tmp"], "watch": True, "low_gb": 20, "crit_gb": 5, "level": "ok"}]}
+
+
+NET_KEY = "rmac:00:00:5e:00:53:01"      # the network fixture's router (the documentation MACs of RFC 7042)
+
+
+def net_blocks(t, work, rng):
+    """One sample's net block and busiest names for the network fixture (NET 12.5): the household's background,
+    a backup pushed on Thursday afternoon, and a model pulled from Friday 12:40 at most of a 250/40 line."""
+    down = max(0.1, 0.6 + 4.0 * work + rng.gauss(0, 0.8))
+    up = max(0.05, 0.2 + 0.9 * work + rng.gauss(0, 0.2))
+    if T(19, 15, 0) <= t < T(19, 16, 10):
+        up += 31.0 + rng.gauss(0, 2.0)                  # the backup: most of the uplink for an hour
+    if t >= T(20, 12, 40):
+        down += 176.0 + rng.gauss(0, 9.0)               # hf download: 150 granted, a little over now and then
+    names = [{"name": "curl", "down": round(down * 0.9, 1), "up": 0.3, "n": 1}] if t >= T(20, 12, 40) else []
+    if up > 20:
+        names.append({"name": "rsync", "down": 0.2, "up": round(up * 0.95, 1), "n": 1})
+    names.append({"name": "Google Chrome", "down": round(down * 0.08 if names else down * 0.6, 1), "up": 0.1, "n": 9})
+    return {"net": {"if": "en0", "vpn": False, "network": NET_KEY, "src": "flows", "flows": 40 + int(work * 60),
+                    "down_mbps": round(down, 1), "up_mbps": round(up, 1), "lan_mbps": 0.2},
+            "net_names": names}
 
 
 PURPOSES = [("gradle assembleDebug", 6.0, "atlas", 6), ("pnpm check", 2.0, "webshop", 9), ("pytest -n 8", 4.0, "ml-eval", 5),
@@ -166,6 +190,13 @@ LIVE_RES = [("gradle assembleDebug", 6.0, "atlas", 730, 4.1, 1800, False,
             ("docker build api", 8.0, "atlas", 40, 0.0, 1800, True),
             ("cargo build --release", 0.01, "indexer", 95, 0.0, 1800, True,
              lambda req, now: {"v": 2, "res": {"cpu": {"ask": 8, "min": 8}}, "waiting_on": ["cpu"], "hold": ["cpu"]})]
+# the network fixture's (NET 12.9): a model pulled at 150 Mbit/s, and an image pull waiting for the line
+LIVE_NET = [("hf download llama-70b", 0.01, "ml-eval", 2800, 0.0, 7200, False,
+             _vec(lambda req, now: {"net": {"ask": 150, "min": 75, "got": 150, "used": 168.4, "peak": 191.0, "gb": 40,
+                                            "moved": 12.3, "eta": now + 1440, "network": NET_KEY}})),
+            ("docker pull api", 0.01, "atlas", 60, 0.0, 1800, True,
+             lambda req, now: {"v": 2, "res": {"net": {"ask": 94, "min": 47, "gb": 8, "network": NET_KEY}},
+                               "waiting_on": ["net.down"], "hold": ["net.down"]})]
 # finished reservations of the resources fixture that also held cores or disk space, by purpose (no random numbers:
 # the memory blocks stay those of the other scenarios)
 RES_RECORDS = {"cargo build --release": {"cpu": 8}, "gradle assembleDebug": {"cpu": 6},
@@ -269,9 +300,10 @@ def write_fixture(d, scenario):
     os.makedirs(log)
     os.makedirs(led)
     crisis = scenario == "critical"
-    res = scenario == "resources"
+    res = scenario in ("resources", "network")
+    net = scenario == "network"
     until = T(20, 13, 2) if scenario == "silent" else NOW
-    pts = synth(until=until, start=NOW - 14 * 60 if scenario == "fresh" else None, crisis=crisis, res=res)
+    pts = synth(until=until, start=NOW - 14 * 60 if scenario == "fresh" else None, crisis=crisis, res=res, net=net)
     by_day = {}
     for p in pts:
         by_day.setdefault(time.strftime("%Y-%m-%d", time.localtime(p["t"])), []).append(p)
@@ -308,6 +340,14 @@ def write_fixture(d, scenario):
                             {"pid": 413, "name": "WindowServer", "g": "WindowServer", "gpu": 6.2}],
                    top_io=[{"pid": 2215, "name": "python", "g": "python", "w": 71.0}, {"pid": 1201, "name": "OrbStack Helper",
                                                                                      "g": "OrbStack", "w": 12.4}])
+    if net:                    # the line's figure, what agents hold of it, who moves the most (NET 12.5, 12.8)
+        cur["pools"] = {"t": NOW, "net.down": {"network": NET_KEY, "cap": 250.0, "margin": 62.5, "reserved": 150.0,
+                                               "busy": cur["net"]["down_mbps"], "others": 14.2},
+                        "net.up": {"network": NET_KEY, "cap": 40.0, "margin": 12.0, "reserved": 0.0,
+                                   "busy": cur["net"]["up_mbps"], "others": 1.1}}
+        cur["top_net"] = [{"pid": 7301, "name": "curl", "g": "curl", "s": 2210, "uid": 501, "down": 168.2, "up": 0.3},
+                          {"pid": 4402, "name": "Google Chrome", "g": "Google Chrome", "uid": 501, "down": 9.7,
+                           "up": 0.1}]
     if scenario.startswith("linux"):
         linuxify(pts, cur, desktop=scenario == "linux-desktop")
         # (the samples again: a Linux machine's, every day's file rewritten)
@@ -345,8 +385,8 @@ def write_fixture(d, scenario):
                        "summary": dict(INCIDENT_SUMMARY, jetsam_kills=kills) if kills == 14 else
                        {"jetsam_kills": kills}}, f)
     if scenario != "fresh":
-        recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else LIVE_RES if res
-                                    else LIVE, agents=res)
+        recs, ledger = reservations(LIVE_CRISIS if crisis else HOSTILE if scenario == "hostile" else
+                                    LIVE_RES + LIVE_NET if net else LIVE_RES if res else LIVE, agents=res)
         with open(os.path.join(led, "reservations.jsonl"), "w") as f:
             for r in recs:
                 f.write(json.dumps(r) + "\n")
@@ -579,6 +619,11 @@ FRAMES = [
     # with the CPU's plot and the others as sparklines, from 30 rows (04 §3.14, 02 §3.7.12)
     ("80x24-resources", "resources", 80, 24, "24h", "256", "unicode", "dark", "golden", "C"),
     ("80x32-resources-cpu", "resources", 80, 32, "6h", "256", "unicode", "dark", "golden", "c M G D"),
+    # NET N4 (1.15): the fifth tile; w gives the network the plot (download above, upload mirrored below), with Memory
+    # and the CPU added as small rows and the line's band; the same in ASCII (§11 Q5: the old frames stay)
+    ("80x24-network", "network", 80, 24, "24h", "256", "unicode", "dark", "golden", "w"),
+    ("80x32-resources-network", "network", 80, 32, "6h", "256", "unicode", "dark", "golden", "w M C"),
+    ("80x24-network-ascii", "network", 80, 24, "24h", "256", "ascii", "dark", "golden", "w"),
     # T3 (1.13.4): a Linux server in its own words (Kernel, Available, stall time, groups) on the Linux console
     # (16 colours, the cp437 glyphs); the same server in 256 colours and a laptop whose only swap is zram are held
     # to row rules (ROW_FRAMES: 04 §10 closes the list of goldens)
@@ -601,9 +646,9 @@ def press_keys(model, w, h, span, keys):
         ui["detected"] = oomph_top.detected_text(view.Caps("256", "unicode", "dark"), {"theme": True}, (w, h))
     for k in (keys or "").split():
         P = view.layout(model, w, h)
-        if model.get("rv") and k in ("m", "c", "g", "d", "M", "C", "G", "D"):
+        if model.get("rv") and k.lower() in view.RES_KEYS:
             sel, focus, _ = view.selection_apply(model["rv"]["sel"], model["rv"]["focus"], "click" if k.islower() else "cmd",
-                                                 view.RES_KEYS[k.lower()], model.get("avail") or list(view.RESOURCES))
+                                                 view.RES_KEYS[k.lower()], model.get("avail") or view.available(None))
             model["rv"] = {"sel": sel, "focus": focus}
         elif k == "i":
             view.inspect_at(ui, model, P, P["plot_w"] - 1)
@@ -635,7 +680,8 @@ def frames(base, which=None):
         log, led = dirs[scen]
         oomph.LEDGER_DIR = led
         model = oomph_top.load_model(span, NOW, log_dir=log, live=False,
-                                     rv={"sel": ["memory"], "focus": "memory"} if scen == "resources" else None)
+                                     rv={"sel": ["memory"], "focus": "memory"} if scen in ("resources", "network")
+                                     else None)
         model.update(host=HOST if scen != "hostile" else "st\x1b[2Judio\u202e", os=OS if not scen.startswith("linux") else
                      "Linux 6.8.0")
         caps = view.Caps(color, glyphs, theme)
@@ -659,7 +705,7 @@ def frames(base, which=None):
 def main(argv):
     if "--dir" in argv:
         base = argv[argv.index("--dir") + 1]
-        for scen in ("default", "critical", "silent", "fresh", "hostile", "resources"):
+        for scen in ("default", "critical", "silent", "fresh", "hostile", "resources", "network"):
             write_fixture(os.path.join(base, scen), scen)
         print("topfixture: fixtures in %s (now = %d)" % (base, NOW))
         return 0

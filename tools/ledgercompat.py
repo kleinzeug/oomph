@@ -28,7 +28,18 @@ process next to this checkout's, on one ledger directory, in both directions:
      it refuses it with exit 2; before that (1.8.1 to 1.8.4 read `--cpu 8 6G` as 8 GB) `oomph resources` does
      not exist, so the skill's first-line guard keeps an agent at memory only. No CLI before 1.12.0 lists
      anything but memory as reservable; 1.12.0 not disk. A CLI that knows the flags (and this one) reads each
-     example as the skill means it.
+     example as the skill means it. The examples of "The internet line" (`--net 40G`, `--net-rate 200M`, …),
+     a block of their own: every CLI from 1.8.5 to 1.14 refuses them with exit 2 and reaches no acquire (never
+     a volume read as memory); this one refuses them with 75 while net_reservations is off (set "0", whatever
+     the root-owned config.json says) and hands their numbers on with it on.
+  NR network reservations (NET N2, 1.15): a ledger with a granted, an unmanaged and a queued `net` part read
+     and written by 1.14.0 (the tag) and by this code; 1.14 cannot weigh the queued one and waits behind it, the
+     next refresh here lets memory pass it; old readers read the records with net_gb, this one's end record
+     carries the network.
+  NQ metered networks (NET N3, 1.15): a request waiting on net.quota under 1.14.0 and this code; older
+     capsules and verdicts read a sample whose pools hold net.quota.
+  N  samples with internet traffic (`net`, `net_names`, `top_net`) read by older readers: their summary
+     (report, incidents) and the slim and full samples they send to another machine leave the new blocks out.
   C  1.8.1's own files: this code reads them, makes a memory vector of an old lease without
      writing one, and writes back what 1.8.1 writes plus `agent` (D11) and, from 1.9.4 (L1), `user`
      and the holder's uid (03 §6.5); 1.8.1 reads that back.
@@ -674,6 +685,143 @@ check(agent_is(lease(raw(d), st["id"])["agent"], new.agent_key(SES, START - 50))
       and "agent" not in lease(raw(d), st["id"])["holder"],
       "D a reservation made by `oomph run` inside a session has the session's agent key")
 
+# ======================================= NR: network reservations (NET N2, 1.15): `net` and `net_up` parts of a lease,
+# granted, unmanaged and queued, and their records, under 1.8.1, 1.9.1 and 1.14.0 (12.9: old code carries the parts
+# through its own writes; 1.14 cannot weigh a queued net request and waits behind it; the next refresh here lets
+# memory pass it; old readers read the records with net_gb and drop net_network)
+d = use("nr")
+KEYN = "rmac:00:00:5e:00:53:03"
+put(d, "networks.json", json.dumps({"v": 1, "networks": {KEYN: {"down": 194.0, "up": 48.0, "source": "set",
+                                                                "set_by": "x", "set": round(NOW - 60)}}}))
+NSAMPLE = dict(SAMPLE, net={"if": "en0", "network": KEYN, "src": "flows", "down_mbps": 10.0, "up_mbps": 1.0})
+saved_n = new._sample_override
+os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+new._sample_override = lambda: dict(NSAMPLE)
+b14 = old_module("v1.14.0")
+try:
+    for tag, m in (("1.8.1", old), ("1.9.1", mid), ("1.14.0", b14)):
+        if m is None:
+            print("skip  NR %s on a ledger with network parts: tag v%s is not in this clone" % (tag, tag))
+            continue
+        m.LEDGER_DIR = d
+        if m is not old:
+            m._plat = Procs
+        m._sample_override = lambda: dict(SAMPLE)
+        new.release("all", ME)
+        g = new.reserve(0, "a pull", HOLDER, net_gb=40, net_up_gb=5)
+        new._sample_override = lambda: dict(NSAMPLE, net=dict(NSAMPLE["net"], network="gw:192.0.2.1/24"))
+        u = new.reserve(0, "unmanaged", HOLDER, net_gb=4)
+        new._sample_override = lambda: dict(NSAMPLE)
+        w = new.reserve(0, "waits", HOLDER, net_mbps=145, net_min_mbps=145)
+        L0 = raw(d)
+        st = quietly(m.reserve, 0.5, "a %s client" % tag, HOLDER)
+        L1 = raw(d)
+        bad = [(x["id"], k) for x in (g, u, w) for k in ("res", "v")
+               if (lease(L0, x["id"]) or {}).get(k) != (lease(L1, x["id"]) or {}).get(k)]
+        check(g.get("status") == "granted" and u.get("status") == "granted" and w.get("status") == "queued"
+              and isinstance(st, dict) and not bad and (lease(L1, g["id"]) or {}).get("state") == "granted",
+              "NR %s on a ledger with a granted, an unmanaged and a queued network request keeps their res and v (%s)"
+              % (tag, bad or (st.get("status") if isinstance(st, dict) else repr(st))))
+        if m is b14:
+            check(st.get("status") == "queued" and lease(L1, w["id"])["state"] == "queued",
+                  "NR 1.14.0 cannot weigh the network request that waits, so its own memory request waits behind it")
+            new.refresh_ledger(dict(NSAMPLE), Procs.collect_procs())
+            again = m.reserve(0.5, "a 1.14.0 client", HOLDER, ticket=st["id"])
+            check(again.get("status") == "granted" and lease(raw(d), w["id"])["state"] == "queued"
+                  and lease(raw(d), g["id"])["res"]["net"]["got"] == 72,
+                  "NR the next refresh here grants it (memory passes a request waiting for the line); the network "
+                  "request still waits, the grant keeps its 72 Mbit/s (%s)" % again.get("status"))
+        else:
+            new.refresh_ledger(dict(NSAMPLE), Procs.collect_procs())
+            x = lease(raw(d), w["id"])
+            check(x and x["state"] == "queued" and not x.get("res_granted") and lease(raw(d), g["id"])["state"] == "granted",
+                  "NR after %s, the network request is queued again here (granted by its gb, it was told nothing), "
+                  "the grant keeps its line" % tag)
+        new.release("all", ME)
+        hist = quietly(m.reservation_history)
+        recs = [x for x in (hist.get("reservations") if isinstance(hist, dict) else []) if x.get("id") == g["id"]]
+        if m is b14:
+            ok = recs and recs[0].get("res", {}).get("net_gb") == 40 and recs[0]["res"].get("net") == 72 \
+                and "net_network" not in recs[0]["res"]
+        else:
+            ok = bool(recs)
+        check(isinstance(hist, dict) and ok, "NR %s reads the history with network records (net_gb%s)" % (
+            tag, ", net_network dropped" if m is b14 else "") + ("" if ok else " %s" % (recs or hist)))
+    rec = [x for x in log(d) if x.get("event") == "end" and (x.get("res") or {}).get("net_gb") == 40]
+    check(rec and rec[-1]["res"].get("net_network") == KEYN and rec[-1]["res"].get("net_up_gb") == 5,
+          "NR this code's end record carries net, net_gb, net_up_gb and the network (%s)" % (rec[-1:] or "none"))
+finally:
+    new._sample_override = saved_n
+    os.environ["OOMPH_NET_RESERVATIONS"] = "0"
+    new.release("all", ME)
+    if b14 is not None:
+        del b14
+        gc.collect()
+
+# ======================================= NQ: metered networks (NET N3, 1.15): a request waiting on net.quota under
+# 1.8.1, 1.9.1 and 1.14.0 (they carry its parts and the pool ids it waits on through their own writes), and a
+# sample whose pools hold net.quota read by their verdict and capsule (current.json's pools stay home: no mirror)
+d = use("nq")
+put(d, "networks.json", json.dumps({"v": 1, "networks": {KEYN: {"down": 194.0, "up": 48.0, "source": "set", "set_by": "x",
+                                                                "set": round(NOW - 60),
+                                                                "metered": {"cap_gb": 20.0, "period": "month"}}}}))
+
+
+def qpools(used):
+    """current.json's pools with the logger's net.quota now (fresh, in this period)."""
+    q = new._T().quota_pool({"cap_gb": 20.0, "period": "month"}, KEYN, used, 0.0, time.time())
+    return {"t": time.time(), "net.quota": dict({k: q[k] for k in ("network", "cap", "margin", "used", "reserved", "from",
+                                                                   "to", "period")}, label="phone")}
+
+
+QSAMPLE = dict(NSAMPLE, pools=qpools(18.5))
+saved_q = new._sample_override
+os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+new._sample_override = lambda: dict(NSAMPLE, pools=qpools(10.0))
+b14 = old_module("v1.14.0")
+try:
+    for tag, m in (("1.8.1", old), ("1.9.1", mid), ("1.14.0", b14)):
+        if m is None:
+            print("skip  NQ %s: tag v%s is not in this clone" % (tag, tag))
+            continue
+        m.LEDGER_DIR = d
+        if m is not old:
+            m._plat = Procs
+        m._sample_override = lambda: dict(SAMPLE)
+        new.release("all", ME)
+        g = new.reserve(0, "a metered pull", HOLDER, net_gb=6)
+        w = new.reserve(0, "waits on the quota", HOLDER, net_gb=3)
+        L0 = raw(d)
+        st = quietly(m.reserve, 0.5, "a %s client" % tag, HOLDER)
+        L1 = raw(d)
+        bad = [(x["id"], k) for x in (g, w) for k in ("res", "v")
+               if (lease(L0, x["id"]) or {}).get(k) != (lease(L1, x["id"]) or {}).get(k)]
+        if m is not b14:   # 1.8 and 1.9 grant it by its gb (it is told nothing): the next refresh here queues it again
+            new.refresh_ledger(new._sample_override(), Procs.collect_procs())
+        wl = lease(raw(d), w["id"]) or {}
+        check(g.get("status") == "granted" and w.get("status") == "queued" and w.get("waiting_on") == ["net.quota"]
+              and isinstance(st, dict) and not bad and wl.get("state") == "queued" and not wl.get("res_granted")
+              and wl.get("waiting_on") == ["net.quota"],
+              "NQ %s on a ledger with a request waiting on net.quota keeps its res and v; it waits on net.quota%s (%s)"
+              % (tag, "" if m is b14 else " again after the next refresh here",
+                  bad or [w.get("waiting_on"), wl.get("waiting_on"), st.get("status") if isinstance(st, dict) else st]))
+        if hasattr(m, "capsule"):
+            cap = quietly(m.capsule, dict(QSAMPLE))
+            check(isinstance(cap, dict) and cap.get("text") == "Normal" and "network" not in cap,
+                  "NQ %s's capsule over a sample whose pools hold a quota under 10 %%: its own verdict (%s)" % (tag, cap))
+        v = quietly(m.verdict, dict(QSAMPLE))
+        check(isinstance(v, dict) and v.get("level") == "ok", "NQ %s's verdict reads a sample with net.quota" % tag)
+    nc = new.capsule(dict(QSAMPLE))
+    check(nc.get("text") == "Network 1.5 GB left" and nc.get("network") == 1,
+          "NQ this checkout's capsule says the quota under 10 %% (%s)" % nc)
+finally:
+    new._sample_override = saved_q
+    os.environ["OOMPH_NET_RESERVATIONS"] = "0"
+    new.release("all", ME)
+    if b14 is not None:
+        del b14
+        gc.collect()
+
 # --- S: the skill's vector syntax against older CLIs (roadmap 4.7: "the new skill's commands against a frozen CLI")
 SKILL = open(os.path.join(ROOT, "skills", "oomph", "SKILL.md"), encoding="utf-8").read()
 sec = SKILL[SKILL.index("**Reserving several resources**"):]
@@ -687,6 +835,18 @@ CMDS = ([["reserve"] + o.split() + ["--for", "x"] for o in opts] + [["reserve", 
                                                                      for o in opts]
         + [["amend", "r1"] + o.split() for o in opts if "@" not in o] + [["amend", "r1", "--cpu", "0"]]
         + [shlex.split(x) for x in runs])
+# the internet line's examples (1.15, a block of their own): an older CLI refuses every one with exit 2 and reaches no
+# acquire (never a volume read as memory); this one hands their numbers on with net_reservations on, and refuses them
+# before anything is written with it off (exit 75)
+nsec = SKILL[SKILL.index("**The internet line**"):]
+nsec = nsec[:nsec.index("\n\n")]
+nspans = re.findall(r"`([^`]+)`", nsec)
+nopts = sorted({x for x in nspans if re.match(r"--net(-up|-rate)? \S+$", x)})
+nruns = [x.replace("OOMPH ", "", 1).replace("\u2026", "true") for x in nspans if x.startswith("OOMPH run ") and "--net" in x]
+check(any(o.startswith("--net ") for o in nopts) and any(o.startswith("--net-rate") for o in nopts) and nruns,
+      "S the skill's section on the internet line has its examples (%s; %s)" % (", ".join(nopts), "; ".join(nruns)))
+NET_CMDS = [["reserve"] + o.split() + ["--for", "x"] for o in nopts] + [shlex.split(x) for x in nruns]
+NET_KW = ("net_gb", "net_up_gb", "net_mbps", "net_min_mbps", "net_up_mbps", "net_up_min_mbps")
 
 
 def drive(m, argv):
@@ -766,9 +926,66 @@ for tag in tags + ["this checkout"]:
     check(not bad, "S %s: %s" % (tag, "every example of the skill is %s" % (
         "read as meant" if v >= (1, 12, 1) else "refused with exit 2 where it names an unknown flag, read as meant "
         "otherwise" if v >= (1, 8, 5) else "behind the guard (no `oomph resources`)") if not bad else "; ".join(bad[:4])))
+    if v >= (1, 8, 5):
+        bad = []
+        saved_env = os.environ.get("OOMPH_NET_RESERVATIONS")
+        os.environ["OOMPH_NET_RESERVATIONS"] = "0"   # off whatever the root-owned config.json says (D-N19)
+        try:
+            for argv in NET_CMDS:
+                rc, calls, _ = drive(m, argv)
+                if m is not new and (rc != 2 or calls):
+                    bad.append("%s → %s %s (should refuse it, exit 2)" % (" ".join(argv), rc, calls[:1]))
+                elif m is new and (rc != 75 or calls):
+                    bad.append("%s → %s %s with the switch off (should refuse it, exit 75)" % (" ".join(argv), rc,
+                                                                                               calls[:1]))
+                if m is new:
+                    os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+                    try:
+                        rc, calls, _ = drive(m, argv)
+                    finally:
+                        os.environ["OOMPH_NET_RESERVATIONS"] = "0"
+                    if not (rc in (0, 75) and len(calls) == 1 and any(k in calls[0][1] for k in NET_KW)
+                            and calls[0][0][0] == 0):
+                        bad.append("%s → %s %s with the switch on" % (" ".join(argv), rc, calls[:1]))
+        finally:
+            if saved_env is not None:
+                os.environ["OOMPH_NET_RESERVATIONS"] = saved_env
+        check(not bad, "S %s: the skill's network examples are %s" % (
+            tag, ("handed on with net_reservations on, refused (75) with it off" if m is new else
+                  "refused with exit 2, no volume read as memory") if not bad else "; ".join(bad[:4])))
     if m is not new:
         del m
         gc.collect()
+
+# --- N: samples with internet traffic (NET, 1.15) read by older readers: their summary (report, incidents), the slim
+# and full samples they send to another machine. The new blocks are additive: an old reader keeps working and leaves
+# them out (an unknown object never travels from an old slim_sample).
+NET = {"if": "en16", "vpn": False, "network": "rmac:00:00:5e:00:53:03", "src": "flows", "flows": 40, "down_mbps": 212.4,
+       "up_mbps": 8.1, "lan_mbps": 0.1, "in_gb": 41.2, "out_gb": 3.1}
+NS = [dict(SAMPLE, t=NOW - 300 + 30 * i, iso="2026-11-26T03:%02d:00+01:00" % i, swap_used_gb=0.0, net=dict(NET),
+           net_names=[{"name": "curl", "down": 195.4, "up": 0.2, "n": 1}],
+           top_net=[{"pid": ME, "name": "curl", "uid": 501, "down": 195.4, "up": 0.2}]) for i in range(4)]
+bad = []
+for tag in tags + ["this checkout"]:
+    m = new if tag == "this checkout" else old_module(tag)
+    if m is None:
+        continue
+    try:
+        sm = m.summarize(list(NS), [])
+        sl = m.slim_sample(dict(NS[0])) if hasattr(m, "slim_sample") else {}
+        fu = m.full_sample(dict(NS[0])) if hasattr(m, "full_sample") else {}
+        if sm.get("samples") != 4 or (m is not new and ("net" in sl or "net_names" in fu or "top_net" in fu)):
+            bad.append("%s: %s" % (tag, [sm.get("samples"), sorted(sl)[:3]]))
+        if m is new and not (sm.get("max_net_down_mbps") == 212.4 and sl.get("net", {}).get("down_mbps") == 212.4
+                             and "in_gb" not in sl["net"]):
+            bad.append("this checkout: %s" % [sm.get("max_net_down_mbps"), sl.get("net")])
+    except Exception as e:  # noqa: B902
+        bad.append("%s raised %r" % (tag, e))
+    if m is not new:
+        del m
+        gc.collect()
+check(not bad, "N: samples with net, net_names and top_net are summarized by every reader from 1.8.1 on; old slim and "
+      "full samples leave them out, this one sends the rates and never the day's GB %s" % bad[:3])
 
 print("ledger compatibility: %s" % ("all %s" % "ok" if not failures else "%d FAILED" % len(failures)))
 sys.exit(1 if failures else 0)

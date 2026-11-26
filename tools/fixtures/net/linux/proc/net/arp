@@ -1,0 +1,5 @@
+IP address       HW type     Flags       HW address            Mask     Device
+192.168.178.61   0x1         0x2         00:00:5e:00:53:2a     *        enp1s0f0
+192.168.178.62   0x1         0x0         00:00:00:00:00:00     *        enp1s0f0
+192.168.178.1    0x1         0x2         00:00:5e:00:53:13     *        enp1s0f0
+192.168.122.50   0x1         0x2         00:00:5e:00:53:2b     *        virbr0

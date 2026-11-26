@@ -455,7 +455,7 @@ def remote_coordination(r):
 
 
 CHECK_TEXT = ["coordination.others[].purpose", "coordination.others[].project", "coordination.others[].user",
-              "coordination.history[].purpose", "coordination.history[].project", "machine.name"]
+              "coordination.history[].purpose", "coordination.history[].project", "machine.name", "network.if"]
 
 
 def remote_verdict(r):
@@ -473,6 +473,7 @@ def remote_verdict(r):
     v = oomph.verdict(cur)
     v["resources"] = {k: cur[k] for k in ("cpu", "gpu", "io") if k in cur}
     oomph.coordination_verdict(v, remote_coordination(r))
+    v["network"] = oomph.network_info(cur, mirror=True)   # its pools alone (oomph_traffic.mirror_net): none of this machine's files
     queued = any(o["state"] == "queued" for o in v["coordination"]["others"])
     v["advice"] = REMOTE_ADVICE[v["level"]] % r.label + (" Sessions there are queued for memory." if queued else "")
     v.update(base, remote_text=CHECK_TEXT)
@@ -496,6 +497,7 @@ def remote_resources(r, c=None):
                   for g in cur["gpu"] if isinstance(g, dict)] if isinstance(cur.get("gpu"), list) else None
     if isinstance(cur.get("io"), dict):
         out["io"] = cur["io"]
+    out["network"] = oomph.network_info(cur, mirror=True)   # its pools alone, as remote_verdict
     try:
         out["disks"] = [{k: d[k] for k in ("id", "name", "free_gb", "total_gb", "kind", "roles", "level", "low_gb",
                                            "crit_gb") if k in d} for d in oomph.disk_rows(cur, set())]
@@ -524,6 +526,7 @@ def remote_check(r, args):
         print(r.header())
         lines = [(k, "not in its latest sample" if "--measure" in t else t)
                  for k, t in oomph.resource_lines(dict(r.cur, source="remote"), set(), set())]
+        lines += oomph.network_lines(r.cur, mirror=True) if oomph.logger_measures(r.cur) else []   # its pools alone (mirror_net)
         c = v.get("coordination") or {}
         if c.get("others"):  # all of them are that machine's sessions': none is this one's
             g, q = (sum(1 for o in c["others"] if o["state"] == k) for k in ("granted", "queued"))

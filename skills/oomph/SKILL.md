@@ -1,13 +1,13 @@
 ---
 name: oomph
-description: Make a long-running session memory-aware with oomph (macOS and Linux), and coordinate memory with the other Claude sessions on the same machine. Reserve memory before heavy work — builds, test suites, Docker/VMs, browsers, parallel jobs, sub-agents — so sessions take turns instead of competing for RAM; check memory pressure, free memory, swap and disk; back off when memory is tight; find what this session is using; and read oomph incident reports after crashes, killed processes or an "out of application memory" dialog. Use when asked to watch or monitor memory, be "OOM-aware" or coordinate with other sessions, during long autonomous runs, before starting heavy or parallel work, and after unexplained process deaths.
+description: Make a long-running session memory-aware with oomph (macOS and Linux), and coordinate memory with the other Claude sessions on the same machine. Reserve memory before heavy work — builds, test suites, Docker/VMs, browsers, parallel jobs, sub-agents — so sessions take turns instead of competing for RAM; check memory pressure, free memory, swap and disk; back off when memory is tight; find what this session is using; and read oomph incident reports after crashes, killed processes or an "out of application memory" dialog. Use when asked to watch or monitor memory, be "OOM-aware" or coordinate with other sessions, during long autonomous runs, before starting heavy or parallel work (large downloads or uploads too), and after unexplained process deaths.
 ---
 
 # oomph — be memory-aware, take turns
 
-> **Memory only, unless `oomph resources` says otherwise.** Use resource flags (CPU, GPU, disk)
-> only for a resource that `oomph resources --json` lists under `reservable`; otherwise reserve
-> memory only. An older oomph may read an unknown flag's number as gigabytes; a newer one refuses
+> **Memory only, unless `oomph resources` says otherwise.** Use resource flags (CPU, GPU, disk,
+> the network) only for a resource that `oomph resources --json` lists under `reservable`; otherwise
+> reserve memory only. An older oomph may read an unknown flag's number as gigabytes; a newer one refuses
 > the flag (exit 2).
 
 > **Installing this skill:** it belongs at `.claude/skills/oomph/SKILL.md` in a project, or
@@ -82,7 +82,8 @@ fix. Pass its fix lines on to the user; don't run them yourself (most need `sudo
 | `OOMPH --machine NAME check [--json]` | Another machine this one watches (`OOMPH remote list` names them), read only: its verdict and reservations. Exit 0 / 1 / 2 as above, **3** when its data is old (it can't be reached, or its logger has gone silent), **4** when its data could not be read here, **64** when no machine has that name here or the command can't be run there (none is a verdict). `status` and `reservations` (`--history`) work the same way, and with `--json` each of check, status and reservations prints one JSON object with `"origin": "remote:NAME"`; `incidents` and `report` print text under a line naming the machine (no `--json`). You cannot reserve there from here. |
 
 The MCP tools map one-to-one: `reserve_memory` (gb, purpose, wait_s ≤ 300, ttl_min,
-ticket), `update_reservation` (id, gb?, ttl_min?, purpose?), `release_memory` (id or
+ticket, and the other resources' amounts below), `update_reservation` (id, gb?, ttl_min?, purpose?, and
+the other resources' amounts: `cpu_cores`, `disk_gb`, `net_gb`, `net_up_gb`, `net_mbps`, …; 0 drops that part), `release_memory` (id or
 "all"), `reservations`, `reservation_history` (hours ≤ 336, limit, purpose filter),
 `memory_check`, `my_session`,
 `wait_for_memory` (timeout ≤ 300 s), `memory_status`, `incidents`, `incident`.
@@ -154,7 +155,7 @@ processing, and every sub-agent you spawn. Trivial commands need no reservation.
   about 5 GB: `disk_gb` (`--disk 20G`), and `disk_path` (`--disk 20G@/Volumes/Scratch`) when it
   is not the temporary folder's disk. Write at most that much; delete what you no longer need.
 - **The answer says what happens.** While queued, `waiting_on` names what you wait for (`ram`,
-  `cpu`, `disk:<volume>`, `gpu:<card>`, `vram:<card>`); a request waiting for cores holds up
+  `cpu`, `disk:<volume>`, `gpu:<card>`, `vram:<card>`, `net.down`, `net.up`, `net.quota`); a request waiting for cores holds up
   nobody's memory. Once granted, an answer may carry `flags` with its advice first: **`over`** (your
   processes use more cores than granted, or wrote more than the disk space reserved: lower the
   parallelism or `amend` it) or **`idle`** (the cores have been nearly unused for ten minutes:
@@ -182,6 +183,52 @@ and a request is then refused with how to switch it on: tell the user, don't swi
   you hold no reservation on): pin them. **`over`** means they hold more than granted: amend (`gpu_mem_gb`) or load less. A model
   served by another account's process (an Ollama or ComfyUI service) is not measured against your
   grant: reserve what it will load all the same, and expect no `used`, `over` or `elsewhere`.
+
+**The internet line** (only where `OOMPH resources --json` lists `net` under `reservable`; it ships
+switched off, and a request is then refused (exit 75) with how to switch it on: tell the user, don't
+switch it yourself). The household shares this line: a video call stutters while three agents pull
+40 GB each.
+- **When:** before moving more than about 2 GB through the internet: model weights, container images,
+  datasets, a large `git clone`, a push of images or artifacts. Package installs, API calls and small
+  downloads need nothing. Copies to a machine or a NAS on the LAN don't count: only the internet does.
+- **Volume or rate:** say how much you will move, `net_gb: 40` (`--net 40G`), `net_up_gb: 5`
+  (`--net-up 5G`) for an upload. A volume alone is granted half of what the line can share, so two
+  pulls run side by side. Ask for a rate, `net_mbps: 200` (`--net-rate 200M`; `200M/20M` is down and
+  up), when you know what the tool needs; it is granted between half of it and all of it, and
+  `net_min_mbps` equal to it means exactly that (or wait). Give both when you know both: the volume
+  gives an ETA and is what a data cap is charged.
+- **Units:** rates are megabits per second (`200M`; 25 MB/s is `200M`, and `G` or `MB/s` is refused
+  with the reason); volumes are gigabytes (`0.5G`, never `500M`). MCP takes plain numbers.
+- **Run at the grant**, not at what you asked: `run_with.net_mbps`, and `run_with.limit` in bytes per
+  second for the tool's limiter: `curl --limit-rate <limit>`, `wget --limit-rate=<limit>`, `rsync
+  --bwlimit=<limit / 1024>`, `aria2c --max-overall-download-limit=<limit>`. Easier: `OOMPH run --net
+  40G --for "llama weights" -- curl -LO …` adds that flag itself to curl, wget, rsync or aria2c
+  (when the command sets none), and puts `{net}` (Mbit/s) and `{net_limit}` (bytes per second) into the
+  command and `OOMPH_NET_LIMIT` into its environment for any other tool. A tool without a limiter
+  (`docker pull`, `git`, `huggingface-cli`) still gets reserved: the others then plan around it.
+- **An unknown network:** where the line has no figure yet (`network.cap` is null, "line not
+  tested") and it is not metered, `reservable` lists no `net`: reserve nothing for it, tell the user
+  once that `oomph net test` (a Mac) or `oomph net set DOWN/UP` (Linux) would let agents share the
+  line, and never run the speed test yourself (not with `--yes` either): it moves a few hundred MB
+  through the line they are using. A request that names the line there anyway (a script's `oomph run
+  --net`) is granted at once without a rate (`run_with.net_unmanaged`, a limit of 0 = no limit), with
+  a `note`; run it unlimited.
+- **Advice:** `over` means your processes move more than 1.25 × the rate granted (limit the tool or
+  `amend --net-rate`), or more than the volume you named (grow it: `--net 60G`); `idle` means the
+  rate has sat nearly unused for ten minutes: release it, or drop it with `amend rN --net 0`
+  (`update_reservation` with `net_gb: 0`; a new rate is `net_mbps`). The
+  answer carries an ETA ("40 GB at 150 Mbit/s ≈ 36 min"); a grant lives `ttl_min` like any other, so
+  extend it or use `OOMPH run` for a long pull.
+- **A metered network** (a hotspot, a hotel line with a cap): `network.metered` in `memory_check`
+  says `left_gb` and when it `resets`. There `reservable` lists `net` even without a figure: reserve
+  the volume of every transfer over about 2 GB (`--net 40G`); without a figure it is granted at once
+  without a rate, and charged against the cap in full all the same. One that can never fit is
+  refused with what is left. Don't work around it: tell the user and ask whether the transfer is
+  worth it. Where `net` is not reservable (switched off) but `network.metered` is set, compare the
+  transfer with `left_gb` and ask the user before moving more than about 2 GB. The hook says once
+  per period when less than 10 % is left.
+- Release the line when the transfer is done, before the build or the tests that follow it (or drop
+  it with `amend rN --net 0` when it shares one reservation with memory or cores).
 
 **3. When you are queued:**
 - Don't start the work, and don't "just start it anyway" because memory looks free —
@@ -267,6 +314,13 @@ session's own work.
   disk says whether the user `pinned` it (`OOMPH volumes watch PATH`); a pinned disk carries
   its floors `low_gb` and `crit_gb` and its `level`, and a low or critical one raises your
   check as memory would.
+- **network** (`network` in `check --json`, `memory_check` and `memory_status`; oomph 1.15 with
+  its logger): `down_mbps`/`up_mbps` this machine moves through the internet now (payload, LAN
+  traffic left out), `cap` the line's stored figure ([down, up], null where it has none: "line not
+  tested"), `room` what can still be reserved, `stale` when this machine alone was faster than
+  the figure, `metered` a data cap with `left_gb` and `resets` (`low` under 10 %). The network is
+  named by its label or an id (`net-…`). A busy line never makes the check tight: only a metered
+  cap under 10 % is said, and then move nothing big over it that can wait.
 
 **On Linux** the words differ a little; the levels, exit codes and rules above do not:
 

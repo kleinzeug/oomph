@@ -52,7 +52,7 @@ for d in (code, ledgers, victims):
     os.mkdir(d)
     os.chmod(d, 0o755)
 for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_linux.py", "oomph_ioreport.py", "oomph_top.py", "oomph_view.py",
-          "oomph_net.py", "oomph_sync.py", "oomph_remote.py", "oomph_gpu.py"):
+          "oomph_net.py", "oomph_sync.py", "oomph_remote.py", "oomph_gpu.py", "oomph_traffic.py"):
     shutil.copy(os.path.join(ROOT, "daemon", f), code)
     os.chmod(os.path.join(code, f), 0o644)
 os.environ["OOMPH_DIR"] = os.path.join(base, "logs")
@@ -66,6 +66,8 @@ import oomphd  # noqa: E402
 if not REAL:  # pretend: the code takes its root paths, the children simply run as us
     os.geteuid = lambda: 0
     oomph._drop_to = lambda user, group: {}
+    if hasattr(oomph.plat(), "_nobody"):   # route and scutil "as nobody" would fail as us, and the net section see no egress
+        oomph.plat()._nobody = lambda: {}
 print("H0 root test, " + ("as root (ledger children as uid %s, the daemon's as nobody)" % (USER or "nobody") if REAL
                            else "DRY RUN as uid %d (pretending to be root; all children run as you)" % os.getuid()))
 failures = []
@@ -289,6 +291,134 @@ check(rd_[0] in (0, 75) and (granted or short),
       "disk: `oomph reserve --disk 1G@PATH` as root names the system's pool, decided in a child; the sample carries it "
       "(%s)" % [rd_[0], got.get("status"), got.get("asked"), rd_[2][-200:]])
 no_hits("disk")
+
+# 1d. internet traffic (NET, 1.15): the sample's net block (a dry run reads a recorded nettop with this process's
+# connections), `oomph net set` as root written by the child as the user, the logger's child naming this network's
+# entry of networks.json; root opens nothing in the ledger folder. As real root: nettop as root and as nobody
+P_ = oomph.plat()
+if hasattr(P_, "net_route"):
+    p = case("net")
+    eg_ = P_.net_route() or {}
+    if os.environ.get("OOMPH_ROOTTEST_OFFLINE") and not eg_.get("if"):
+        print("SKIP  net: no egress (OOMPH_ROOTTEST_OFFLINE): the net block and the child's network entry go untested")
+    else:   # a net block "on None" passes nothing: offline, say so with OOMPH_ROOTTEST_OFFLINE=1
+        check(eg_.get("if"), "net: the egress is found (%s)" % {k: eg_.get(k) for k in ("if", "tun", "gw", "subnet")})
+    nfx = os.path.join(base, "nettop.csv")
+    if not REAL and getattr(P_, "NET_FLOWS", None) == "nettop" and eg_.get("if"):
+        with open(nfx, "w") as f:
+            f.write(",interface,state,bytes_in,bytes_out,\npython3.%d,,,0,0,\n"
+                    "tcp4 192.168.178.42:61001<->203.0.113.9:443,%s,Established,%%d,0,\n" % (os.getpid(), eg_["if"]))
+        os.environ["OOMPH_NETTOP_FIXTURE"] = nfx
+
+    def grow(n):
+        if os.environ.get("OOMPH_NETTOP_FIXTURE"):
+            text = open(nfx).read()
+            with open(nfx, "w") as f:
+                f.write(text.replace("%d", str(n)) if "%d" in text else
+                        text.rsplit("Established,", 1)[0] + "Established,%d,0,\n" % n)
+    with Watch():
+        grow(1000)
+        tick()
+        net_id = (d.net.ident.id if d.net else None) or "rmac:00:00:5e:00:53:03"
+        rn_ = cli("net", "set", "250/40", net_id, "--json")
+        rm_ = cli("net", "metered", "--cap", "20G/month", net_id, "--json")   # N3: the quota, from the child's answer
+        grow(10 ** 6)
+        tick()
+        grow(11 * 10 ** 6)
+        s, dt, ran = tick()
+        ans_ = d.ledger.network(60) or {}
+        os.environ["OOMPH_NET_RESERVATIONS"] = "1"   # N2: the switch reaches root's child; it weighs the line there
+        rr_ = cli("reserve", "--net", "4G", "--for", "root's pull", "--json")
+        os.environ["OOMPH_NET_RESERVATIONS"] = "0"
+        try:
+            rj_ = json.loads(rr_[1])
+        except ValueError:
+            rj_ = {}
+        if rj_.get("id"):
+            cli("release", rj_["id"])
+    os.environ.pop("OOMPH_NETTOP_FIXTURE", None)
+    check(not eg_.get("if") or (rr_[0] == 0 and 47 <= ((rj_.get("granted") or {}).get("net_mbps") or 0) <= 93),
+          "net: `oomph reserve --net 4G` as root, the switch on for the command: granted in its child, half of the "
+          "187.5 Mbit/s the line shares at most, as much of it as is idle (%s)"
+          % [rr_[0], rj_.get("granted"), rj_.get("advice", "")[:80], rr_[2][-200:].replace(net_id, "<key>")])
+    nst = os.lstat(os.path.join(p, "networks.json")) if os.path.lexists(os.path.join(p, "networks.json")) else None
+    nb_ = s.get("net") or {}
+    check(rn_[0] == 0 and nst and stat.S_IMODE(nst.st_mode) == 0o666 and (not REAL or not USER or nst.st_uid == USER),
+          "net: `oomph net set` as root writes networks.json 0666 through a child as uid %s (%s)"
+          % (nst and nst.st_uid, [rn_[0], rn_[2][-200:].replace(net_id, "<key>")]))
+    check(not eg_.get("if") or (nb_.get("if") == eg_["if"] and dt < 2 and ans_.get("key") == net_id and
+                                (ans_.get("entry") or {}).get("down") == 250.0),
+          "net: the sample's net block on %s, and the logger's child names this network's entry (%s)" % (
+              eg_.get("if"), [nb_.get("src"), ans_.get("key") == net_id, round(dt, 2)]))   # never the key: a log
+    if eg_.get("if"):  # N2: the line's pools from the child's answer (root never opens networks.json)
+        pl_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json"))).get("pools") or {}
+        check((pl_.get("net.down") or {}).get("cap") == 250.0 and pl_["net.down"].get("margin") == 62.5
+              and (pl_.get("net.up") or {}).get("cap") == 40.0 and pl_["net.up"].get("margin") == 12.0
+              and pl_["net.down"].get("network") == net_id,
+              "net: current.json's pools net.down and net.up from the child's answer about this network (%s)"
+              % {k: v for k, v in (pl_.get("net.down") or {}).items() if k != "network"})
+    if eg_.get("if"):  # N3: net.quota from the child's answer; the day counters in the logger's own folder, 0644
+        q_ = (json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json"))).get("pools") or {}).get("net.quota")
+        ndp = os.path.join(os.environ["OOMPH_DIR"], "netdays.json")
+        nds = os.lstat(ndp) if os.path.lexists(ndp) else None
+        ndv = json.load(open(ndp)) if nds else {}
+        check(rm_[0] == 0 and isinstance(q_, dict) and q_.get("cap") == 20.0 and q_.get("margin") == 2.0
+              and q_.get("network") == net_id and isinstance(q_.get("used"), (int, float)) and q_.get("to", 0) > time.time()
+              and nds and stat.S_IMODE(nds.st_mode) == 0o644 and (not REAL or nds.st_uid == 0)
+              and net_id in (ndv.get("days") or {}),
+              "net: `oomph net metered` reaches current.json's net.quota through the child; the logger keeps its day "
+              "counters in netdays.json in its own folder, 0644 (%s, %s, %s)" % (
+                  {k: v for k, v in (q_ or {}).items() if k not in ("network", "label")}, nds and oct(nds.st_mode),
+                  rm_[2][-200:].replace(net_id, "<key>")))
+    if not REAL and os.path.exists(nfx) and eg_.get("if"):
+        cur_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json")))
+        check(nb_.get("src") == "flows" and [x.get("pid") for x in cur_.get("top_net") or []] == [os.getpid()] and
+              s.get("net_names") and "203.0.113" not in json.dumps(s) + json.dumps(cur_),
+              "net (dry, a recorded nettop): this process's 10 MB named in net_names and top_net; no remote address "
+              "in the sample or current.json")
+    no_hits("net")
+    if REAL and getattr(P_, "NET_FLOWS", None) == "nettop":
+        check(eg_.get("if") and eg_.get("gw"), "net: as root, route (run as nobody) names the egress and its gateway "
+              "(%s)" % {k: eg_.get(k) for k in ("if", "tun", "gw", "subnet")})
+        import pwd as _pwd
+        nb = _pwd.getpwnam("nobody")
+        procs_ = P_.collect_procs()
+        seen = {}
+        for who, kw in (("root", {}), ("nobody", {"user": nb.pw_uid, "group": nb.pw_gid, "extra_groups": []})):
+            try:
+                o = subprocess.run(P_.NETTOP, capture_output=True, timeout=10, cwd="/", **kw).stdout
+            except (OSError, subprocess.TimeoutExpired) as e:
+                o = b""
+                print("info  nettop as %s: %r" % (who, e))
+            rows_, why_ = oomph._T().nettop_flows(o, procs_, (), eg_.get("if"), eg_.get("tun"))
+            seen[who] = (len(o.splitlines()), len(rows_ or []), len({r[0] for r in rows_ or [] if r[0] is not None}), why_)
+        r_, n_ = seen["root"], seen["nobody"]
+        msg = ("nettop as root: %d rows, %d flows on %s, %d processes; as nobody: %d rows, %d flows, %d processes "
+               "(N1: whether the logger may run it as nobody)" % ((r_[0], r_[1], eg_.get("if"), r_[2]) + n_[:3])
+               if all(x[3] is None for x in seen.values()) else "nettop: %s" % (seen,))
+        print("info  " + msg)
+        if os.environ.get("GITHUB_ACTIONS"):   # in the run's summary, until the logger's choice follows it (12.19)
+            print("::notice title=nettop as nobody (NET N1)::" + msg.replace("\n", " "))
+        check(nb_.get("if") == eg_.get("if"), "net: a real sample has the net block (%s)"
+              % {k: v for k, v in nb_.items() if k != "network"})   # the router's MAC stays out of CI's log
+        # the network's identity: macOS 26/27 hides the neighbour caches from anyone but root (arp: "no entry"), so
+        # the logger reads them as root; whether root sees the gateway's MAC decides rmac: or gw: (12.6)
+        if eg_.get("gw"):
+            try:
+                o = subprocess.run(["/usr/sbin/arp", "-n", eg_["gw"]], capture_output=True, timeout=10, cwd="/",
+                                   user=nb.pw_uid, group=nb.pw_gid, extra_groups=[]).stdout
+            except (OSError, subprocess.TimeoutExpired) as e:
+                o = repr(e).encode()
+            as_nobody = oomph._T().norm_mac(((o.decode("utf-8", "replace").split(" at ") + [""])[1].split() or [""])[0])
+            m4, m6 = oomph._T().norm_mac(P_.router_mac(eg_["gw"], eg_["if"])), oomph._T().norm_mac(P_.router_mac6(eg_["if"]))
+            msg = "router MAC as root: IPv4 %s, IPv6 %s; arp as nobody: %s; the identity: %s" % (
+                "found" if m4 else "none", "found" if m6 else "none", "found" if as_nobody else "none",
+                (d.net.ident.id or "none").split(":")[0] if d.net else "?")
+            print("info  " + msg)
+            if os.environ.get("GITHUB_ACTIONS"):
+                print("::notice title=router MAC as root (NET N1)::" + msg)
+            check(m4 or not as_nobody, "net: the logger's arp (as root) finds the gateway's MAC whenever nobody's "
+                  "does (%s)" % msg)
 
 # 2. symbolic links planted at ledger.json and reservations.jsonl, to files only root may read and write
 p = case("symlink")

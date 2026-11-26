@@ -8,6 +8,7 @@ Unprivileged and portable; tools/selftest.py runs it. All data is invented.
     /usr/bin/python3 -I -B tools/reporttest.py
 """
 import base64
+import datetime
 import gzip
 import html.parser
 import io
@@ -691,6 +692,155 @@ def ledger_untouched_checks(tmp, mdir, share):
           "(%s)" % refused)
 
 
+def network_mirror_checks(tmp, mdir):
+    """The network line of another machine (1.15.0, the merge of R2 and NET): under --machine check, status and
+    report read its line from its mirrored sample alone, its figure and its metered cap from its pools (the key and
+    label never travel), never this machine's networks.json, netdays.json or samples, and write nothing into the
+    mirror: no networks.json, no netdays.json, every file byte for byte as it was."""
+    T = oomph._T()
+    here = os.path.join(tmp, "here-net")
+    hlog, hled = os.path.join(here, "log"), os.path.join(here, "ledger")
+    os.makedirs(hlog)
+    os.makedirs(hled)
+    key = "rmac:02:00:5e:00:53:01"   # a hostile mirror's net block naming this machine's own network's key
+    with open(os.path.join(hled, "networks.json"), "w") as f:
+        json.dump({"v": 1, "networks": {key: {"label": "HERE-LABEL", "down": 999.0, "up": 99.0, "source": "set",
+                                               "set": NOW - 60, "set_by": "x",
+                                               "metered": {"cap_gb": 5.0, "period": "day"}}}}, f)
+    os.chmod(os.path.join(hled, "networks.json"), 0o666)
+    with open(os.path.join(hlog, "netdays.json"), "w") as f:
+        json.dump({"v": 1, "days": {key: {time.strftime("%Y-%m-%d"): [4.9, 0]}}}, f)
+    with open(os.path.join(hlog, "samples-%s.jsonl" % time.strftime("%Y-%m-%d")), "w") as f:
+        for _ in range(3):   # this machine seen at 5000 Mbit/s: its stale hint must not reach the other's line
+            f.write(json.dumps({"t": time.time(), "net": {"if": "en0", "network": key, "src": "flows",
+                                                          "down_mbps": 5000.0, "up_mbps": 1.0}}) + "\n")
+    cur_p = os.path.join(mdir, "log", "current.json")
+    saved = open(cur_p, "rb").read()
+    c = json.loads(saved)
+    now = time.time()
+    a = T.local_midnight(datetime.date.today().replace(day=1))
+    c.update(t=now, net={"if": "en0", "network": key, "src": "flows", "vpn": False, "down_mbps": 174.0,
+                         "up_mbps": 1.2, "lan_mbps": 0.0, "flows": 12},
+             pools={"t": now, "net.down": {"cap": 250.0, "margin": 62.5, "reserved": 100.0, "busy": 174.0},
+                    "net.up": {"cap": 40.0, "margin": 12.0, "reserved": 0.0},
+                    "net.quota": {"cap": 20.0, "margin": 2.0, "used": 12.4, "from": a, "to": a + 30 * 86400,
+                                  "period": "month"}})
+    with open(cur_p, "w") as f:
+        json.dump(c, f)
+    env = {"OOMPH_TEST": "1", "OOMPH_DIR": hlog, "OOMPH_LEDGER_DIR": hled}
+    try:
+        before = folder_bytes(mdir)
+        outs = {}
+        for argv in (["check"], ["check", "--json"], ["status"], ["status", "--json"], ["report", "--last", "2h"],
+                     ["resources"]):
+            r = cli("--machine", "studio", *argv, "--no-connect", env=env)
+            outs[" ".join(argv)] = (r.returncode, r.stdout + r.stderr)
+        after = folder_bytes(mdir)
+    finally:
+        with open(cur_p, "wb") as f:
+            f.write(saved)
+    made = [k for k in after if os.path.basename(k) in ("networks.json", "netdays.json")]
+    check(after == before and not made, "--machine studio check, status, report, resources with net blocks in its mirror: "
+          "every file of the mirror byte for byte as it was, no networks.json or netdays.json made there (changed: %s)"
+          % sorted(k for k in set(before) | set(after) if before.get(k, 0) != after.get(k, 0)))
+    ck, ss = (" ".join(outs[k][1].split()) for k in ("check", "status"))   # as one line: the terminal's width wraps
+    txt = ck + ss
+    check("↓174 ↑1.2 of 250/40 Mbit/s (its network)" in ck and "↓174 ↑1.2 of 250/40 Mbit/s (its network)" in ss and
+          "12.4 of 20 GB used this period" in ck and "HERE-LABEL" not in txt and "999" not in txt and
+          "5000" not in txt and "4.9" not in txt and "left to reserve" not in txt and "reservable" not in txt,
+          "check and status: its line, its figure and its cap from its pools; nothing of this machine's networks.json, "
+          "netdays.json or samples (%s)" % [ln.strip() for k in ("check", "status") for ln in outs[k][1].splitlines()
+                                              if ln.lstrip().startswith("net ")])
+    j = json.loads(outs["check --json"][1] or "{}").get("network") or {}
+    check(j.get("cap") == [250.0, 40.0] and j.get("id") is None and j.get("label") is None and j.get("room") is None
+          and (j.get("metered") or {}).get("left_gb") == 7.6 and j.get("stale") is False and not j.get("reservable")
+          and "reservable_off" not in j,
+          "check --json: its network object from its pools, no id, label or room of this machine's (%s)" % j)
+    check("HERE-LABEL" not in outs["report --last 2h"][1] and "5000" not in outs["report --last 2h"][1],
+          "report: nothing of this machine's networks.json or samples in another machine's report")
+
+    def scalars(x):
+        return [y for v in x.values() for y in scalars(v)] if isinstance(x, dict) else \
+            [y for v in x for y in scalars(v)] if isinstance(x, list) else [x]
+    sj = scalars(json.loads(outs["status --json"][1] or "{}"))
+    check(sj and "HERE-LABEL" not in sj and 999.0 not in sj and 5000.0 not in sj and 4.9 not in sj,
+          "status --json: its own sample as its mirror has it, no label, figure, rate or day count of this machine's")
+    check(outs["resources"][0] == 64, "resources under --machine: refused, it measures here (exit 64)")
+
+    # a machine whose logger is older than 1.15 (every machine today): no net block, a line without a command
+    # (`oomph net` measures this machine, not that one)
+    with open(cur_p, "w") as f:
+        json.dump({k: v for k, v in c.items() if k not in ("net", "pools")}, f)
+    try:
+        old = {}
+        for argv in (["check"], ["status"]):
+            r = cli("--machine", "studio", *argv, "--no-connect", env=env)
+            old[argv[0]] = " ".join((r.stdout + r.stderr).split())
+    finally:
+        with open(cur_p, "wb") as f:
+            f.write(saved)
+    check(all("not in its latest sample (its logger is older than 1.15)" in t and "oomph net" not in t
+              for t in old.values()),
+          "check and status of a pre-1.15 machine: its net line says its logger is older, with no `oomph net` (%s)"
+          % [t[t.find(" net "):][:80] for t in old.values()])
+
+    # in-process, as the AI's tools ask (remote_status): nothing of this machine's is opened for the network
+    opened = []
+    saved_fns = {n: getattr(T, n) for n in ("read_networks", "read_netdays", "recent_samples", "net_coordination")}
+    for n in saved_fns:
+        setattr(T, n, (lambda n: lambda *a, **k: opened.append(n) or (_ for _ in ()).throw(AssertionError(n)))(n))
+    saved_q = oomph._quietly_leases
+    oomph._quietly_leases = lambda *a, **k: opened.append("_quietly_leases") or []
+    saved_dirs = (oomph.REMOTE, oomph.LOG_DIR, oomph.LEDGER_DIR)
+    try:
+        oomph.REMOTE, oomph.LOG_DIR, oomph.LEDGER_DIR = {"label": "studio"}, hlog, hled
+        tc = remote.typed_current(c)
+        info, lines = oomph.network_info(tc, {}), oomph.network_lines(tc, True)
+    finally:
+        oomph.REMOTE, oomph.LOG_DIR, oomph.LEDGER_DIR = saved_dirs
+        oomph._quietly_leases = saved_q
+        for n, f in saved_fns.items():
+            setattr(T, n, f)
+    check(not opened and info and info.get("cap") == [250.0, 40.0] and lines and "its network" in lines[0][1],
+          "the AI's network object and line under --machine: its pools alone, nothing of this machine read (%s)" % opened)
+
+    # oomph_remote asks for the mirror path itself: REMOTE unset (a later caller, a harness) reads nothing of here
+    # either; a hostile quota period (a list) drops the quota, not the line
+    hostile = json.loads(json.dumps(c))
+    hostile["pools"]["net.quota"]["period"] = ["month"]
+    del hostile["pools"]["net.down"], hostile["pools"]["net.up"]
+    opened[:] = []
+    for n in saved_fns:
+        setattr(T, n, (lambda n: lambda *a, **k: opened.append(n) or (_ for _ in ()).throw(AssertionError(n)))(n))
+    oomph._quietly_leases = lambda *a, **k: opened.append("_quietly_leases") or []
+    saved_dirs = (oomph.REMOTE, oomph.LOG_DIR, oomph.LEDGER_DIR)
+
+    class R:
+        label, fresh, unread, reached, origin = "studio", True, False, True, "remote:studio"
+        cur = remote.typed_current(c)
+
+        def about(self):
+            return {"name": "studio"}
+
+    try:
+        oomph.REMOTE, oomph.LOG_DIR, oomph.LEDGER_DIR = None, hlog, hled
+        rinfo = remote.remote_resources(R(), {"reserved_gb": 0, "available_gb": 1, "others": []})["network"]
+        hinfo = oomph.network_info(hostile, mirror=True)
+        hline = oomph.network_lines(hostile, mirror=True)
+    finally:
+        oomph.REMOTE, oomph.LOG_DIR, oomph.LEDGER_DIR = saved_dirs
+        oomph._quietly_leases = saved_q
+        for n, f in saved_fns.items():
+            setattr(T, n, f)
+    check(not opened and rinfo and rinfo.get("cap") == [250.0, 40.0] and rinfo.get("id") is None,
+          "remote_resources with REMOTE unset: its pools alone, nothing of this machine read (%s, %s)" % (opened, rinfo))
+    check(hinfo and hinfo.get("metered") is None and hline and "↓174" in hline[0][1] and "metered" not in hline[0][1]
+          and "no figure in its sample" in hline[0][1],
+          "a mirror's quota period that is a list: the line without its quota, and no figure is not 'line not tested' "
+          "(%s)" % hline)
+    check("network.if" in remote.CHECK_TEXT, "check --json under --machine marks network.if as the other machine's text")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="oomph-reporttest-")
     try:
@@ -896,6 +1046,7 @@ def run(tmp):
           "`syslog` tool, cleaned of controls (%s)" % (r.stdout + r.stderr).strip().replace("\n", " ")[-160:])
     check(os.path.exists(os.path.join(mdir, "contact.json")), "... and the contact kept apart from the engine's status.json")
     ledger_untouched_checks(tmp, mdir, share)
+    network_mirror_checks(tmp, mdir)
 
     # --machine after the command is the same option: never this machine's answer (01 §9)
     for argv in (["check", "--machine", "studio", "--json"], ["check", "--json", "--machine=studio", "--no-connect"]):

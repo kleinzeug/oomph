@@ -97,7 +97,7 @@ os.replace(tmp, l)' "$1" "$2"
 # 1. the new version, complete, in a directory of its own
 NEW=$(mktemp -d "$LIBDIR/.oomph-new.XXXXXX")
 trap 'rm -rf "$NEW"' EXIT
-for f in oomph.py oomphd.py oomph_linux.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py oomph_remote.py oomph_gpu.py; do
+for f in oomph.py oomphd.py oomph_linux.py oomph_ai.py oomph_upgrade.py oomph_top.py oomph_view.py oomph_net.py oomph_sync.py oomph_remote.py oomph_gpu.py oomph_traffic.py; do
   cp "$SRC/$f" "$NEW/$f"
 done
 mkdir -p "$NEW/skills/oomph"

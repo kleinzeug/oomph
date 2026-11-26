@@ -844,6 +844,29 @@ check([b["id"] for b in s2.get("leases", [])] == [x["id"]] and set(s2["leases"][
       | set(oomph.SAMPLE_LEASE_NUMS), "daemon: the next sample carries the live reservation from the child")
 dd2.ledger.at -= 3 * oomphd.INTERVAL
 check(not dd2.ledger.latest(2 * oomphd.INTERVAL), "daemon: a snapshot older than two intervals is dropped")
+net_calls = []
+
+
+def net_tick(s, procs, **kw):  # answers about the first network, then fails (a timeout under memory pressure)
+    net_calls.append(kw.get("net"))
+    if len(net_calls) == 1:
+        kw["answer"]["network"] = {"asked": "gw:192.168.178.1/24", "key": "rmac:00:00:5e:00:53:03", "entry": {"down": 5.0}}
+        return [], None
+    raise oomph.LedgerError("ledger refresh failed: timed out")
+
+
+lw = oomphd.LedgerWorker(lambda *a, **k: None, tick=net_tick)
+lw.run_once({"t": 1}, {}, net={"network": "gw:192.168.178.1/24"})
+first_ans = lw.network(60)
+lw.start()
+lw.offer({"t": 2}, {}, net={"network": "gw:10.0.0.1/24"})
+for _ in range(100):
+    if lw.runs >= 2:
+        break
+    time.sleep(0.05)
+check((first_ans or {}).get("asked") == "gw:192.168.178.1/24" and lw.network(60) is None,
+      "daemon: the ledger child's answer names the network it was asked about, and a failed run drops it (after a "
+      "move the answer about the network left is never taken over)")
 oomph.release(x["id"])
 dd2.sample()
 for _ in range(100):
@@ -1665,7 +1688,7 @@ if MAC:  # install.sh needs macOS (BSD tools, launchd)
         os.makedirs(os.path.join(d, "skills", "oomph"))
         for f in ("oomphd.py", "oomph.py", "oomph_darwin.py", "oomph_linux.py", "oomph_ioreport.py", "oomph_ai.py",
                   "oomph_upgrade.py", "oomph_top.py", "oomph_view.py", "oomph_net.py", "oomph_sync.py", "oomph_remote.py",
-                  "oomph_gpu.py", "local.oomph.daemon.plist"):
+                  "oomph_gpu.py", "oomph_traffic.py", "local.oomph.daemon.plist"):
             shutil.copy(os.path.join(ROOT, "daemon", f), d)
         for f in ("install.sh", "uninstall.sh"):
             shutil.copy(os.path.join(ROOT, f), d)
@@ -2053,6 +2076,11 @@ if MAC:
     slow = P.run_capped(["/bin/sleep", "30"], 1 << 20, 1)
     check(big is None and slow is None and time.time() - t0 < 8,
           "a command that prints 20 MB or never ends costs its reading within the deadline (%.1f s)" % (time.time() - t0))
+    why_x = []
+    part = P.run_capped(["/bin/sh", "-c", "echo partial; exit 3"], 1 << 20, 5, why_x, strict=True)
+    check(part is None and why_x == ["exit 3"] and P.run_capped(["/bin/sh", "-c", "echo ok; exit 3"], 1 << 20, 5)
+          == b"ok\n", "strict (nettop): a command that exits non-zero after printing part of its output is no answer "
+          "(%s); others keep what they printed" % why_x)
 else:
     print("skip  the registry parser and the bounded reads are the Mac backend's")
 
@@ -3797,6 +3825,53 @@ for line in r.stdout.splitlines():
         print("      gpu: " + line)
 check(r.returncode == 0, "GPU reservations (tools/gputest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                     + r.stderr[-400:]))
+
+# internet traffic (NET step N1, 1.15): nettop's and ss's rows, LAN or internet, deltas, identity, networks.json,
+# oomph net, ps --net, the network line (tools/traffictest.py)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "traffictest.py")], capture_output=True,
+                   text=True, timeout=300, env={k: v for k, v in os.environ.items()
+                                                if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("  traffic: " + line)
+check(r.returncode == 0, "internet traffic (tools/traffictest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                         + r.stderr[-400:]))
+
+# network reservations (NET step N2, 1.15): the pools net.down and net.up, elastic grants, unmanaged ones, the switch
+# net_reservations, the network changing under a grant, over and idle, oomph run's limiter flags (tools/netrestest.py)
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "netrestest.py")], capture_output=True,
+                   text=True, timeout=300, env={k: v for k, v in os.environ.items()
+                                                if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR",
+                                                             "OOMPH_NET_RESERVATIONS")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("   netres: " + line)
+check(r.returncode == 0, "network reservations (tools/netrestest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                            + r.stderr[-400:]))
+
+# metered networks (NET step N3, 1.15): the periods, the logger's day counters (netdays.json), net.quota, quota
+# admission and amend, oomph net metered, the network line, the hook's line once per session and period, the capsule
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "quotatest.py")], capture_output=True,
+                   text=True, timeout=300, env={k: v for k, v in os.environ.items()
+                                                if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR",
+                                                             "OOMPH_NET_RESERVATIONS", "TMPDIR", "XDG_RUNTIME_DIR")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("  metered: " + line)
+check(r.returncode == 0, "metered networks (tools/quotatest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                       + r.stderr[-400:]))
+
+# how the network is shown (NET step N4, 1.15): the fifth tile in every state, a lease's network parts as rows and a
+# band, the scales, the mirror's current sample, oomph top's frames of the network fixture in every glyph set
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "netviewtest.py")], capture_output=True,
+                   text=True, timeout=300, env={k: v for k, v in os.environ.items()
+                                                if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR",
+                                                             "OOMPH_NET_RESERVATIONS", "TMPDIR", "XDG_RUNTIME_DIR")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("  network view: " + line)
+check(r.returncode == 0, "the network shown (tools/netviewtest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                          + r.stderr[-400:]))
 
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,

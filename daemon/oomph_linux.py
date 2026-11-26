@@ -865,8 +865,270 @@ def machine(all_procs=None):
                      "presence": "none", "footprint": "anon+swap", "names": "argv", "containers": "main-program",
                      "unowned": False, "scope": sc["kind"], "cpu": "proc-stat", "io": "diskstats", "disks": "mountinfo",
                      "gpu": "nvidia-smi" if gpu_available() else "none",
+                     "net": "ss" if ss_path() and _netdir() == "/proc/net" else "proc-net-dev",
                      "all_procs": (os.geteuid() == 0 or hp == "0") if all_procs is None else bool(all_procs)}
     return m
+
+
+# ------------------------------------------------------------------ internet traffic (NET, 1.15; NET-concept §12.2)
+# The backend contract's network part (oomph_darwin.py lists it). No packet is sent. The logger runs as the
+# service oomphd in a network namespace of its own (PrivateNetwork=yes, no netlink): its /proc/net shows only lo,
+# so the host's figures are read where pid 1 sees them (/proc/1/net, world-readable), and ss and ip, which need
+# netlink, are not there for it: its samples are totals only ("src": "if"). A user's CLI, and a logger run as root,
+# have ss: as root every socket's process, as a user one's own (12.2, epyc-1).
+NET_FLOWS = "ss"
+SS_ARGS = ["-tinpeHO"]            # TCP, internal info, processes, extended (uid, cookie), no header, one line each
+SS_CAP, SS_TIMEOUT = 4 << 20, 3.0
+_IFN = re.compile(r"[A-Za-z0-9_.:@-]{1,15}\Z")
+
+
+def _ifname_ok(x):
+    """A device name the kernel could have given (dev_valid_name: no '/', not '.' or '..'): safe in a /sys path."""
+    return bool(isinstance(x, str) and _IFN.match(x) and x not in (".", ".."))
+
+_TUN_TYPES = ("65534", "512")     # ARPHRD_NONE (tun, WireGuard), ARPHRD_PPP
+_TUN_NAME = re.compile(r"(tun|wg|ppp|tap|vpn)")
+
+
+def _netdir():
+    """/proc/net, or /proc/1/net where this process's network namespace has nothing but lo (the service's
+    PrivateNetwork): the host's devices, routes and neighbours."""
+    for d in ("/proc/net", "/proc/1/net"):
+        dev = read(d + "/dev", 64 << 10) or ""
+        if any(ln.split(":", 1)[0].strip() not in ("", "lo") for ln in dev.splitlines()[2:] if ":" in ln):
+            return d
+    return "/proc/net"
+
+
+def _hex4(h):
+    """/proc/net/route's little-endian hex address as a dotted quad."""
+    try:
+        return ".".join(str(b) for b in bytes.fromhex(h.zfill(8))[::-1])
+    except ValueError:
+        return None
+
+
+def _routes(d):
+    """/proc/net/route's IPv4 routes: [(dev, dest, gateway, mask, metric, flags)]."""
+    out = []
+    for ln in (read(d + "/route", 256 << 10) or "").splitlines()[1:4096]:
+        t = ln.split()
+        if len(t) >= 8 and _ifname_ok(t[0]):
+            flags = int(t[3], 16) if re.fullmatch(r"[0-9A-Fa-f]{1,8}", t[3]) else 0
+            out.append((t[0], _hex4(t[1]), _hex4(t[2]), _hex4(t[7]), _int(t[6], 0), flags))
+    return out
+
+
+def _is_tunnel(dev):
+    if not _ifname_ok(dev):
+        return False
+    t = (read("/sys/class/net/%s/type" % dev, 64) or "").strip()
+    return t in _TUN_TYPES if t else bool(_TUN_NAME.match(dev))
+
+
+def _ip():
+    """iproute2's ip, where it is (never for a recorded machine, OOMPH_SYSROOT)."""
+    for p in ("/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"):
+        if not ROOT and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _v4_addrs(dev, ip):
+    """A device's own IPv4 addresses: `ip -o -4 addr show dev X` (as nobody), else its primary one (SIOCGIFADDR);
+    none for a recorded machine."""
+    if ROOT or not _ifname_ok(dev):
+        return []
+    if ip:
+        out = (run_capped([ip, "-o", "-4", "addr", "show", "dev", dev], 64 << 10, 2.0) or b"").decode("utf-8", "replace")
+        return re.findall(r"\binet (\d{1,3}(?:\.\d{1,3}){3})/\d{1,2}\b", out)[:64]
+    import fcntl
+    import struct
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as so:
+            r = fcntl.ioctl(so.fileno(), 0x8915, struct.pack("256s", dev.encode()[:15]))   # SIOCGIFADDR
+        return [socket.inet_ntoa(r[20:24])]
+    except OSError:
+        return []
+
+
+def _v6_dev(d, ip):
+    """The device of the IPv6 route to the internet: `ip -o -6 route get` (no packet), else the lowest-metric
+    default of `d`/ipv6_route (RTF_GATEWAY or RTF_ADDRCONF, not lo), or None."""
+    if ip:
+        out = (run_capped([ip, "-o", "-6", "route", "get", "2606:4700:4700::1111"], 16 << 10, 2.0) or b"").decode(
+            "utf-8", "replace")
+        m = re.search(r"\bdev (\S+)", out)
+        return m.group(1) if m and _ifname_ok(m.group(1)) else None
+    best = None
+    for ln in (read(d + "/ipv6_route", 256 << 10) or "").splitlines()[:4096]:
+        t = ln.split()
+        if len(t) == 10 and t[0] == "0" * 32 and t[1] == "00" and t[9] != "lo" and _ifname_ok(t[9]) and \
+                re.fullmatch(r"[0-9a-f]{8}", t[5]) and re.fullmatch(r"[0-9a-f]{8}", t[8]) and \
+                int(t[8], 16) & 0x40002 and not int(t[8], 16) & 0x200 and (best is None or int(t[5], 16) < best[0]):
+            best = (int(t[5], 16), t[9])   # 0x200: RTF_REJECT (the unreachable default some systems keep)
+    return best[1] if best else None
+
+
+def net_route():
+    """The egress (12.2): `ip -o route get 1.1.1.1` (honours policy routing, which wg-quick uses; no packet), else the
+    lowest-metric default of /proc/net/route. A tun/WireGuard/ppp device is a VPN; the physical device is then the
+    main table's lowest-metric default on another device. With its IPv4 subnet (the on-link route, not a host route,
+    that holds the gateway: a link-local 169.254/16 one can come first) and IPv6 prefixes (if_inet6), and the addresses of it and of
+    the tunnel (`addrs`, `tun_addrs`: ss names no device, a socket's local address does)."""
+    d = _netdir()
+    routes = _routes(d)
+    defaults = sorted((m, dev, gw) for dev, dest, gw, mask, m, fl in routes if dest == "0.0.0.0" and mask == "0.0.0.0"
+                      and fl & 1)
+    dev = gw = None
+    ip = _ip() if d == "/proc/net" else None
+    if ip:
+        out = (run_capped([ip, "-o", "route", "get", "1.1.1.1"], 16 << 10, 2.0) or b"").decode("utf-8", "replace")
+        m = re.search(r"\bdev (\S+)", out)
+        dev = m.group(1) if m and _ifname_ok(m.group(1)) else None
+        m = re.search(r"\bvia (\d{1,3}(?:\.\d{1,3}){3})\b", out)
+        gw = m.group(1) if m else None
+    if dev is None and defaults:
+        _, dev, gw = defaults[0]
+    if dev is None:   # IPv6 only (or NAT64 without CLAT): online all the same, no IPv4 gateway (the identity: router_mac6)
+        dev = _v6_dev(d, ip)
+    if dev is None:
+        return None
+    tun = None
+    if _is_tunnel(dev):
+        phys = [(m, x, g) for m, x, g in defaults if not _is_tunnel(x)]
+        if phys:
+            tun, (_, dev, gw) = dev, phys[0]
+        # else the tunnel is the line itself (PPPoE dialled on this machine, a box reached only through it): no VPN
+    gw = gw if gw and gw != "0.0.0.0" else None
+    import ipaddress
+    nets = ["%s/%d" % (dest, bin(int.from_bytes(bytes(int(x) for x in mask.split(".")), "big")).count("1"))
+            for x_dev, dest, g, mask, m, fl in routes if x_dev == dev and g == "0.0.0.0" and mask not in (None, "0.0.0.0")
+            and dest]
+    lans = ["%s/%d" % (dest, bin(int.from_bytes(bytes(int(x) for x in mask.split(".")), "big")).count("1"))
+            for x_dev, dest, g, mask, m, fl in routes if x_dev == dev and g == "0.0.0.0" and mask not in (None, "0.0.0.0")
+            and dest and not fl & 4]   # not a host route (DHCP adds one to the gateway: 192.168.178.1/32)
+    subnet = lans[0] if lans else nets[0] if nets else None
+    if gw:
+        try:
+            held = [ipaddress.ip_network(n, strict=False) for n in lans]
+            held = [n for n in held if ipaddress.ip_address(gw) in n]
+            subnet = str(max(held, key=lambda n: n.prefixlen)) if held else subnet
+        except ValueError:
+            pass
+    v6, a6 = [], {dev: [], tun: []}
+    for ln in (read(d + "/if_inet6", 64 << 10) or "").splitlines()[:1024]:
+        t = ln.split()
+        if len(t) == 6 and t[5] in a6 and re.fullmatch(r"[0-9a-f]{32}", t[0]) and re.fullmatch(r"[0-9a-f]{2}", t[2]):
+            try:
+                a = socket.inet_ntop(socket.AF_INET6, bytes.fromhex(t[0]))
+            except (ValueError, OSError):
+                continue
+            a6[t[5]].append(a)
+            if t[5] == dev and t[3] == "00":  # global scope
+                v6.append("%s/%d" % (a, int(t[2], 16)))
+    out = {"if": dev, "tun": tun, "gw": gw, "subnet": subnet, "onlink": nets + v6,
+           "addrs": _v4_addrs(dev, ip) + a6[dev][:64]}
+    if tun:
+        out["tun_addrs"] = _v4_addrs(tun, ip) + a6[tun][:64]
+    return out
+
+
+def net_bytes(ifname):
+    """(bytes in, bytes out) of a device from /proc/net/dev, or None."""
+    for ln in (read(_netdir() + "/dev", 64 << 10) or "").splitlines()[2:1024]:
+        name, sep, rest = ln.partition(":")
+        if sep and name.strip() == ifname:
+            t = rest.split()
+            if len(t) >= 9 and t[0].isdigit() and t[8].isdigit() and len(t[0]) <= 20 and len(t[8]) <= 20:
+                return int(t[0]), int(t[8])
+    return None
+
+
+def ss_path():
+    for p in ("/usr/bin/ss", "/usr/sbin/ss", "/bin/ss", "/sbin/ss"):
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def net_flows(tun=None):
+    """(`ss -tinpeHO`'s output or None, why: "timeout", "cap", "missing", "exit N"); `tun` is the macOS backend's concern. As root it keeps root (only root sees
+    every socket's process); a test may hand over a recorded one with OOMPH_SS_FIXTURE, never to a process whose real
+    user is root."""
+    fx = os.environ.get("OOMPH_SS_FIXTURE")
+    if fx and os.getuid() != 0:
+        try:
+            with open(fx, "rb") as f:
+                data = f.read(SS_CAP + 1)
+            return (data, None) if len(data) <= SS_CAP else (None, "cap")
+        except OSError:
+            return None, "missing"
+    ss = ss_path()
+    if ss is None or ROOT or _netdir() != "/proc/net":   # none, or in a namespace of its own: its sockets are not the host's
+        return None, "missing"
+    why = []
+    out = run_capped([ss] + SS_ARGS, SS_CAP, SS_TIMEOUT, as_root=True, why=why)
+    return (out, None) if out is not None else (None, why[0] if why else "missing")
+
+
+@functools.lru_cache(maxsize=1)
+def host_secret():
+    """/etc/machine-id (or D-Bus's copy), or None: the salt of a network's public id (oomph_traffic.public_id). It
+    never leaves the machine; machine.id is a hash of it."""
+    for f in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        v = (read(f, 64) or "").strip()
+        if re.fullmatch(r"[0-9a-f]{32}", v):
+            return v
+    return None
+
+
+def router_mac(gw, ifname):
+    """The gateway's MAC from /proc/net/arp (complete entries only: ATF_COM, a permanent one too), or None."""
+    for ln in (read(_netdir() + "/arp", 256 << 10) or "").splitlines()[1:4096]:
+        t = ln.split()
+        if len(t) >= 6 and t[0] == gw and t[5] == ifname and re.fullmatch(r"0x[0-9a-fA-F]{1,4}", t[2]) and \
+                int(t[2], 16) & 0x2:
+            return t[3]
+    return None
+
+
+def _v6(x):
+    """An IPv6 address without its %scope, normalised, or None."""
+    import ipaddress
+    try:
+        return ipaddress.IPv6Address(str(x or "").partition("%")[0])
+    except ValueError:
+        return None
+
+
+def router_mac6(ifname):
+    """The IPv6 default router's MAC on that interface (`ip -6 route show default dev X` names it, `ip -6 neigh show
+    dev X` holds its MAC), or None (no ip, or no netlink). Not any router: a Thread border router or a mesh
+    repeater sends router advertisements on the LAN too."""
+    ip = _ip() if _netdir() == "/proc/net" else None
+    if not ip or not _ifname_ok(ifname):
+        return None
+    routes = (run_capped([ip, "-6", "route", "show", "default", "dev", ifname], 64 << 10, 2.0) or b"").decode(
+        "utf-8", "replace")
+    best = None   # the lowest metric's (the kernel's choice; ip lists it first anyway)
+    for ln in routes.splitlines()[:256]:
+        m = re.search(r"\bvia (\S+)", ln)
+        gw = _v6(m.group(1)) if m else None
+        met = re.search(r"\bmetric (\d{1,10})\b", ln)
+        met = int(met.group(1)) if met else 0
+        if gw is not None and (best is None or met < best[0]):
+            best = (met, gw)
+    if best is None:
+        return None
+    out = (run_capped([ip, "-6", "neigh", "show", "dev", ifname], 256 << 10, 2.0) or b"").decode(
+        "utf-8", "replace")
+    for ln in out.splitlines()[:4096]:
+        t = ln.split()
+        m = re.search(r"\blladdr (\S+)", ln)
+        if t and m and _v6(t[0]) == best[1]:
+            return m.group(1)
+    return None
 
 
 # ------------------------------------------------------------------ CPU, disks, I/O (03 §11.2)
@@ -1168,18 +1430,23 @@ def _nobody():
     return {"user": uid, "group": gid, "extra_groups": []}
 
 
-def run_capped(cmd, cap, timeout, tail=False, rc=None):
+def run_capped(cmd, cap, timeout, tail=False, rc=None, as_root=False, why=None):
     """stdout of `cmd` (bytes), at most `cap` of them within `timeout` seconds, else None; as nobody
-    when this process is root. With `tail`, more than `cap` (or the deadline) keeps the last whole lines
-    within `cap` instead. `rc`, a list, gets the child's exit status when it ended by itself within both
-    (a timeout or too much output adds nothing). The child is always reaped."""
+    when this process is root (unless `as_root`: ss names the processes of other users only to root). With `tail`,
+    more than `cap` (or the deadline) keeps the last whole lines within `cap` instead. `rc`, a list, gets the
+    child's exit status when it ended by itself within both (a timeout or too much output adds nothing); `why`, a
+    list, gets "missing", "timeout", "cap" or "exit N" (the child's status, not 0) when the answer is None for one of
+    those. The child is always reaped."""
     import collections
     import select
     import subprocess
+    why = why if why is not None else []
     try:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd="/",
-                             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}, **_nobody())
+                             env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"},
+                             **({} if as_root else _nobody()))
     except OSError:
+        why.append("missing")
         return None
     out, n, cut, deadline = collections.deque(), 0, False, time.monotonic() + timeout
     fd = p.stdout.fileno()
@@ -1191,6 +1458,7 @@ def run_capped(cmd, cap, timeout, tail=False, rc=None):
         while True:
             left = deadline - time.monotonic()
             if left <= 0 or not select.select([fd], [], [], left)[0]:
+                why.append("timeout")
                 return kept() if tail else None
             b = os.read(fd, 1 << 16)
             if not b:
@@ -1199,6 +1467,7 @@ def run_capped(cmd, cap, timeout, tail=False, rc=None):
             out.append(b)
             while n > cap:
                 if not tail:
+                    why.append("cap")
                     return None
                 cut, drop = True, out.popleft()
                 n -= len(drop)
@@ -1208,7 +1477,10 @@ def run_capped(cmd, cap, timeout, tail=False, rc=None):
         p.wait(max(0.01, deadline - time.monotonic()))
         if rc is not None:
             rc.append(p.returncode)
-        return kept() if p.returncode == 0 or (tail and out) else None
+        if p.returncode == 0 or (tail and out):
+            return kept()
+        why.append("exit %d" % p.returncode)
+        return None
     except (OSError, subprocess.TimeoutExpired):
         return kept() if tail and out else None
     finally:

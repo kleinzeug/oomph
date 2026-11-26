@@ -23,6 +23,7 @@ import re
 import select
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -181,16 +182,27 @@ def _point(s, res=False):
 
 def res_point(s):
     """A sample's cores busy (and of them the system's), the GPU (and whether at full speed), its memory,
-    and the free space of the Disk tile's pool (02 §5.1; Point.take in the app)."""
+    the free space of the Disk tile's pool (02 §5.1; Point.take in the app), and the internet line's download and
+    upload in Mbit/s with whether they told the LAN from the internet and its network's mark (NET 12.5: `nd`, `nu`,
+    `nf`, `nk`: view.net_key)."""
     c = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
     gl = s.get("gpu") if isinstance(s.get("gpu"), list) else []
     g = gl[0] if gl and isinstance(gl[0], dict) else {}
     d, _ = view.tile_pool(s)
+    nb = s.get("net") if isinstance(s.get("net"), dict) else None
     return {"cpu": _num(c.get("busy"), None), "sys": _num(c.get("sys"), None), "gpu": _num(g.get("util"), None),
             "gfull": g.get("src") == "ioreport", "gmem": _num(g.get("mem_gb"), None),
-            "disk": _num(d.get("free_gb"), None) if d else _num(s.get("disk_free_gb"), None)}
+            "disk": _num(d.get("free_gb"), None) if d else _num(s.get("disk_free_gb"), None),
+            "nd": _f32(view.net_rate(nb, "down_mbps")), "nu": _f32(view.net_rate(nb, "up_mbps")),
+            "nf": bool(nb) and nb.get("src") == "flows", "nk": view.net_key(nb)}
 
 
+def _f32(x):
+    """x as the typed arrays keep it (RES_CODE: 32-bit, as the app's Point), so that every path reads the same figure."""
+    return None if x is None else struct.unpack("f", struct.pack("f", x))[0]
+
+
+RES_CODE = {"nd": "f", "nu": "f"}   # the network's Mbit/s as 32-bit floats, as the app's Point keeps them: 1 MB less
 RES_SETTING = "resourcesUI"     # top.json: the four resources (1.11.0), off until the owner has seen the renders
 
 
@@ -221,12 +233,21 @@ def resource_facts(model, s):
     g = gl[0] if gl and isinstance(gl[0], dict) else {}
     d, _ = view.tile_pool(s)
     busy, sys_ = _num(c.get("busy"), None), _num(c.get("sys"), None)
+    nd, nu, _ = view.net_pools(s)
+    nb = s.get("net") if isinstance(s.get("net"), dict) else None
     rf = {"n": _num(c.get("n"), None), "sys": sys_, "user": busy - (sys_ or 0.0) if busy is not None else None,
           "util": _num(g.get("util"), None), "full": g.get("src") == "ioreport", "gmem": _num(g.get("mem_gb"), None),
           "free": _num(d.get("free_gb"), None) if d else _num(s.get("disk_free_gb"), None),
           "pool": str(d.get("name") or d.get("id") or "") if d else None,
-          "pool_id": d.get("id") if d and isinstance(d.get("id"), str) else None}
-    model.update(capsule=cap, tiles=view.tiles(s, cap, waiting), avail=view.available(s), rfacts=rf)
+          "pool_id": d.get("id") if d and isinstance(d.get("id"), str) else None,
+          # the network (NET 12.15): its figures each way, what of the download agents can share, the rates now
+          "net_cap_d": nd["cap"] if nd else None, "net_cap_u": nu["cap"] if nu else None,
+          "net_line": nd["cap"] - nd["margin"] if nd else None,
+          "net_d": view.net_rate(nb, "down_mbps"), "net_u": view.net_rate(nb, "up_mbps")}
+    # the stale hint reads the last three samples (the newest points; a bucket of several is their mean)
+    recent = [(p.get("nd"), p.get("nu"), p.get("nf"), p.get("nk", 0)) for p in (model.get("pts") or [])[-3:]] \
+        if model.get("pts") and "nd" in model["pts"][-1] else None
+    model.update(capsule=cap, tiles=view.tiles(s, cap, waiting, recent), avail=view.available(s), rfacts=rf)
 
 
 def load_points(log_dir, now, since, res=False):
@@ -286,6 +307,15 @@ def readings(s):
                pressure=pressure, free=max(0.0, ram - app - wired - comp),
                unowned=s.get("unowned_gb") if isinstance(s.get("unowned_gb"), (int, float)) else None,
                procs=int(_num(s.get("procs"), 0)) or None, groups=groups, claude=claude, top=top)
+    # the busiest names on the internet line and its processes (NET 12.16: the `a` panel with the network shown)
+    # a name's process count 1 … 9999 as the app clamps it (another machine's value may be anything: 1e300, N4-3)
+    nn = [(str(x.get("name") or "?"), _num(view.net_rate(x, "down")), _num(view.net_rate(x, "up")),
+           int(min(max(_num(x.get("n"), 1), 1), 9999))) for x in _list(s.get("net_names"))[:5] if isinstance(x, dict)]
+    if nn:
+        out["net_names"] = [(n, d + u, k, d, u) for n, d, u, k in sorted(nn, key=lambda x: -(x[1] + x[2]))]
+        out["top_net"] = [(int(_num(x.get("pid"), 0)), str(x.get("name") or "?"), _num(view.net_rate(x, "down")),
+                           _num(view.net_rate(x, "up")), str(x.get("g") or ""))
+                          for x in _list(s.get("top_net"))[:8] if isinstance(x, dict)]
     if s.get("os") == "linux":
         out["linux"] = linux_facts(s)
     return out
@@ -662,8 +692,10 @@ class Day:
         self.ordered, self.tmax = True, float("-inf")      # so that series() need not look at every sample
         self.t, self.w, self.a, self.c, self.s = (array.array("d") for _ in range(5))
         self.away, self.kills = bytearray(), array.array("l")
-        # with the resources on: cpu, sys, gpu, gmem, disk (NaN where none) and the GPU's kind (1 at full speed)
-        self.res = ([array.array("d") for _ in range(5)] + [bytearray()]) if res else None
+        # with the resources on: view.RES_POINT (NaN where none), the GPU's kind (1 at full speed) and whether the
+        # network's figures told the LAN from the internet (bit 0) with its network's mark (the bits above, view.net_key)
+        self.res = ([array.array(RES_CODE.get(k, "d")) for k in view.RES_POINT] + [bytearray(), bytearray()]) \
+            if res else None
 
     def add(self, line):
         try:
@@ -681,7 +713,8 @@ class Day:
             nan = float("nan")
             for a, k in zip(self.res, view.RES_POINT):
                 a.append(nan if p[k] is None else p[k])
-            self.res[5].append(1 if p["gfull"] else 0)
+            self.res[len(view.RES_POINT)].append(1 if p["gfull"] else 0)
+            self.res[len(view.RES_POINT) + 1].append((1 if p["nf"] else 0) | p["nk"] << 1)
         self.tmax = max(self.tmax, p["t"])
         self.t.append(p["t"])
         self.w.append(p["wired"])
@@ -775,7 +808,7 @@ class History:
         older, n = len(days) < len(self.days), sum(len(d.t) for d in days)
         cols = [array.array("d", [0.0]) * n for _ in range(5)] + [bytearray(n), array.array("l", [0]) * n]
         if self.res:
-            cols += [array.array("d", [0.0]) * n for _ in range(5)] + [bytearray(n)]
+            cols += [array.array(RES_CODE.get(k, "d"), [0.0]) * n for k in view.RES_POINT] + [bytearray(n), bytearray(n)]
         ordered, future, prev, at = True, False, float("-inf"), 0
         for d in days:
             k = len(d.t)
@@ -840,7 +873,9 @@ def multires_cols(cols, now):
 def res_row(R, k):
     """The other resources of sample k of the typed arrays, as a point carries them (None for NaN)."""
     out = {key: (None if R[n][k] != R[n][k] else R[n][k]) for n, key in enumerate(view.RES_POINT)}
-    out["gfull"] = bool(R[5][k])
+    out["gfull"] = bool(R[len(view.RES_POINT)][k])
+    x = R[len(view.RES_POINT) + 1][k]
+    out["nf"], out["nk"] = bool(x & 1), x >> 1
     return out
 
 
@@ -2452,16 +2487,16 @@ class App:
         add or remove it, the last one refused (02 §3.7.3, §3.7.12)."""
         res = view.RES_KEYS[k.lower()]
         sel, focus, out = view.selection_apply(self.rv["sel"], self.rv["focus"], "click" if k.islower() else "cmd", res,
-                                               m.get("avail") or list(view.RESOURCES))
+                                               m.get("avail") or view.available(None))
         if out == "refused":
             self.note("the last resource shown can't be removed", "dim", 3.0)
         elif out == "callout":                    # as the `a` key: a fresh apps panel, or closing it
             self.panel_key("a", m)
         elif out == "changed":
-            keep = [r for r in self.rv["sel"] if r not in (m.get("avail") or view.RESOURCES)] if k.isupper() else []
+            keep = [r for r in self.rv["sel"] if r not in (m.get("avail") or view.available(None))] if k.isupper() else []
             self.rv = {"sel": [r for r in view.RESOURCES if r in sel or r in keep], "focus": focus}
             self.full = True
-        elif res not in (m.get("avail") or view.RESOURCES):
+        elif res not in (m.get("avail") or view.available(None)):
             self.note("no %s reading on this machine" % view.RES_WORDS[res], "dim", 3.0)
 
     def panel_key(self, k, m, P=None):
@@ -2546,7 +2581,7 @@ class App:
             return
         if self.M is not None and not ui.get("inspect") and self.key_machines(k, m):
             return
-        if self.rv and k in ("m", "c", "g", "d", "M", "C", "G", "D"):
+        if self.rv and len(k) == 1 and k.lower() in view.RES_KEYS:   # m c g d w, and with shift
             self.res_key(k, m)
             return
         if ui.get("inspect") and W >= 40 and H >= 10:

@@ -248,10 +248,32 @@ struct Measures: Decodable { var psi: Soft<Bool>?; var kills: Soft<String>?; var
 /// The machine block the logger puts into current.json (`daemon.machine`): its kind and measures.
 struct DaemonMachine: Decodable { var kind: String?; var measures: Soft<Measures>? }
 struct RateProc: Decodable { var name: String?; var g: String?; var cpu: Double?; var gpu: Double?; var w: Double? }
+/// The sample's internet line (NET 12.5, logged from 1.15): the physical interface (nil offline), whether the egress is a
+/// tunnel, whether the figures told the LAN from the internet (`src` "flows"), the rates in Mbit/s of payload.
+struct NetBlock: Decodable { var `if`: Soft<String>?; var vpn: Soft<Bool>?; var src: Soft<String>?
+                             var down_mbps: Soft<Double>?; var up_mbps: Soft<Double>?; var network: Soft<String>? }
+/// One of the network's last points for the stale hint (Tile.netStale): Mbit/s each way, whether it told the LAN from
+/// the internet, its network's mark (Point.netKey).
+typealias NetRecent = (down: Double?, up: Double?, flows: Bool, key: UInt8)
+/// One of net_names: the busiest names on the line, Mbit/s each way.
+struct NetName: Decodable { var name: Soft<String>?; var down: Soft<Double>?; var up: Soft<Double>?; var n: Soft<Double>? }
 struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
 struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool?
                                var machine: Soft<DaemonMachine>?; var all_procs: Soft<Bool>? }
+/// current.json's pools as the verdict reads them (NET 12.8): a metered network's quota, its cap and what this
+/// machine used this period (GB), and when it resets.
+/// `to` and `label` are only the tooltip's: a mistyped one costs that word, never the warning (as oomph.quota_low).
+struct QuotaPool: Decodable { var cap: Double?; var used: Double?; var to: Soft<Double>?; var label: Soft<String>? }
+/// net.down and net.up (NET 12.8): the line's figure each way, what the household keeps, what agents hold, and the
+/// logger's level ("busy").
+struct NetPool: Decodable { var cap: Soft<Double>?; var margin: Soft<Double>?; var reserved: Soft<Double>?; var level: Soft<String>? }
+struct PoolsBlock: Decodable {
+    var quota: Soft<QuotaPool>?
+    var down: Soft<NetPool>?
+    var up: Soft<NetPool>?
+    enum CodingKeys: String, CodingKey { case quota = "net.quota", down = "net.down", up = "net.up" }
+}
 
 struct Sample: Decodable {
     var t: Double
@@ -285,6 +307,11 @@ struct Sample: Decodable {
     var scope: Soft<ScopeBlock>?
     var cached_gb: Soft<Double>?
     var free_gb: Soft<Double>?
+    // what only current.json has: the pools (02 §5.2); the verdict reads a metered network's quota (NET 12.8)
+    var pools: Soft<PoolsBlock>?
+    // the internet line (NET 12.5, 1.15): the Network tile's
+    var net: Soft<NetBlock>?
+    var net_names: Soft<[Soft<NetName>]>?
 
     var isAway: Bool {
         guard let a = away else { return false }
@@ -403,6 +430,14 @@ struct Point: Identifiable {
     /// A Linux machine's stall time (PSI, % of 10 s; 03 §5.3): "some", "full" and what was taken out at a container's
     /// own limit; NaN where a sample has none (a Mac's). A bucket keeps the highest of each (L3, the hover's line).
     var stall: Float = .nan, stallFull: Float = .nan, stallLimit: Float = .nan
+    /// The internet line (NET 12.15): download and upload in Mbit/s (a bucket's mean, and its peak), whether every
+    /// sample of it told the LAN from the internet (the stale hint reads only those), and its busiest name.
+    var netDown: Float = .nan, netUp: Float = .nan, netDownPeak: Float = .nan, netUpPeak: Float = .nan
+    var netFlows = false
+    /// The sample's network as a 7-bit mark (Tile.netKey; 255: a bucket over a change): the stale hint reads only
+    /// samples of one network.
+    var netKey: UInt8 = 0
+    var netTop: String?
 
     var used: Double { wired + app + comp }
 
@@ -419,6 +454,13 @@ struct Point: Identifiable {
             if let m = g.mem_gb { gpuMem = Float(m) }
         }
         if let d = Tile.pool(r.disks?.v).pool?.free_gb { disk = Float(d) } else if let d = r.disk_free_gb { disk = Float(d) }
+        if let n = r.net?.v {
+            if let x = Tile.rate(n.down_mbps?.v) { netDown = Float(x); netDownPeak = Float(x) }
+            if let x = Tile.rate(n.up_mbps?.v) { netUp = Float(x); netUpPeak = Float(x) }
+            netFlows = n.src?.v == "flows"
+            netKey = Tile.netKey(n.network?.v)
+            netTop = Tile.netTop(r.net_names?.v)
+        }
     }
 
     /// The resource fields of a bucket (Store.worst keeps memory's worst point and its time).
@@ -435,6 +477,20 @@ struct Point: Identifiable {
         gpuPeak = g.map { max($0.gpu, $0.gpuPeak.isNaN ? $0.gpu : $0.gpuPeak) }.max() ?? .nan
         gpuMem = slice.map(\.gpuMem).filter { !$0.isNaN }.max() ?? .nan
         disk = slice.map(\.disk).filter { !$0.isNaN }.min() ?? .nan
+        aggregateNet(slice)
+    }
+
+    /// The network's fields of a bucket (oomph_view.res_agg): the mean each way, the peak, every sample flows.
+    mutating func aggregateNet(_ slice: ArraySlice<Point>) {
+        func mean(_ xs: [Float]) -> Float { xs.isEmpty ? .nan : xs.reduce(0, +) / Float(xs.count) }
+        let d = slice.filter { !$0.netDown.isNaN }, u = slice.filter { !$0.netUp.isNaN }
+        netDown = mean(d.map(\.netDown)); netUp = mean(u.map(\.netUp))
+        netDownPeak = d.map { $0.netDownPeak.isNaN ? $0.netDown : $0.netDownPeak }.max() ?? .nan
+        netUpPeak = u.map { $0.netUpPeak.isNaN ? $0.netUp : $0.netUpPeak }.max() ?? .nan
+        netFlows = slice.allSatisfy { $0.netFlows }
+        let k: UInt8 = slice.first?.netKey ?? 0
+        netKey = slice.allSatisfy { $0.netKey == k } ? k : Tile.netMixed
+        netTop = slice.last { $0.netTop != nil }?.netTop
     }
 }
 
@@ -444,6 +500,8 @@ struct ChartSampleR: Decodable {
     var gpu: Soft<[GPUBlock]>?
     var disks: Soft<[DiskPool]>?
     var disk_free_gb: Double?
+    var net: Soft<NetBlock>?
+    var net_names: Soft<[Soft<NetName>]>?
 }
 
 /// One reservation of the agents' memory ledger: live (ledger.json) or finished (reservations.jsonl).
@@ -477,6 +535,17 @@ struct Reservation: Identifiable {
     var flags: [Resource: (flag: String, since: Double?)] = [:]  // a grant's advice: over, idle (02 §6.3)
     var waitingFor: [Resource] = []      // a queued one: what it waits for (waiting_on), in tile order
     var resSegs: [Resource: [(t: Double, v: Double)]] = [:]     // cores and disk over time (segments[].res)
+    // The network (NET 12.9, 1.15; oomph_view.res_vector): the rate each way in Mbit/s (granted, else asked; nil for
+    // an unmanaged part), the volume, what it moved, the download it uses, when it should be done, unmanaged.
+    var net: Double?
+    var netUp: Double?
+    var netGB: Double?
+    var netUpGB: Double?
+    var netMoved: Double?
+    var netUpMoved: Double?
+    var netUsed: Double?
+    var netEta: Double?
+    var netUnmanaged = false
 
     var live: Bool { ended == nil }
     var gb: Double { segments.last?.gb ?? 0 }
@@ -578,9 +647,11 @@ struct Reservation: Identifiable {
         let d = n.doubleValue
         return d.isFinite && d > 0 && d < 1e11 ? d : nil
     }
-    /// The resource of a pool id in `waiting_on` (02 §6.4): ram, mem and "critical" are memory's; cpu; gpu, vram; disk:<id>.
-    static func waited(_ id: String) -> Resource {
-        id == "ram" || id == "mem" || id == "critical" ? .memory : id == "cpu" ? .cpu
+    /// The resource of a pool id in `waiting_on` (02 §6.4): ram, mem and "critical" are memory's; cpu; gpu, vram;
+    /// net.down, net.up, net.quota the network's (NET 1.15); disk:<id>.
+    static func waited(_ id: String) -> Resource? {
+        if id.hasPrefix("net.") { return .net }
+        return id == "ram" || id == "mem" || id == "critical" ? .memory : id == "cpu" ? .cpu
             : id.hasPrefix("gpu") || id.hasPrefix("vram") ? .gpu : .disk
     }
 
@@ -591,10 +662,18 @@ struct Reservation: Identifiable {
         func waits(_ deflt: [String]) {
             guard !isGranted && open else { return }
             let w = ((o["waiting_on"] as? [Any]) ?? []).prefix(16).compactMap { $0 as? String }
-            let got = Set((w.isEmpty ? deflt : w).map(Reservation.waited))
+            let got = Set((w.isEmpty ? deflt : w).compactMap(Reservation.waited))
             waitingFor = Resource.allCases.filter { got.contains($0) }
         }
-        guard let res = o["res"] as? [String: Any] else { waits(["ram"]); return }
+        guard let res = o["res"] as? [String: Any] else {
+            // another machine's queued lease as its mirror carries it (no `res`, no `waiting_on`) without memory: it
+            // waits for what the mirror does not say (the network's parts): "waiting", never "0G … for memory"
+            // (N4-4). A granted one stays as 1.14.2 had it: a CPU-, disk- or GPU-only grant carries gb 0.01 too.
+            if !isGranted && open && (Reservation.amt(o["gb"]) ?? 0) <= 0.015 && o["waiting_on"] == nil {
+                holdsMemory = false; return
+            }
+            waits(["ram"]); return
+        }
         let lease = res.values.contains { $0 is [String: Any] }
         holdsMemory = res["ram"] != nil || (Reservation.amt(o["gb"]) ?? 0) > 0.015
         func s(_ x: Any?) -> String? { (x as? String).map { String($0.prefix(200)) } }
@@ -611,11 +690,29 @@ struct Reservation: Identifiable {
             if disk != nil { diskPool = s(d["pool"]); diskName = s(d["name"]) }
             cpuUsed = Reservation.amt((res["cpu"] as? [String: Any])?["used"])
             diskWrote = Reservation.amt(d["w"])
+            for k in ["net", "net_up"] {
+                guard let part = res[k] as? [String: Any] else { continue }
+                // an unmanaged part has no rate (its `ask` is kept for a later network's figure)
+                let unmanaged: Bool = (part["unmanaged"] as? Bool) == true
+                    && CFGetTypeID(part["unmanaged"] as CFTypeRef) == CFBooleanGetTypeID()
+                let rate: Double? = unmanaged ? nil
+                    : (isGranted ? Reservation.amt(part["got"]) : nil) ?? Reservation.amt(part["ask"])
+                let gb = Reservation.amt(part["gb"]), moved = Reservation.amt(part["moved"])
+                if k == "net" { net = rate; netGB = gb; netMoved = moved; netUsed = Reservation.amt(part["used"]) }
+                else { netUp = rate; netUpGB = gb; netUpMoved = moved }
+                if netEta == nil { netEta = Reservation.since(part["eta"]) }
+                if unmanaged { netUnmanaged = true }
+                if isGranted, flags[.net] == nil, let f = part["flag"] as? String, f == "over" || f == "idle" {
+                    flags[.net] = (f, Reservation.since(part[f == "over" ? "over_t" : "low_t"]))
+                }
+            }
         } else {
             cpu = Reservation.amt(res["cpu"]); disk = Reservation.amt(res["disk"])
             if disk != nil { diskPool = s(res["disk_pool"]) }
+            net = Reservation.amt(res["net"]); netUp = Reservation.amt(res["net_up"])
+            netGB = Reservation.amt(res["net_gb"]); netUpGB = Reservation.amt(res["net_up_gb"])
         }
-        for (k, r) in [("cpu", Resource.cpu), ("disk", Resource.disk)] where (r == .cpu ? cpu : disk) != nil {
+        for (k, r) in [("cpu", Resource.cpu), ("disk", Resource.disk), ("net", Resource.net)] where (r == .cpu ? cpu : r == .disk ? disk : net) != nil {
             let seq = ((o["segments"] as? [[String: Any]]) ?? []).compactMap { sg -> (t: Double, v: Double)? in
                 guard let t = (sg["t"] as? NSNumber)?.doubleValue, let x = Reservation.amt((sg["res"] as? [String: Any])?[k])
                 else { return nil }
@@ -626,22 +723,25 @@ struct Reservation: Identifiable {
         var asked: [String] = holdsMemory ? ["ram"] : []
         if cpu != nil { asked.append("cpu") }
         if disk != nil { asked.append("disk") }
+        if holds(.net, band: true) { asked.append("net.down") } else if holds(.net) { asked.append("net.up") }
         waits(asked)
     }
 
-    /// Does it hold resource k (the disk: on `pool`, when one is named)?
-    func holds(_ k: Resource, pool: String? = nil) -> Bool {
+    /// Does it hold resource k (the disk: on `pool`, when one is named)? `band`: in k's band, which for the network is
+    /// the download's (NET 12.15): a lease with an upload part alone has a row but no block there.
+    func holds(_ k: Resource, pool: String? = nil, band: Bool = false) -> Bool {
         switch k {
         case .memory: return holdsMemory
         case .cpu: return cpu != nil
         case .gpu: return false
         case .disk: return disk != nil && (pool == nil || diskPool == pool)
+        case .net: return net != nil || netGB != nil || (!band && (netUp != nil || netUpGB != nil))   // a rate or a volume
         }
     }
     /// Its amount of k over time, the first from its request.
     func amountSegs(_ k: Resource) -> [(t: Double, v: Double)] {
         if k == .memory { return segments.map { ($0.t, $0.gb) } }
-        return resSegs[k] ?? [(requested, (k == .cpu ? cpu : disk) ?? 0)]
+        return resSegs[k] ?? [(requested, (k == .cpu ? cpu : k == .net ? net : disk) ?? 0)]
     }
     func amount(_ k: Resource, at t: Double) -> Double {
         if k == .memory { return gb(at: t) }
@@ -651,20 +751,25 @@ struct Reservation: Identifiable {
 
     /// The strip's bands (02 §3.4.5, §3.7.6): of the resources shown, those reserved in the 14 days kept, the focus's
     /// first (the tall one), then the others in tile order. The Disk band is the tile's pool's.
-    static let bandResources: [Resource] = [.memory, .cpu, .disk]
+    static let bandResources: [Resource] = [.memory, .cpu, .disk, .net]
     static func bands(_ rs: [Reservation], shown: [Resource], focus: Resource, pool: String?) -> [Resource] {
-        let have = bandResources.filter { k in shown.contains(k) && rs.contains { $0.holds(k, pool: pool) } }
+        let have = bandResources.filter { k in shown.contains(k) && rs.contains { $0.holds(k, pool: pool, band: true) } }
         return (have.contains(focus) ? [focus] : []) + have.filter { $0 != focus }
     }
-    /// A band's scale: the strip's round figures; GB of disk go on up to 64 TB.
-    static func bandTop(_ vis: Double, _ k: Resource) -> Double {
+    /// A band's scale: the strip's round figures; GB of disk go on up to 64 TB; the network's what the line has to
+    /// share (`line`: its figure less the margin, NET 12.15: a block's height is got / (cap − margin)), else 1, 2, 5 × 10ⁿ.
+    static func bandTop(_ vis: Double, _ k: Resource, line: Double? = nil) -> Double {
+        if k == .net {
+            if let line, line.isFinite, line >= max(vis, 1) { return line }
+            return Tile.netScale(vis)
+        }
         if k == .disk && vis > 256 {
             return [384.0, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768, 65536].first { $0 >= vis } ?? vis
         }
         return MemoryChart.stripTop(vis)
     }
 
-    static let word: [Resource: String] = [.memory: "memory", .cpu: "CPU", .gpu: "GPU", .disk: "disk"]
+    static let word: [Resource: String] = [.memory: "memory", .cpu: "CPU", .gpu: "GPU", .disk: "disk", .net: "the network"]
     static func amtG(_ x: Double) -> String { abs(x - x.rounded()) < 0.05 ? "\(Int(x.rounded()))G" : String(format: "%.1fG", x) }
     static func coresWords(_ x: Double) -> String {
         var t = String(format: "%.1f", x)
@@ -682,11 +787,31 @@ struct Reservation: Identifiable {
             let other = pool != nil && diskPool != nil && diskPool != pool
             parts.append(Reservation.amtG(d) + " " + (other ? Tile.midFit(diskName ?? diskPool ?? "?", 12) : "disk"))
         }
+        parts += netAmounts
         return parts.isEmpty ? "–" : parts.joined(separator: " · ")
     }
-    /// One use figure of a grant: "using 2.1G", "using 5.2 cores", "wrote 11G of 20G"; nil where not measured.
-    func useFigure(_ k: Resource) -> String? {
+    /// A rate or a volume of the network as people write it: 150, 18.5, 0.5.
+    static func netNum(_ x: Double) -> String { abs(x - x.rounded()) < 0.05 ? "\(Int(x.rounded()))" : String(format: "%.1f", x) }
+    /// The network's amounts (NET 12.15): "150 Mbit/s · 40 GB", "↑20 Mbit/s · ↑5 GB"; a volume alone "↓40 GB".
+    var netAmounts: [String] {
+        var out: [String] = []
+        if let n = net { out.append(Reservation.netNum(n) + " Mbit/s") }
+        if let g = netGB { out.append((net == nil ? "↓" : "") + Reservation.netNum(g) + " GB") }
+        if let n = netUp { out.append("↑" + Reservation.netNum(n) + " Mbit/s") }
+        if let g = netUpGB { out.append("↑" + Reservation.netNum(g) + " GB") }
+        return out
+    }
+    /// One use figure of a grant: "using 2.1G", "using 5.2 cores", "wrote 11G of 20G", "12.3 of 40 GB · ≈ 24 min left";
+    /// nil where not measured.
+    func useFigure(_ k: Resource, now: Double? = nil) -> String? {
         switch k {
+        case .net:
+            if let g = netGB, let m = netMoved {
+                var text: String = String(format: "%.1f of ", m) + Reservation.netNum(g) + " GB"
+                if let e = netEta, let now, e > now { text += " · ≈ " + MemoryChart.duration(e - now) + " left" }
+                return text
+            }
+            return netUsed.map { "using " + Tile.mbps($0) + " Mbit/s" }
         case .memory: return String(format: "using %.1fG", used ?? 0)
         case .cpu: return cpuUsed.map { "using " + Reservation.coresWords($0) }
         case .disk:
@@ -716,7 +841,7 @@ struct Reservation: Identifiable {
         let held: [Resource] = Resource.allCases.filter { holds($0) }
         if !idle, let first = held.first {
             let u: Resource = held.contains(focus) ? focus : (held.first { shown.contains($0) } ?? first)
-            if let fig = useFigure(u) { parts.append(fig) }
+            if let fig = useFigure(u, now: now) { parts.append(fig) }
         }
         if let e = expires { parts.append(MemoryChart.shortDuration(e - now) + " left") }
         return parts.joined(separator: " · ")
@@ -735,6 +860,14 @@ struct Reservation: Identifiable {
         if which.contains(.disk), g.contains(where: { $0.disk != nil }) {
             let n: Double = g.reduce(0.0) { (a: Double, r: Reservation) in a + (r.disk ?? 0) }
             out.append(String(amtG(n).dropLast()) + " GB disk")
+        }
+        if which.contains(.net), g.contains(where: { $0.net != nil }) {
+            let n: Double = g.reduce(0.0) { (a: Double, r: Reservation) in a + (r.net ?? 0) }
+            out.append(netNum(n) + " Mbit/s")
+        }
+        if which.contains(.net), g.contains(where: { $0.netUp != nil }) {
+            let n: Double = g.reduce(0.0) { (a: Double, r: Reservation) in a + (r.netUp ?? 0) }
+            out.append("↑" + netNum(n) + " Mbit/s")
         }
         return out
     }
@@ -851,24 +984,33 @@ enum Pressure: Int { case unknown = 0, normal = 1, warn = 2, critical = 4
 
 /// The resources a tile shows, in tile order. `oomph top` has the same (oomph_view.RESOURCES).
 enum Resource: String, CaseIterable {
-    case memory, cpu, gpu, disk
-    var name: String { ["memory": "Memory", "cpu": "CPU", "gpu": "GPU", "disk": "Disk"][rawValue]! }
-    var letter: String { String(rawValue.prefix(1)) }
-    /// The resource hues (02 §3.4): blue, teal, violet, magenta. Agents never wear them (§3.8.3).
+    case memory, cpu, gpu, disk, net
+    var name: String { ["memory": "Memory", "cpu": "CPU", "gpu": "GPU", "disk": "Disk", "net": "Network"][rawValue]! }
+    /// The key that shows it (§3.7.3): its initial; the network's w (n is `oomph top`'s next machine, NET 12.15).
+    var letter: String { self == .net ? "w" : String(rawValue.prefix(1)) }
+    /// The resource hues (02 §3.4): blue, teal, violet, magenta, and the network's navy (light) or steel blue (dark),
+    /// chosen with the dataviz validator in NET N4 against the four, the six agent colours, red, amber and the memory
+    /// chart's grey and orange. Agents never wear them (§3.8.3).
     var color: Color {
         switch self {
         case .memory: Color(red: 0.0, green: 0.53, blue: 1.0)
         case .cpu: Color(red: 0.0, green: 0.66, blue: 0.70)
         case .gpu: Color(red: 0.62, green: 0.36, blue: 0.95)
         case .disk: Color(red: 0.90, green: 0.25, blue: 0.62)
+        case .net: Resource.netColor
         }
     }
-    var unit: String { ["memory": "GB", "cpu": "cores", "gpu": "%", "disk": "GB"][rawValue]! }
+    static let netColor = Color(nsColor: NSColor(name: nil) { a in
+        a.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? NSColor(srgbRed: 0x2D / 255.0, green: 0x6B / 255.0, blue: 0xAB / 255.0, alpha: 1)
+            : NSColor(srgbRed: 0x2B / 255.0, green: 0x48 / 255.0, blue: 0xA9 / 255.0, alpha: 1)
+    })
+    var unit: String { ["memory": "GB", "cpu": "cores", "gpu": "%", "disk": "GB", "net": "Mbit/s"][rawValue]! }
 
     /// The tiles a machine shows: every resource, except a GPU the logger looked for and found none of
-    /// (`gpu: []`, a VM). Without the blocks (a logger older than 1.9.1, or none) the tiles stay and say "–".
+    /// (`gpu: []`, a VM), and the network where the logger reports none (before 1.15: four tiles, NET 12.15).
+    /// Without the blocks (a logger older than 1.9.1, or none) the tiles stay and say "–".
     static func available(_ s: Sample?) -> [Resource] {
-        Resource.allCases.filter { !($0 == .gpu && s?.gpu?.v?.isEmpty == true) }
+        Resource.allCases.filter { !($0 == .gpu && s?.gpu?.v?.isEmpty == true) && ($0 != .net || s?.net?.v != nil) }
     }
 }
 
@@ -919,7 +1061,32 @@ struct Selection: Equatable {
 /// `capsule` over `_verdict_parts`, held together by tools/vectors/chart.json, so the chip agrees with
 /// `oomph check`. The machine-wide verdict: no one caller's coordination, no pins.
 enum Verdict {
-    struct Capsule: Equatable { var text: String; var level: Int; var memory: Int; var disk: Int }
+    struct Capsule: Equatable { var text: String; var level: Int; var memory: Int; var disk: Int; var network: Int = 0 }
+
+    /// GB left of a metered network's cap while under 10 % of it (oomph.quota_low; NET D-N13): the one network
+    /// state the capsule shows (D-N20). nil otherwise, and for figures oomph could not have written.
+    static func quotaLeft(_ s: Sample) -> Double? {
+        guard let q = s.pools?.v?.quota?.v, let cap = q.cap, let used = q.used, cap.isFinite, used.isFinite,
+              cap >= 0.1, cap <= 100000, used >= 0, used <= 1e6 else { return nil }
+        let left: Double = cap - used
+        return left < 0.1 * cap ? max(0, left) : nil
+    }
+
+    /// The capsule tooltip's line about a metered network under 10 % (NET 12.15), on a Mac's tab and a Linux
+    /// machine's: what is left, until when, and the command. nil while it is not under 10 %.
+    static func quotaHelp(_ s: Sample) -> String? {
+        guard let left = quotaLeft(s), let q = s.pools?.v?.quota?.v, let cap = q.cap else { return nil }
+        let label: String? = q.label?.v
+        let name: String = (label?.isEmpty == false) ? "the metered network " + String(label!.prefix(32)) : "this metered network"
+        var until = ""
+        if let t = q.to?.v, t.isFinite, t > 0, t < 1e11 {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")   // "14 Dec", as the hook and `oomph net` say it
+            f.dateFormat = "d MMM"
+            until = " until " + f.string(from: Date(timeIntervalSince1970: t))
+        }
+        return String(format: "%@: %.1f of %g GB left%@ (oomph net)", name, left, cap, until)
+    }
 
     static func capsule(_ s: Sample) -> Capsule {
         let os = s.os?.v ?? "macos"
@@ -939,10 +1106,20 @@ enum Verdict {
         }
         if (s.jetsam_kills ?? 0) > 0 { mem = max(mem, 1) }
         if let u = s.unowned_gb?.v, ram > 0, u >= max(16.0, 0.4 * ram) { mem = max(mem, 1) }
-        let worst = max(mem, dsk)
-        let text = worst == 0 ? "Normal" : mem >= dsk ? "Memory " + (mem == 2 ? "critical" : "tight")
-                                                       : "Disk " + (dsk == 2 ? "critical" : "low")
-        return Capsule(text: text, level: worst, memory: mem, disk: dsk)
+        let left = quotaLeft(s)
+        let net = left == nil ? 0 : 1
+        let worst: Int = max(mem, dsk, net)
+        var text: String = "Normal"
+        if worst == 0 {
+            text = "Normal"
+        } else if mem == worst {
+            text = mem == 2 ? "Memory critical" : "Memory tight"
+        } else if dsk == worst {
+            text = dsk == 2 ? "Disk critical" : "Disk low"
+        } else {
+            text = String(format: "Network %.1f GB left", left ?? 0)
+        }
+        return Capsule(text: text, level: worst, memory: mem, disk: dsk, network: net)
     }
 
     static func color(_ level: Int) -> Color { level >= 2 ? .red : level == 1 ? .yellow : .green }
@@ -955,6 +1132,8 @@ enum Verdict {
 /// What a tile says (02 §3.4.1; oomph_view.tiles, held together by tools/vectors/chart.json).
 struct Tile {
     var reading = "–"
+    var short: String?          // the reading where five tiles leave too little room (NET 12.15)
+    var note: String?           // the network's line 4 in place of the biggest consumer: stale, metered?, not tested
     var flag: String?           // the one flag slot
     var level = 0               // 2 red, 1 amber: the border and the glyph; 0 quiet
     var queue = 0               // requests waiting for this resource
@@ -963,6 +1142,13 @@ struct Tile {
     var full = false            // the GPU figure is at full speed
 
     /// The flag slot as drawn: a flag of rank 1 to 6 keeps the queue after it; a queue alone outranks busy.
+    /// `short`: the network's metered words without "metered · " (oomph_view.flag_text).
+    func flagText(short: Bool) -> String {
+        var t = self
+        if short, let f = flag, f.hasPrefix("metered · ") { t.flag = String(f.dropFirst("metered · ".count)) }
+        if short && queue > 0 && (t.flag == nil || t.flag == "busy") { return "◻\(queue)" }
+        return t.flagText
+    }
     var flagText: String {
         if queue > 0 && (flag == nil || flag == "busy") { return "\(queue) waiting" }
         if let f = flag, queue > 0 { return "\(f) ◻\(queue)" }
@@ -1001,10 +1187,11 @@ struct Tile {
         return String(c[..<a]) + "…" + String(c[(c.count - (n - 1 - a))...])
     }
 
-    static func facts(_ s: Sample, _ cap: Verdict.Capsule, waiting: [Resource: Int] = [:]) -> [Resource: Tile] {
+    static func facts(_ s: Sample, _ cap: Verdict.Capsule, waiting: [Resource: Int] = [:],
+                      recent: [NetRecent] = [], hint: Bool = false) -> [Resource: Tile] {
         var out: [Resource: Tile] = [:]
         let used = s.app_gb + s.wired_gb + s.compressed_gb
-        out[.memory] = Tile(reading: String(format: "%.1f / %.0f GB", used, s.ram_gb),
+        out[.memory] = Tile(reading: String(format: "%.1f / %.0f GB", used, s.ram_gb), short: String(format: "%.1f/%.0f GB", used, s.ram_gb),
                             flag: cap.memory == 2 ? "critical" : cap.memory == 1 ? "tight" : nil, level: cap.memory,
                             top: s.groups?.first(where: { !$0.name.isEmpty })?.name, meter: s.ram_gb > 0 ? used / s.ram_gb : 0)
         let c = s.cpu?.v
@@ -1012,6 +1199,7 @@ struct Tile {
         if let n = c?.n, n > 0, let b = c?.busy {
             // never Int(n): another machine's sample may say 1e300 cores (as Python's "%d", truncated)
             t.reading = String(format: "%.1f / %.0f cores", b, n.rounded(.towardZero)); t.meter = b / n
+            t.short = String(format: "%.1f/%.0f", b, n.rounded(.towardZero))
             if b >= 0.9 * n { t.flag = "busy" }
         }
         if (c?.therm ?? 0) >= 2 { t.flag = "throttled" }
@@ -1021,6 +1209,7 @@ struct Tile {
         t.full = g?.src == "ioreport"
         if let u = g?.util {
             t.reading = String(format: "%.0f %%", u) + (t.full ? "" : " busy") + (g?.mem_gb.map { String(format: " · %.1f GB", $0) } ?? "")
+            t.short = String(format: "%.0f %%", u)
             t.meter = u / 100
             if t.full && u >= 90 { t.flag = "busy" }
         }
@@ -1035,11 +1224,130 @@ struct Tile {
             if k > 0 { t.flag = "+\(k) critical"; t.level = 2 } else if l > 0 { t.flag = "+\(l) low"; t.level = 1 }
         }
         t.reading = String(format: "%.0f GB free", free)
+        t.short = String(format: "%.0f GB", free)
         if let d, pools.count > 1 { t.reading += " · " + midFit((d.name?.isEmpty == false ? d.name : nil) ?? d.id ?? "?", 12) }
         if let tot = d?.total_gb, tot > 0 { t.meter = min(1, free / tot) }
         out[.disk] = t
+        out[.net] = Tile.net(s, recent: recent, hint: hint)
         for r in Resource.allCases { out[r]!.queue = waiting[r] ?? 0 }
         return out
+    }
+
+    // MARK: the network (NET N4, 1.15: 12.15; oomph_view.net_tile, held together by tools/vectors/chart.json)
+
+    /// Mbit/s as the tiles say them: 212, 41, 8.1, 0.4.
+    static func mbps(_ x: Double) -> String { x >= 10 ? String(format: "%.0f", x) : String(format: "%.1f", x) }
+    /// A figure between lo and hi, else nil (another logger's numbers are anything).
+    static func fig(_ x: Double?, _ lo: Double, _ hi: Double) -> Double? {
+        guard let x, x.isFinite, x >= lo, x <= hi else { return nil }
+        return x
+    }
+    static func rate(_ x: Double?) -> Double? { fig(x, 0, 1e6) }
+
+    /// What the pools say about the network: (down, up) as (cap, margin, reserved, busy) while the line has a figure,
+    /// and a metered cap and what was used (GB).
+    struct NetPools {
+        var down: (cap: Double, margin: Double, reserved: Double, busy: Bool)?
+        var up: (cap: Double, margin: Double, reserved: Double, busy: Bool)?
+        var quota: (cap: Double, used: Double)?
+    }
+    static func netPools(_ s: Sample?) -> NetPools {
+        var out = NetPools()
+        func one(_ p: NetPool?) -> (cap: Double, margin: Double, reserved: Double, busy: Bool)? {
+            guard let p, let cap = fig(p.cap?.v, 0.5, 1e5) else { return nil }
+            return (cap, fig(p.margin?.v, 0, cap) ?? 0, fig(p.reserved?.v, 0, 1e6) ?? 0, p.level?.v == "busy")
+        }
+        let pools = s?.pools?.v
+        out.down = one(pools?.down?.v); out.up = one(pools?.up?.v)
+        if let q = pools?.quota?.v, let cap = fig(q.cap, 0.1, 1e5), let used = fig(q.used, 0, 1e6) { out.quota = (cap, used) }
+        return out
+    }
+
+    /// The stale-figure hint (D-N8): (direction, seen, figure) when the last three samples, all of which told the LAN
+    /// from the internet and were on one network (`key`: after a move from a fast line the old one's samples say
+    /// nothing about the new one's figure), average above 1.1 × the line's figure.
+    static func netStale(_ p: NetPools, _ recent: [NetRecent]) -> (String, Double, Double)? {
+        let rows = Array(recent.suffix(3))
+        guard rows.count == 3, rows.allSatisfy({ $0.flows }) else { return nil }
+        guard let k = rows.first?.key, k != netMixed, rows.allSatisfy({ $0.key == k }) else { return nil }
+        for (i, P) in [(0, p.down), (1, p.up)] {
+            let v: [Double] = rows.compactMap { rate(i == 0 ? $0.down : $0.up) }
+            if let P, v.count == 3 {
+                let mean: Double = v.reduce(0, +) / 3
+                if mean > 1.1 * P.cap { return (i == 0 ? "down" : "up", (mean * 10).rounded() / 10, P.cap) }
+            }
+        }
+        return nil
+    }
+
+    /// A bucket's netKey when its samples were on more than one network.
+    static let netMixed: UInt8 = 255
+    /// A sample's network as a 7-bit mark, 1-127 (0: none named; oomph_view.net_key, by another hash: the marks are
+    /// only compared with each other). Two networks share one a time in 127; the hint may then read the one before.
+    static func netKey(_ k: String?) -> UInt8 {
+        guard let k, !k.isEmpty else { return 0 }
+        var h: UInt32 = 2166136261                         // FNV-1a
+        for b in k.utf8.prefix(200) { h = (h ^ UInt32(b)) &* 16777619 }
+        return UInt8(1 + h % 127)
+    }
+
+    /// The busiest of net_names, by down + up (a tie keeps the earlier row).
+    static func netTop(_ rows: [Soft<NetName>]?) -> String? {
+        var best: String?, most = -1.0
+        for row in rows ?? [] {
+            guard let x = row.v, let n = x.name?.v, !n.isEmpty else { continue }
+            let v: Double = (rate(x.down?.v) ?? 0) + (rate(x.up?.v) ?? 0)
+            if v > most { best = String(n.prefix(200)); most = v }
+        }
+        return best
+    }
+
+    static func q(_ x: Double) -> String { x >= 10 ? String(format: "%.0f", x) : String(format: "%.1f", x) }
+
+    /// The Network tile: ↓ and ↑ now, "offline" without an interface; the meter the download against the line's figure;
+    /// the flag "metered · 12/20 GB", "1.8 GB left" (amber under 10 %), or busy; line 4 the stale hint, "metered?"
+    /// (`hint`: the system marks the network expensive, this Mac's tab only) or "line not tested".
+    static func net(_ s: Sample, recent: [NetRecent] = [], hint: Bool = false) -> Tile {
+        let nb = s.net?.v
+        let p = netPools(s)
+        let d = rate(nb?.down_mbps?.v), u = rate(nb?.up_mbps?.v)
+        var t = Tile()
+        if nb == nil {
+            t.reading = "–"
+        } else if (nb?.if?.v ?? "").isEmpty {
+            t.reading = "offline"
+        } else {
+            t.reading = "↓" + (d.map(mbps) ?? "–") + " ↑" + (u.map(mbps) ?? "–")
+        }
+        t.short = t.reading
+        if let down = p.down, let d { t.meter = min(1, d / down.cap) }
+        t.top = netTop(s.net_names?.v)
+        if let q = p.quota {
+            let left: Double = q.cap - q.used
+            if left < 0.1 * q.cap {
+                t.flag = String(format: "%.1f GB left", max(0, left)); t.level = 1
+            } else {
+                t.flag = "metered · " + Tile.q(q.used) + "/" + Tile.q(q.cap) + " GB"
+            }
+        } else if p.down?.busy == true || p.up?.busy == true {
+            t.flag = "busy"
+        }
+        if let st = netStale(p, recent) {
+            t.note = "seen " + (st.0 == "down" ? "" : "↑") + mbps(st.1) + " > " + mbps(st.2)
+        } else if hint && p.quota == nil {
+            t.note = "metered?"
+        } else if nb != nil, !(nb?.if?.v ?? "").isEmpty, p.down == nil, p.up == nil {
+            t.note = "line not tested"
+        }
+        return t
+    }
+
+    /// The network chart's scale (12.15): 0 to the first 1, 2, 5 × 10ⁿ Mbit/s at or above top, at least 1.
+    static func netScale(_ top: Double) -> Double {
+        let v: Double = max(top.isFinite ? top : 0, 1)
+        let e: Double = pow(10, log10(v).rounded(.down))
+        for m in [1.0, 2, 5, 10] where m * e >= v - 1e-9 { return m * e }
+        return 10 * e
     }
 
     /// How many queued requests wait for each resource, from ledger.json's leases (oomph_view.waiting_on): a
@@ -1048,7 +1356,7 @@ struct Tile {
         var out: [Resource: Int] = [:]
         for l in leases where (l["state"] as? String) == "queued" {
             let ids = ((l["waiting_on"] as? [Any]) ?? []).map { "\($0)" }
-            let got = Set((ids.isEmpty ? ["ram"] : ids).map(Reservation.waited))  // "critical": memory's
+            let got = Set((ids.isEmpty ? ["ram"] : ids).compactMap(Reservation.waited))  // "critical": memory's
             for r in got { out[r, default: 0] += 1 }
         }
         return out
@@ -1395,6 +1703,7 @@ enum LinuxTab {
             t += String(format: "; swap %.1f of %.0f GB", s.swap_used_gb, s.swap_total_gb)
         }
         lines.append(t + ".")
+        if let h = Verdict.quotaHelp(s) { lines.append(h) }   // a metered network under 10 % (NET 12.15)
         return lines.joined(separator: "\n")
     }
 
@@ -1820,6 +2129,8 @@ final class MachineStore: ObservableObject {
         for p in Set(disk.compactMap(\.diskPool)) {
             out["disk:" + p] = ResBlock.stack(disk.filter { $0.diskPool == p }, now: now, kind: .disk)
         }
+        let net = rs.filter { $0.holds(.net, band: true) }   // the line's band: the download's rate (NET 12.15)
+        if !net.isEmpty { out["net"] = ResBlock.stack(net, now: now, kind: .net) }
         return out
     }
 
@@ -1976,6 +2287,7 @@ final class MachineStore: ObservableObject {
 
     private func parse(_ data: Data.SubSequence) -> [Point] {
         var out: [Point] = []
+        var names: [String: String] = [:]    // the busiest names, one copy each: a long one is not stored per point
         for line in data.split(separator: 0x0A) {
             let d = Data(line)
             guard let s = try? loadDecoder.decode(ChartSample.self, from: d) else { continue }
@@ -1987,7 +2299,10 @@ final class MachineStore: ObservableObject {
                 if let x = q.mem_full { p.stallFull = Float(x) }
                 if let x = q.limit?.v?.some { p.stallLimit = Float(x) }
             }
-            if resourcesUIOn, let r = try? loadDecoder.decode(ChartSampleR.self, from: d) { p.take(r) }
+            if resourcesUIOn, let r = try? loadDecoder.decode(ChartSampleR.self, from: d) {
+                p.take(r)
+                if let n = p.netTop { if let k = names[n] { p.netTop = k } else if names.count < 4096 { names[n] = n } }
+            }
             out.append(p)
         }
         return out
@@ -2051,6 +2366,24 @@ final class Store: ObservableObject {
     @Published var calloutAsked = 0
     /// The last refused ⌘-click (the tile shakes): which tile, and a count that changes each time.
     @Published var refused: (Resource, Int)?
+    /// macOS marks the network expensive (a phone's hotspot) or Low Data Mode is on (NWPathMonitor; NET 12.15): this
+    /// Mac's Network tile says "metered?" while its network has no cap. Nothing is assumed from it. Renders read
+    /// `-netMetered YES`.
+    @Published var netMetered = renderMode && UserDefaults.standard.bool(forKey: "netMetered")
+    private var pathMonitor: NWPathMonitor?
+
+    /// Starts watching the system's network path (with the resources on, once): the path without tunnels (12.15: the
+    /// physical interface's, which is what is metered; under a VPN the default path is the utun's, of type .other).
+    func watchPath() {
+        guard resourcesUIOn, pathMonitor == nil, !renderMode else { return }
+        let pm = NWPathMonitor(prohibitedInterfaceTypes: [.other])
+        pm.pathUpdateHandler = { [weak self] p in
+            let metered: Bool = p.status == .satisfied && (p.isExpensive || p.isConstrained)
+            DispatchQueue.main.async { if self?.netMetered != metered { self?.netMetered = metered } }
+        }
+        pm.start(queue: DispatchQueue(label: "local.oomph.path", qos: .utility))
+        pathMonitor = pm
+    }
     var onSelectionChanged: (() -> Void)?
 
     static func storedSelection() -> [Resource] {
@@ -2567,8 +2900,9 @@ final class Store: ObservableObject {
         return gaps
     }
 
-    /// Shared with `oomph top`, like worst (tools/vectors/chart.json).
-    static func multires(_ pts: [Point], now: Double) -> [Point] {
+    /// Shared with `oomph top`, like worst (tools/vectors/chart.json). `aggregate`: a bucket's other resources too
+    /// (the switch; the vectors force it, so "net_row" tests the path the chart draws).
+    static func multires(_ pts: [Point], now: Double, aggregate: Bool = resourcesUIOn) -> [Point] {
         var out: [Point] = []
         var j = pts.count - 1
         while j >= 0 {
@@ -2576,14 +2910,16 @@ final class Store: ObservableObject {
             var i = j
             // never across a gap: a bucket spanning one would bridge it
             while i > 0 && pts[i - 1].id > pts[j].id - width && pts[i].id - pts[i - 1].id <= gapSeconds { i -= 1 }
-            out.append(worst(pts[i...j]))
+            out.append(worst(pts[i...j], aggregate: aggregate))
             j = i - 1
         }
         return out.reversed()
     }
 
-    /// The worst point of a bucket, so spikes survive downsampling.
-    static func worst(_ slice: ArraySlice<Point>) -> Point {
+    /// The worst point of a bucket, so spikes survive downsampling (the charts' `reduce`), with the switch.
+    static func worst(_ slice: ArraySlice<Point>) -> Point { worst(slice, aggregate: resourcesUIOn) }
+    /// ... and with `aggregate` its other resources' (Point.aggregate) whatever the switch.
+    static func worst(_ slice: ArraySlice<Point>, aggregate: Bool) -> Point {
         guard slice.count > 1 else { return slice.first! }
         let w = slice.max { ($0.app + $0.comp + $0.swap) < ($1.app + $1.comp + $1.swap) }!
         var p = Point(id: w.id, date: w.date, wired: w.wired, app: w.app, comp: w.comp,
@@ -2592,7 +2928,7 @@ final class Store: ObservableObject {
             func top(_ k: KeyPath<Point, Float>) -> Float { slice.map { $0[keyPath: k] }.filter { !$0.isNaN }.max() ?? .nan }
             p.stall = top(\.stall); p.stallFull = top(\.stallFull); p.stallLimit = top(\.stallLimit)
         }
-        if resourcesUIOn { p.aggregate(slice) }
+        if aggregate { p.aggregate(slice) }
         return p
     }
 
@@ -3113,20 +3449,12 @@ struct ResourceTile: View {
                 Text(resource.name).font(.system(size: 10.5, weight: .semibold)).lineLimit(1).fixedSize()
                     .foregroundStyle(role == .focus ? Color.primary : Color.secondary)
                 Spacer(minLength: 2)
-                ViewThatFits(in: .horizontal) { flag(true); flag(false) }
+                ViewThatFits(in: .horizontal) { flag(0); flag(1); flag(2); flag(3); flag(4) }
                 if chevron && compact { arrow }
             }
-            Text(tile.reading).font(.system(size: 13, weight: .semibold)).monospacedDigit()
-                .lineLimit(1).minimumScaleFactor(0.75)
+            reading
             meter.padding(.vertical, 1)
-            if !compact {
-                HStack(spacing: 2) {
-                    Text(tile.top.map(ResourceTile.friendly) ?? " ").lineLimit(1).truncationMode(.middle)
-                    Spacer(minLength: 0)
-                    if chevron { arrow }
-                }
-                .font(.system(size: 10)).foregroundStyle(.secondary)
-            }
+            if !compact { line4 }
         }
         .padding(.horizontal, 7).padding(.vertical, 5)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -3141,16 +3469,62 @@ struct ResourceTile: View {
         Image(systemName: open ? "chevron.up" : "chevron.down").font(.system(size: 7, weight: .bold)).foregroundStyle(.secondary)
     }
 
+    /// The reading, or its short form where the tile is too narrow for it (five tiles, NET 12.15).
+    @ViewBuilder var reading: some View {
+        let long = Text(tile.reading).font(.system(size: 13, weight: .semibold)).monospacedDigit().lineLimit(1)
+        if let s = tile.short, s != tile.reading {
+            ViewThatFits(in: .horizontal) {
+                long.fixedSize()
+                Text(s).font(.system(size: 13, weight: .semibold)).monospacedDigit().lineLimit(1).minimumScaleFactor(0.75)
+            }
+        } else {
+            long.minimumScaleFactor(0.75)
+        }
+    }
+
+    /// Line 4: the biggest consumer, or the network's note (the stale hint, "metered?", "line not tested").
+    var line4: some View {
+        HStack(spacing: 2) {
+            if let n = tile.note {
+                let style: Color = n.hasPrefix("seen") || n == "metered?" ? Color.orange : Color.secondary
+                // "line not tested", else "not tested"; "seen 940 > 500", else "seen 940" (the tooltip has the rest)
+                let shorter: String = n == "line not tested" ? "not tested" : n.components(separatedBy: " > ").first ?? n
+                ViewThatFits(in: .horizontal) {
+                    Text(n).lineLimit(1).fixedSize().foregroundStyle(style)
+                    Text(shorter).lineLimit(1).truncationMode(.tail).foregroundStyle(style)
+                }
+            } else {
+                Text(tile.top.map(ResourceTile.friendly) ?? " ").lineLimit(1).truncationMode(.middle)
+            }
+            Spacer(minLength: 0)
+            if chevron { arrow }
+        }
+        .font(.system(size: 10)).foregroundStyle(.secondary)
+    }
+
     /// The flag slot (§3.4.1): a shape and a word, never colour alone; the queue after a flag of rank 1 to 6,
     /// or "n waiting" on its own (outranking busy). A two-digit queue drops the word.
-    @ViewBuilder func flag(_ words: Bool) -> some View {
+    /// `short`: 0 every word; 1 "n" for "n waiting" and the network's cap without "metered · ", what is left without
+    /// "left"; 2 and up the network's figures shorter still (its flag in a fifth of the row, NET 12.15): what is left
+    /// outranks the queue ("▲ 1.8 GB", then "▲ 1.8"), and only where even that does not fit the glyph and the queue.
+    @ViewBuilder func flag(_ short: Int) -> some View {
         let f = tile.flag, q = tile.queue
+        let words: Bool = short == 0
         HStack(spacing: 2) {
-            if let f, f != "busy" {
+            if let f, f.hasPrefix("metered · ") {      // the network's metered cap, not a warning (NET 12.15)
+                let cap: String = String(f.dropFirst("metered · ".count))
+                Text(short == 0 ? f : short == 1 ? cap : cap.replacingOccurrences(of: " GB", with: "")).foregroundStyle(.secondary)
+                if q > 0 { Text("◻\(q)").foregroundStyle(resource.color) }
+            } else if let f, f != "busy" {
                 let glyph = f.hasSuffix("critical") ? "●" : f == "throttled" ? "△" : "▲"
                 Text(glyph).foregroundStyle(f.hasSuffix("critical") ? Color.red : f == "throttled" ? Color.primary : Color.orange)
-                Text(f).foregroundStyle(Color.primary)
-                if q > 0 { Text("◻\(q)").foregroundStyle(resource.color) }
+                let low: Bool = f.hasSuffix(" GB left")     // the network's "1.8 GB left": "1.8 GB", "1.8", the glyph
+                if !low || short < 4 {
+                    let amount: String = String(f.dropLast(" left".count))
+                    Text(!low || short == 0 ? f : short == 3 ? String(amount.dropLast(" GB".count)) : amount)
+                        .foregroundStyle(Color.primary)
+                }
+                if q > 0 && !(low && (short == 2 || short == 3)) { Text("◻\(q)").foregroundStyle(resource.color) }
             } else if q > 0 {
                 Text("◻").foregroundStyle(resource.color)
                 Text(q > 9 || !words ? "\(q)" : "\(q) waiting").foregroundStyle(Color.primary)
@@ -3564,6 +3938,11 @@ struct MemoryChart: View, Animatable {
     var rowHeight: CGFloat = 22
     var cores: Double?
     var floors: (low: Double, crit: Double)?
+    /// The network's (NET 12.15): the line's figure each way, what agents hold of it each way, and what of the download
+    /// they can share (the band's scale).
+    var netCap: (down: Double?, up: Double?) = (nil, nil)
+    var netShare: (down: Double, up: Double) = (0, 0)
+    var netLine: Double?
     /// The wired series' name: "Kernel" on a Linux tab (03 §3.9: the same field, `wired_gb`).
     var wiredName = "Wired"
     /// A Linux tab's facts (nil on a Mac's): its hover card keeps 03 §3.9's row budget (L3).
@@ -3669,6 +4048,8 @@ struct MemoryChart: View, Animatable {
         case .gpu: return (["Full speed", "Busy time", "Busy"],
                            [Resource.gpu.color, Resource.gpu.color.opacity(0.3), Resource.gpu.color.opacity(0.95)])
         case .disk: return (["Free", "Free line"], [Resource.disk.color.opacity(0.16), Resource.disk.color])
+        case .net: return (["Down", "Up", "Down peak", "Up peak"],
+                           [Resource.net.color.opacity(0.85), Resource.net.color.opacity(0.5), Resource.net.color, Resource.net.color.opacity(0.7)])
         }
     }
 
@@ -3686,11 +4067,16 @@ struct MemoryChart: View, Animatable {
         var stack: [Double: Double] = [:]
         for e in entries where e.kind != "Busy" && e.kind != "Free line" { stack[e.x, default: 0] += e.gb }
         let peak = stack.values.max() ?? 0
+        if focus == .net {          // one scale both ways (12.15): the figures and the busiest moment in view
+            let most: Double = entries.map { abs($0.gb) }.max() ?? 0
+            return Tile.netScale(max(netCap.down ?? 0, netCap.up ?? 0, most))
+        }
         switch focus {
         case .memory: return max(10, (max(ram ?? 0, peak) / 10).rounded(.up) * 10)
         case .cpu: return max(cores ?? 0, peak, 1) * 1.08
         case .gpu: return 100
         case .disk: return MemoryChart.niceStep(max(peak, 2 * (floors?.low ?? 0), 1))
+        case .net: return 1
         }
     }
 
@@ -3713,6 +4099,9 @@ struct MemoryChart: View, Animatable {
                 let k = p?.gpuKind ?? 0, u = v(p?.gpu)
                 vals = [k == 2 ? u : 0, k == 1 ? u : 0, k == 2 ? v(p?.gpuBusy) : 0]
             case .disk: vals = [v(p?.disk), v(p?.disk)]
+            case .net:              // down above the axis, up mirrored below it; each column's mean and its peak
+                let d = v(p?.netDown), u = v(p?.netUp)
+                vals = [d, -u, max(d, v(p?.netDownPeak)), -max(u, v(p?.netUpPeak))]
             case .memory: return
             }
             for (k, name) in kinds.enumerated() { out.append(Entry(id: id, x: x, kind: name, gb: vals[k])); id += 1 }
@@ -3727,7 +4116,15 @@ struct MemoryChart: View, Animatable {
 
     @ChartContentBuilder func resourceMarks(_ entries: [Entry]) -> some ChartContent {
         ForEach(entries) { (e: Entry) in
-            if e.kind == "Busy" || e.kind == "Free line" {
+            if e.kind == "Down" || e.kind == "Up" {     // the network: each from the axis, never stacked
+                AreaMark(x: .value("time", e.x), yStart: .value("axis", 0.0), yEnd: .value("value", e.gb),
+                         series: .value("kind", e.kind))
+                    .foregroundStyle(by: .value("kind", e.kind))
+            } else if e.kind == "Down peak" || e.kind == "Up peak" {
+                LineMark(x: .value("time", e.x), y: .value("value", e.gb), series: .value("kind", e.kind))
+                    .foregroundStyle(by: .value("kind", e.kind))
+                    .lineStyle(StrokeStyle(lineWidth: 0.5))
+            } else if e.kind == "Busy" || e.kind == "Free line" {
                 LineMark(x: .value("time", e.x), y: .value("value", e.gb), series: .value("kind", e.kind))
                     .foregroundStyle(by: .value("kind", e.kind))
                     .lineStyle(StrokeStyle(lineWidth: 1))
@@ -3746,6 +4143,8 @@ struct MemoryChart: View, Animatable {
             RuleMark(y: .value("cores", n))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                 .foregroundStyle(Color.primary.opacity(0.6))
+        } else if focus == .net {
+            netCapacityMarks
         } else if focus == .disk, let fl = floors {
             RuleMark(y: .value("low", fl.low))
                 .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
@@ -3756,12 +4155,56 @@ struct MemoryChart: View, Animatable {
         }
     }
 
+    /// The network's lines (12.15): its figure each way dashed (down above, up below the axis), the agents' share thin,
+    /// the axis itself.
+    @ChartContentBuilder var netCapacityMarks: some ChartContent {
+        RuleMark(y: .value("axis", 0.0)).lineStyle(StrokeStyle(lineWidth: 0.75)).foregroundStyle(Color.primary.opacity(0.45))
+        if let d = netCap.down {
+            RuleMark(y: .value("line down", d)).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(Color.primary.opacity(0.6))
+        }
+        if let u = netCap.up {
+            RuleMark(y: .value("line up", -u)).lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
+                .foregroundStyle(Color.primary.opacity(0.6))
+        }
+        if netShare.down > 0 {
+            RuleMark(y: .value("agents down", netShare.down)).lineStyle(StrokeStyle(lineWidth: 1))
+                .foregroundStyle(Resource.net.color.opacity(0.9))
+        }
+        if netShare.up > 0 {
+            RuleMark(y: .value("agents up", -netShare.up)).lineStyle(StrokeStyle(lineWidth: 1))
+                .foregroundStyle(Resource.net.color.opacity(0.9))
+        }
+    }
+
     /// The big chart with the resources on: memory's four series, or the focus's, on an explicit y scale.
+    @ViewBuilder
     func resourceChart(_ f: @escaping (Double) -> Double, entries: [Entry], away: [TimeAxis.Band], gaps: [TimeAxis.Band],
                        missing: [TimeAxis.Band], grid: [TimeAxis.GridLine], labels: [TimeAxis.Label]) -> some View {
-        let rentries = focus == .memory ? entries : resourceEntries(f)
+        let rentries: [Entry] = focus == .memory ? entries : resourceEntries(f)
+        let top: Double = yTop(rentries)
+        let chart = resourceChart(f, rentries, top: top, away: away, gaps: gaps, missing: missing, grid: grid, labels: labels)
+        if focus == .net {          // the scale both ways, as magnitudes: ↓ above the axis, ↑ below it (12.15)
+            chart.chartYAxis {
+                AxisMarks(position: .trailing, values: [-top, -top / 2, 0, top / 2, top]) { (v: AxisValue) in
+                    AxisGridLine()
+                    AxisValueLabel { Text(MemoryChart.netAxisLabel(v.as(Double.self) ?? 0)) }
+                }
+            }
+        } else {
+            chart
+        }
+    }
+
+    /// A label of the network's y axis: "↓200" above the axis, "↑200" below it, "0" on it.
+    static func netAxisLabel(_ v: Double) -> String {
+        abs(v) < 1e-9 ? "0" : (v > 0 ? "↓" : "↑") + Tile.mbps(abs(v))
+    }
+
+    func resourceChart(_ f: @escaping (Double) -> Double, _ rentries: [Entry], top: Double, away: [TimeAxis.Band],
+                       gaps: [TimeAxis.Band], missing: [TimeAxis.Band], grid: [TimeAxis.GridLine],
+                       labels: [TimeAxis.Label]) -> some View {
         let style = seriesStyle
-        let top = yTop(rentries)
         return Chart {
             TimeAxis.gridMarks(grid, color: .primary, scale: 1)
             if focus == .memory { areaMarks(rentries) } else { resourceMarks(rentries) }
@@ -3770,7 +4213,7 @@ struct MemoryChart: View, Animatable {
             TimeAxis.incidentMarks(TimeAxis.incidentXs(incidents, f))
         }
         .chartXScale(domain: 0...1)
-        .chartYScale(domain: 0...top)
+        .chartYScale(domain: (focus == .net ? -top : 0)...top)
         .chartXAxis {
             AxisMarks(values: labels.map(\.x)) { _ in
                 AxisTick(length: 3)
@@ -3797,6 +4240,7 @@ struct MemoryChart: View, Animatable {
         case .cpu: return p.cpu
         case .gpu: return p.gpu
         case .disk: return p.disk
+        case .net: return p.netDown
         }
     }
 
@@ -3807,6 +4251,9 @@ struct MemoryChart: View, Animatable {
         case .gpu: return 100
         case .disk:
             return MemoryChart.niceStep(max(Double(points.map(\.disk).filter { !$0.isNaN }.max() ?? 1), 2 * (floors?.low ?? 0)))
+        case .net:
+            let most: Float = points.map { max($0.netDownPeak.isNaN ? 0 : $0.netDownPeak, $0.netUpPeak.isNaN ? 0 : $0.netUpPeak) }.max() ?? 0
+            return Tile.netScale(max(netCap.down ?? 0, netCap.up ?? 0, Double(most)))
         }
     }
 
@@ -3818,6 +4265,7 @@ struct MemoryChart: View, Animatable {
         case .memory, .disk: return v < 9.95 ? String(format: "%.1fG", v) : String(format: "%.0fG", v)
         case .cpu: return String(format: "%.1f", v)
         case .gpu: return String(format: "%.0f%%", v)
+        case .net: return "↓" + Tile.mbps(v)
         }
     }
 
@@ -3848,6 +4296,9 @@ struct MemoryChart: View, Animatable {
                         c.clip(to: hp)
                         c.stroke(TimeAxis.hatchLines(in: CGRect(x: 0, y: 0, width: w, height: h)), with: .color(.gray.opacity(0.4)), lineWidth: 1)
                     }
+                    if r == .net {
+                        MemoryChart.netRow(&ctx, cols: cols, w: w, h: h, scale: scale, cap: netCap)
+                    } else {
                     var line = Path(), area = Path()
                     var open = false, startX = 0.0, lastX = 0.0
                     func close() {
@@ -3872,6 +4323,7 @@ struct MemoryChart: View, Animatable {
                     let color = r.color
                     ctx.fill(area, with: .color(color.opacity(r == .disk ? 0.10 : 0.35)))
                     ctx.stroke(line, with: .color(color.opacity(0.9)), lineWidth: 1)
+                    }
                     for x in incs { ctx.fill(Path(CGRect(x: x * w - 0.5, y: 0, width: 1, height: h)), with: .color(.red)) }
                     let name = ctx.resolve(Text(r.name).font(.system(size: 8.5, weight: .medium)).foregroundColor(.secondary))
                     let sz = name.measure(in: CGSize(width: 200, height: 20))
@@ -3887,6 +4339,38 @@ struct MemoryChart: View, Animatable {
         .allowsHitTesting(false)
     }
 
+    /// The network's small chart (12.15): 11 pt each side of a middle axis, the download rising above it and the upload
+    /// falling below, each column's mean filled and its peak a hairline; the line's figures dashed where they fit.
+    static func netRow(_ ctx: inout GraphicsContext, cols: [TimeAxis.Column<Point>], w: Double, h: Double, scale: Double,
+                       cap: (down: Double?, up: Double?)) {
+        let mid: Double = h / 2
+        let half: Double = mid - 1
+        var down = Path(), up = Path(), peak = Path()
+        func y(_ v: Float, _ sign: Double) -> Double { mid - sign * min(Double(v) / scale, 1) * half }
+        for c in cols {
+            let x: Double = c.x * w
+            let d = c.p.netDown, u = c.p.netUp
+            if !d.isNaN && d > 0 { down.addRect(CGRect(x: x - 0.5, y: y(d, 1), width: 1.2, height: mid - y(d, 1))) }
+            if !u.isNaN && u > 0 { up.addRect(CGRect(x: x - 0.5, y: mid, width: 1.2, height: y(u, -1) - mid)) }
+            let dp = c.p.netDownPeak, up_ = c.p.netUpPeak
+            if !dp.isNaN && dp > d { peak.addRect(CGRect(x: x - 0.5, y: y(dp, 1), width: 1.2, height: 0.5)) }
+            if !up_.isNaN && up_ > u { peak.addRect(CGRect(x: x - 0.5, y: y(up_, -1) - 0.5, width: 1.2, height: 0.5)) }
+        }
+        let color = Resource.net.color
+        ctx.fill(down, with: .color(color.opacity(0.75)))
+        ctx.fill(up, with: .color(color.opacity(0.45)))
+        ctx.fill(peak, with: .color(color.opacity(0.9)))
+        ctx.fill(Path(CGRect(x: 0, y: mid - 0.25, width: w, height: 0.5)), with: .color(.primary.opacity(0.35)))
+        for (v, sign) in [(cap.down, 1.0), (cap.up, -1.0)] {
+            guard let v, v <= scale else { continue }
+            let yy: Double = mid - sign * (v / scale) * half
+            var dash = Path()
+            var x = 0.0
+            while x < w { dash.addRect(CGRect(x: x, y: yy - 0.25, width: 3, height: 0.5)); x += 6 }
+            ctx.fill(dash, with: .color(.primary.opacity(0.45)))
+        }
+    }
+
     // MARK: reservation strip
 
     /// Every reservation as blocks on the chart's time axis: height ∝ GB, stacked where they
@@ -3899,7 +4383,7 @@ struct MemoryChart: View, Animatable {
         for b in reservations where f(b.end) >= 0 {
             for st in b.steps where f(st.b) >= 0 { vis = max(vis, st.hi) }
         }
-        let top = Reservation.bandTop(vis, kind)
+        let top = Reservation.bandTop(vis, kind, line: kind == .net ? netLine : nil)
         let usable = H - 4
         var out: [(i: Int, r: CGRect, queued: Bool)] = []
         for (i, b) in reservations.enumerated() {
@@ -4026,8 +4510,8 @@ struct MemoryChart: View, Animatable {
                     }
                 }
                 guard tall else {  // a small band: its name in the gutter, nothing else
-                    ctx.draw(Text(kind.name).font(.system(size: 8.5)).foregroundColor(.secondary),
-                             at: CGPoint(x: W + 4, y: H / 2), anchor: .leading)
+                    ctx.draw(Text(kind == .net ? "Net" : kind.name).font(.system(size: 8.5)).foregroundColor(.secondary),
+                             at: CGPoint(x: W + 4, y: H / 2), anchor: .leading)   // "Network" is wider than the gutter
                     return
                 }
                 // right of the plot: the scale, and how long each live grant has left
@@ -4039,7 +4523,7 @@ struct MemoryChart: View, Animatable {
                              at: CGPoint(x: W + 4, y: x.r.midY), anchor: .leading)
                 }
                 if !used.contains(where: { abs($0 - (H - usable)) < 9 }) {
-                    let scale = String(format: kind == .cpu ? "%.0fc" : "%.0fG", scaleTop)  // "24c": the gutter is 30 pt
+                    let scale = String(format: kind == .cpu ? "%.0fc" : kind == .net ? "%.0fM" : "%.0fG", scaleTop)  // "24c": the gutter is 30 pt
                     ctx.draw(Text(scale).font(.system(size: 8.5)).foregroundColor(.secondary),
                              at: CGPoint(x: W + 4, y: H - usable), anchor: .leading)
                 }
@@ -4308,6 +4792,13 @@ struct MemoryChart: View, Animatable {
         if let d = pts.map(\.disk).filter({ !$0.isNaN }).min() {
             out.append(("Disk", String(format: "%.0f GB free", Double(d)), Resource.disk.color))
         }
+        // the internet line (NET 12.15): "Network  ↓212 ↑8.1 Mbit/s · curl"
+        let nd = mean(pts.map(\.netDown)), nu = mean(pts.map(\.netUp))
+        if nd != nil || nu != nil {
+            let top: String = pts.last { $0.netTop != nil }?.netTop.map { " · " + Tile.midFit($0, 24) } ?? ""
+            out.append(("Network", "↓" + (nd.map(Tile.mbps) ?? "–") + " ↑" + (nu.map(Tile.mbps) ?? "–") + " Mbit/s" + top,
+                        Resource.net.color))
+        }
         return out
     }
 
@@ -4511,6 +5002,15 @@ struct ReservationCard: View {
         if on, let u = res.cpuUsed { t += " · using " + Reservation.coresWords(u) }
         return t
     }
+    /// The network's line of the card (NET 12.15): its rates and volumes, what it moved and when it should be done, and
+    /// whether the line had a figure.
+    func cardNet(on: Bool) -> String {
+        var text: String = res.netAmounts.joined(separator: " · ")
+        if on, let fig = res.useFigure(.net, now: now) { text += " · " + fig }
+        if res.netUnmanaged { text += " · unmanaged: the line has no figure" }
+        return text
+    }
+
     func cardDisk(_ d: Double, on: Bool) -> String {
         var t: String = Reservation.amtG(d) + " on " + Tile.midFit(res.diskName ?? res.diskPool ?? "?", 24)
         if on, let w = res.diskWrote { t += " · wrote " + Reservation.amtG(w) }
@@ -4551,6 +5051,7 @@ struct ReservationCard: View {
                 let on = res.live && res.granted != nil
                 if let c = res.cpu { row("Cores", cardCores(c, on: on)) }
                 if let d = res.disk { row("Disk", cardDisk(d, on: on)) }
+                if res.holds(.net) { row("Network", cardNet(on: on)) }
                 if on {
                     ForEach(Resource.allCases.filter { res.flags[$0] != nil }, id: \.self) { (k: Resource) in
                         row("Advice", Reservation.adviceWords(k, res.flags[k]!, now: now, clock: { at($0) }))
@@ -4688,6 +5189,8 @@ struct ResourceLegend: View {
         case .cpu: return "Cores busy, of the logical cores; the dashed line is all of them. "
         case .gpu: return "The GPU in % of what it can do at full speed, or of the time it was busy where the speed is not reported. "
         case .disk: return "Free space in GB on the disk the tile shows; dashed: its low and critical floors. "
+        case .net: return "This Mac's internet traffic in Mbit/s: download above the axis, upload below; dashed: the line's figure, "
+            + "thin: what agents reserved. "
         }
     }
 
@@ -4735,6 +5238,14 @@ struct ResourceLegend: View {
             let of = d?.total_gb.map { String(format: " of %.0f GB", $0) } ?? " GB"
             return [Entry(name: name, value: free.map { String(format: "%.0f", $0) + of }, color: Resource.disk.color, line: false,
                           help: "Free space on the disk that holds your home folder and the temporary files.")]
+        case .net:
+            let n = s?.net?.v
+            return [Entry(name: "Down", value: Tile.rate(n?.down_mbps?.v).map(Tile.mbps), color: Resource.net.color, line: false,
+                          help: "What this Mac downloads from the internet now (the LAN not counted)."),
+                    Entry(name: "Up", value: Tile.rate(n?.up_mbps?.v).map(Tile.mbps), color: Resource.net.color.opacity(0.55), line: false,
+                          help: "What this Mac uploads to the internet now."),
+                    Entry(name: "Mbit/s", value: nil, color: .clear, line: false,
+                          help: "Megabits per second of payload, the unit of speed tests and of every limiter.")]
         }
     }
 
@@ -5044,6 +5555,9 @@ struct PopoverView: View {
         parts.append(String(format: "pressure %@ · %.1f GB free · swap %.1f / %.0f GB · %.0f GB disk free",
                             (Pressure(rawValue: c.pressure) ?? .unknown).label.lowercased(),
                             max(0, c.ram_gb - c.app_gb - c.wired_gb - c.compressed_gb), c.swap_used_gb, c.swap_total_gb, c.disk_free_gb))
+        // The metered warning is measuring, behind no switch (NET 12.11): with resourcesUI off the pressure capsule's
+        // tooltip carries this line too, the one place the switched-off popup says it (deliberate).
+        if let h = Verdict.quotaHelp(c) { parts.append(h) }
         return parts.joined(separator: "\n")
     }
 
@@ -5309,7 +5823,8 @@ struct PopoverView: View {
     var tilesRow: some View {
         let sel = store.selection(for: m)
         let live = m.current != nil && (m.isLocal ? m.daemonRunning : true)
-        var facts: [Resource: Tile] = live ? Tile.facts(m.current!, Verdict.capsule(m.current!), waiting: m.waiting) : [:]
+        var facts: [Resource: Tile] = live ? Tile.facts(m.current!, Verdict.capsule(m.current!), waiting: m.waiting,
+                                                        recent: netRecent, hint: m.isLocal && store.netMetered) : [:]
         if m.isLinux, let s = m.current, let t = facts[.memory] { facts[.memory] = LinuxTab.memoryTile(t, s, m.facts) }
         let avail = Resource.available(m.current)
         // equal tiles (02 §3.4.1: four of 108 pt, three of 146): the panel's content width shared out
@@ -5320,6 +5835,25 @@ struct PopoverView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Resources")
+    }
+
+    /// What the network's charts are drawn against (NET 12.15): the line's figure each way, what agents were granted
+    /// each way (the pools' `reserved`: managed grants on this network only, never an unmanaged part's asked rate),
+    /// and what of the download they can share (the band's scale).
+    var netFacts: (cap: (down: Double?, up: Double?), share: (down: Double, up: Double), line: Double?) {
+        let p = Tile.netPools(m.current)
+        let line: Double? = p.down.map { max(0, $0.cap - $0.margin) }
+        return ((p.down?.cap, p.up?.cap), (p.down?.reserved ?? 0, p.up?.reserved ?? 0), line)
+    }
+
+    /// The tour names the network where its tile is shown (a 1.15 logger, NET 12.15).
+    var tourNet: Bool { Resource.available(m.current).contains(.net) }
+
+    /// The network's last three points, for the stale hint (Tile.netStale).
+    var netRecent: [NetRecent] {
+        m.history.suffix(3).map { (p: Point) -> NetRecent in
+            (p.netDown.isNaN ? nil : Double(p.netDown), p.netUp.isNaN ? nil : Double(p.netUp), p.netFlows, p.netKey)
+        }
     }
 
     /// One tile of the row, apart from it, its parts typed one by one: as one expression with the row
@@ -5373,11 +5907,45 @@ struct PopoverView: View {
 
     /// A tile's tooltip (§3.7.2): its reading in words, then what the clicks do.
     func tileHelp(_ r: Resource, role: ResourceTile.Role, alone: Bool, tile: Tile?) -> String {
-        let what = tile.map { r.name + ": " + $0.reading + ($0.flagText.isEmpty ? "" : " · " + $0.flagText)
+        var what = tile.map { r.name + ": " + $0.reading + (r == .net && $0.reading.hasPrefix("↓") ? " Mbit/s" : "")
+                              + ($0.flagText.isEmpty ? "" : " · " + $0.flagText)
                               + ($0.top.map { " · biggest: " + $0 } ?? "") } ?? r.name
+        if r == .net, let t = tile { what += PopoverView.netHelp(m.current, t, recent: netRecent, linux: m.isLinux, who: m.title) }
         let click = role == .focus && alone ? "Click: biggest apps · ⌘-click another tile to add it"
             : "Click: \(r == .gpu ? "the GPU" : r.name) alone · ⌘-click to \(role == .plain ? "add" : "remove")"
         return what + "\n" + click
+    }
+
+    /// The Network tile's tooltip lines (NET 12.15): the line's figure each way and what agents can share, or how to
+    /// get one; the stale hint; the system's "metered?" with the command for a cap. In the tab's words: `who` the
+    /// machine ("This Mac"); a Linux machine has no speed test, its figure is set by hand (D-N7).
+    static func netHelp(_ s: Sample?, _ t: Tile, recent: [NetRecent] = [], linux: Bool = false, who: String = "This Mac") -> String {
+        let p = Tile.netPools(s)
+        var lines: [String] = []
+        if s?.net?.v?.vpn?.v == true { lines.append("Through a VPN: the network underneath is counted.") }
+        if let d = p.down {
+            var line: String = "The line: " + Tile.mbps(d.cap) + " down"
+            if let u = p.up { line += " / " + Tile.mbps(u.cap) + " up" }
+            line += " Mbit/s; agents can share " + Tile.mbps(max(0, d.cap - d.margin)) + " down, "
+                + Tile.mbps(d.reserved) + " reserved."
+            lines.append(line)
+        } else if t.note == "line not tested" {
+            lines.append("This network's line has no figure yet: "
+                         + (linux ? "oomph net set DOWN/UP." : "oomph net test (or oomph net set DOWN/UP)."))
+        }
+        if let st = Tile.netStale(p, recent) {
+            let dir: String = st.0 == "down" ? "" : " up"
+            lines.append(who + " alone moved " + Tile.mbps(st.1) + " Mbit/s" + dir + ", above the line's "
+                         + Tile.mbps(st.2) + ": the figure looks stale. " + (linux ? "oomph net set DOWN/UP" : "oomph net test"))
+        }
+        if t.note == "metered?" {
+            lines.append("macOS marks this network as expensive (or Low Data Mode is on). If it has a data cap: "
+                         + "oomph net metered --cap 20G/month")
+        }
+        if let q = p.quota {
+            lines.append(String(format: "Metered: %.1f of %g GB used this period.", q.used, q.cap))
+        }
+        return lines.isEmpty ? "" : "\n" + lines.joined(separator: "\n")
     }
 
     /// A click on a tile, with the modifiers held: ⌘ toggles, ⇧ adds a run.
@@ -5669,19 +6237,29 @@ struct PopoverView: View {
         let (rows, key): ([RateProc], KeyPath<RateProc, Double?>) = r == .cpu ? (c?.top_cpu?.v ?? [], \.cpu)
             : r == .gpu ? (c?.top_gpu?.v ?? [], \.gpu) : (c?.top_io?.v ?? [], \.w)
         var tot: [String: (Double, Int)] = [:], order: [String] = []
-        for x in rows {
+        for x in r == .net ? [] : rows {
             guard let v = x[keyPath: key] else { continue }
             let name = (x.g?.isEmpty == false ? x.g : x.name) ?? "?"
             if tot[name] == nil { order.append(name) }
             tot[name] = ((tot[name]?.0 ?? 0) + v, (tot[name]?.1 ?? 0) + 1)
         }
+        if r == .net {              // the busiest names on the internet line, down and up together (NET 12.15)
+            for row in c?.net_names?.v ?? [] {
+                guard let x = row.v, let name = x.name?.v, !name.isEmpty, tot[name] == nil else { continue }
+                order.append(name)
+                let n: Int = Int(min(max(x.n?.v ?? 1, 1), 9999))
+                tot[name] = ((Tile.rate(x.down?.v) ?? 0) + (Tile.rate(x.up?.v) ?? 0), n)
+            }
+        }
         let items = Array(order.sorted { tot[$0]!.0 > tot[$1]!.0 }.prefix(12))
         let top = items.first.map { tot[$0]!.0 } ?? 1
         func fmt(_ v: Double) -> String {
-            r == .cpu ? String(format: "%.1f cores", v) : r == .gpu ? String(format: "%.0f %%", v) : String(format: "%.1f MB/s", v)
+            r == .net ? Tile.mbps(v) + " Mbit/s"
+                : r == .cpu ? String(format: "%.1f cores", v) : r == .gpu ? String(format: "%.0f %%", v) : String(format: "%.1f MB/s", v)
         }
-        let title = r == .cpu ? "Busiest apps now" : r == .gpu ? "Busiest on the GPU" : "Biggest writers now"
-        let note = r == .cpu ? "Cores an app keeps busy, all its processes together, over the last sample."
+        let title = r == .net ? "Busiest on the internet" : r == .cpu ? "Busiest apps now" : r == .gpu ? "Busiest on the GPU" : "Biggest writers now"
+        let note = r == .net ? "What each app moved through the internet line in the last sample, down and up together; the LAN is not counted."
+            : r == .cpu ? "Cores an app keeps busy, all its processes together, over the last sample."
             : r == .gpu ? (full ? "Each app's share of the GPU at full speed." : "Each app's share of the time the GPU was busy, at any speed.")
             : "What each app wrote to disk, all its processes together, over the last sample."
         return VStack(spacing: 0) {
@@ -5861,6 +6439,7 @@ struct PopoverView: View {
                                 bands: stripBands, smallBand: smallBandHeight, highlight: rowHighlight,
                                 focus: sel.focus, rows: smallRows, rowHeight: smallRowHeight, cores: m.current?.cpu?.v?.n,
                                 floors: pool?.watch == true ? pool.flatMap { p in p.low_gb.map { (low: $0, crit: p.crit_gb ?? 0) } } : nil,
+                                netCap: netFacts.cap, netShare: netFacts.share, netLine: netFacts.line,
                                 wiredName: m.isLinux ? "Kernel" : "Wired", linux: m.isLinux ? m.facts : nil)
                         .id(sel.focus)  // a plain click cross-fades the chart area (§3.7.4)
                         .transition(.opacity)
@@ -6083,9 +6662,10 @@ struct PopoverView: View {
                             : "The chip's colour is macOS memory pressure, and the badge on the right names it. The figure in the menu bar is free memory. Hover the chip to come back to this tour.",
                          left: m, width: half, above: false,
                          xs: [chip.midX], y: chip.maxY + 3, reach: zone.maxY - chip.maxY + 10),
-                TourNote(title: resourcesUIOn ? "Four resources" : "Live readings",
+                TourNote(title: resourcesUIOn ? (tourNet ? "Five resources" : "Four resources") : "Live readings",
                          text: resourcesUIOn
-                            ? "Memory, CPU, GPU and disk right now. Click a tile to see it alone; ⌘-click another to add it below. Click the one with the big chart again for its twelve biggest apps. One flag per tile says what needs you: critical, low, throttled, 2 waiting. Hover it for the rest."
+                            ? (tourNet ? "Memory, CPU, GPU, disk and the internet line right now. " : "Memory, CPU, GPU and disk right now. ")
+                            + "Click a tile to see it alone; ⌘-click another to add it below. Click the one with the big chart again for its twelve biggest apps. One flag per tile says what needs you: critical, low, throttled, 2 waiting. Hover it for the rest."
                             : self.m.isLinux ? LinuxTab.tourNotes[1]
                             : "Updated every 30 seconds: the same figures as Activity Monitor. Click the biggest app for the twelve largest.",
                          left: m + half + 8, width: half, above: false,
@@ -8401,6 +8981,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
         signal(SIGPIPE, SIG_IGN)  // a child that ended (the engine, a report) must not take the app with it
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         store.machine.reloadPoints()  // in the background: the first popup then opens with its chart ready
+        store.watchPath()             // the Network tile's "metered?" (behind resourcesUI)
         item.button?.target = self
         item.button?.action = #selector(toggle)
         item.button?.imageScaling = .scaleNone
@@ -8672,6 +9253,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPo
             let t = Tile.facts(c, cap)
             item.button?.toolTip = "\(brand) — \(cap.text)\n\(label ?? "?") memory free · pressure \(p.label.lowercased())"
                 + "\nCPU \(t[.cpu]!.reading) · GPU \(t[.gpu]!.reading) · Disk \(t[.disk]!.reading)"
+                + (t[.net]!.reading.hasPrefix("↓") ? " · Network \(t[.net]!.reading) Mbit/s" : "")   // a 1.15 logger's
             return
         }
         let img = ChipIcon.make(running: running, pressure: p, label: label)
@@ -8807,7 +9389,8 @@ func renderPopup(to path: String, dark: Bool, ai: String = "", mirror: String? =
     if ai == "checking" { store.upgradeButton = .checking }
     if ai == "uptodate" { store.upgradeButton = .upToDate }
     if ai.hasPrefix("hover:") || ai.hasPrefix("hoverlog:") {
-        renderHoverX = Double(ai.split(separator: ":").last ?? "").map { CGFloat($0) }
+        // `hover:X`, `hover:X:6h` (the 6 h range, below)
+        renderHoverX = Double(ai.split(separator: ":").dropFirst().first ?? "").map { CGFloat($0) }
         if ai.hasPrefix("hoverlog:") { store.range = .infinity }
     }
     if ai.hasPrefix("blend:") { renderBlend = Double(ai.dropFirst(6)) }
@@ -9206,17 +9789,46 @@ func chartVectors(_ path: String) -> Int32 {
     out["capsule"] = cases("capsule").map { c -> Any in
         guard let s = sample(c["sample"]) else { return NSNull() }
         let v = Verdict.capsule(s)
-        return ["text": v.text, "level": v.level, "memory": v.memory, "disk": v.disk] as [String: Any]
+        return ["text": v.text, "level": v.level, "memory": v.memory, "disk": v.disk, "network": v.network] as [String: Any]
     }
     out["tiles"] = cases("tiles").map { c -> Any in
         guard let s = sample(c["sample"]) else { return NSNull() }
         var waiting: [Resource: Int] = [:]
         for (k, n) in (c["waiting"] as? [String: Any]) ?? [:] { if let r = Resource(rawValue: k) { waiting[r] = (n as? NSNumber)?.intValue ?? 0 } }
-        let t = Tile.facts(s, Verdict.capsule(s), waiting: waiting)
+        let recent = ((c["recent"] as? [[Any]]) ?? []).map { r -> NetRecent in
+            let flows: Bool = r.count > 2 && (r[2] as? NSNumber).map { CFGetTypeID($0) == CFBooleanGetTypeID() && $0.boolValue } == true
+            let key: UInt8 = r.count > 3 ? UInt8(clamping: (r[3] as? NSNumber)?.intValue ?? 0) : 0
+            return (r.first.flatMap { ($0 as? NSNumber)?.doubleValue }, r.count > 1 ? (r[1] as? NSNumber)?.doubleValue : nil, flows, key)
+        }
+        let t = Tile.facts(s, Verdict.capsule(s), waiting: waiting, recent: recent, hint: (c["hint"] as? Bool) ?? false)
         return Resource.allCases.map { r -> [Any] in
             let x = t[r]!
-            return [x.reading, x.flagText, x.level, x.queue, x.top.map { $0 as Any } ?? NSNull(), x.meter]
+            func opt(_ s: String?) -> Any { s.map { $0 as Any } ?? NSNull() }
+            return [x.reading, x.flagText, x.level, x.queue, opt(x.top), x.meter, opt(x.short), opt(x.note), x.flagText(short: true)]
         }
+    }
+    // the network (NET N4): the chart's scale, and its row thinned with each bucket's mean and peak
+    out["net_scale"] = cases("net_scale").map { Tile.netScale(num($0["top"])) }
+    out["net_row"] = cases("net_row").map { c -> [String: Any] in
+        let pts: [Point] = ((c["points"] as? [[String: Any]]) ?? []).map { p in
+            var x = Point(id: num(p["t"]), date: Date(timeIntervalSince1970: num(p["t"])), wired: num(p["wired"]), app: num(p["app"]),
+                          comp: num(p["comp"]), swap: num(p["swap"]), away: false, kills: 0)
+            if let d = (p["nd"] as? NSNumber)?.doubleValue { x.netDown = Float(d); x.netDownPeak = Float(d) }
+            if let u = (p["nu"] as? NSNumber)?.doubleValue { x.netUp = Float(u); x.netUpPeak = Float(u) }
+            x.netFlows = (p["nf"] as? Bool) ?? false
+            x.netKey = UInt8(clamping: (p["nk"] as? NSNumber)?.intValue ?? 0)
+            return x
+        }
+        let row = Store.multires(pts, now: num(c["now"]), aggregate: true)   // the chart's own path, the switch forced
+        // to 3 decimals: a point keeps Float, Python doubles (the inputs are whole Mbit/s, so no mean ends in a half there)
+        func f(_ v: Float) -> Any { v.isNaN ? NSNull() : (Double(v) * 1000).rounded() / 1000 as Any }
+        let most: Double = row.map { Double(max($0.netDownPeak.isNaN ? 0 : $0.netDownPeak, $0.netUpPeak.isNaN ? 0 : $0.netUpPeak)) }.max() ?? 0
+        let cap = (c["cap"] as? [Any]) ?? []
+        let cd: Double = cap.first.flatMap { ($0 as? NSNumber)?.doubleValue } ?? 0
+        let cu: Double = cap.count > 1 ? ((cap[1] as? NSNumber)?.doubleValue ?? 0) : 0
+        return ["scale": Tile.netScale(max(cd, cu, most)),
+                "points": row.map { [$0.id, f($0.netDown), f($0.netUp), f($0.netDownPeak), f($0.netUpPeak), $0.netFlows,
+                                     Int($0.netKey)] as [Any] }]
     }
     out["agent"] = cases("agent").map { Reservation.agentIndex($0["agent"]) }
     // a band per reserved resource and the list's words (B3, 1.12.3): the bands of a selection, the rows of what holds a
@@ -9250,13 +9862,14 @@ func chartVectors(_ path: String) -> Int32 {
     out["band_stack"] = cases("band_stack").map { c -> [[String: Any]] in
         let k = Resource(rawValue: (c["kind"] as? String) ?? "") ?? .memory
         let pool = c["pool"] as? String
-        let rs = merged(c).filter { $0.holds(k, pool: pool) }
+        let rs = merged(c).filter { $0.holds(k, pool: pool, band: true) }
         return ResBlock.stack(rs, now: num(c["now"]), kind: k).map { b in
             ["key": b.res.id, "lane": b.lane, "steps": b.steps.map { [$0.a, $0.b, $0.lo, $0.hi] }] as [String: Any]
         }
     }
     out["band_top"] = cases("band_top").map { c -> Double in
-        Reservation.bandTop(num(c["tallest"]), Resource(rawValue: (c["kind"] as? String) ?? "") ?? .memory)
+        Reservation.bandTop(num(c["tallest"]), Resource(rawValue: (c["kind"] as? String) ?? "") ?? .memory,
+                            line: (c["line"] as? NSNumber)?.doubleValue)
     }
     guard let json = try? JSONSerialization.data(withJSONObject: out, options: [.sortedKeys]) else { return 1 }
     FileHandle.standardOutput.write(json)

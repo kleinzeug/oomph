@@ -88,6 +88,18 @@ The header reads "oomph: resource monitor". It is off by default while its desig
 `defaults write local.oomph.menubar resourcesUI -bool YES`, then quit and reopen
 oomph (`-bool NO` switches it off again).
 
+**The internet line (1.15, in the same switched-off popup).** With a logger of 1.15 or newer a
+fifth tile, **Network**, shows what this Mac moves through the internet now, download and upload
+in Mbit/s, against the line's figure once you have measured or set it ("line not tested" before),
+the busiest name, and "seen 940 > 500" when this Mac alone was faster than the stored figure (the
+line was upgraded: test it again). Its chart draws the download above the axis and the upload
+mirrored below it, with the line's figure dashed and what agents hold as a thin line; its band and
+list rows show what agents reserved of the line ("150 Mbit/s · 40 GB … 12.3 of 40 GB · ≈ 24 min
+left"). On a network with a data cap the tile says "metered · 12/20 GB" and turns amber under 10 %
+left; where macOS marks the network expensive or Low Data Mode is on and no cap is set, it says
+"metered?" with the command to set one. `w` and `W` select it from the keyboard, as `m c g d` and
+`M C G D` do the others.
+
 New to it? Hover the chip in the popup's top-left corner: it turns into a **?**. Click it
 for a four-step tour. It lights up one part of the dashboard at a time, with notes on what
 each control does. Move through it with the bar under the header or with ← / →, and close
@@ -107,6 +119,7 @@ Every 30 seconds — every 5 seconds while things are getting tight:
 | Agent sessions | every `claude` process with its whole process tree: project directory, total memory, biggest child |
 | Memory kills | jetsam kills from the system log, aggregated per sample with their reasons |
 | Unowned memory | memory no running process accounts for — normally a few GB; a large, lasting amount is a leak outside the processes (e.g. in the GPU driver) that only a restart frees |
+| Internet traffic (1.15) | download and upload through the internet line in Mbit/s, the busiest processes by name, this machine's bytes per network and day; traffic to the LAN (a NAS, another Mac) is told apart and left out; never with whom |
 
 An **incident** opens when memory pressure goes critical, when macOS starts killing
 processes for memory (≥ 10 jetsam kills in a minute), when it reports kills for
@@ -308,9 +321,11 @@ oomph incident latest --html    # open the latest incident's report
 oomph html --open               # HTML report of the last 24 h (switch to 6 h / 1 h on the page; --last 3d for longer)
 oomph top                       # the popup's dashboard, full screen in the terminal (see below)
 oomph doctor                    # what works here and what to fix: logger, versions, ledger, Claude setup (--json)
-oomph ps --cpu                  # the busiest processes now (--gpu, --io: writing to disk, --memory)
+oomph ps --cpu                  # the busiest processes now (--gpu, --io: writing to disk, --memory, --net: internet)
+oomph net                       # this network, its line's figure and the internet traffic now (test, set, name, metered, list)
+oomph net metered --cap 20G/month --from 14   # a data cap: this machine's internet bytes counted from the 14th (--off)
 oomph volumes --all             # the disks oomph records, and the ones it ignores and why
-oomph resources                 # memory, cores, GPU and disks of this Mac, and which can be reserved
+oomph resources                 # memory, cores, GPU, disks and the network of this Mac, and which can be reserved
 ```
 
 An HTML report (`html`, `incident … --html`, `ai-report`) goes to the file named with `-o`, else, from
@@ -334,6 +349,49 @@ keeps it off either way). `oomph status` then says "% of full
 speed" instead of "busy … of the time", and `oomph doctor` says whether it works. A helper that
 crashes four times, or whose readings do not fit the Mac, is switched off until the Mac restarts
 or macOS is updated (`/Library/Logs/oomph/ioreport.json` keeps the count).
+
+### The internet line (1.15)
+
+From 1.15 the logger also measures what this machine moves through the internet, per process:
+on a Mac with `nettop` (per connection, without looking names up) and the interface's own
+counters, on Linux with `/proc/net/dev` and, where it may, `ss` (TCP). Traffic to the LAN (private
+and link-local addresses, the interface's own prefixes: a NAS reached by its global IPv6 address
+too) does not count. A VPN belongs to the network under it, so tunnelled traffic is not counted
+twice. Remote addresses are read to tell the LAN from the internet and dropped at once. Measuring
+sends nothing. A network is known by its router's MAC address, else by its gateway and subnet, so
+Wi-Fi and Ethernet to one router are one network.
+
+How fast the line is cannot be measured by watching, so oomph keeps a figure per network only
+when someone stands behind it:
+
+```sh
+oomph net                       # this network: its figure and who set it, traffic now, the busiest, reservations
+oomph net test                  # a Mac: Apple's networkQuality (about 30 s, a few hundred MB), then asks to store it
+oomph net set 250/40            # the figure by hand, down/up in Mbit/s (Linux has no speed test: use one you trust)
+oomph net name home             # a label for this network
+oomph net metered --cap 20G/month --from 14   # a data cap from the 14th (a week: --from 1–7; a day); --off removes it
+oomph net list                  # every network stored here, * on this one
+oomph net forget home           # remove one
+oomph ps --net                  # the biggest internet users now
+```
+
+The figures are kept in `networks.json` in the shared ledger folder: any local user may test or
+set them, and `oomph net` says who did and when. A figure is never changed by itself: when this
+machine alone has been faster than it for three samples, `oomph net` and the tile say so and ask for
+a new test. `oomph net test` is the only part of the network measuring that causes traffic (the
+logger sends nothing); without `--yes` it runs only in a terminal (`--yes` is for a person's own
+scripts; the skill tells agents never to run it), as the user, never as root, and wants `--yes` on a
+metered network or a busy line (the result would read low). `oomph check`, `oomph status` and `oomph
+resources` print a network line (`net  ↓212 ↑8.1 of 194/48 Mbit/s (home)`, or "line not tested"),
+`oomph report` the peaks and the busiest. On a metered network the cap counts this machine's internet
+bytes since the period began (other devices on a hotspot are not seen); under 10 % left the capsule
+turns amber, `oomph check` says so, and the hook tells a session once per period. Nothing else about
+the network raises a verdict: a full line is not an emergency.
+
+On Linux `ss` names another user's processes only to root: a per-user install names your own
+processes and counts the rest as others. The machine's logger (`--system`) runs without network
+access and records the interface's totals alone, the LAN included (`oomph doctor` says which). Where
+`ss` is missing, totals only; QUIC and other UDP traffic is never named per process there.
 
 ### In the terminal
 
@@ -387,7 +445,10 @@ the plot. The capsule says oomph's verdict and the reservations wear their agent
 strip has a band per reserved resource shown (the plot's first; the others a row each, named at
 the right), and the list the same words as the app's: every amount, *over* and *idle*, what a
 request waits for, and a line for what holds nothing shown. The
-selection is remembered in `top.json` (`"selection"`, `"focus"`), apart from the app's.
+selection is remembered in `top.json` (`"selection"`, `"focus"`), apart from the app's. With a 1.15
+logger a fifth tile, Network, joins them: `w` shows it alone and `W` adds or removes it (`n` and `N`
+move between machines); its plot has the download above the axis and the upload below, its band
+and rows the rates and volumes agents reserved, and `a` lists the busiest names on the line.
 
 For scripts and agents there are also `oomph check`, `oomph session`, `oomph wait`,
 `oomph run --reserve`, `oomph reserve` / `amend` / `release` / `reservations`,
@@ -477,20 +538,21 @@ What a session gets:
 
 | | |
 |---|---|
-| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations, then a line each for CPU, GPU and disks; exit code 0 / 1 / 2; `--json`; `--measure` reads CPU and GPU for a quarter second when the logger is off |
-| `oomph resources` | this Mac's memory, cores, GPU and disks, and which of them can be reserved (memory; on a Mac from 1.12.0 cores and from 1.12.1 disk space), with what is reserved and left |
+| `oomph check` | one-line verdict **ok / tight / critical** with reasons, advice and other sessions' reservations, then a line each for CPU, GPU, disks and, from 1.15, the network (internet traffic now against the line's stored figure; `--json`: a `network` object); exit code 0 / 1 / 2; `--json`; `--measure` reads CPU and GPU for a quarter second when the logger is off |
+| `oomph resources` | this Mac's memory, cores, GPU, disks and, from 1.15, the network (internet traffic now against the line's stored figure; `--json`: a `network` object), and which of them can be reserved (memory; on a Mac from 1.12.0 cores and from 1.12.1 disk space), with what is reserved and left |
 | `oomph run --reserve 6G --for "gradle build" -- ./gradlew assembleDebug` | waits its turn for 6 GB, runs the command, releases when it exits and records the peak it really added; exit 75 if it never got a turn |
 | `oomph run --cpu 4..12 -- make -j{cpu}` | the same for cores: `{cpu}` becomes the number granted, which also goes to `OOMPH_CPU_CORES` and, where not already set, to `MAKEFLAGS`, `CARGO_BUILD_JOBS`, `GOMAXPROCS` and friends |
 | `oomph run --disk 30G@/Volumes/Scratch -- ./fetch-dataset.sh` | the same for disk space on a volume: any path on it names it (default: the temporary folder's disk); the grant goes to `OOMPH_DISK_GB` |
-| `oomph reserve 6G [--cpu 8] [--disk 20G[@PATH]] [--gpu-mem 16G[@CARD]] --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
-| `oomph amend r7 --gb 2G [--cpu 4] [--disk 10G] [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
+| `oomph run --net 40G --for "model weights" -- curl -LO https://…` | the same for the internet line (1.15, switched off for now): waits for its share of the line and adds curl's `--limit-rate` with the rate granted (also wget's, rsync's and aria2c's, never when the command sets one); `{net}`, `{net_limit}` and `OOMPH_NET_LIMIT` hand the rate to any other tool |
+| `oomph reserve 6G [--cpu 8] [--disk 20G[@PATH]] [--gpu-mem 16G[@CARD]] [--net 40G] [--net-rate 200M[/20M]] --for "…"` · `oomph release <id\|all>` | the same for multi-step work: reserve, start once granted, release when the heavy part is over |
+| `oomph amend r7 --gb 2G [--cpu 4] [--disk 10G] [--net-rate 100M] [--ttl 20m] [--for "…"]` | change a reservation in place: shrink it once the heaviest part is over, grow it, extend or shorten it, rename it |
 | `oomph reservations` | who holds or waits for how much (project, purpose, memory actually used), what's available, and the measured peaks of recent work |
 | `oomph reservations --history --last 3d` | every reservation of the last 14 days, also of sessions that are gone: span, size changes, reserved vs. peak, how it ended |
 | `oomph session` | the memory of the Claude session it runs in — its whole process tree and the biggest children |
 | `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
-| `oomph status --json` | the full latest sample |
-| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident`. A server that outlives an update takes the installed new version at its next request, once the new code has passed a self-check, when the install is root's (a Mac, or Linux's system mode; a Linux user install is restarted with its session); the session keeps the tools it was shown at its start |
-| `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
+| `oomph status --json` | the full latest sample; from 1.15 with the internet traffic, the network named by its label or a hash of its identity, never the router's MAC |
+| MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` (from 1.15 `memory_check` and `memory_status` also answer with a `network` object, and `reserve_memory` and `update_reservation` take the line's `net_gb`, `net_up_gb`, `net_mbps`, `net_min_mbps`, `net_up_mbps` and `net_up_min_mbps`). A server that outlives an update takes the installed new version at its next request, once the new code has passed a self-check, when the install is root's (a Mac, or Linux's system mode; a Linux user install is restarted with its session); the session keeps the tools it was shown at its start |
+| `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes); about the network only one line, once per session and period, while a metered network has less than 10 % of its cap left (1.15) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
 free, under 20 GB free disk, right after jetsam kills, or when a large amount of
@@ -557,6 +619,28 @@ session B  → granted r8, tests start
   been measured with real model runs; without the switch a GPU flag is refused (exit 75) and says
   how to switch it on: `"gpu_reservations": true` in the settings file below
   (`/etc/oomph/config.json` on Linux), or `OOMPH_GPU_RESERVATIONS=1` for one command.
+- **The internet line** (1.15, switched off for now): `--net 40G` (MCP `net_gb`) says how much a
+  step will download, `--net-up 5G` (`net_up_gb`) upload, and `--net-rate 200M` (`net_mbps`, Mbit/s;
+  `200M/20M` down and up, `100M..200M` a range) the rate it wants. The line is shared out only on
+  a network with a figure (`oomph net test` or `set`); the household keeps max(10 Mbit/s, 25 %) of
+  the download and max(5 Mbit/s, 30 %) of the upload, since a video call breaks on the uplink first.
+  Grants share the rest like cores: a rate is granted between half of it and all of it, a volume
+  alone half of what the line can share, so two pulls run side by side and a third waits; an exact
+  range (`200M..200M`) waits for its turn; a minimum the line can never give is refused. The answer
+  names the rate to run at and how long the volume takes (`run_with.net_mbps`, `run_with.limit` in
+  bytes per second: curl, wget and aria2c read `M` as MiB). On a network without a figure, a line too
+  slow to share or offline the request is granted at once without a rate (exit 0), with a note
+  saying how to measure the line; its volume is still counted. When a laptop moves, its grants are
+  granted again on the new network. What a grant's processes move to and from the internet counts
+  as its use (never the LAN's), so it is *over* above 1.25 × its rate or past its volume and *idle*
+  under a tenth of its rate for ten minutes; where no process can be named (Linux's logger) the
+  line's totals are shared out and no grant is called idle. On a metered network a volume is
+  charged against the cap in full, with or without a figure (`oomph resources` lists the network as
+  reservable there either way): refused, with what is left and when it resets, if it can never
+  fit. Nothing is shaped: it is advice, like the rest. It ships switched off until it has been tried
+  on real lines; without the switch a network flag is refused (exit 75) with how to switch it on:
+  `"net_reservations": true` in the settings file below, or `OOMPH_NET_RESERVATIONS=1` for one command.
+  Measuring, `oomph net` and the metered warning are not behind it.
 - **Advice on a grant** (1.12.3, with the logger): a grant whose processes keep more cores busy
   than 1.25 × what it got, two samples in a row, or that wrote more than the disk space it
   reserved, is *over*; one that has used less than a tenth of its cores for ten minutes is
@@ -744,7 +828,10 @@ What came from the other machine (process names, paths, purposes) is said to be 
 above the output, `"origin": "remote:studio"` and the list of such fields in the JSON, and a sentence
 in the AI analysis's prompt and tool results. Nothing is measured here and nothing written there,
 nor in its mirror's ledger: its verdict and reservations (also the AI's `current_status`) are read
-from its latest sample and its ledger as its logger judged them. `reserve`, `run`, `release`,
+from its latest sample and its ledger as its logger judged them; from 1.15 its network line too (`net` in
+`check` and `status`, `network` in `check --json` and the AI's answers), with its line's figure and data cap
+from its own pools and never this machine's `networks.json` or `netdays.json` (its network's name and key
+never travel: the line reads "its network"). `reserve`, `run`, `release`,
 `amend`, `wait`, `hook` and the others are refused with `--machine`, and so are `ps`, `resources`,
 `volumes`, `session` and `doctor`, which measure the machine they run on (exit 64, as for a name no
 machine has here: never 1 or 2, which `check` means as tight and critical). In the app (with
@@ -765,6 +852,7 @@ may launch or bring up the menu-bar app; without the switch it shows and sends n
 | `/Library/Logs/oomph/samples-YYYY-MM-DD.jsonl[.gz]` | one sample per line; older days compressed; kept 14 days |
 | `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications; since 1.9.5 also `thermal`, `cpu_saturated` (and `_cleared`), `disk_low` per disk, `disk_filling` and `volume` |
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
+| `/Library/Logs/oomph/netdays.json` | this machine's internet bytes per network and day (62 days), what a metered network's cap is counted from (1.15) |
 | `/Library/Logs/oomph/ioreport.json` | how often the IOReport helper crashed since the Mac started (only when it is switched on) |
 | `/usr/local/libexec/oomph/` | a link to the installed daemon and CLI, `/usr/local/libexec/oomph-<version>/` |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job (replaced by every install) |
@@ -774,6 +862,7 @@ may launch or bring up the menu-bar app; without the switch it shows and sends n
 | `~/Library/Application Support/oomph/machines/` | the machines you watch (`machines.json`, tokens in `secrets.json`) and a mirror of each |
 | `/Users/Shared/oomph/ledger.json` | the sessions' memory reservations and the last 100 finished ones (shared by all users; advisory) |
 | `/Users/Shared/oomph/reservations.jsonl` | every reservation edit and finished reservation, one JSON record per line; kept 14 days |
+| `/Users/Shared/oomph/networks.json` | each network's line figure, label and data cap, with who set them and when (1.15; `oomph net`) |
 
 All in, that is roughly 50–150 MB of logs. The daemon itself uses about 25 MB of
 memory and no measurable CPU.
@@ -792,6 +881,7 @@ write them (`sudo mkdir -p "/Library/Application Support/oomph"`, then edit the 
 | `"ioreport": true` | the GPU's figure at full speed, from the IOReport helper (from 1.9.3; `false` switches it off; see above) |
 | `"no_ioreport": true` | never start the IOReport helper, also once it is on by default |
 | `"gpu_reservations": true` | GPU reservations, `--gpu` and `--gpu-mem` (from 1.14.0, off by default; read per request, no restart) |
+| `"net_reservations": true` | reservations of the internet line, `--net`, `--net-up` and `--net-rate` (from 1.15, off by default; read per request, no restart) |
 
 ### Privacy
 
@@ -799,11 +889,18 @@ The logs contain process names and working directories — never command-line ar
 or file contents — and are readable by every user on the Mac. From 1.9.1 they also hold
 how much CPU, GPU time and disk writing each process used, and the names and mount points
 of the disks oomph records (a volume's name can say something: `oomph volumes hide` keeps it
-out of your own lists, not out of the logs). No telemetry. oomph does not talk to the
+out of your own lists, not out of the logs). From 1.15 they also hold how much each process
+moved to and from the internet (never with whom: remote addresses are not kept) and the
+network's identity: its router's MAC address, or its gateway and subnet. That identity stays
+on the Mac: what goes to a watching machine leaves it out, and the answers to Claude (MCP,
+`oomph check --json`, `oomph status --json`, and `oomph net`'s text) name the network by its
+label or by a hash of it; only `oomph net list` and the `--json` answers of `oomph net` show
+the key itself, for your own tools. No telemetry. oomph does not talk to the
 network unless you ask it to: when you turn on the AI analysis with Claude or OpenAI, which
 sends figures, process names, project paths and the names and mount points of recorded disks
 from the logs to that provider for each AI report (Ollama keeps it local); when you check for
-upgrades; when you **share this Mac** (off by default, needs an administrator, only on the
+upgrades; when you run `oomph net test` (Apple's networkQuality moves a few hundred MB to and from
+Apple's test servers; 1.15); when you **share this Mac** (off by default, needs an administrator, only on the
 networks you turn it on for) or **watch one that was shared with you**. Shared data goes
 directly between your machines, encrypted, and nowhere else, and a watching machine only
 connects while its popup is open (and a minute after), or while you run `oomph remote add`,
@@ -825,6 +922,8 @@ daemon/oomph_gpu.py               GPU reservations (1.14): the NVIDIA pools per 
                                   request or lease has a GPU part
 daemon/oomph_top.py               `oomph top`: reads the files; the terminal, the keys, the loop, --ssh
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
+daemon/oomph_traffic.py           internet traffic (1.15): parsing nettop and ss, the deltas, the network's identity,
+                                  networks.json and `oomph net`; loaded only where a network is shown
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)
 daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer
 daemon/oomph_remote.py            `oomph --machine NAME …`: another machine read here, its reports drawn here (1.14.2)
@@ -847,6 +946,9 @@ tools/chartvectors.py             holds `oomph top`'s chart maths to the app's (
 tools/topfixture.py               the golden frames of `oomph top` (tools/golden/top), from fixed data
 tools/toptest.py                  `oomph top` in a pseudo-terminal: keys, signals, --ssh; tmux as the oracle
 tools/nettest.py                  the protocol's tests: serve, sync through a pipe, coverage, hostile input
+tools/traffictest.py              the internet line (1.15): nettop's and ss's rows as hostile input (tools/fixtures/net),
+                                  LAN or internet, the deltas, the identity, networks.json, `oomph net`; netrestest.py
+                                  its reservations, quotatest.py metered networks, netviewtest.py the tile and top
 tools/mirrorfixture.py            another machine's mirror, for `oomph.app --render-popup … --mirror DIR`
 tools/renderfixture.py            renders that repeat themselves: `--render-popup … --fixture DIR --now T --no-liveness`
                                   and, with `--against OLD`, every state byte for byte against an older build
