@@ -52,7 +52,7 @@ for d in (code, ledgers, victims):
     os.mkdir(d)
     os.chmod(d, 0o755)
 for f in ("oomph.py", "oomphd.py", "oomph_darwin.py", "oomph_linux.py", "oomph_ioreport.py", "oomph_top.py", "oomph_view.py",
-          "oomph_net.py", "oomph_sync.py", "oomph_gpu.py"):
+          "oomph_net.py", "oomph_sync.py", "oomph_remote.py", "oomph_gpu.py"):
     shutil.copy(os.path.join(ROOT, "daemon", f), code)
     os.chmod(os.path.join(code, f), 0o644)
 os.environ["OOMPH_DIR"] = os.path.join(base, "logs")

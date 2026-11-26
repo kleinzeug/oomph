@@ -719,6 +719,44 @@ Its mirrors are kept in `$XDG_STATE_HOME/oomph/machines` (`~/.local/state/oomph/
 opens no port of its own: other machines watch it over ssh (the rest of `oomph share` is macOS's;
 `sudo oomph share ai on` works on both).
 
+**Reading another machine** (1.14.2). `check`, `status`, `reservations`, `incidents`, `incident`,
+`report`, `html`, `ai-report` and `top` take `--machine NAME` (a name `oomph remote list` shows),
+before the command or after it:
+
+```sh
+oomph --machine studio check [--json]    # its verdict and reservations; exit 3 when its latest sample is
+                                         # old (it can't be reached, or its logger has gone silent), so a
+                                         # script tells it from tight; 4 when its data is not one this
+                                         # oomph reads; 64 when no machine has that name here (top too)
+oomph --machine studio status | reservations | incidents | report --last 2h
+oomph --machine studio html --last 6h --open          # a report of it, drawn here
+oomph --machine studio incident 20261120-120000 --html
+oomph --machine studio ai-report --open               # only if studio allows it: sudo oomph share ai on there
+```
+
+Unless its link is live already (or `--no-connect`), the command connects once first and catches up
+its current sample, ledger and incidents. A report always connects (unless `--no-connect`) to fetch
+the full samples of its window (its last day at most, its newest 48 MB of them), kept a day in its mirror's `full/`; an AI
+analysis also fetches the system logs of the latest incidents in its window. Reports are drawn **on
+this machine** by this machine's code: a page another machine wrote is never opened. Without `-o` a
+page goes where this machine's reports go (a folder of your own, new and readable by you alone).
+What came from the other machine (process names, paths, purposes) is said to be its text: a line
+above the output, `"origin": "remote:studio"` and the list of such fields in the JSON, and a sentence
+in the AI analysis's prompt and tool results. Nothing is measured here and nothing written there,
+nor in its mirror's ledger: its verdict and reservations (also the AI's `current_status`) are read
+from its latest sample and its ledger as its logger judged them. `reserve`, `run`, `release`,
+`amend`, `wait`, `hook` and the others are refused with `--machine`, and so are `ps`, `resources`,
+`volumes`, `session` and `doctor`, which measure the machine they run on (exit 64, as for a name no
+machine has here: never 1 or 2, which `check` means as tight and critical). In the app (with
+`machinesUI`) Report and ✦ on a machine's tab and an incident's row do the same, and `o` in
+`oomph top`.
+
+**Links** (1.14.2): the app opens `oomph://CODE@HOST` links (from a message, a page or
+`open 'oomph://…'`). With `machinesUI` on, the popup opens at the + with the link filled in, at the
+code step with the host shown; nothing is sent until Pair. The app is registered as the handler of
+`oomph://` whether or not the switch is on (a bundle can't register a scheme conditionally), so a link
+may launch or bring up the menu-bar app; without the switch it shows and sends nothing.
+
 ## Files
 
 | Path | What |
@@ -789,6 +827,7 @@ daemon/oomph_top.py               `oomph top`: reads the files; the terminal, th
 daemon/oomph_view.py              `oomph top`: draws the frame (pure: no I/O, no clock)
 daemon/oomph_net.py               the wire protocol and `oomph serve --stdio` (read only)
 daemon/oomph_sync.py              `oomph remote sync`: the client, coverage and the mirror writer
+daemon/oomph_remote.py            `oomph --machine NAME …`: another machine read here, its reports drawn here (1.14.2)
 daemon/local.oomph.daemon.plist   the LaunchDaemon job
 app/oomph.swift                   the menu-bar app (AppKit + SwiftUI + Swift Charts)
 app/Info.plist

@@ -55,15 +55,25 @@ import sys
 import time
 import zlib
 
-try:
-    import ssl
-except ImportError:  # a Python built without it: --stdio still works
-    ssl = None
-
 import oomph
 
+
+def _ssl():
+    """ssl, imported at the first TLS use, never by `oomph top`, which loads this module for its tabs (its memory
+    budget, 1.14.2); None in a Python built without it (--stdio still works)."""
+    try:
+        import ssl
+    except ImportError:
+        return None
+    return ssl
+
+
 PROTO = (1, 1)                       # the protocol versions this code speaks
-CAPS = ("samples", "events", "incidents", "ledger")   # what this server offers (`full`, `files`, `broker`: later)
+CAPS = ("samples", "events", "incidents", "ledger", "full", "files")   # what this server offers (`broker`: later)
+FULL_S = 86400                       # `samples` with `full` (R2): a window of at most a day
+INCIDENT_FILES = ("syslog.txt",)     # what `incident_file` serves of an incident's folder (R2), by name
+FILE_CHUNK = 192 << 10               # ... in chunks of this many bytes
+FILE_CAP = 8 << 20                   # ... of at most this many
 AI_CAP = "ai"                        # in caps only when this machine allows AI analysis of its data (D7; off by default)
 PORT = 6674                          # O-M-P-H on a phone's keypad
 ROLE = "_oomph"                      # the share service's account and its group of its own (macOS)
@@ -92,6 +102,7 @@ PAGE = 256 << 10                     # compressed bytes of a page at most (max_b
 INFLATE = 16 << 20                   # what a page may inflate to
 ITEM = {"sample_raw": 512 << 10,     # a sample line as logged; a longer one is skipped
         "sample": 64 << 10,          # ... once slimmed
+        "full": 128 << 10,           # ... or rebuilt whole for a report (report_sample)
         "record": 16 << 10,          # an event or a reservation record
         "incident": 256 << 10,       # an incident.json
         "current": 512 << 10}        # current.json
@@ -195,7 +206,8 @@ class SockStream:
         except socket.timeout:
             return None
         except OSError as e:  # the TLS layer's want-read is an OSError too
-            if ssl is not None and isinstance(e, ssl.SSLWantReadError):
+            tls = sys.modules.get("ssl")  # a want-read comes only from a TLS socket: ssl is loaded then
+            if tls is not None and isinstance(e, tls.SSLWantReadError):
                 return None
             return b""
 
@@ -343,6 +355,22 @@ def incident_out(inc):
     return out
 
 
+# The full samples of a report window another machine asks for (R2, roadmap 01 §4.8): oomph.FULL_LISTS' named
+# fields, and the disks with what a report's panels draw: names and sizes, never mount paths
+REPORT_DISKS = (16, ("id", "name", "kind", "total_gb", "free_gb", "low_gb", "crit_gb", "watch", "roles"))
+
+
+def report_sample(s):
+    """A logged sample as it may leave the machine for a report rendered elsewhere (`samples` with
+    `full`, R2): the full sample's named fields, plus the disks (REPORT_DISKS)."""
+    out = oomph.full_sample(s)
+    cap, keys = REPORT_DISKS
+    v = oomph._block(s.get("disks"), cap, keys, oomph.LIMITS["str"])
+    if v is not oomph._NOT:
+        out["disks"] = v
+    return out
+
+
 # ------------------------------------------------------------------ reading the directories
 def _open_regular(path):
     """A file object for a regular file at `path`, never through a link, never blocking; None
@@ -351,6 +379,31 @@ def _open_regular(path):
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return os.fdopen(fd, "rb")
+
+
+def _open_in_incident(log_dir, iid, name):
+    """_open_regular of `name` in log_dir/incidents/iid, reached through the descriptors of incidents/ and of
+    the incident's folder, none of them a link (the logger's account could have put one there, or swap one in
+    since the folder was listed: 03 §12.3, as oomph.open_incident_file). None otherwise."""
+    fds = []
+    try:
+        fl = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+        fds.append(os.open(os.path.join(log_dir, "incidents"), fl))
+        fds.append(os.open(iid, fl, dir_fd=fds[-1]))
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fds[-1])
+    except OSError:
+        return None
+    finally:
+        for x in fds:
+            os.close(x)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
@@ -520,9 +573,15 @@ class Server:
         return {"now": self.now(), "last": self.newest()[0]}
 
     def rpc_samples(self, p):
+        """A page of samples after the cursor, up to `to`: slimmed, or with `full` (R2: a window of at
+        most FULL_S, for a report drawn on the viewer) rebuilt from the named fields of a full sample."""
         after, to, cap = _cursor(p.get("after", [0, 0])), _time(p.get("to")), _max_bytes(p.get("max_bytes"))
         if after is None or to is None:
             raise RPCError(ERR["params"], "samples: after [t, k], to t")
+        full = p.get("full", False)
+        if not isinstance(full, bool) or full and not (0 < after[0] and to - after[0] <= FULL_S):
+            raise RPCError(ERR["params"], "samples: full is true or false, and a full window at most %d s" % FULL_S)
+        make, item = (report_sample, ITEM["full"]) if full else (oomph.slim_sample, ITEM["sample"])
         oldest = self.oldest()
         if oldest is not None and to < oldest - 1:
             raise RPCError(ERR["retention"], "older than retention", {"oldest": oldest})
@@ -540,8 +599,8 @@ class Server:
                     s = _untrusted(line)
                     if not isinstance(s, dict) or not oomph._t(s.get("t")):
                         continue
-                    b = dumps(oomph.slim_sample(s))
-                    yield s["t"], d, (b if len(b) <= ITEM["sample"] else None)
+                    b = dumps(make(s))
+                    yield s["t"], d, (b if len(b) <= item else None)
         page = _page(rows, after, to, cap, day_counted=True)
         vouch = self.vouch()
         page["to"] = page.pop("last_t") if page["more"] else min(to, vouch)
@@ -626,6 +685,27 @@ class Server:
         # fetches an open incident again until it closes, and a quiet one grows (viewers leave it out by its flag)
         return {"enc": "zlib+b64", "data": pack(lines), "n": len(lines), "next": nxt, "more": more,
                 "skipped": skipped, "open": open_now}
+
+    def rpc_incident_file(self, p):
+        """A chunk of a file of an incident's folder (R2): `id` an incident id, `name` one of
+        INCIDENT_FILES, `after` a byte offset. Read as a regular file, never through a link, at most
+        FILE_CAP bytes of it; {"enc", "data", "next", "more", "size"}."""
+        iid, name, after = p.get("id"), p.get("name"), p.get("after", 0)
+        if not (isinstance(iid, str) and INCIDENT_ID.fullmatch(iid) and name in INCIDENT_FILES and
+                isinstance(after, int) and not isinstance(after, bool) and 0 <= after <= FILE_CAP):
+            raise RPCError(ERR["params"], "incident_file: id, name (%s), after a byte offset" % ", ".join(INCIDENT_FILES))
+        if iid not in self.incident_ids():
+            raise RPCError(ERR["params"], "no such incident")
+        f = _open_in_incident(self.log_dir, iid, name)
+        if f is None:
+            return {"enc": "zlib+b64", "data": pack([]), "next": 0, "more": False, "size": None}
+        with f:
+            size = os.fstat(f.fileno()).st_size
+            f.seek(after)
+            chunk = f.read(max(0, min(FILE_CHUNK, FILE_CAP - after)))
+        nxt = after + len(chunk)
+        return {"enc": "zlib+b64", "data": base64.b64encode(zlib.compress(chunk, 6)).decode(), "next": nxt,
+                "more": nxt < min(size, FILE_CAP), "size": size}
 
     def rpc_subscribe(self, p):
         streams = p.get("streams", list(STREAMS))
@@ -1209,7 +1289,7 @@ class ShareDir:
     def fp(self):
         """The SHA-256 of this machine's certificate (DER): its public identity."""
         with open(self.cert) as f:
-            return hashlib.sha256(ssl.PEM_cert_to_DER_cert(f.read(16 << 10))).digest()
+            return hashlib.sha256(_ssl().PEM_cert_to_DER_cert(f.read(16 << 10))).digest()
 
     def key_ok(self):
         """The key is root's (or the tester's), nothing for others, not writable by its group, and
@@ -1636,6 +1716,7 @@ class Session:
 
 # ------------------------------------------------------------------ TLS (roadmap 01 §5.2)
 def server_context(sh):
+    ssl = _ssl()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     ctx.set_ciphers(CIPHERS)
@@ -1648,6 +1729,7 @@ def server_context(sh):
 def client_context():
     """The viewer's: no name or date check (identity is the pinned key, as with SSH host keys),
     TLS 1.2 or newer, AEAD suites with forward secrecy."""
+    ssl = _ssl()
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -2033,7 +2115,7 @@ def serve_connection(sock, sh=None, now=None, gate_fn=None):
     cfg = sh.config()
     run = RunDir(sh.run)
     why = "sharing is off" if cfg.get("on") is not True else (gate_fn or default_gate)(peer, local, cfg, run)
-    if why is not None or ssl is None or not sh.key_ok():
+    if why is not None or _ssl() is None or not sh.key_ok():
         _close(sock)
         return 0 if why is not None else 1
     ip = str(norm_addr(peer)[0])

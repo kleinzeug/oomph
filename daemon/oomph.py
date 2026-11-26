@@ -64,6 +64,10 @@ other machines (read-only, Mac to Mac over TLS, or anything with `oomph` over ss
   oomph remote sync [--json]        keep the watched machines' mirrors live (what the app runs)
   oomph remote sync --once [NAME]   catch up once, then exit
   oomph serve --stdio               answer for this machine on stdin/stdout, read only (what ssh runs)
+  oomph --machine NAME check|status|reservations|incidents|incident|report|html|ai-report|top
+                                    the same for a machine `remote list` shows, read only (also after the
+                                    command); check exits 3 when its data is old (not reached, or a silent
+                                    logger), 4 when it can't be read here; any: 64 for an unknown name
 """
 import datetime
 import errno
@@ -78,7 +82,6 @@ import math
 import os
 import pwd
 import re
-import secrets
 import select
 import stat
 import subprocess
@@ -205,6 +208,13 @@ def _path(kind):
 
 STATE_DIR = os.environ.get("OOMPH_STATE_DIR") or _path("state")
 LOG_DIR = os.environ.get("OOMPH_DIR", PATHS_HERE["log"])
+# `--machine NAME` (01 §9, oomph_remote.cmd_machine): LOG_DIR and LEDGER_DIR are its mirror's; what it is, its clock
+# against this one's, and the full samples fetched for a report (FULL_DIR, covering FULL_SPANS of its time)
+REMOTE = None
+CLOCK_S = 0.0
+DAY_PAD = 0          # days read around a window: another machine's files are named by its own dates
+FULL_DIR = None
+FULL_SPANS = ()
 
 # What the daemon reads from the unified log. On macOS 27 memory kills show up as
 # launchd exits with OS_REASON_JETSAM and as ReportSystemMemory batch lines
@@ -283,8 +293,8 @@ def term_text(x):
 
 
 def _day_range(since, until):
-    d = datetime.date.fromtimestamp(since)
-    end = datetime.date.fromtimestamp(until)
+    d = datetime.date.fromtimestamp(since) - datetime.timedelta(days=DAY_PAD)
+    end = datetime.date.fromtimestamp(until) + datetime.timedelta(days=DAY_PAD)
     while d <= end:
         yield d.isoformat()
         d += datetime.timedelta(days=1)
@@ -362,32 +372,41 @@ def _read_lines(path):
         return
 
 
+def _sources(since, until):
+    """(directory, from, to, retyped) to read a window's samples from: LOG_DIR, as it is, but for another machine's
+    (--machine: oomph_remote.sources, its full samples where a report fetched them, R2)."""
+    return [(LOG_DIR, since, until, False)] if REMOTE is None else _rmod().sources(since, until)
+
+
+def _day_paths(d, since, until):
+    return [p for day in _day_range(since, until)
+            for p in (os.path.join(d, "samples-%s.jsonl.gz" % day), os.path.join(d, "samples-%s.jsonl" % day))
+            if os.path.exists(p)]
+
+
 def load_samples(since, until):
     out = []
-    for day in _day_range(since, until):
-        for path in (os.path.join(LOG_DIR, "samples-%s.jsonl.gz" % day),
-                     os.path.join(LOG_DIR, "samples-%s.jsonl" % day)):
-            if not os.path.exists(path):
-                continue
+    for d, a, b, typed in _sources(since, until):
+        for path in _day_paths(d, a, b):
             for line in _read_lines(path):
                 try:
                     s = json.loads(line)
                 except ValueError:
                     continue
-                if since <= s.get("t", 0) <= until:
-                    out.append(s)
+                if isinstance(s, dict) and _t(s.get("t")) and a <= s["t"] <= b:
+                    out.append(_rmod().typed_sample(s) if typed else s)  # another machine's (R2)
     out.sort(key=lambda s: s["t"])
     return out
 
 
-def _samples_in(path, since, until):
+def _samples_in(path, since, until, typed=False):
     for line in _read_lines(path):
         try:
             s = json.loads(line)
         except ValueError:
             continue
-        if since <= s.get("t", 0) <= until:
-            yield s
+        if isinstance(s, dict) and _t(s.get("t")) and since <= s["t"] <= until:
+            yield _rmod().typed_sample(s) if typed else s
 
 
 def iter_samples(since, until):
@@ -396,10 +415,9 @@ def iter_samples(since, until):
     the files gives load_samples' order without sorting them all. Only a wall clock set
     back makes a file go back in time; its samples then come in the order they were
     written, which moves a summary's from/to and a chart point or two, nothing more."""
-    paths = [p for day in _day_range(since, until)
-             for p in (os.path.join(LOG_DIR, "samples-%s.jsonl.gz" % day), os.path.join(LOG_DIR, "samples-%s.jsonl" % day))
-             if os.path.exists(p)]
-    return heapq.merge(*[_samples_in(p, since, until) for p in paths], key=lambda s: s["t"])
+    return heapq.merge(*[_samples_in(p, a, b, typed) for d, a, b, typed in _sources(since, until)
+                         for p in _day_paths(d, a, b)],
+                       key=lambda s: s["t"])
 
 
 class SampleWindow:
@@ -413,16 +431,31 @@ class SampleWindow:
         return iter_samples(self.since, self.until)
 
 
+def _event(e):
+    """An event with the types its readers rely on (another machine's may hold anything, R2): a time, a kind and
+    an iso string; a pressure change's levels small integers, else not one."""
+    if not (isinstance(e, dict) and _t(e.get("t"))):
+        return None
+    if not isinstance(e.get("iso"), str):
+        e["iso"] = datetime.datetime.fromtimestamp(e["t"]).astimezone().isoformat(timespec="seconds")
+    if not isinstance(e.get("kind"), str):
+        e["kind"] = "?"
+    if e["kind"] == "pressure_change" and not all(isinstance(e.get(k), int) and not isinstance(e.get(k), bool)
+                                                  for k in ("old", "new")):
+        e["kind"] = "pressure"
+    return e
+
+
 def load_events(since, until):
     out = []
     for path in (os.path.join(LOG_DIR, "events.jsonl.1"), os.path.join(LOG_DIR, "events.jsonl")):
         if os.path.exists(path):
             for line in _read_lines(path):
                 try:
-                    e = json.loads(line)
+                    e = _event(json.loads(line))
                 except ValueError:
                     continue
-                if since <= e.get("t", 0) <= until:
+                if e is not None and since <= e["t"] <= until:
                     out.append(e)
     out.sort(key=lambda e: e["t"])
     return out
@@ -971,6 +1004,8 @@ def _svg_chart(samples, series, stacked, marks=(), bands=(), ymax=None, unit="GB
     W, H, L, R, T, B = 960, height, 48, 10, 10, 26
     if not samples:
         return "<p class=sub>No samples.</p>"
+    if not series:  # e.g. no app groups: another machine's summary samples hold none (R2)
+        return "<p class=sub>Not in these samples.</p>"
     t0 = samples[0]["t"] if t0 is None else min(t0, samples[0]["t"])
     t1 = samples[-1]["t"] if t1 is None else max(t1, samples[-1]["t"])
     if t1 == t0:
@@ -1567,7 +1602,9 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
     def seg(target):
         return ('<div class=seg data-for="%s"><button class=on data-mode=list>List</button>'
                 '<button data-mode=tree>Tree</button></div>' % target)
-    blob = json.dumps(data, separators=(",", ":")).replace("</", "<\\/")
+    # no `<` at all in the data block: neither `</script>` nor `<!--<script` (which would run the block on
+    # past the page's own script) can come from a name in it, this machine's or another's (R2)
+    blob = json.dumps(data, separators=(",", ":")).replace("<", "\\u003c")
     parts = [
         "<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>",
         "<title>%s</title><style>%s%s%s</style></head><body data-view=\"%s\"><main>" % (_e(title), CSS, view_css, extra_css, first),
@@ -1595,17 +1632,17 @@ def render_html(samples, events, title, incident=None, views=None, extra_css="",
     return "".join(parts)
 
 
-def incident_html(inc):
+def incident_html(inc, title=None, intro_html=""):
     """An incident's report: the incident itself (from 15 min before it opened), plus the
     24h / 6h / 1h before it settled (its last trigger, plus the time it takes to close)."""
     start = inc["start"]
-    end = inc.get("end") or time.time()
+    end = inc.get("end") or time.time() + CLOCK_S
     anchor = end if inc.get("open") else min(end, inc.get("last_trigger", end) + 180)
     lo = min(start - 900, anchor - 86400)
     samples, events = SampleWindow(lo, end), load_events(lo, end)
     views = [("incident", "Incident", start - 900, end)] + [(k, k, anchor - sec, anchor) for k, sec in VIEW_SPANS]
-    title = "Memory incident %s%s" % (inc["id"], " (open)" if inc.get("open") else "")
-    return render_html(samples, events, title, inc, views)
+    title = title or "Memory incident %s%s" % (inc["id"], " (open)" if inc.get("open") else "")
+    return render_html(samples, events, title, inc, views, intro_html=intro_html)
 
 
 REPORT_JS = r"""
@@ -1909,7 +1946,7 @@ def parse_time(s):
 
 
 def window(args, default="2h"):
-    until = time.time()
+    until = time.time() + CLOCK_S  # another machine's now, by its clock (--machine)
     since = None
     i = 0
     while i < len(args):
@@ -1983,17 +2020,20 @@ def wrap(text, width=None, first="", indent=2):
                                     break_long_words=False, break_on_hyphens=False)) or first.rstrip()
 
 
-def cmd_status():
+def cmd_status(c=None):
+    """`oomph status` from the logger's current sample; `c`: another machine's, typed (--machine, R2)."""
     p = os.path.join(LOG_DIR, "current.json")
-    if not os.path.exists(p) and sys.platform.startswith("linux"):
+    if c is None and not os.path.exists(p) and sys.platform.startswith("linux"):
         return cmd_status_live()
-    if not os.path.exists(p):
+    if c is None and not os.path.exists(p):
         print("oomph: no data in %s — daemon not installed or not running" % LOG_DIR)
         return 1
-    c = load_log_json(p)
-    age = time.time() - c["t"]
+    c = load_log_json(p) if c is None else c
+    age = time.time() + CLOCK_S - c["t"]
     d = c.get("daemon", {})
-    alive = age < 3 * (d.get("interval") or 30) + 10
+    rem = REMOTE.get("remote") if REMOTE else None
+    # another machine's: fresh as its exit code says (Remote.fresh, its clock and interval checked)
+    alive = rem.fresh if rem is not None else age < 3 * (d.get("interval") or 30) + 10
     a = c.get("away") or {}
     w = max(80, term_width())
 
@@ -2002,24 +2042,28 @@ def cmd_status():
     if c.get("os") == "linux":  # the Linux logger (1.13.0): never root, the words of 03 §3.3
         return _status_linux(c, d, age, alive, line, w)
     line("daemon", "%s (pid %s, v%s, sample %ds ago, interval %ss%s)" % (
-        "running" if alive else "NOT RUNNING", d.get("pid"), d.get("version"), age, d.get("interval"),
+        "running" if alive else "not connected" if REMOTE and REMOTE.get("stale") else "NOT RUNNING",
+        d.get("pid"), d.get("version"), age, d.get("interval"),
         ", root" if d.get("root") else ", NOT root"))
     line("pressure", "%s   free %s%%" % (PRESSURE.get(c["pressure"], c["pressure"]), c.get("free_pct")))
     line("memory", "RAM %.0f GB · app %.1f · wired %.1f · compressed %.1f · cached %.1f · free %.1f GB" % (
         c["ram_gb"], c["app_gb"], c["wired_gb"], c["compressed_gb"], c["cached_gb"], c["free_gb"]))
-    line("swap", "%.1f / %.1f GB used (%d swapfiles)" % (c["swap_used_gb"], c["swap_total_gb"], c["swapfiles"]))
+    line("swap", "%.1f / %.1f GB used (%d swapfiles)" % (c.get("swap_used_gb") or 0, c.get("swap_total_gb") or 0,
+                                                       c.get("swapfiles") or 0))
     u = unowned_gb(c)
     if u is not None:
         line("unowned", "%.1f GB held outside any process%s" % (
             u, "  <- LEAK? only a restart frees it" if u >= unowned_limit_gb(c["ram_gb"]) else ""))
-    res = resource_lines(c, *volume_prefs(), io=True)
-    if not c.get("disks"):  # a logger before 1.9.1
+    # this user's disk choices are this machine's disks' (another's are shown as its logger has them)
+    res = resource_lines(c, *(volume_prefs() if REMOTE is None else (set(), set())), io=True)
+    if not c.get("disks") and _num(c.get("disk_free_gb")):  # a logger before 1.9.1
         line("disk", "%.0f GB free" % c["disk_free_gb"])
-    for label, text in res if logger_measures(c) else ():
-        line(label, text)
-    line("you", "idle %ss · display %s · %s · sleep held by %s" % (
-        a.get("idle_s"), "on" if a.get("display_on") else "off", "locked" if a.get("locked") else "unlocked",
-        ", ".join(a.get("sleep_preventers") or []) or "nobody"))
+    for label, text in res if logger_measures(c) else ():  # `check --measure` would measure this machine
+        line(label, "not in its latest sample" if REMOTE is not None and "--measure" in text else text)
+    you = ["idle %ss" % a["idle_s"]] if _n(a.get("idle_s")) is not None else []  # none on Linux (no display session)
+    you += ["display %s" % ("on" if a["display_on"] else "off")] if a.get("display_on") is not None else []
+    line("you", " · ".join(you + ["locked" if a.get("locked") else "unlocked", "sleep held by %s" % (
+        ", ".join(a.get("sleep_preventers") or []) or "nobody")]))
     if d.get("incident"):
         line("INCIDENT", "open: %s" % d["incident"])
     print("\ntop apps:")
@@ -2054,13 +2098,15 @@ def _status_linux(c, d, age, alive, line, w):
     ms = (d.get("machine") or {}).get("measures") or {}
     kills = {"journal": "kills from the journal", "count": "kills counted (no journal)"}.get(ms.get("kills"), "")
     line("logger", "%s (pid %s, v%s, sample %ds ago, every %ss%s%s)" % (
-        "running" if alive else "NOT RUNNING", d.get("pid"), d.get("version"), age, d.get("interval"),
+        "running" if alive else "not connected" if REMOTE and REMOTE.get("stale") else "NOT RUNNING", d.get("pid"),
+        d.get("version"), age, d.get("interval"),
         ", as %s" % term_text(d["user"])[:32] if isinstance(d.get("user"), str) else "", ", " + kills if kills else ""))
     for label, text in status_lines_linux(c):
         if label != "disk" or not c.get("disks"):
             line(label, text)
-    for label, text in resource_lines(c, *volume_prefs(), io=True):
-        line(label, text)
+    # this user's disk choices are this machine's disks' (another's are shown as its logger has them, R2)
+    for label, text in resource_lines(c, *(volume_prefs() if REMOTE is None else (set(), set())), io=True):
+        line(label, "not in its latest sample" if REMOTE is not None and "--measure" in text else text)
     if c.get("jetsam_kills") or c.get("cgroup_kills"):
         names = ", ".join(term_text(k.get("name"))[:30] for k in c.get("killed") or () if isinstance(k, dict))
         line("killed", "%d by the OOM killer or a killer of memory%s, %d at a cgroup's own limit (last sample)" % (
@@ -2226,7 +2272,7 @@ def cmd_report(args):
     if notable:
         print("\nevents:")
         for e in notable[-30:]:
-            print("  %s  %-16s %s" % (term_text(e["iso"][11:19]), term_text(e["kind"])[:40],
+            print("  %s  %-16s %s" % (term_text(str(e.get("iso") or "")[11:19]), term_text(str(e.get("kind")))[:40],
                                       cut_end(term_text(_event_detail(e)), w - 29)))
     return 0
 
@@ -2279,6 +2325,8 @@ def list_incidents(quiet=True):
                 continue
             try:
                 inc = load_log_json("incident.json", dir_fd=ifd)
+                if REMOTE is not None:  # another machine's may hold anything (R2)
+                    inc = _rmod().typed_incident(inc)
             except Exception:
                 continue
             finally:
@@ -2313,7 +2361,7 @@ def cmd_incidents(args=()):
     w = max(80, term_width())
     print(INCIDENT_ROW % ("incident", "took", "state", "kills", "headline"))
     for i in shown:
-        dur = ("%dm" % ((i.get("end", time.time()) - i["start"]) // 60))
+        dur = ("%dm" % ((i.get("end", time.time() + CLOCK_S) - i["start"]) // 60))
         kills = (i.get("summary") or {}).get("jetsam_kills")
         head = term_text((i.get("reasons") or [{}])[0].get("desc", ""))
         state = "quiet" if i.get("quiet") else "OPEN" if i.get("open") else ""
@@ -2649,7 +2697,7 @@ def _report_write(stem, text, out=None):
                 os.unlink(f)
     except OSError:
         pass
-    p = os.path.join(d, "%s-%s.html" % (stem, secrets.token_hex(4)))
+    p = os.path.join(d, "%s-%s.html" % (stem, _token_hex(4)))
     fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(text)
@@ -2741,6 +2789,8 @@ def _daemon_sample(max_age=45):
 
 
 def live_sample(with_procs=True):
+    if REMOTE is not None:  # never measure this machine and report it under another's name (01 §9)
+        raise Unsupported("%s is another machine: nothing of it is measured here" % REMOTE.get("label"))
     P = plat()
     s = {"t": round(time.time(), 1), "iso": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
          "source": "live", "os": P.OS}
@@ -2946,17 +2996,17 @@ def verdict(s):
     return v
 
 
-def verdict_line(v, width=None, lines=()):
+def verdict_line(v, width=None, lines=(), who="oomph: "):
     """The verdict as `oomph check` and the hook print it, wrapped at `width` (the terminal's);
-    `lines`: (label, text) of the other resources, which `check` prints before the advice."""
+    `lines`: (label, text) of the other resources, which `check` prints before the advice; `who` its first words."""
     w = width or term_width()
     lin = v.get("os") == "linux"
     if lin:  # 03 F5: "available", no disk (it does not enter the Linux verdict)
-        out = [wrap("oomph: %s — %.1fG available of %s · pressure %s · swap %.1f/%.1fG" % (
+        out = [wrap(who + "%s — %.1fG available of %s · pressure %s · swap %.1f/%.1fG" % (
             v["level"].upper(), v["free_gb"], ("%.0fG" if v["ram_gb"] >= 10 else "%.1fG") % v["ram_gb"], v["pressure"],
             v["swap_used_gb"] or 0, v["swap_total_gb"] or 0), w)]
     else:
-        out = [wrap("oomph: %s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
+        out = [wrap(who + "%s — %.1fG free of %.0fG · pressure %s · swap %.1f/%.1fG · disk %.0fG free" % (
             v["level"].upper(), v["free_gb"], v["ram_gb"], v["pressure"], v["swap_used_gb"] or 0,
             v["swap_total_gb"] or 0, v["disk_free_gb"]), w)]
     sc = v.get("scope") or {}
@@ -2970,7 +3020,7 @@ def verdict_line(v, width=None, lines=()):
     if c.get("others") or c.get("mine"):
         g = [o for o in c["others"] if o["state"] == "granted"]
         q = [o for o in c["others"] if o["state"] == "queued"]
-        out.append(wrap("others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG %s"
+        out.append(wrap(c.get("line") or "others hold %d (%.1fG not yet used), %d waiting · yours %d · %.1fG %s"
                         % (len(g), c["reserved_by_others_gb"], len(q), len(c["mine"]), c["available_to_me_gb"],
                            "left for you" if lin else "available to you"), w, "  reservations: "))
     led = c.get("ledger") or {}
@@ -3025,6 +3075,8 @@ def find_session(pid=None):
 def checked_verdict(mine=None, s=None):
     """verdict() plus what other sessions have reserved or are waiting for, and the disks this user
     pinned (`resources`: the sample's CPU, GPU, disk and I/O blocks, for the caller to show)."""
+    if REMOTE is not None:  # another machine's (--machine): from its mirror alone, never this one's processes
+        return _remote("remote_verdict")  # judged against its ledger, which would write there (R2)
     s = s or (_sample_override() if _sample_override else sample(with_procs=False))
     v = verdict(s)
     try:
@@ -4780,12 +4832,19 @@ def _per_user_ledger():
         (PATHS_HERE["ledger_mode"] == 0o700 and LEDGER_DIR == _path("ledger"))
 
 
+def _token_hex(n):
+    """secrets.token_hex, imported at the first temporary name: `oomph top` never needs it (secrets and its hmac,
+    hashlib and random are a megabyte of the dashboard's memory budget; 1.14.2)."""
+    import secrets
+    return secrets.token_hex(n)
+
+
 def _replace(dfd, name, data):
     """Write `name` in the ledger directory without opening any file that is already there: a
     temporary file with a random name, created exclusively (a link or file planted under that
     name makes it fail instead of being written through), made 0666 on its descriptor, then
     renamed over `name` — which replaces whatever had the name, link or not."""
-    tmp = "%s.%s.tmp" % (name, secrets.token_hex(8))
+    tmp = "%s.%s.tmp" % (name, _token_hex(8))
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
     try:
         try:
@@ -4835,6 +4894,29 @@ def _lock(dfd, wait):
         raise
 
 
+def _not_remote(what):
+    """Under --machine LEDGER_DIR is another machine's mirror: nothing decides about it or writes there (R2)."""
+    if REMOTE is not None:
+        raise LedgerError("%s: %s is another machine's, read only here" % (what, REMOTE.get("label") or "this"))
+
+
+def _remote(name):
+    """oomph_remote's `name` over the machine --machine reads (REMOTE["remote"]): answers from its mirror (R2)."""
+    r = REMOTE.get("remote") if REMOTE is not None else None
+    if r is None:
+        raise Unsupported("%s: no mirror of another machine read here" % name)
+    return getattr(_rmod(), name)(r)
+
+
+def _rmod():
+    """oomph_remote, for another machine's data (R2): its readers live there, outside what `oomph top` compiles."""
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    sys.modules.setdefault(CMD, sys.modules[__name__])  # one copy of this module: the globals it sets count
+    import oomph_remote
+    return oomph_remote
+
+
 class Ledger:
     """`with Ledger() as L:` — exclusive, read-modify-write access to the shared ledger."""
 
@@ -4844,6 +4926,7 @@ class Ledger:
     def __enter__(self):
         global _held
         _not_root("writing the ledger")
+        _not_remote("writing the ledger")
         self.dir = LEDGER_DIR
         self.dfd = _ledger_dir(create=True)
         try:
@@ -5879,6 +5962,7 @@ def _cmd_ledger_call(name):
 
 
 def _decide_inputs(s=None):
+    _not_remote("deciding about reservations")
     if _given:  # an unprivileged child: root measured them
         return s or _given[0], _given[1], time.time()
     s = s or (_sample_override() if _sample_override else _with_pools(live_sample(with_procs=False)))
@@ -6619,7 +6703,7 @@ def _span(rec, now):
 def reservation_history(since_s=24 * 3600, limit=50):
     """Finished reservations from the history log (last `since_s` seconds) plus the live ones,
     newest first: what each reserved, what it really used at its peak, and how it ended."""
-    now = time.time()
+    now = time.time() + CLOCK_S  # another machine's now, by its clock (--machine)
     last = {rec["key"]: rec for rec in merge_history(read_history()) if _rec_time(rec) >= now - since_s}
     for h in read_ledger()["history"]:  # finished before the log existed
         if h.get("ended", 0) >= now - since_s:
@@ -6768,7 +6852,7 @@ def ledger_snapshot(procs=None):
         L = read_ledger()
     except Exception:
         return []
-    now = time.time()
+    now = time.time() + CLOCK_S  # another machine's ledger is judged by its clock (--machine)
     out = []
     for r in L["leases"]:
         if procs is not None and _holder_gone(r, procs, now):
@@ -7292,7 +7376,7 @@ def _hook_load(path):
 def _hook_save(path, level):
     """The hook's state, by a new file renamed over the name: never written through a link
     someone planted there (/tmp is everybody's)."""
-    tmp = "%s.%s.tmp" % (path, secrets.token_hex(6))
+    tmp = "%s.%s.tmp" % (path, _token_hex(6))
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         with os.fdopen(fd, "w") as f:
@@ -8356,6 +8440,9 @@ def _main(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(usage(__doc__))
         return 0
+    m = argv[0] != "top" and any(a.startswith("--machine") for a in argv) and _rmod().machine_opt(argv)
+    if m:  # another machine's mirror, read only (roadmap 01 §9)
+        return _rmod().cmd_machine(*m)
     c, rest = argv[0], argv[1:]
     if c == "status":
         return cmd_status_json() if "--json" in rest else cmd_status()

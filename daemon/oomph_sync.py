@@ -58,6 +58,7 @@ HELLO_TIMEOUT_S = 20
 CALL_TIMEOUT_S = 60
 NOISE = (64 << 10, 200)        # what may precede the answer to hello: bytes, lines
 MAX_PAGES = 20000              # requests per run, whatever the other end says
+FULL_KEEP_S = 86400            # full samples fetched for a report are kept this long (roadmap 01 §4.8)
 
 
 class SyncError(Exception):
@@ -367,18 +368,18 @@ class Mirror:
         self.write(sub, name, net.dumps(obj) + b"\n")
 
     # -- days of samples
-    def day_name(self, day):
-        names = set(self.names("log"))
+    def day_name(self, day, sub="log"):
+        names = set(self.names(sub))
         for n in ("samples-%s.jsonl" % day, "samples-%s.jsonl.gz" % day):
             if n in names:
                 return n
         return None
 
-    def day_rows(self, day):
-        """{t: line} of a mirrored day."""
-        n = self.day_name(day)
+    def day_rows(self, day, sub="log"):
+        """{t: line} of a mirrored day (of `sub`: log, or full)."""
+        n = self.day_name(day, sub)
         out = {}
-        for line in (self.read("log", n) or b"").split(b"\n") if n else []:
+        for line in (self.read(sub, n) or b"").split(b"\n") if n else []:
             try:
                 t = json.loads(line).get("t")
             except (ValueError, AttributeError):
@@ -387,22 +388,46 @@ class Mirror:
                 out[t] = line
         return out
 
-    def merge_day(self, day, rows, gz=None):
+    def merge_day(self, day, rows, gz=None, sub="log"):
         """Merge rows {t: line} into a day file: deduplicated by t, in time order, written whole
         and renamed (a reader keyed on the file's identity reads it again from the start)."""
-        old = self.day_name(day)
-        have = self.day_rows(day)
+        old = self.day_name(day, sub)
+        have = self.day_rows(day, sub)
         if rows and all(have.get(t) == b for t, b in rows.items()) and gz is None:
             return
         have.update(rows)
         gz = old is not None and old.endswith(".gz") if gz is None else gz
         name = "samples-%s.jsonl%s" % (day, ".gz" if gz else "")
-        self.write("log", name, b"".join(have[t] + b"\n" for t in sorted(have)), gz=gz)
+        self.write(sub, name, b"".join(have[t] + b"\n" for t in sorted(have)), gz=gz)
         if old and old != name:
-            self.remove("log", old)
+            self.remove(sub, old)
 
-    def days(self):
-        return sorted({m.group(1) for m in map(net.DAY_FILE.fullmatch, self.names("log")) if m})
+    def days(self, sub="log"):
+        return sorted({m.group(1) for m in map(net.DAY_FILE.fullmatch, self.names(sub)) if m})
+
+    @contextlib.contextmanager
+    def full_locked(self):
+        """full.lock held: full/ and its cover.json changed by one process at a time (two reports
+        about one machine at once must not leave a cover that claims what the other removed)."""
+        fd = os.open(os.path.join(self.path, "full.lock"), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)  # held for local file work only, never across a network call
+            yield
+        finally:
+            os.close(fd)
+
+    def drop_full(self, older_than=None):
+        """full/ (the full samples fetched for reports, roadmap 01 §4.8) emptied: all of it, or only
+        once it was begun more than `older_than` seconds ago (it is kept a day)."""
+        if "full" not in self.names(""):
+            return
+        if older_than is not None:
+            made = (self.json("full", "cover.json") or {}).get("made")
+            if oomph._num(made, 0, 1e11) and 0 <= time.time() - made < older_than:
+                return
+        for n in self.names("full"):
+            if net.DAY_FILE.fullmatch(n) or n == "cover.json":
+                self.remove("full", n)
 
 
 def _not_root():
@@ -904,6 +929,8 @@ class Sync:
                 self.m.merge_day(day, {}, gz=True)
 
     def prune(self):
+        with self.m.full_locked():
+            self.m.drop_full(older_than=FULL_KEEP_S)
         cut = time.strftime("%Y-%m-%d", time.gmtime(self.machine["now"] + self.tz_s - RETENTION_S - 86400))
         for day in self.m.days():
             if day < cut:
@@ -914,7 +941,8 @@ class Sync:
             if net.INCIDENT_ID.fullmatch(iid):  # an id shape that is no date: an older client's, gone too
                 t = _incident_t(iid)
                 if t is None or t < self.machine["now"] - INCIDENT_KEEP_S:
-                    self.m.remove("log/incidents/" + iid, "incident.json")
+                    for n in ("incident.json",) + net.INCIDENT_FILES:  # and what a report fetched for it (R2)
+                        self.m.remove("log/incidents/" + iid, n)
                     try:
                         fd = self.m._dir("log/incidents")
                         try:
@@ -1381,7 +1409,7 @@ def tls_wrap(sock):
     """TLS on a connected socket, as a viewer: (the TLS socket, SHA-256 of the certificate it
     presented). A peer that accepts and closes before a byte (the gate there, or its caps) is
     turned_away."""
-    if net.ssl is None:
+    if net._ssl() is None:
         raise SyncError("incompatible", "this Python has no TLS")
     sock.settimeout(TLS_S)
     try:

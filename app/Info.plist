@@ -12,6 +12,13 @@
 	<key>LSMinimumSystemVersion</key><string>14.0</string>
 	<key>LSUIElement</key><true/>
 	<key>NSLocalNetworkUsageDescription</key><string>oomph connects to the machines you add to its dashboard, and to nothing else.</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key><string>local.oomph.link</string>
+			<key>CFBundleURLSchemes</key><array><string>oomph</string></array>
+		</dict>
+	</array>
 	<key>NSAppleEventsUsageDescription</key><string>oomph asks for an administrator password to install or remove its logging daemon.</string>
 </dict>
 </plist>

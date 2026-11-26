@@ -35,7 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PY = ("daemon/oomph.py", "daemon/oomphd.py", "daemon/oomph_darwin.py", "daemon/oomph_linux.py", "daemon/oomph_ioreport.py",
       "daemon/oomph_ai.py",
       "daemon/oomph_upgrade.py", "daemon/oomph_top.py", "daemon/oomph_view.py", "daemon/oomph_net.py", "daemon/oomph_sync.py",
-      "daemon/oomph_gpu.py")
+      "daemon/oomph_remote.py", "daemon/oomph_gpu.py")
 SWIFT = ("app/oomph.swift",)
 HELP_DOCS = ("daemon/oomph.py", "daemon/oomph_upgrade.py")  # module docstrings printed as help
 SUBCOMMANDS = {"status", "report", "incidents", "incident", "html", "upgrade", "ai-report", "ai-check",
@@ -146,6 +146,8 @@ def why_ok(s, i):
     m = re.match(r" ([a-z][a-z-]*)\b", after)
     if m and m.group(1) in SUBCOMMANDS:
         return "a command (oomph %s)" % m.group(1)
+    if re.match(r" --machine\b", after):
+        return "a command (oomph --machine NAME …)"
     if m and m.group(1) == "skill":
         return "the skill's name"
     if re.search(r"\bclaude mcp \w+( --scope \w+)? $", before) or re.search(r"\bMCP +$", before):

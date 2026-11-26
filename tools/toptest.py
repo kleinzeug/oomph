@@ -1579,10 +1579,19 @@ def test_pty_machines(base):
                         capture_output=True, text=True, timeout=30)
     r2 = subprocess.run(top("--once", "--machine", "nope", "--size", "80x24"), env=env, capture_output=True, text=True,
                         timeout=30)
-    check(r1.returncode == 0 and "build-box · No answer since 12:47" in r1.stdout and r2.returncode == 2 and
+    check(r1.returncode == 0 and "build-box · No answer since 12:47" in r1.stdout and r2.returncode == 64 and
           "no machine named nope" in r2.stderr,
-          "machines: --once --machine NAME prints that tab's frame; an unknown name is refused (exit 2) (%s %s)"
-          % (r1.returncode, r1.stderr[-200:] + r2.stderr[-200:]))
+          "machines: --once --machine NAME prints that tab's frame; an unknown name is refused (exit 64, as every "
+          "--machine command) (%s %s)" % (r1.returncode, r1.stderr[-200:] + r2.stderr[-200:]))
+    p3 = Pty(top("--machine", "nope"), env)
+    try:
+        rc3 = p3.wait(20)
+        t3 = p3.text()
+    finally:
+        p3.close()
+    check(rc3 == 64 and "no machine named nope" in t3 and "\x1b[?1049h" not in t3,
+          "machines: the dashboard with an unknown --machine exits 64 before it takes the screen (%s %s)"
+          % (rc3, t3[-200:]))
     p = Pty(top(), env, jobs=True)
     mini, build, gpu = "m-7f3a9c1e5b2d4a68", "m-1b2c3d4e5f607182", "m-90a1b2c3d4e5f607"
 
@@ -2455,6 +2464,35 @@ def test_children(base):
     check(not app.children and "report failed (oomph html: exit 3)" in str(failed) and
           "\x1b]52;c;" in app.pending, "o: a report writer that fails says so; y: a clipboard tool that hangs is "
                                        "stopped after 3 s and OSC 52 sent instead (%s)" % (failed,))
+    # another machine's tab (R2): its report is drawn here from its data, through `--machine`
+    rec = os.path.join(base, "argv.json")
+    app.mid, app.model, app.children = "m-0123456789abcdef", {"host": "studio"}, []
+    app.me = [PY, "-I", "-c", "import json, sys; json.dump(sys.argv[1:], open(%r, 'w'))" % rec]
+    if sys.platform == "darwin":
+        app.report({"id": "20261120-120000"})
+        end = time.time() + 8
+        while not os.path.exists(rec) and time.time() < end:
+            time.sleep(0.05)
+        got = json.load(open(rec)) if os.path.exists(rec) else None
+        check(got == ["--machine", "m-0123456789abcdef", "incident", "20261120-120000", "--html"],
+              "o on another machine's incident: %s --machine MID incident ID --html (%s)" % (oomph.CMD, got))
+    app.local_desktop = lambda: False
+    app.report(None)
+    check("--machine m-0123456789abcdef html" in str(app.ui.get("note")),
+          "o on another machine's tab without a desktop: says the --machine command (%s)" % (app.ui.get("note"),))
+    app.model = {"host": "studio", "tabs": [{"mid": "local"}, {"mid": "m-0123456789abcdef", "cli": "studio"}]}
+    app.report({"id": "20261120-120000"})
+    check("--machine studio incident 20261120-120000 --html" in str(app.ui.get("note")),
+          "... by the name `remote list` shows where the command finds it by that (%s)" % (app.ui.get("note"),))
+    import oomph_sync
+    M = T.Machines.__new__(T.Machines)
+    M.S = oomph_sync
+    a_, b_, c_, d_ = ({"mid": "m-%016x" % i, "transport": "ssh"} for i in range(1, 5))
+    a_["label"], b_["name"], c_["host"], d_["label"] = "studio", "box", "studio", "two words"
+    M.entries = [a_, b_, c_, d_]
+    check([M.cli_name(e) for e in M.entries] == ["studio", "box", c_["mid"], d_["mid"]],
+          "... a label the command would find another machine by, or not a plain word, is the mirror id")
+    app.leave_children()
 
 
 def budget_fixture(base):
