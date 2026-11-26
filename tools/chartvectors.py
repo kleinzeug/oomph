@@ -40,7 +40,7 @@ import oomph_top  # noqa: E402
 import oomph_view as V  # noqa: E402
 
 GROUPS = ("mapper", "invert", "color_index", "strip_top", "multires", "gaps", "calm_bands", "stack", "merge", "order",
-          "hover", "selection", "capsule", "tiles", "agent", "rows", "band_stack", "band_top")
+          "hover", "selection", "capsule", "tiles", "agent", "rows", "band_stack", "band_top", "net_scale", "net_row")
 
 
 def cases():
@@ -299,12 +299,80 @@ def resource_cases(v):
         v["capsule"].append({"sample": smp})
         waiting = [{}, {"memory": 1}, {"memory": 2, "cpu": 1}][i % 3]
         v["tiles"].append({"sample": smp, "waiting": waiting})
+    net_cases(v, base)
     band_cases(v)
     for a in ({"key": "3f9a0c21", "slot": 0}, {"key": "3f9a0c21", "slot": 5}, {"key": "3f9a0c21"},
               {"key": "3f9a0c21", "slot": 6}, {"key": "3f9a0c21", "slot": -1}, {"key": "3F9A0C21", "slot": 1},
               {"key": "3f9a0c2", "slot": 1}, {"key": 12345678, "slot": 1}, {"key": "3f9a0c21", "slot": True},
               {"key": "3f9a0c21", "slot": 2.0}, None, "3f9a0c21", {}):
         v["agent"].append({"agent": a})
+
+
+def net_cases(v, base):
+    """The network (NET N4, 1.15): its tile over samples that touch each rule (no figure, a figure, busy, metered, under
+    10 % left, offline, the stale hint each way, the system's "metered?", hostile figures and names); the chart's scale;
+    its row thinned, each bucket's mean and peak."""
+    nb = {"if": "en0", "vpn": False, "network": "rmac:00:00:5e:00:53:01", "src": "flows", "flows": 87,
+          "down_mbps": 212.4, "up_mbps": 8.14, "lan_mbps": 0.1}
+    names = [{"name": "Google Chrome", "down": 3.1, "up": 0.2, "n": 9}, {"name": "curl", "down": 205.0, "up": 0.3, "n": 1}]
+    down = {"network": "rmac:00:00:5e:00:53:01", "cap": 250.0, "margin": 62.5, "reserved": 150.0, "busy": 212.4, "others": 8}
+    up = {"network": "rmac:00:00:5e:00:53:01", "cap": 40.0, "margin": 12.0, "reserved": 0.0, "busy": 8.1, "others": 1}
+    quota = {"network": "rmac:00:00:5e:00:53:01", "cap": 20.0, "margin": 2.0, "used": 12.4, "from": 1795129200.0,
+             "to": 1797807600.0, "period": "month"}
+    pools = {"t": 1795180000.0, "net.down": down, "net.up": up}
+    flows3 = [[300.0, 7.0, True], [310.0, 8.0, True], [320.0, 9.0, True]]
+    keyed = [[300.0, 7.0, True, 5], [310.0, 8.0, True, 5], [320.0, 9.0, True, 5]]   # one network's mark (net_key)
+    for more, recent, hint, waiting in (
+            ({"net": nb, "net_names": names}, None, False, {}),
+            ({"net": nb, "net_names": names, "pools": pools}, None, False, {"net": 1}),
+            ({"net": nb, "pools": dict(pools, **{"net.down": dict(down, level="busy")})}, None, False, {}),
+            ({"net": nb, "pools": dict(pools, **{"net.down": dict(down, level="busy")})}, None, False, {"net": 2}),
+            ({"net": nb, "pools": dict(pools, **{"net.quota": quota})}, None, False, {}),
+            ({"net": nb, "pools": dict(pools, **{"net.quota": quota})}, None, False, {"net": 1}),
+            ({"net": nb, "pools": {"t": 1, "net.quota": dict(quota, used=18.2)}}, None, False, {}),
+            ({"net": nb, "pools": {"t": 1, "net.quota": dict(quota, used=25.0)}}, None, True, {}),
+            ({"net": {"if": None}}, None, False, {}), ({"net": {"src": "if"}}, None, False, {}),
+            ({"net": dict(nb, **{"if": 5})}, None, False, {}), ({"net": dict(nb, **{"if": ""})}, None, False, {}),
+            ({"net": dict(nb, down_mbps=None, up_mbps=None)}, None, False, {}),
+            ({"net": dict(nb, down_mbps=1e300, up_mbps="x")}, None, False, {}),
+            ({"net": dict(nb, down_mbps=0.04, up_mbps=9.96)}, None, False, {}),
+            ({"net": dict(nb, down_mbps=900.0)}, None, False, {}),
+            ({"net": nb, "pools": pools}, flows3, False, {}),
+            ({"net": nb, "pools": pools}, [[230.0, 7.0, True], [290.0, 8.0, False], [300.0, 9.0, True]], False, {}),
+            ({"net": nb, "pools": pools}, flows3[1:], False, {}),
+            ({"net": nb, "pools": pools}, [[10.0, 45.0, True], [12.0, 47.0, True], [9.0, 46.0, True]], False, {}),
+            ({"net": nb, "pools": pools}, [[None, 45.0, True], ["x", 47.0, True], [9.0, 46.0, True]], False, {}),
+            ({"net": nb}, None, True, {}), ({"net": nb, "pools": pools}, None, True, {}),
+            ({"net": nb, "pools": pools}, flows3, True, {}),
+            ({"net": nb, "pools": pools}, keyed, False, {}),
+            ({"net": nb, "pools": pools}, [[300.0, 7.0, True, 9]] + keyed[1:], False, {}),     # moved here: no hint
+            ({"net": nb, "pools": pools}, keyed[:2] + [[320.0, 9.0, True, 255]], False, {}),   # a bucket over a move
+            ({"net": nb, "pools": {"t": 1, "net.down": dict(down, cap=0.2), "net.up": dict(up, cap=True)}}, None, False, {}),
+            ({"net": nb, "pools": {"t": 1, "net.down": dict(down, cap=1e6, margin=-1), "net.up": "x"}}, None, False, {}),
+            ({"net": nb, "pools": {"t": 1, "net.down": dict(down, margin=900, reserved=1e9)}}, None, False, {}),
+            ({"net": nb, "net_names": [{"name": 5, "down": 9}, {"name": "", "down": 9}, {"name": "x", "down": -1, "up": 1e300},
+                                       {"name": "y", "down": 0.2}, "junk"]}, None, False, {}),
+            ({"net": nb, "net_names": [{"name": "a", "down": 1.0}, {"name": "b", "up": 1.0}]}, None, False, {}),
+            ({"net": nb, "net_names": "x"}, None, False, {}), ({"net": "x"}, None, False, {}), ({"net": [1]}, None, False, {})):
+        smp = dict(base, **more)
+        case = {"sample": smp, "waiting": waiting}
+        if recent is not None:
+            case["recent"] = recent
+        if hint:
+            case["hint"] = True
+        v["tiles"].append(case)
+    for top in (0, 0.4, 1, 1.01, 2, 2.5, 9.99, 10, 194, 200, 250, 501, 999.9, 1000, 1000.1, 100000, -3):
+        v["net_scale"].append({"top": top})
+    now = 1795180000.0
+    pts = []
+    for i in range(150):                    # 10 s apart over 20 min, then every 20 s a day back, whole Mbit/s
+        t = now - 1200 + 10 * i if i < 120 else now - 86400 + 20 * (i - 120)
+        pts.append({"t": t, "wired": 6.0, "app": 9.0 + (i * 7 % 5), "comp": 5.0, "swap": 0.0, "away": False, "kills": 0,
+                    "cpu": None, "nd": float((i * 37) % 260) if i % 41 else None, "nu": float((i * 13) % 45),
+                    "nf": i % 17 != 0, "nk": 1 + (i // 40) % 3})
+    pts.sort(key=lambda p: p["t"])
+    for cap in ([250.0, 40.0], [0, 0]):
+        v["net_row"].append({"now": now, "points": pts, "cap": cap})
 
 
 def band_cases(v):
@@ -357,6 +425,43 @@ def band_cases(v):
     for kind in ("memory", "cpu", "disk"):
         for tallest in (0, 3, 12, 255, 300, 1500, 70000):
             v["band_top"].append({"tallest": tallest, "kind": kind})
+    # the network (NET N4, 1.15): the fixture's grant and a request waiting for the line, through several selections;
+    # hand-made parts (unmanaged, upload only, a record, over, hostile); the band's scale against what the line shares
+    nrecs, nledger = topfixture.reservations(topfixture.LIVE_RES + topfixture.LIVE_NET, agents=True)
+    nrecs = nrecs[-6:]
+    for shown, focus, pool in ((["net"], "net", None), (["memory", "net"], "memory", "data"),
+                               (["memory", "cpu", "gpu", "disk", "net"], "net", "data"), (["cpu"], "cpu", None)):
+        v["rows"].append({"now": now, "records": nrecs, "ledger": nledger, "shown": shown, "focus": focus, "pool": pool,
+                          "day": 9})
+    odd_net = {"seq": 40, "v": 2, "history": [], "leases": [
+        lease("n1", t0, 0.01, granted=t0, v=2, res={"net": {"gb": 40, "unmanaged": True, "moved": 3.5, "network": "gw:x"}}),
+        lease("n2", t0 + 50, 0.01, granted=t0 + 50, expires=now + 900, v=2,
+              res={"net_up": {"ask": 20, "got": 20, "used": 26, "gb": 5, "moved": 6.1, "flag": "over", "over_t": now - 30}}),
+        lease("n3", t0 + 100, 2.0, granted=t0 + 100, v=2,
+              res={"ram": {"ask": 2, "got": 2}, "net": {"ask": 200, "min": 100, "got": 150.5, "used": 3, "gb": 12.25,
+                                                        "moved": 0.04, "eta": now + 7200, "flag": "idle", "low_t": now - 700},
+                   "net_up": {"ask": 10, "got": 10}},
+              segments=[{"t": t0 + 100, "gb": 2, "res": {"ram": 2, "net": 200}},
+                        {"t": t0 + 900, "gb": 2, "res": {"ram": 2, "net": 150.5}}]),
+        lease("n4", t0 + 150, 0.01, v=2, waiting_on=["net.quota"], res={"net": {"ask": 50, "min": 50, "gb": 8}}),
+        lease("n5", t0 + 200, 0.01, granted=t0 + 200, v=2,
+              res={"net": {"ask": "fast", "got": -5, "gb": 1e9, "moved": True, "eta": "soon", "unmanaged": 1}}),
+        lease("n6", t0 + 250, 0.01, v=2, res={"net": {"ask": 80}}),
+        # granted unmanaged with the rate it asked kept (the network changed to one without a figure): no rate held
+        lease("n7", t0 + 300, 0.01, granted=t0 + 300, v=2,
+              res={"net": {"ask": 200, "min": 100, "gb": 40, "unmanaged": True, "moved": 1.5}}),
+        lease("n8", t0 + 350, 0.01, v=2, res={"net_up": {"ask": 20, "min": 10}})]}   # waiting, upload only
+    odd_net_recs = [{"event": "end", "key": "z1@%d" % int(t0 - 2000), "id": "z1", "purpose": "p z1", "gb": 0.01,
+                     "requested": t0 - 2000, "granted": t0 - 2000, "ended": t0 - 50, "outcome": "released", "v": 2,
+                     "res": {"net": 150, "net_gb": 40, "net_up": 20, "net_up_gb": 0.41, "net_network": "rmac:x"}}]
+    for shown, focus, pool in ((["net"], "net", None), (["memory", "net"], "memory", None), (["memory"], "memory", None)):
+        v["rows"].append({"now": now, "records": odd_net_recs, "ledger": odd_net, "shown": shown, "focus": focus,
+                          "pool": pool, "day": 3})
+    v["band_stack"].append({"now": now, "records": nrecs, "ledger": nledger, "kind": "net", "pool": None})
+    v["band_stack"].append({"now": now, "records": odd_net_recs, "ledger": odd_net, "kind": "net", "pool": None})
+    for line in (None, 187.5, 28.0, 0.5):
+        for tallest in (0, 0.5, 94, 150, 187.5, 244, 70000):
+            v["band_top"].append({"tallest": tallest, "kind": "net", "line": line})
 
 
 def band_answers(v, out):
@@ -371,15 +476,17 @@ def band_answers(v, out):
                             "rest": [r["key"] for r in rest], "caption": V.caption_text(rows, c["shown"], c["day"]),
                             "other": V.other_text(rest), "other_short": V.other_text(rest, short=True)})
     for c in v["band_stack"]:
-        rs = [r for r in V.merge_reservations(c["records"], c["ledger"], c["now"]) if V.holds(r, c["kind"], c["pool"])]
+        rs = [r for r in V.merge_reservations(c["records"], c["ledger"], c["now"]) if V.holds(r, c["kind"], c["pool"], band=True)]
         out["band_stack"].append([{"key": b["res"]["key"], "lane": b["lane"], "steps": [list(st) for st in b["steps"]]}
                                   for b in V.stack_reservations(rs, c["now"], c["kind"])])
-    out["band_top"] = [V.band_top(c["tallest"], c["kind"]) for c in v["band_top"]]
+    out["band_top"] = [V.band_top(c["tallest"], c["kind"], c.get("line")) for c in v["band_top"]]
 
 
 def tile_answer(t):
-    """What the vectors keep of a tile: its words, its flag slot as drawn, its level, queue and top."""
-    return [t["reading"], V.flag_text(t), t["level"], t["queue"], t["top"], t["meter"]]
+    """What the vectors keep of a tile: its words, its flag slot as drawn, its level, queue and top; its short reading,
+    the network's note and the flag as a narrow tile draws it (NET 12.15)."""
+    return [t["reading"], V.flag_text(t), t["level"], t["queue"], t["top"], t["meter"], t.get("short"), t.get("note"),
+            V.flag_text(t, short=True)]
 
 
 def fixture_hover():
@@ -480,8 +587,19 @@ def python_answers(v):
     for c in v["capsule"]:
         out["capsule"].append(oomph.capsule(c["sample"]))
     for c in v["tiles"]:
-        t = V.tiles(c["sample"], oomph.capsule(c["sample"]), c["waiting"])
+        recent = [tuple(r) for r in c["recent"]] if "recent" in c else None
+        t = V.tiles(c["sample"], oomph.capsule(c["sample"]), c["waiting"], recent, c.get("hint", False))
         out["tiles"].append([tile_answer(t[r]) for r in V.RESOURCES])
+    out["net_scale"] = [V.net_scale(c["top"]) for c in v["net_scale"]]
+    for c in v["net_row"]:
+        row = V.multires(c["points"], c["now"])
+
+        def r3(x):
+            return None if x is None else round(x, 3)
+        most = max([max(p.get("ndp", p["nd"]) or 0.0, p.get("nup", p["nu"]) or 0.0) for p in row] + [0.0])
+        out["net_row"].append({"scale": V.net_scale(max(c["cap"] + [most])),
+                               "points": [[p["t"], r3(p["nd"]), r3(p["nu"]), r3(p.get("ndp", p["nd"])),
+                                           r3(p.get("nup", p["nu"])), p["nf"], p.get("nk", 0)] for p in row]})
     out["agent"] = [V.agent_index(c["agent"]) for c in v["agent"]]
     band_answers(v, out)
     return out

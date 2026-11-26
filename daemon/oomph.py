@@ -464,6 +464,11 @@ FULL_LISTS = {"top": (25, ("pid", "ppid", "name", "uid", "mb", "rss_mb", "g", "p
               "net_names": (5, ("name", "down", "up", "n")),
               "top_net": (8, ("pid", "name", "g", "s", "uid", "down", "up"))}
 FULL_DAEMON = ("pid", "version", "started", "interval", "incident", "root", "all_procs", "net")
+# The network's pools as another machine's Network tile reads them (NET N4: its figure, what agents hold of it, a
+# metered cap): never its key or label (a router's MAC places a household; a label is the owner's word for a place)
+FULL_POOLS = {"net.down": ("cap", "margin", "reserved", "busy", "others", "level"),
+              "net.up": ("cap", "margin", "reserved", "busy", "others", "level"),
+              "net.quota": ("cap", "margin", "used", "from", "to", "period")}
 FULL_MACHINE = ("id", "name", "os", "arch", "os_version", "kernel", "kind", "cpus", "virt")
 
 
@@ -563,6 +568,10 @@ def full_sample(s):
     for k, (cap, keys) in FULL_LISTS.items():
         if isinstance(s.get(k), list):
             out[k] = [_fields(x, keys, n, {"biggest": ("name", "pid", "mb")}) for x in s[k][:cap] if isinstance(x, dict)]
+    pools = s.get("pools") if isinstance(s.get("pools"), dict) else {}
+    net = {k: _fields(pools[k], keys, SLIM_STR) for k, keys in FULL_POOLS.items() if isinstance(pools.get(k), dict)}
+    if net:
+        out["pools"] = dict(net, **({"t": pools["t"]} if _num(pools.get("t"), 0, 1e11) else {}))
     d = s.get("daemon")
     if isinstance(d, dict):
         out["daemon"] = _fields(d, FULL_DAEMON, n)

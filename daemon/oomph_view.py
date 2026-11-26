@@ -19,6 +19,7 @@ import math
 import re
 import time
 import unicodedata
+import zlib
 
 BOLD, REV, UL, DIM = 1, 2, 4, 8
 KEEP = object()          # Frame.put(..., bg=KEEP): leave the cell's background as it is
@@ -51,7 +52,7 @@ THEMES = {
         "away": "#303031", "hatch": "#6C6C6C", "sel": "#5F5F5F", "selfg": "#FFFFFF", "trough": "#2B2B2B",
         "accent": "#0091FF", "onblock": "#111111", "rowsel": "#3A3A3A",
         "r0": "#06AEB9", "r1": "#BF5AF2", "r2": "#E8507A", "r3": "#7A78F5", "r4": "#D69E00", "r5": "#AC8E68",
-        "r6": "#4CB85C", "g0": "#7E9A2E", "g1": "#9C4B36", "g2": "#9580C4", "g3": "#B5CF70", "g4": "#D99A82",
+        "r6": "#4CB85C", "r7": "#2D6BAB", "g0": "#7E9A2E", "g1": "#9C4B36", "g2": "#9580C4", "g3": "#B5CF70", "g4": "#D99A82",
         "g5": "#CBB0F5", "gx": "#6E6E73",
     },
     "light": {
@@ -61,7 +62,7 @@ THEMES = {
         "away": "#EEEEEF", "hatch": "#A8A8A8", "sel": "#FFFFFF", "selfg": "#000000", "trough": "#E4E4E4",
         "accent": "#0088FF", "onblock": "#FFFFFF", "rowsel": "#DCDCDC",
         "r0": "#12A5B0", "r1": "#A550E0", "r2": "#F04F78", "r3": "#5E5CE6", "r4": "#C89400", "r5": "#A2845E",
-        "r6": "#34A853", "g0": "#0E9021", "g1": "#8A3D24", "g2": "#986AC5", "g3": "#7BC98A", "g4": "#D08A5E",
+        "r6": "#34A853", "r7": "#2B48A9", "g0": "#0E9021", "g1": "#8A3D24", "g2": "#986AC5", "g3": "#7BC98A", "g4": "#D08A5E",
         "g5": "#CDA0EE", "gx": "#A3A3A8",
     },
 }
@@ -70,14 +71,14 @@ ON_PAINT = ("ink", "selfg", "onblock")      # text colours that only make sense 
 ROLE_CODE = {None: ".", "fg": ".", "ink": "I", "dim": "d", "faint": "f", "line": "l", "grid": "g", "bar": "B",
              "trough": "T", "sel": "S", "selfg": "s", "wired": "w", "app": "a", "comp": "c", "swap": "p",
              "incident": "i", "ok": "o", "warn": "W", "warntx": "x", "crit": "C", "away": "y", "hatch": "h",
-             "accent": "A", "onblock": "k", "rowsel": "R", "r0": "0", "r1": "1", "r2": "2", "r3": "3", "r4": "4", "r5": "5", "r6": "6",
+             "accent": "A", "onblock": "k", "rowsel": "R", "r0": "0", "r1": "1", "r2": "2", "r3": "3", "r4": "4", "r5": "5", "r6": "6", "r7": "7",
              "g0": "u", "g1": "v", "g2": "z", "g3": "q", "g4": "j", "g5": "e", "gx": "n"}
 MOD_CODE = {"": ".", "off": "o"}
 # 16 colours: the index (0-7 normal, 8-15 bright) or None for the terminal's default. Whatever is a
 # block or a background is one of the eight base colours, so it works as SGR 40-47 too.
 ROLE16 = {"fg": None, "ink": None, "selfg": None, "dim": 8, "faint": 8, "line": 8, "grid": 8, "hatch": 8,
           "wired": 7, "app": 4, "comp": 3, "swap": 1, "incident": 9, "crit": 1, "ok": 2, "warn": 3, "warntx": 3,
-          "accent": 12, "onblock": 0, "r0": 6, "r1": 5, "r2": 1, "r3": 4, "r4": 3, "r5": 7, "r6": 2,
+          "accent": 12, "onblock": 0, "r0": 6, "r1": 5, "r2": 1, "r3": 4, "r4": 3, "r5": 7, "r6": 2, "r7": 4,
           "g0": None, "g1": None, "g2": None, "g3": None, "g4": None, "g5": None, "gx": 8}
 # With 16 colours an agent is the text colour, neighbouring slots alternating full and medium (dim) shade:
 # every free index is a state's or a resource's hue (02 §3.8.3, §16 "04 Terminal dashboard").
@@ -170,13 +171,13 @@ GLYPHS = {
                     hatch="╱", grid="┊", inc="┃", awaydot="·", sw="■", swq="□", dot="●", odot="○",
                     sel="›", ell="…", inf="∞", mid="·", shades="█▓▒░", queued="▒", ram=("_", "╌", "‾"),
                     meter="█", meterbg="░", arrows="←→", updown="↑↓", legend_sw="■", legend_away="░",
-                    more_l="‹", more_r="›", up="▴", down="▾", dash="–", arrow="→", miss=":", close="×", queue="◻",
+                    more_l="‹", more_r="›", up="▴", down="▾", dash="–", arrow="→", miss=":", close="×", queue="◻", upper="▀",
                     marks=dict(ok="●", warn="◐", crit="◆", silent="◦", busy="↻", off="⊘", att="▲")),
     "ascii": dict(h="-", v="|", tl="+", tr="+", bl="+", br="+", lt="+", rt="+", eighths=" ...::###",
                   hatch="/", grid=" ", inc="!", awaydot=".", sw="#", swq="o", dot="*", odot="o",
                   sel=">", ell="~", inf="all", mid="-", shades="#=:*", queued="?", ram=("_", "-", "-"),
                   meter="#", meterbg=".", arrows="<>", updown="^v", legend_sw="#", legend_away=".",
-                  more_l="<", more_r=">", up="^", down="v", dash="-", arrow="->", miss=":", close="x", queue="#",
+                  more_l="<", more_r=">", up="^", down="v", dash="-", arrow="->", miss=":", close="x", queue="#", upper="=",
                   marks=dict(ok="*", warn="w", crit="C", silent="-", busy="~", off="o", att="^")),
 }
 GLYPHS["cells"] = dict(GLYPHS["unicode"])      # --glyphs cells: the rasteriser differs, the characters do not
@@ -525,7 +526,16 @@ def worst(bucket):
     return out
 
 
-RES_POINT = ("cpu", "sys", "gpu", "gmem", "disk")      # a point's other resources (oomph_top.res_point)
+RES_POINT = ("cpu", "sys", "gpu", "gmem", "disk", "nd", "nu")   # a point's other resources (oomph_top.res_point)
+NET_MIXED = 255         # a bucket's `nk` when its samples were on more than one network (net_key)
+
+
+def net_key(nb):
+    """A sample's network as a 7-bit mark, 1-127 (0: none named; Point.netKey): enough to tell that the last samples
+    were not all on one network (the stale hint, 12.8), at the cost of a byte per sample. Two networks share a mark
+    one time in 127: the hint may then read a sample of the network before, as it did without the mark."""
+    k = nb.get("network") if isinstance(nb, dict) else None
+    return 1 + zlib.crc32(k[:200].encode("utf-8", "replace")) % 127 if isinstance(k, str) and k else 0
 
 
 def res_agg(rows):
@@ -535,7 +545,13 @@ def res_agg(rows):
         return sum(xs) / len(xs) if xs else None
     full = next((r["gfull"] for r in reversed(rows) if r.get("gpu") is not None), False)
     gm, dk = [r["gmem"] for r in rows if r.get("gmem") is not None], [r["disk"] for r in rows if r.get("disk") is not None]
-    return {"cpu": mean([r["cpu"] for r in rows if r.get("cpu") is not None]),
+    nd, nu = [r for r in rows if r.get("nd") is not None], [r for r in rows if r.get("nu") is not None]
+    return {"nd": mean([r["nd"] for r in nd]), "nu": mean([r["nu"] for r in nu]),     # the network: mean and peak
+            "ndp": max([r.get("ndp", r["nd"]) for r in nd]) if nd else None,
+            "nup": max([r.get("nup", r["nu"]) for r in nu]) if nu else None,
+            "nf": all(r.get("nf") is True for r in rows),
+            "nk": rows[0].get("nk", 0) if all(r.get("nk", 0) == rows[0].get("nk", 0) for r in rows) else NET_MIXED,
+            "cpu": mean([r["cpu"] for r in rows if r.get("cpu") is not None]),
             "sys": mean([r["sys"] for r in rows if r.get("sys") is not None]),
             "gpu": mean([r["gpu"] for r in rows if r.get("gpu") is not None and r["gfull"] == full]), "gfull": full,
             "gmem": max(gm) if gm else None, "disk": min(dk) if dk else None}
@@ -679,8 +695,10 @@ def _norm(o):
 
 
 # ------------------------------------------------------------------ a reservation's resources (B3, T4b: 02 §3.4.5, §3.4.6)
-BAND_RES = ("memory", "cpu", "disk")     # what agents reserve, in tile order (the GPU from 1.14)
-RES_WORD = {"memory": "memory", "cpu": "CPU", "gpu": "GPU", "disk": "disk"}   # in "waiting for CPU", "over on disk"
+BAND_RES = ("memory", "cpu", "disk", "net")     # what agents reserve, in tile order (the GPU from 1.14; the network 1.15)
+RES_WORD = {"memory": "memory", "cpu": "CPU", "gpu": "GPU", "disk": "disk",   # in "waiting for CPU", "over on disk"
+            "net": "the network"}
+NET_PARTS = ("net", "net_up")            # a lease's rate parts on the line, download and upload (NET 12.9)
 
 
 def _amt(x):
@@ -699,7 +717,10 @@ def res_vector(o):
     `pool_name` of the disk; `cpu_used`, `disk_w` (written since the grant); `flags` {resource: [over|idle, since]}
     (a grant's advice, 02 §6.3); `waiting` the resources a queued lease waits for, in tile order; `rsegs` the
     amounts over time {cpu: [(t, cores)], disk: [...]} from its segments. Only what differs from "memory alone,
-    nothing else" is returned (readers use .get with those defaults): 14 days of records stay small in oomph top."""
+    nothing else" is returned (readers use .get with those defaults): 14 days of records stay small in oomph top.
+    The network (NET 12.9, 1.15): `net`, `net_up` the rate in Mbit/s (granted, else asked; none for an unmanaged part),
+    `net_gb`, `net_up_gb` the volume, `net_moved`, `net_up_moved` what it moved, `net_used` the download it uses,
+    `net_eta` when it should be done, `net_unmanaged` (a network without a figure); its advice is flags["net"]."""
     res = o.get("res") if isinstance(o.get("res"), dict) else None
     out = {}
     if res is None:
@@ -737,8 +758,28 @@ def res_vector(o):
         x = _amt(d.get("w"))
         if x is not None:
             out["disk_w"] = x
+        for k in NET_PARTS:
+            part = res.get(k) if isinstance(res.get(k), dict) else None
+            if part is None:
+                continue
+            unmanaged = part.get("unmanaged") is True     # no rate: its `ask` is kept for a later network's figure
+            rate = _amt(part.get("got")) if granted and not unmanaged else None
+            rate = rate if rate is not None or unmanaged else _amt(part.get("ask"))
+            for f, x in ((k, rate), (k + "_gb", _amt(part.get("gb"))), (k + "_moved", _amt(part.get("moved")))):
+                if x is not None:
+                    out[f] = x
+            if k == "net" and _amt(part.get("used")) is not None:
+                out["net_used"] = _amt(part.get("used"))
+            if _since(part.get("eta")) is not None and "net_eta" not in out:
+                out["net_eta"] = _since(part["eta"])
+            if unmanaged:
+                out["net_unmanaged"] = True
+            if granted and part.get("flag") in ("over", "idle") and "net" not in flags:
+                flags["net"] = [part["flag"], _since(part.get("over_t" if part["flag"] == "over" else "low_t"))]
+        if flags:
+            out["flags"] = flags
     else:
-        for k in ("cpu", "disk"):
+        for k in ("cpu", "disk", "net", "net_up", "net_gb", "net_up_gb"):
             x = _amt(res.get(k))
             if x is not None:
                 out[k] = x
@@ -746,7 +787,7 @@ def res_vector(o):
         if x is not None:
             out["pool"] = x
     rsegs = {}
-    for k in ("cpu", "disk"):
+    for k in ("cpu", "disk", "net"):
         if k not in out:
             continue
         seq = [(sg["t"], _amt(sg["res"].get(k))) for sg in (o.get("segments") or [])
@@ -758,7 +799,9 @@ def res_vector(o):
         out["rsegs"] = rsegs
     if not granted and o.get("ended") is None:
         got = {waited_resource(i) for i in _waiting_ids(o, (["ram"] if mem else []) +
-                                                        [k for k in ("cpu", "disk") if k in out])}
+                                                        [k for k in ("cpu", "disk") if k in out] +
+                                                        (["net.down"] if holds(out, "net", band=True) else
+                                                         ["net.up"] if holds(out, "net") else []))}
         w = [k for k in RESOURCES if k in got]
         if w:
             out["waiting"] = w
@@ -774,19 +817,22 @@ def _waiting_ids(o, default):
 
 def waited_resource(pool_id):
     """The resource of a pool id in `waiting_on` (02 §6.4): ram and mem, and "critical" (memory is critical), are
-    memory; cpu; gpu and vram; net.down and net.up the network (NET 1.15: no tile of its own yet, so no band says it);
+    memory; cpu; gpu and vram; net.down, net.up and net.quota the network (NET 1.15, the Network tile's band);
     disk:<id> is disk."""
     i = str(pool_id)
     return "memory" if i in ("ram", "mem", "critical") else "cpu" if i == "cpu" else \
         "gpu" if i.startswith(("gpu", "vram")) else "net" if i.startswith("net.") else "disk"
 
 
-def holds(r, k, pool=None):
-    """Does reservation r hold resource k (for disk: on `pool`, when one is named)?"""
+def holds(r, k, pool=None, band=False):
+    """Does reservation r hold resource k (for disk: on `pool`, when one is named)? `band`: in k's band, which for the
+    network is the download's (NET 12.15): a lease with an upload part alone has a row but no block there."""
     if k == "memory":
         return r.get("mem", True)
     if k == "disk":
         return r.get("disk") is not None and (pool is None or r.get("pool") == pool)
+    if k == "net":              # a rate or a volume, either way (an unmanaged part has a volume only)
+        return any(r.get(f) is not None for f in (("net", "net_gb") if band else ("net", "net_up", "net_gb", "net_up_gb")))
     return r.get(k) is not None
 
 
@@ -802,7 +848,7 @@ def bands(res, shown, focus, pool=None):
     the 14 days kept (a slow fact: the strip changes height when a resource is reserved for the first time, and 14
     days after the last), the focus's first (the tall one), then the others in tile order. The Disk band is the
     tile's pool's."""
-    have = [k for k in BAND_RES if k in shown and any(holds(r, k, pool) for r in res)]
+    have = [k for k in BAND_RES if k in shown and any(holds(r, k, pool, band=True) for r in res)]
     return ([focus] if focus in have else []) + [k for k in have if k != focus]
 
 
@@ -1118,10 +1164,13 @@ def capsule(model):
 # Behind the resources switch (`"resourcesUI": true` in top.json; the app's resourcesUI): model["rv"] is then
 # {"sel": [...], "focus": ...}, the resources shown and the one with the plot. The selection, the tiles' words and
 # the agent's colour are the app's too, held together by tools/vectors/chart.json.
-RESOURCES = ("memory", "cpu", "gpu", "disk")            # tile order
-RES_WORDS = {"memory": "Memory", "cpu": "CPU", "gpu": "GPU", "disk": "Disk"}
-RES_KEYS = {"m": "memory", "c": "cpu", "g": "gpu", "d": "disk"}
-RES_HUE = {"memory": "app", "cpu": "r0", "gpu": "r1", "disk": "r2"}   # blue, teal, violet, magenta (02 §3.4)
+RESOURCES = ("memory", "cpu", "gpu", "disk", "net")     # tile order; the network from 1.15 (NET D-N17)
+RES_WORDS = {"memory": "Memory", "cpu": "CPU", "gpu": "GPU", "disk": "Disk", "net": "Network"}
+# w for the network: n is the next machine (04 §3.10; NET 12.16)
+RES_KEYS = {"m": "memory", "c": "cpu", "g": "gpu", "d": "disk", "w": "net"}
+# blue, teal, violet, magenta (02 §3.4); the network navy (light) and steel blue (dark), chosen with the dataviz
+# validator in N4 against the four, the six agent colours, red, amber and the memory chart's grey and orange
+RES_HUE = {"memory": "app", "cpu": "r0", "gpu": "r1", "disk": "r2", "net": "r7"}
 AGENT_ROLES = ("g0", "g1", "g2", "g3", "g4", "g5")
 AGENT_SLOTS = len(AGENT_ROLES)
 
@@ -1143,9 +1192,11 @@ def agent_role(agent):
 
 def available(s):
     """The resources a sample's machine shows tiles for: every one, except a GPU the logger looked for
-    and found none of (`gpu: []`, a VM). A logger older than 1.9.1 has no `cpu` or `gpu`: those tiles
-    stay and say "–" (02 §3.7.10)."""
-    return [r for r in RESOURCES if not (r == "gpu" and isinstance(s, dict) and s.get("gpu") == [])]
+    and found none of (`gpu: []`, a VM), and the network where the logger reports none (before 1.15: four tiles,
+    NET 12.15). A logger older than 1.9.1 has no `cpu` or `gpu`: those tiles stay and say "–" (02 §3.7.10)."""
+    net = isinstance(s, dict) and isinstance(s.get("net"), dict)
+    return [r for r in RESOURCES if not (r == "gpu" and isinstance(s, dict) and s.get("gpu") == []) and
+            (r != "net" or net)]
 
 
 def selection_shown(sel, focus, avail):
@@ -1258,20 +1309,23 @@ def waiting_on(leases):
     return out
 
 
-def tiles(s, cap, waiting=None):
+def tiles(s, cap, waiting=None, recent=None, hint=False):
     """Tile.facts (02 §3.4.1): what each tile says for a sample. `cap`: oomph.capsule of it (the
-    memory and disk levels); `waiting`: waiting_on of the ledger. {resource: {"reading", "flag" (the one
-    flag slot: "critical", "tight", "low", "+1 critical", "+1 low", "throttled", "busy" or None),
-    "level" (2 red, 1 amber, 0 quiet), "queue" (requests waiting for it), "top" (the biggest consumer),
-    "meter" (0…1, a tank for Disk), "full" (the GPU figure is at full speed)}}. The word "waiting" is
-    the renderer's: a queue shows as "n waiting" alone, or after a flag of rank 1 to 6."""
+    memory and disk levels); `waiting`: waiting_on of the ledger; `recent` and `hint`: the network's (net_tile).
+    {resource: {"reading", "short" (where five tiles leave too little room, NET 12.15), "flag" (the one
+    flag slot: "critical", "tight", "low", "+1 critical", "+1 low", "throttled", "busy", the network's metered
+    words, or None), "level" (2 red, 1 amber, 0 quiet), "queue" (requests waiting for it), "top" (the biggest
+    consumer), "note" (the network's line 4 in place of it), "meter" (0…1, a tank for Disk), "full" (the GPU figure
+    is at full speed)}}. The word "waiting" is the renderer's: a queue shows as "n waiting" alone, or after a flag
+    of rank 1 to 6."""
     waiting = waiting or {}
     out = {}
     ram = _n(s.get("ram_gb")) or 0.0
     used = sum(_n(s.get(k)) or 0.0 for k in ("app_gb", "wired_gb", "compressed_gb"))
     lv = cap.get("memory", 0)
     groups = s.get("groups") if isinstance(s.get("groups"), list) else []
-    out["memory"] = {"reading": "%.1f / %.0f GB" % (used, ram), "meter": used / ram if ram else 0.0,
+    out["memory"] = {"reading": "%.1f / %.0f GB" % (used, ram), "short": "%.1f/%.0f GB" % (used, ram),
+                     "meter": used / ram if ram else 0.0,
                      "flag": "critical" if lv == 2 else "tight" if lv == 1 else None, "level": lv,
                      "top": next((str(x.get("name")) for x in groups if isinstance(x, dict) and x.get("name")), None)}
     c = s.get("cpu") if isinstance(s.get("cpu"), dict) else {}
@@ -1279,6 +1333,7 @@ def tiles(s, cap, waiting=None):
     flag = "throttled" if (_n(c.get("therm")) or 0) >= 2 else "busy" if n and busy is not None and busy >= 0.9 * n \
         else None
     out["cpu"] = {"reading": "%.1f / %d cores" % (busy, n) if n and busy is not None else "–",
+                  "short": "%.1f/%d" % (busy, n) if n and busy is not None else None,
                   "meter": busy / n if n and busy is not None else 0.0, "flag": flag, "level": 0,
                   "top": _busiest(s.get("top_cpu"), "cpu")}
     gl = s.get("gpu") if isinstance(s.get("gpu"), list) else []
@@ -1287,7 +1342,8 @@ def tiles(s, cap, waiting=None):
     reading = "–"
     if util is not None:
         reading = "%.0f %%%s" % (util, "" if full else " busy") + (" · %.1f GB" % mem if mem is not None else "")
-    out["gpu"] = {"reading": reading, "meter": util / 100.0 if util is not None else 0.0, "full": full,
+    out["gpu"] = {"reading": reading, "short": "%.0f %%" % util if util is not None else None,
+                  "meter": util / 100.0 if util is not None else 0.0, "full": full,
                   "flag": "busy" if full and util is not None and util >= 90 else None, "level": 0,
                   "top": _busiest(s.get("top_gpu"), "gpu")}
     d, pools = tile_pool(s)
@@ -1305,8 +1361,10 @@ def tiles(s, cap, waiting=None):
     if d is not None and len(pools) > 1:
         reading += " · " + mid_fit(d.get("name") or d.get("id") or "?", 12)
     total = _n(d.get("total_gb")) if d else None
-    out["disk"] = {"reading": reading, "meter": min(1.0, free / total) if free is not None and total else 0.0,
+    out["disk"] = {"reading": reading, "short": "–" if free is None else "%.0f GB" % free,
+                   "meter": min(1.0, free / total) if free is not None and total else 0.0,
                    "flag": flag, "level": dl, "top": _busiest(s.get("top_io"), "w")}
+    out["net"] = net_tile(s, recent, hint)
     for r in RESOURCES:
         out[r]["queue"] = int(waiting.get(r, 0))
     return out
@@ -1314,14 +1372,135 @@ def tiles(s, cap, waiting=None):
 
 def flag_text(t, g=None, short=False):
     """The flag slot's words (02 §3.4.1): a flag of rank 1 to 6 keeps the queue after it ("critical ◻2");
-    a queue alone is "n waiting" (it outranks busy), or `short` "◻n" where a tile is narrow."""
+    a queue alone is "n waiting" (it outranks busy), or `short` "◻n" where a tile is narrow, where the network's
+    metered words also drop "metered · " (NET 12.15)."""
     box = (g or GLYPHS["unicode"]).get("queue", "◻")
     f, q = t.get("flag"), t.get("queue") or 0
+    if short and f and f.startswith("metered · "):
+        f = f[len("metered · "):]
     if q and (f is None or f == "busy"):
         return "%s%d" % (box, q) if short else "%d waiting" % q
     if f and q:
         return "%s %s%d" % (f, box, q)
     return f or ""
+
+
+# ------------------------------------------------------------------ the network (NET N4, 1.15: 12.15, 12.16)
+NET_STALE_X = 1.1       # this machine alone above its line's figure by this much: the figure is stale (oomph_traffic)
+NET_QUOTA_X = 0.1       # under this share of a metered cap left the network warns (oomph_traffic.QUOTA_X)
+
+
+def mbps(x):
+    """Mbit/s as the tiles say them (oomph_traffic._mb): 212, 41, 8.1, 0.4."""
+    return "%.0f" % x if x >= 10 else "%.1f" % x
+
+
+def _fig(x, lo, hi):
+    x = _n(x)
+    return x if x is not None and lo <= x <= hi else None
+
+
+def net_rate(nb, k):
+    """A net block's rate `k` (down_mbps, up_mbps): a finite Mbit/s 0 … 1e6 or None (another logger's figures)."""
+    return _fig(nb.get(k), 0, 1e6) if isinstance(nb, dict) else None
+
+
+def net_pools(s):
+    """(down, up, quota): what a sample's pools say about its network (current.json; a mirror's from 1.15), each a
+    dict of checked numbers or None. down and up exist while the line has a figure (D-N3): {"cap", "margin",
+    "reserved", "busy" (its level is busy)}; quota while the network is metered: {"cap", "used"} in GB."""
+    pools = s.get("pools") if isinstance(s, dict) and isinstance(s.get("pools"), dict) else {}
+    out = []
+    for k in ("net.down", "net.up"):
+        P = pools.get(k) if isinstance(pools.get(k), dict) else {}
+        cap = _fig(P.get("cap"), 0.5, 1e5)
+        out.append(None if cap is None else {"cap": cap, "margin": _fig(P.get("margin"), 0, cap) or 0.0,
+                                             "reserved": _fig(P.get("reserved"), 0, 1e6) or 0.0,
+                                             "busy": P.get("level") == "busy"})
+    q = pools.get("net.quota") if isinstance(pools.get("net.quota"), dict) else {}
+    cap, used = _fig(q.get("cap"), 0.1, 1e5), _fig(q.get("used"), 0, 1e6)
+    out.append({"cap": cap, "used": used} if cap is not None and used is not None else None)
+    return tuple(out)
+
+
+def net_stale(down, up, recent):
+    """The stale-figure hint (D-N8, 12.8; oomph_traffic.stale): (direction, seen, figure) when the mean of the last three
+    samples is above NET_STALE_X × the line's figure, else None. `recent`: [(down_mbps, up_mbps, flows, key)] oldest
+    first; all three must have told the LAN from the internet (`flows`): a total alone holds the LAN's traffic too; and
+    all three must be on one network (`key`, net_key; a bucket over a change is NET_MIXED): after a move from a fast
+    line to a slower one the fast line's samples say nothing about the slow one's figure (oomph_traffic.stale). A
+    remote tab's samples name no network (its key stays home, oomph.FULL_BLOCKS): there every mark is 0, and for three
+    samples after a move the hint may still read the network before."""
+    rows = list(recent or [])[-3:]
+    if len(rows) < 3 or not all(r[2] is True for r in rows):
+        return None
+    keys = {r[3] if len(r) > 3 else 0 for r in rows}
+    if len(keys) > 1 or NET_MIXED in keys:
+        return None
+    for i, P in ((0, down), (1, up)):
+        v = [r[i] for r in rows if _fig(r[i], 0, 1e6) is not None]
+        if P and len(v) == 3 and sum(v) / 3 > NET_STALE_X * P["cap"]:
+            return ("down" if i == 0 else "up", round(sum(v) / 3, 1), P["cap"])
+    return None
+
+
+def net_names_top(rows):
+    """The busiest name of net_names (by down + up; a tie keeps the earlier row)."""
+    best, most = None, -1.0
+    for x in rows if isinstance(rows, list) else []:
+        if not isinstance(x, dict) or not isinstance(x.get("name"), str) or not x["name"]:
+            continue
+        v = (_fig(x.get("down"), 0, 1e6) or 0.0) + (_fig(x.get("up"), 0, 1e6) or 0.0)
+        if v > most:
+            best, most = x["name"][:200], v
+    return best
+
+
+def _q(x):
+    return "%.0f" % x if x >= 10 else "%.1f" % x
+
+
+def net_tile(s, recent=None, hint=False):
+    """The Network tile (12.15): ↓ and ↑ now in Mbit/s (the unit is the tooltip's and the legend's), "offline" without
+    an interface; the meter the download against the line's figure (no fill without one); the flag slot "metered ·
+    12/20 GB", "1.8 GB left" (amber, under 10 % of the cap), "busy" (the logger's level); line 4 (`note`, in place of
+    the busiest name): the stale hint "seen 940 > 500", "metered?" (`hint`: the app's, from the system), or "line not
+    tested". `recent`: as net_stale."""
+    nb = s.get("net") if isinstance(s, dict) and isinstance(s.get("net"), dict) else None
+    down, up, quota = net_pools(s)
+    d, u = net_rate(nb, "down_mbps"), net_rate(nb, "up_mbps")
+    if nb is None:
+        reading = "–"
+    elif not (isinstance(nb.get("if"), str) and nb["if"]):
+        reading = "offline"
+    else:
+        reading = "↓%s ↑%s" % ("–" if d is None else mbps(d), "–" if u is None else mbps(u))
+    t = {"reading": reading, "short": reading, "meter": min(1.0, d / down["cap"]) if down and d is not None else 0.0,
+         "flag": None, "level": 0, "top": net_names_top(s.get("net_names")) if isinstance(s, dict) else None,
+         "note": None, "full": False}
+    if quota:
+        left = quota["cap"] - quota["used"]
+        if left < NET_QUOTA_X * quota["cap"]:
+            t["flag"], t["level"] = "%.1f GB left" % max(0.0, left), 1
+        else:
+            t["flag"] = "metered · %s/%s GB" % (_q(quota["used"]), _q(quota["cap"]))
+    elif (down and down["busy"]) or (up and up["busy"]):
+        t["flag"] = "busy"
+    st = net_stale(down, up, recent)
+    if st:
+        t["note"] = "seen %s%s > %s" % ("" if st[0] == "down" else "↑", mbps(st[1]), mbps(st[2]))
+    elif hint and not quota:
+        t["note"] = "metered?"
+    elif nb is not None and isinstance(nb.get("if"), str) and nb["if"] and not down and not up:
+        t["note"] = "line not tested"
+    return t
+
+
+def net_scale(top):
+    """The network chart's scale (12.15): 0 to the first 1, 2, 5 × 10ⁿ Mbit/s at or above `top`, at least 1."""
+    top = max(_n(top) or 0.0, 1.0)
+    e = 10 ** math.floor(math.log10(top))
+    return next(m * e for m in (1, 2, 5, 10) if m * e >= top - 1e-9)
 
 
 def capsule_rv(model):
@@ -1541,7 +1720,7 @@ def machine_sentence(t, v, model):
 
 MIDDOT = "·"
 ASCII_WORDS = {ord("·"): "-", ord("…"): "~", ord("“"): '"', ord("”"): '"', ord("›"): ">", ord("‹"): "<", ord("–"): "-",
-               ord("×"): "x"}
+               ord("×"): "x", ord("↓"): "v", ord("↑"): "^", ord("▲"): "^", ord("≈"): "~"}   # ↓ ↑: the network (12.16)
 
 
 def asc(text, fr):
@@ -2028,6 +2207,10 @@ def legend_values(model, focus):
     if focus == "gpu":
         util = "%.0f" % rf["util"] if isinstance(rf.get("util"), (int, float)) else "–"
         return [("Full speed" if rf.get("full") else "Busy", util + " %", "r1"), ("Memory", _g1(rf.get("gmem")) + " GB", "wired")]
+    if focus == "net":
+        d, u = rf.get("net_d"), rf.get("net_u")
+        return [("Down", "–" if d is None else mbps(d), "r7"), ("Up", "–" if u is None else mbps(u), "r7"),
+                ("Mbit/s", None, None)]
     free = "%.0f" % rf["free"] if isinstance(rf.get("free"), (int, float)) else "–"
     return [("Free on " + mid_fit(rf.get("pool") or "disk", 12), free, "r2"), ("GB", None, None)]
 
@@ -2073,7 +2256,7 @@ def draw_tiles(fr, x, y, w, model, g, caps, rows=2):
         fr.put(x, y, "No readings yet", "dim")
         return
     shown, focus = rv_shown(model)
-    avail = model.get("avail") or list(RESOURCES)
+    avail = model.get("avail") or available(None)
     mono = caps.color == "none"
     n = len(avail)
     cw = (w - (n - 1)) // n
@@ -2086,12 +2269,15 @@ def draw_tiles(fr, x, y, w, model, g, caps, rows=2):
         else:
             nx = fr.put(tx, y, name, "fg" if r in shown else "dim", None, BOLD if r in shown else 0)
         reading = asc(t["reading"], fr)
+        if tw(reading) > cw and t.get("short"):     # five tiles leave 14 cells at 80 columns (NET 12.16)
+            reading = asc(t["short"], fr)
         if rows == 1:
             fr.put(nx + 1, y, fit(reading, max(cw - (nx - tx) - 1, 0), g), "fg")
             continue
         room = cw - (nx - tx) - 1
         if flag and tw(flag) > room:
             flag = flag_text(t, g, short=True)
+        flag = asc(flag, fr) if flag else flag
         if flag and room >= 2:
             fr.rput(tx + cw - 1, y, fit(flag, room, g), role, None, BOLD if t["level"] else 0)
         fr.put(tx, y + 1, fit(reading, cw, g), "fg", None, BOLD)
@@ -2101,7 +2287,7 @@ def _rvalue(p, r):
     """A point's value of resource r, or None (the small rows and the resource plot)."""
     if r == "memory":
         return p["wired"] + p["app"] + p["comp"]
-    return p.get({"cpu": "cpu", "gpu": "gpu", "disk": "disk"}[r])
+    return p.get({"cpu": "cpu", "gpu": "gpu", "disk": "disk", "net": "nd"}[r])
 
 
 def r_scale(model, r, pts=None):
@@ -2112,6 +2298,9 @@ def r_scale(model, r, pts=None):
         return float((model.get("rfacts") or {}).get("n") or 1)
     if r == "gpu":
         return 100.0
+    if r == "net":              # the download, to the line's figure or the busiest moment (net_scale)
+        return net_scale(max([(model.get("rfacts") or {}).get("net_cap_d") or 0.0] +
+                             [p.get("ndp") or p.get("nd") or 0.0 for p in (pts or model["pts"])]))
     vals = [v for v in (_rvalue(p, r) for p in (pts or model["pts"])) if v is not None]
     top = max(vals + [1.0])
     e = 10 ** math.floor(math.log10(top))
@@ -2178,6 +2367,85 @@ def draw_rplot(fr, x0, y0, W, H, model, ui, caps, g, r):
     return gridcols
 
 
+def net_gutter(v, arrow):
+    """A network scale in the plot's gutter, at most five cells: "↓500", "↓1000", "↓20k", "↓1G" (a million Mbit/s,
+    the most net_rate lets through)."""
+    return arrow + ("%d" % v if v < 10000 else "%dk" % (v // 1000) if v < 1e6 else "1G")
+
+
+def draw_netplot(fr, x0, y0, W, H, model, ui, caps, g):
+    """The Network plot (NET 12.16): the upper half the download, eighth blocks rising from the middle; the lower half
+    the upload, falling from it (half a row at a time: a terminal has no upper eighths); one Mbit/s scale for both
+    (net_scale over the line's figures and the busiest moment in view); each figure a dashed row on its side; the
+    grid, no-data hatching, incident rules and the time axis of the other plots. Returns the grid columns."""
+    mono = caps.color == "none"
+    whole = mono or caps.glyphs in ("cells", "ascii")
+    now = model["now"]
+    first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
+    f, finv = mapper(now, first, SPANS[ui["span"]])
+    cols = columns(model["pts"], model["gaps"], f, finv, W, now, first, model.get("missing") or ())
+    rf = model.get("rfacts") or {}
+    capd, capu = rf.get("net_cap_d"), rf.get("net_cap_u")
+    peak = max([max(p.get("ndp") or p.get("nd") or 0.0, p.get("nup") or p.get("nu") or 0.0)
+                for st, p in cols if st == "data"] + [0.0])
+    top = net_scale(max(capd or 0.0, capu or 0.0, peak))
+    Hd = (H + 1) // 2
+    Hu = H - Hd
+    labels = axis_labels(f, W, now, log=SPANS[ui["span"]] is None)
+    gridcols = set(min(W - 1, int(round(x * W))) for x, text in labels if text != "now")
+    inc = set(min(W - 1, int(f(i["start"]) * W)) for i in model["incidents"] if 0 <= f(i["start"]) <= 1)
+    hue = None if mono else RES_HUE["net"]
+    shaded = mono or caps.glyphs == "ascii"
+
+    def cap_row(cap, h):        # the row (from the axis out) the figure falls in, or -1
+        return min(h - 1, int(cap / top * h - 1e-9)) if cap and h else -1
+    rd, ru = cap_row(capd, Hd), cap_row(capu, Hu)
+
+    def cells(v, h, falling):   # h cells from the axis out: (character, fg)
+        if v is None or h == 0:
+            return [(" ", None)] * h
+        L = min(8 * h, int(round(v / top * 8 * h)))
+        if v > 0 and L == 0 and v >= top / 200.0:
+            L = 1                   # something moved: a sliver
+        out = []
+        for r in range(h):
+            n = max(0, min(8, L - 8 * r))
+            if whole:
+                full = n >= 4 or (r == 0 and n > 0)
+                out.append(((g["shades"][0] if shaded else FULL) if full else " ", hue if full else None))
+            elif falling:
+                ch = FULL if n >= 6 else g["upper"] if n >= 2 or (r == 0 and n > 0) else " "
+                out.append((ch, hue if ch != " " else None))
+            else:
+                out.append((g["eighths"][n], hue if n else None))
+        return out
+    for c in range(W):
+        st, p = cols[c]
+        down = cells(p.get("nd") if st == "data" else None, Hd, False)
+        up = cells(p.get("nu") if st == "data" else None, Hu, True)
+        for r, (ch, fg), y, capr in [(r, down[r], y0 + Hd - 1 - r, rd) for r in range(Hd)] + \
+                                    [(r, up[r], y0 + Hd + r, ru) for r in range(Hu)]:
+            if ch == " ":
+                if st == "gap":
+                    ch, fg = g["hatch"], "hatch"
+                elif st == "miss":
+                    ch, fg = g["miss"], "faint"
+                elif c in gridcols:
+                    ch, fg = g["grid"], "grid"
+                elif r == capr and c % 2 == 0:
+                    ch, fg = g["ram"][1], "dim"
+            if c in inc:
+                ch, fg = g["inc"], "incident"
+            fr.put(x0 + c, y, ch, fg, None)
+    fr.rput(x0 + W + 4, y0, asc(net_gutter(top, "↓"), fr), "dim")
+    if Hu:
+        fr.rput(x0 + W + 4, y0 + H - 1, asc(net_gutter(top, "↑"), fr), "dim")
+    for x, text in labels:
+        cx = min(max(int(round(x * W)) - len(text) // 2, 0), W - len(text))
+        fr.put(x0 + cx, y0 + H, text, "dim")
+    return gridcols
+
+
 def draw_spark(fr, x0, y, W, model, ui, caps, g, r):
     """One row of eighth blocks for another shown resource, on the plot's time axis, its name in the
     gutter (02 §3.7.12: from 30 rows of height)."""
@@ -2197,7 +2465,7 @@ def draw_spark(fr, x0, y, W, model, ui, caps, g, r):
         else:
             n = max(1 if v > 0 else 0, min(8, int(round(v / top * 8))))
             fr.put(x0 + c, y, eighths[n] if caps.glyphs != "ascii" else eighths[n], None if caps.color == "none" else RES_HUE[r])
-    fr.rput(x0 + W + 4, y, {"memory": "Mem", "cpu": "CPU", "gpu": "GPU", "disk": "Disk"}[r], "dim")
+    fr.rput(x0 + W + 4, y, {"memory": "Mem", "cpu": "CPU", "gpu": "GPU", "disk": "Disk", "net": "Net"}[r], "dim")
 
 
 def _runs(flags):
@@ -2377,13 +2645,16 @@ def band_blocks(model, k):
         c["res"], c["bands"] = res, {}
     key = (k, pool, int(model["now"] // 10))
     if key not in c["bands"]:
-        c["bands"][key] = stack_reservations([r for r in res if holds(r, k, pool)], model["now"], k)
+        c["bands"][key] = stack_reservations([r for r in res if holds(r, k, pool, band=True)], model["now"], k)
     return c["bands"][key]
 
 
-def band_top(tallest, k):
+def band_top(tallest, k, line=None):
     """Reservation.bandTop: a band's scale, the first round figure at or above its tallest stack in view; GB of
-    disk go on in steps up to 64 TB."""
+    disk go on in steps up to 64 TB; the network's what the line has to share (`line`: its figure less the margin,
+    NET 12.15: a block's height is got / (cap − margin)), else net_scale's steps."""
+    if k == "net":
+        return line if _n(line) is not None and line >= max(tallest, 1.0) else net_scale(tallest)
     if k == "disk" and tallest > 256:
         return next((t for t in (384, 512, 768, 1024, 1536, 2048, 3072, 4096, 8192, 16384, 32768, 65536)
                      if t >= tallest), tallest)
@@ -2391,8 +2662,8 @@ def band_top(tallest, k):
 
 
 def band_scale(top, k):
-    """The scale of a tall band in the gutter: "24G", "12c", "320G"."""
-    return ("%dc" if k == "cpu" else "%dG") % top
+    """The scale of a tall band in the gutter: "24G", "12c", "320G", "145M" (Mbit/s)."""
+    return ("%dc" if k == "cpu" else "%dM" if k == "net" else "%dG") % top
 
 
 def strip_plan(model, S):
@@ -2417,7 +2688,7 @@ def draw_bands(fr, x0, y0, W, H, model, ui, caps, g, gridcols=()):
     plan_ = strip_plan(model, H)
     for k, dy, h in plan_:
         draw_strip(fr, x0, y0 + dy, W, h, model, ui, caps, g, gridcols, kind=k, label=None if dy == 0 else
-                   {"memory": "Mem", "cpu": "CPU", "disk": "Disk"}[k])
+                   {"memory": "Mem", "cpu": "CPU", "disk": "Disk", "net": "Net"}[k])
 
 
 def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=(), kind=None, label=None):
@@ -2429,7 +2700,8 @@ def draw_strip(fr, x0, y0, W, H, model, ui, caps, g, gridcols=(), kind=None, lab
     first = model.get("first") or (model["pts"][0]["t"] if model["pts"] else now)
     f, finv = mapper(now, first, SPANS[ui["span"]])
     blocks = [b for b in (model["blocks"] if kind is None else band_blocks(model, kind)) if f(b["end"]) >= 0]
-    top = band_top(max([st[3] for b in blocks for st in b["steps"] if f(st[1]) >= 0] or [0]), kind or "memory")
+    top = band_top(max([st[3] for b in blocks for st in b["steps"] if f(st[1]) >= 0] or [0]), kind or "memory",
+                   (model.get("rfacts") or {}).get("net_line"))
     L = 8 * H
     for c in range(W):
         ta, tb = finv(c / float(W)), finv((c + 1) / float(W))
@@ -2539,15 +2811,42 @@ def amounts_text(r, pool=None):
     if r.get("disk") is not None:
         other = pool is not None and r.get("pool") not in (None, pool)
         parts.append(amt_g(r["disk"]) + " " + (mid_fit(r.get("pool_name") or r.get("pool"), 12) if other else "disk"))
-    return " · ".join(parts) or "–"
+    return " · ".join(parts + net_amounts(r)) or "–"
+
+
+def net_num(x):
+    """A rate or a volume of the network as people write it: 150, 18.5, 0.5."""
+    return "%d" % round(x) if abs(x - round(x)) < 0.05 else "%.1f" % x
+
+
+def net_amounts(r):
+    """The network's amounts of a row (NET 12.15): "150 Mbit/s · 40 GB" down, "↑20 Mbit/s · ↑5 GB" up; a volume
+    without a rate (unmanaged, a network without a figure) "↓40 GB"."""
+    out = []
+    if r.get("net") is not None:
+        out.append(net_num(r["net"]) + " Mbit/s")
+    if r.get("net_gb") is not None:
+        out.append(("" if r.get("net") is not None else "↓") + net_num(r["net_gb"]) + " GB")
+    if r.get("net_up") is not None:
+        out.append("↑" + net_num(r["net_up"]) + " Mbit/s")
+    if r.get("net_up_gb") is not None:
+        out.append("↑" + net_num(r["net_up_gb"]) + " GB")
+    return out
 
 
 def _and(words):
     return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
 
 
-def use_figure(r, k):
-    """One use figure of a grant (02 §3.4.6): "using 2.1G", "using 5.2 cores", "wrote 11G of 20G"; None unmeasured."""
+def use_figure(r, k, now=None):
+    """One use figure of a grant (02 §3.4.6): "using 2.1G", "using 5.2 cores", "wrote 11G of 20G"; the network's
+    "12.3 of 40 GB · ≈ 24 min left" (12.15) or "using 143 Mbit/s"; None unmeasured."""
+    if k == "net":
+        if r.get("net_gb") is not None and r.get("net_moved") is not None:
+            eta = r.get("net_eta")
+            return "%.1f of %s GB" % (r["net_moved"], net_num(r["net_gb"])) + \
+                (" · ≈ %s left" % duration(eta - now) if eta is not None and now is not None and eta > now else "")
+        return "using %s Mbit/s" % mbps(r["net_used"]) if r.get("net_used") is not None else None
     if k == "memory":
         return "using %.1fG" % _gb(r.get("used"))
     if k == "cpu" and r.get("cpu_used") is not None:
@@ -2575,7 +2874,7 @@ def status_text(r, shown, focus, now):
         idle = f == "idle"
     held = [k for k in RESOURCES if holds(r, k)]
     if not idle and held:
-        fig = use_figure(r, focus if focus in held else next((k for k in held if k in shown), held[0]))
+        fig = use_figure(r, focus if focus in held else next((k for k in held if k in shown), held[0]), now)
         if fig:
             parts.append(fig)
     if r.get("expires") is not None:
@@ -2599,6 +2898,10 @@ def _totals(rs, which):
         out.append(cores_words(sum(r["cpu"] for r in g if r.get("cpu") is not None)))
     if "disk" in which and any(r.get("disk") is not None for r in g):
         out.append("%s GB disk" % amt_g(sum(r["disk"] for r in g if r.get("disk") is not None))[:-1])
+    if "net" in which and any(r.get("net") is not None for r in g):
+        out.append("%s Mbit/s" % net_num(sum(r["net"] for r in g if r.get("net") is not None)))
+    if "net" in which and any(r.get("net_up") is not None for r in g):
+        out.append("↑%s Mbit/s" % net_num(sum(r["net_up"] for r in g if r.get("net_up") is not None)))
     return out
 
 
@@ -2690,10 +2993,17 @@ def panel_area(P):
     return P["box_y"], P["bottom_y"] - P["box_y"] - 1, "chart"
 
 
+def net_focus(model):
+    """Does the network have the plot (the resources on)? Then `a` lists the busiest names on the line."""
+    return bool(model.get("rv")) and rv_shown(model)[1] == "net"
+
+
 def panel_items(model, panel):
     """The rows of a panel: apps (name, GB, processes), sessions (pid, cwd, GB, processes, biggest),
     events (t, text, alarming)."""
     cur = model.get("cur") or {}
+    if panel == "a" and net_focus(model):     # the network has the plot: its busiest names (NET 12.16)
+        return cur.get("net_names") or []
     if panel == "a":
         return cur.get("groups") or []
     if panel == "s":
@@ -2984,7 +3294,10 @@ def draw_panel(fr, model, ui, P, caps, g):
             if items else None
     else:
         right = "newest first"
-    title = "Top groups" if panel == "a" and cur.get("linux") is not None else PANELS[panel]
+    if panel == "a" and net_focus(model):
+        right = "Mbit/s " + asc("↓ ↑", fr)
+    title = "Top network" if panel == "a" and net_focus(model) else \
+        "Top groups" if panel == "a" and cur.get("linux") is not None else PANELS[panel]
     section(fr, 0, y0, lw, g, title, right, top=(where == "chart"))
     x, w = 1, lw - 2
     focus = ui.get("focus") == "panel"
@@ -3007,7 +3320,24 @@ def draw_panel(fr, model, ui, P, caps, g):
     body, ncol, per = panel_page(P, model, panel)
     shown = items[off:off + per]
     cw = w // ncol
-    if panel == "a":
+    if panel == "a" and net_focus(model):     # name, processes, a bar of down + up, "↓212 ↑8.1"
+        top = max((x[1] for x in items), default=0) or 1
+        for i, (name, tot, n, d, u) in enumerate(shown):
+            cx, ry = x + (i // body) * cw, y0 + 1 + i % body
+            fr.put(cx + 2, ry, "%2d" % (off + i + 1), "faint", KEEP)
+            nw = max(8, min(18, cw - 28))
+            fr.put(cx + 5, ry, fit(name, nw, g), "fg", KEEP)
+            fr.put(cx + 5 + nw + 1, ry, "%3d" % n, "faint", KEEP)
+            rate = asc("↓%s ↑%s" % (mbps(d), mbps(u)), fr)
+            bw = cw - (5 + nw + 5) - tw(rate) - 3
+            if bw >= 3:
+                bar = min(bw, max(1, int(round(tot / top * bw))))
+                fr.put(cx + 5 + nw + 5, ry, (g["eighths"][5] if g["eighths"][8] == FULL else g["meter"]) * bar,
+                       RES_HUE["net"] if caps.color != "none" else None, KEEP)
+            fr.rput(cx + cw - 2, ry, rate, "fg", KEEP)
+            if off + i == sel and focus:
+                highlight(fr, cx, ry, cw, caps, g, True)
+    elif panel == "a":
         top = max((gb for _, gb, _ in items), default=0) or 1
         for i, (name, gb, n) in enumerate(shown):
             cx, ry = x + (i // body) * cw, y0 + 1 + i % body
@@ -3637,8 +3967,9 @@ def help_pages(g, model):
              ("o", "open the report"), ("y", "copy its path"),
              ("Terminal", None), ("ctrl-o", "mouse on %s off" % g["mid"]), ("ctrl-l", "redraw"), ("ctrl-z", "suspend")]
     if model.get("rv"):         # the four resources (02 §3.7.12): the tiles' keys open the left column
-        left = [("Resources", None), ("m c g d", "one alone, with the plot"), ("M C G D", "add %s remove" % g["mid"]),
-                ("", "")] + left
+        w = "net" in (model.get("avail") or ())     # w: the network (NET 12.16; n is the next machine)
+        left = [("Resources", None), ("m c g d" + (" w" if w else ""), "one alone, with the plot"),
+                ("M C G D" + (" W" if w else ""), "add %s remove" % g["mid"]), ("", "")] + left
     away = model.get("os", "").startswith("macOS") or "os" not in model
     see = [("Chart", None),
            ([(g["sw"], role) for _, role in series_words(model.get("cur"))], "%s, stacked; %s is the RAM" % (
@@ -3838,6 +4169,11 @@ def res_card_lines(r, now, fr, g):
         out.append((1, _kv("Disk", "%s on %s" % (amt_g(r["disk"]), mid_fit(asc(r.get("pool_name") or r.get("pool") or "?", fr),
                                                                           24)) +
                            (" %s wrote %s" % (g["mid"], amt_g(r["disk_w"])) if live and r.get("disk_w") is not None else ""))))
+    if holds(r, "net"):         # NET 12.15: its rate and volume, what it moved and when it should be done
+        fig = use_figure(r, "net", now) if live else None
+        out.append((1, _kv("Network", asc(" · ".join(net_amounts(r)), fr) +
+                           (" %s %s" % (g["mid"], asc(fig, fr)) if fig else "") +
+                           (" %s unmanaged: the line has no figure" % g["mid"] if r.get("net_unmanaged") else ""))))
     for k, (f, since) in sorted((r.get("flags") or {}).items()) if live else ():
         out.append((0, _kv("Advice", advice_words(k, f, since, now), "warntx")))
     return out
@@ -3907,6 +4243,18 @@ def card_procs(fr, caps, g, model, kind, item):
     """enter on an app or a Claude session: its processes among the 25 biggest of the sample, and
     for a session what it holds reserved."""
     procs = (model.get("cur") or {}).get("top") or []
+    if kind == "a" and len(item) == 5:          # a name on the internet line: its processes there (NET 12.16)
+        name, _, n, d, u = item
+        mine = [p for p in (model.get("cur") or {}).get("top_net") or [] if p[1] == name or p[4] == name]
+        lines = [(9, None), (0, _text(asc("↓%s ↑%s Mbit/s in %d process%s" % (mbps(d), mbps(u), n, "" if n == 1 else "es"),
+                                          fr), "fg", BOLD)), (8, None)]
+        for p in mine[:8]:
+            lines.append((1, _kv(asc("↓%s ↑%s" % (mbps(p[2]), mbps(p[3])), fr), "%s  (pid %d)" % (p[1], p[0]), "fg", 14)))
+        if not mine:
+            lines.append((1, _text("none among the busiest processes of the last sample", "dim")))
+        lines.append((9, None))
+        return dialog(fr, g, caps, fit(name, 60, g), 76, len(lines) + 3, lines,
+                      [("esc", "close"), (g["updown"], "previous %s next" % g["mid"])])
     if kind == "a":
         name, gb, n = item
         title, mine = name, [p for p in procs if p[3] == name]
@@ -4495,7 +4843,7 @@ def layout(model, W, H):
 def rv_shown(model):
     """(the resources shown, the focus) with the resources on, over the tiles this machine has."""
     rv = model.get("rv") or {}
-    return selection_shown(rv.get("sel") or ["memory"], rv.get("focus"), model.get("avail") or list(RESOURCES))
+    return selection_shown(rv.get("sel") or ["memory"], rv.get("focus"), model.get("avail") or available(None))
 
 
 def rv_others(model):
@@ -4593,6 +4941,8 @@ def draw_body(fr, P, model, ui, caps, g):
         draw_chart_head(fr, 0, P["box_y"], lw, ui, caps, g, RES_WORDS[focus], miss, values=legend_values(model, focus))
         if focus == "memory":
             gridcols = draw_plot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
+        elif focus == "net":
+            gridcols = draw_netplot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g)
         else:
             gridcols = draw_rplot(fr, x0, P["plot_y"], pw, ph, model, ui, caps, g, focus)
         for i, r in enumerate(rv_others(model)[:P["spark_n"]]):

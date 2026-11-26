@@ -3860,6 +3860,18 @@ for line in r.stdout.splitlines():
 check(r.returncode == 0, "metered networks (tools/quotatest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
                                                                        + r.stderr[-400:]))
 
+# how the network is shown (NET step N4, 1.15): the fifth tile in every state, a lease's network parts as rows and a
+# band, the scales, the mirror's current sample, oomph top's frames of the network fixture in every glyph set
+r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "netviewtest.py")], capture_output=True,
+                   text=True, timeout=300, env={k: v for k, v in os.environ.items()
+                                                if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR", "OOMPH_STATE_DIR",
+                                                             "OOMPH_NET_RESERVATIONS", "TMPDIR", "XDG_RUNTIME_DIR")})
+for line in r.stdout.splitlines():
+    if line.startswith(("ok    ", "FAIL  ")):
+        print("  network view: " + line)
+check(r.returncode == 0, "the network shown (tools/netviewtest.py): %s" % ((r.stdout.strip().splitlines() or [""])[-1]
+                                                                          + r.stderr[-400:]))
+
 # the protocol core: serve --stdio, remote sync --once, coverage, the mirror (tools/nettest.py, a file of its own)
 r = subprocess.run([sys.executable, "-I", "-B", os.path.join(ROOT, "tools", "nettest.py")], capture_output=True, text=True,
                    timeout=600, env={k: v for k, v in os.environ.items() if k not in ("OOMPH_DIR", "OOMPH_LEDGER_DIR")})

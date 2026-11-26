@@ -82,7 +82,10 @@ ALL = ([("fx", ai, []) for ai in (
     + [(fx, ai, []) for fx in ("fx8", "fx16") for ai in ("", "log")]
     # the four resources' fixture with their switch off (1.11.0): the samples' cpu, gpu and disks blocks and the
     # agents of the reservations change nothing in the popup until the switch is on
-    + [("fxr", ai, []) for ai in ("", "log", "hover:300", "rhover:420:30", "top", "tour:1", "tour:2")])
+    + [("fxr", ai, []) for ai in ("", "log", "hover:300", "rhover:420:30", "top", "tour:1", "tour:2")]
+    # the network's fixture with the switch off (NET N4, 1.15): the samples' net blocks, the pools of the line and the
+    # network's leases change nothing in the popup until the switch is on
+    + [("fxn", ai, []) for ai in ("", "log", "hover:300", "rhover:420:30", "top", "6h")])
 # The four resources forced on (--resources, and two in the check): (name, fixture, --ai state, extra arguments).
 RON = ["-resourcesUI", "YES"]
 
@@ -92,6 +95,7 @@ def sel(focus, *shown):
 
 
 ALL4 = ("memory", "cpu", "gpu", "disk")
+ALL5 = ALL4 + ("net",)
 RESOURCES = ([("memory-alone", "fxr", "", sel("memory")), ("memory-cpu", "fxr", "", sel("memory", "memory", "cpu")),
               ("memory-gpu-disk", "fxr", "", sel("memory", "memory", "gpu", "disk")),
               ("all-memory", "fxr", "", sel("memory", *ALL4)), ("all-gpu", "fxr", "", sel("gpu", *ALL4)),
@@ -117,7 +121,25 @@ RESOURCES = ([("memory-alone", "fxr", "", sel("memory")), ("memory-cpu", "fxr", 
                 ("old-logger", "fx", "", sel("memory", *ALL4)), ("machines-and-resources", "fxr", "", sel("memory", "memory", "cpu")
                                                                 + ["-machinesUI", "YES"]),
                 # NET N3 (1.15): a metered network with less than 10 % of its cap left, the capsule amber
-                ("network-metered-low", "fxr-metered", "", sel("memory", *ALL4))])
+                ("network-metered-low", "fxr-metered", "", sel("memory", *ALL4))]
+             # NET N4 (1.15): the fifth tile and the network's chart, band, list and hover (topfixture's "network": a
+             # 250/40 line, a model pulled at 150 Mbit/s granted, an image pull waiting for the line)
+             + [("net-five-tiles-idle", "fxn-idle", "", sel("memory")),
+                ("net-saturated-grant", "fxn", "", sel("net", "memory", "net")),
+                ("net-alone", "fxn", "", sel("net")), ("net-alone-6h", "fxn", "6h", sel("net")),
+                ("net-all-five", "fxn", "", sel("net", *ALL5)), ("net-memory-focus-all-five", "fxn", "", sel("memory", *ALL5)),
+                ("net-hover", "fxn", "hover:400:6h", sel("net", "memory", "net")),
+                ("net-callout", "fxn", "top", sel("net")), ("net-all-rows", "fxn", "resmore", sel("net", *ALL5)),
+                ("net-unknown", "fxn-unknown", "", sel("net")),
+                ("net-metered", "fxn-metered", "", sel("net", "memory", "net")),
+                ("net-metered-low", "fxn-metlow", "", sel("net", "memory", "net")),
+                ("net-metered-hint", "fxn-unknown", "", sel("net") + ["-netMetered", "YES"]),
+                ("net-stale", "fxn-stale", "", sel("net")),
+                ("net-offline", "fxn-offline", "", sel("memory", "memory", "net")),
+                ("net-old-logger", "fxr", "", sel("memory", *ALL5)),
+                # another machine's tab: its mirror carries the line's rates, figures and busiest names (no key)
+                ("net-remote-tab", "mirnet", "", sel("net", "memory", "net")),
+                ("net-level-3", "fxn", "lvl:3", sel("net", *ALL5))])
 # what each variant of the resources fixture changes in its current.json (the samples stay the week's)
 VARIANTS = {"fxr-tight": {"pressure": 2}, "fxr-crit": {"pressure": 4, "jetsam_kills": 3},
             "fxr-disklow": {"disk_free_gb": 12.0, "disks!": [12.0, "low"]},
@@ -127,6 +149,21 @@ VARIANTS = {"fxr-tight": {"pressure": 2}, "fxr-crit": {"pressure": 4, "jetsam_ki
                                                               "used": 18.2, "from": NOW - 12 * 86400,
                                                               "to": NOW + 18 * 86400, "period": "month",
                                                               "label": "phone"}}}}
+# ... and of the network fixture (NET N4): the line quiet, without a figure, metered, near its cap, its figure stale (the
+# pull runs at 176 Mbit/s against 150 stored), offline
+_NK = topfixture.NET_KEY
+_NDOWN = {"network": _NK, "cap": 250.0, "margin": 62.5, "reserved": 150.0, "busy": 176.0, "others": 14.2}
+_NUP = {"network": _NK, "cap": 40.0, "margin": 12.0, "reserved": 0.0, "busy": 1.2, "others": 1.1}
+_NQ = {"network": _NK, "cap": 20.0, "margin": 2.0, "from": NOW - 12 * 86400, "to": NOW + 18 * 86400, "period": "month"}
+NET_VARIANTS = {
+    "fxn-idle": {"net": {"if": "en0", "vpn": False, "network": _NK, "src": "flows", "flows": 31, "down_mbps": 2.1,
+                         "up_mbps": 0.4, "lan_mbps": 0.0},
+                 "net_names": [{"name": "Google Chrome", "down": 1.4, "up": 0.2, "n": 9}]},
+    "fxn-unknown": {"pools": None},
+    "fxn-metered": {"pools": {"t": NOW, "net.down": _NDOWN, "net.up": _NUP, "net.quota": dict(_NQ, used=12.4)}},
+    "fxn-metlow": {"pools": {"t": NOW, "net.down": _NDOWN, "net.up": _NUP, "net.quota": dict(_NQ, used=18.2, label="phone")}},
+    "fxn-stale": {"pools": {"t": NOW, "net.down": dict(_NDOWN, cap=150.0, margin=37.5), "net.up": _NUP}},
+    "fxn-offline": {"net": {"if": None}, "net_names": None, "pools": None}}
 
 
 def write(d, ram=None, scenario="default", change=None):
@@ -144,7 +181,9 @@ def write(d, ram=None, scenario="default", change=None):
         if ram is not None:
             cur["ram_gb"] = float(ram)
         for k, v in (change or {}).items():
-            if k == "disks!":
+            if v is None:
+                cur.pop(k, None)
+            elif k == "disks!":
                 cur["disks"][0].update(free_gb=v[0], level=v[1])
             elif k == "cpu!":
                 cur["cpu"].update(v)
@@ -178,6 +217,15 @@ def write_remote(d):
     os.rename(os.path.join(d, "m", "machines"), os.path.join(fx, "machines"))
     dead_holders(os.path.join(fx, "ledger", "ledger.json"))
     return fx, os.path.join(d, "m", "offline", "mirror"), now
+
+
+def net_mirror(d):
+    """A live mirror of topfixture's network machine, through the real `oomph remote sync --once` (mirrorfixture's
+    "network" scene); its directory. Drawn right after (a live link goes stale)."""
+    import mirrorfixture
+    with contextlib.redirect_stdout(io.StringIO()):
+        mirrorfixture.main([d, "network"])
+    return os.path.join(d, "mirror")
 
 
 def stamp(exe):
@@ -237,7 +285,8 @@ def against(exe, old, keep=None, same_version=False):
         where = {"fx": (fx, NOW, []), "remote": (rfx, rnow, []), "mirror": (rfx, rnow, ["--mirror", mirror]),
                  "fx8": (write(os.path.join(base, "fx8"), 8), NOW, []),
                  "fx16": (write(os.path.join(base, "fx16"), 16), NOW, []),
-                 "fxr": (write(os.path.join(base, "fxr"), scenario="resources"), NOW, [])}
+                 "fxr": (write(os.path.join(base, "fxr"), scenario="resources"), NOW, []),
+                 "fxn": (write(os.path.join(base, "fxn"), scenario="network"), NOW, [])}
         for i, (kind, ai, extra) in enumerate(ALL):
             if i and i % 20 == 0:
                 print("  %d of %d states drawn, %d pairs byte-identical" % (i, len(ALL), same), flush=True)
@@ -288,13 +337,20 @@ def resources(exe, out):
     os.makedirs(out, exist_ok=True)
     bad = 0
     try:
-        where = {"fx": write(os.path.join(base, "fx")), "fxr": write(os.path.join(base, "fxr"), scenario="resources")}
+        where = {"fx": write(os.path.join(base, "fx")), "fxr": write(os.path.join(base, "fxr"), scenario="resources"),
+                 "fxn": write(os.path.join(base, "fxn"), scenario="network")}
         for k, ch in VARIANTS.items():
             where[k] = write(os.path.join(base, k), scenario="resources", change=ch)
+        for k, ch in NET_VARIANTS.items():
+            where[k] = write(os.path.join(base, k), scenario="network", change=ch)
+        where["mirnet"] = where["fx"]
+        mirror = net_mirror(os.path.join(base, "mirnet"))
         for name, fx, ai, extra in RESOURCES:
             for dark in (False, True):
                 path = os.path.join(out, "%s-%s.png" % (name, "dark" if dark else "light"))
-                rc, data, err = render(exe, where[fx], path, ai, list(extra) + (["--dark"] if dark else []))
+                more = ["--mirror", mirror] if fx == "mirnet" else []
+                rc, data, err = render(exe, where[fx], path, ai, list(extra) + more + (["--dark"] if dark else []),
+                                       int(time.time()) if fx == "mirnet" else NOW)   # a mirror is dated now
                 bad += data is None
                 print("%s  %s%s" % ("ok   " if data else "FAIL ", os.path.basename(path), "" if data else ": " + err),
                       flush=True)
@@ -349,6 +405,18 @@ def check(exe):
                % (" ".join(extra[1:]) or "switched off", "%d bytes" % len(a[1]) if a[1] and a[1] == b[1] else a[2] or b[2] or "differ"))
         ok(len({pics[i] for i in pics if pics[i]}) == 4,
            "the four resources: the switch takes, and Memory alone, all four on the GPU and a compact level differ")
+        # the network (NET N4, 1.15): its states drawn twice the same; the tile, its chart and "metered?" each show
+        fxn = write(os.path.join(base, "fxn"), scenario="network")
+        npics = {}
+        for i, (ai, extra) in enumerate([("", []), ("", sel("memory")), ("", sel("net")),
+                                         ("", sel("net") + ["-netMetered", "YES"])]):
+            a = render(exe, fxn, os.path.join(base, "n%d-a.png" % i), ai, extra)
+            b = render(exe, fxn, os.path.join(base, "n%d-b.png" % i), ai, extra)
+            npics[i] = a[1]
+            ok(a[0] == 0 and a[1] is not None and a[1] == b[1], "render of the network %s: drawn twice, byte-identical (%s)"
+               % (" ".join(extra[1:]) or "switched off", "%d bytes" % len(a[1]) if a[1] and a[1] == b[1] else a[2] or b[2] or "differ"))
+        ok(len({npics[i] for i in npics if npics[i]}) == 4 and npics[1] not in (None, pics[1]),
+           "the network: its tile, its chart and the system's \"metered?\" each change the picture")
         later = render(exe, fx, os.path.join(base, "later.png"), now=NOW + 3600)
         ok(later[1] is not None and first[0] is not None and later[1] != first[0],
            "render an hour later by --now: a different picture (the clock comes from --now)")
