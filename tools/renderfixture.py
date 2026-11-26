@@ -115,12 +115,18 @@ RESOURCES = ([("memory-alone", "fxr", "", sel("memory")), ("memory-cpu", "fxr", 
                 ("disk-low", "fxr-disklow", "", sel("memory")), ("disk-critical", "fxr-diskcrit", "", sel("memory", *ALL4)),
                 ("cpu-busy-throttled", "fxr-hot", "", sel("cpu", *ALL4)), ("no-gpu", "fxr-nogpu", "", sel("memory", *ALL4)),
                 ("old-logger", "fx", "", sel("memory", *ALL4)), ("machines-and-resources", "fxr", "", sel("memory", "memory", "cpu")
-                                                                + ["-machinesUI", "YES"])])
+                                                                + ["-machinesUI", "YES"]),
+                # NET N3 (1.15): a metered network with less than 10 % of its cap left, the capsule amber
+                ("network-metered-low", "fxr-metered", "", sel("memory", *ALL4))])
 # what each variant of the resources fixture changes in its current.json (the samples stay the week's)
 VARIANTS = {"fxr-tight": {"pressure": 2}, "fxr-crit": {"pressure": 4, "jetsam_kills": 3},
             "fxr-disklow": {"disk_free_gb": 12.0, "disks!": [12.0, "low"]},
             "fxr-diskcrit": {"disk_free_gb": 3.5, "disks!": [3.5, "critical"]},
-            "fxr-hot": {"cpu!": {"busy": 13.4, "user": 11.0, "sys": 2.4, "therm": 2}}, "fxr-nogpu": {"gpu": []}}
+            "fxr-hot": {"cpu!": {"busy": 13.4, "user": 11.0, "sys": 2.4, "therm": 2}}, "fxr-nogpu": {"gpu": []},
+            "fxr-metered": {"pools": {"t": NOW, "net.quota": {"network": "rmac:00:00:5e:00:53:01", "cap": 20.0, "margin": 2.0,
+                                                              "used": 18.2, "from": NOW - 12 * 86400,
+                                                              "to": NOW + 18 * 86400, "period": "month",
+                                                              "label": "phone"}}}}
 
 
 def write(d, ram=None, scenario="default", change=None):

@@ -278,6 +278,21 @@ def resource_cases(v):
                 {"os": "linux", "pressure": 1, "linux": {"overcommit": True, "commit_pct": 99}},
                 {"os": "linux", "pressure": 1, "linux": {"overcommit": 2, "commit_pct": "99"}},
                 {"pressure": 1, "linux": {"overcommit": 2, "commit_pct": 99}}]
+    # a metered network under 10 % of its cap (NET D-N13, 1.15): amber "Network 1.8 GB left", after memory and disk;
+    # current.json's pools are what the verdict reads, and another logger's figures may be anything
+    q = {"network": "rmac:00:00:5e:00:53:01", "cap": 20, "margin": 2, "used": 18.2, "from": 1795129200.0,
+         "to": 1797807600.0, "period": "month", "label": "phone"}
+    for qv, more in (({}, {}), ({"used": 18.0}, {}), ({"used": 18.0001}, {}), ({"used": 18.25}, {}), ({"used": 25.0}, {}),
+                     ({"used": 19.95}, {}), ({"used": 12.4}, {}), ({}, {"pressure": 2}), ({}, {"pressure": 4}),
+                     ({}, {"disk_free_gb": 14.0}), ({}, {"disk_free_gb": 3.5}), ({"cap": True}, {}), ({"cap": "20"}, {}),
+                     ({"used": -1}, {}), ({"cap": 0.05, "used": 0.049}, {}), ({"cap": 1e300}, {}), ({"used": None}, {}),
+                     ({"cap": 100000, "used": 99999.5}, {}), ({"cap": 100001, "used": 100000.5}, {}),
+                     ({"label": 5}, {}), ({"to": "14 Dec"}, {}), ({"label": ["phone"], "to": True}, {})):
+        v_q = dict(q, **qv)
+        variants.append(dict({"pools": {"t": 1795180000.0, "net.quota": {k: x for k, x in v_q.items() if x is not None}}},
+                             **more))
+    variants += [{"pools": "x"}, {"pools": {"net.quota": [1, 2]}}, {"pools": {"net.quota": {"cap": 20}}},
+                 {"pools": {"t": 1795180000.0, "net.down": {"cap": 250, "margin": 62.5}}}]
     for i, var in enumerate(variants):
         smp = dict(base, **var)
         smp = {k: x for k, x in smp.items() if x is not None}

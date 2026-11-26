@@ -747,6 +747,70 @@ finally:
         del b14
         gc.collect()
 
+# ======================================= NQ: metered networks (NET N3, 1.15): a request waiting on net.quota under
+# 1.8.1, 1.9.1 and 1.14.0 (they carry its parts and the pool ids it waits on through their own writes), and a
+# sample whose pools hold net.quota read by their verdict and capsule (current.json's pools stay home: no mirror)
+d = use("nq")
+put(d, "networks.json", json.dumps({"v": 1, "networks": {KEYN: {"down": 194.0, "up": 48.0, "source": "set", "set_by": "x",
+                                                                "set": round(NOW - 60),
+                                                                "metered": {"cap_gb": 20.0, "period": "month"}}}}))
+
+
+def qpools(used):
+    """current.json's pools with the logger's net.quota now (fresh, in this period)."""
+    q = new._T().quota_pool({"cap_gb": 20.0, "period": "month"}, KEYN, used, 0.0, time.time())
+    return {"t": time.time(), "net.quota": dict({k: q[k] for k in ("network", "cap", "margin", "used", "reserved", "from",
+                                                                   "to", "period")}, label="phone")}
+
+
+QSAMPLE = dict(NSAMPLE, pools=qpools(18.5))
+saved_q = new._sample_override
+os.environ["OOMPH_NET_RESERVATIONS"] = "1"
+new._sample_override = lambda: dict(NSAMPLE, pools=qpools(10.0))
+b14 = old_module("v1.14.0")
+try:
+    for tag, m in (("1.8.1", old), ("1.9.1", mid), ("1.14.0", b14)):
+        if m is None:
+            print("skip  NQ %s: tag v%s is not in this clone" % (tag, tag))
+            continue
+        m.LEDGER_DIR = d
+        if m is not old:
+            m._plat = Procs
+        m._sample_override = lambda: dict(SAMPLE)
+        new.release("all", ME)
+        g = new.reserve(0, "a metered pull", HOLDER, net_gb=6)
+        w = new.reserve(0, "waits on the quota", HOLDER, net_gb=3)
+        L0 = raw(d)
+        st = quietly(m.reserve, 0.5, "a %s client" % tag, HOLDER)
+        L1 = raw(d)
+        bad = [(x["id"], k) for x in (g, w) for k in ("res", "v")
+               if (lease(L0, x["id"]) or {}).get(k) != (lease(L1, x["id"]) or {}).get(k)]
+        if m is not b14:   # 1.8 and 1.9 grant it by its gb (it is told nothing): the next refresh here queues it again
+            new.refresh_ledger(new._sample_override(), Procs.collect_procs())
+        wl = lease(raw(d), w["id"]) or {}
+        check(g.get("status") == "granted" and w.get("status") == "queued" and w.get("waiting_on") == ["net.quota"]
+              and isinstance(st, dict) and not bad and wl.get("state") == "queued" and not wl.get("res_granted")
+              and wl.get("waiting_on") == ["net.quota"],
+              "NQ %s on a ledger with a request waiting on net.quota keeps its res and v; it waits on net.quota%s (%s)"
+              % (tag, "" if m is b14 else " again after the next refresh here",
+                  bad or [w.get("waiting_on"), wl.get("waiting_on"), st.get("status") if isinstance(st, dict) else st]))
+        if hasattr(m, "capsule"):
+            cap = quietly(m.capsule, dict(QSAMPLE))
+            check(isinstance(cap, dict) and cap.get("text") == "Normal" and "network" not in cap,
+                  "NQ %s's capsule over a sample whose pools hold a quota under 10 %%: its own verdict (%s)" % (tag, cap))
+        v = quietly(m.verdict, dict(QSAMPLE))
+        check(isinstance(v, dict) and v.get("level") == "ok", "NQ %s's verdict reads a sample with net.quota" % tag)
+    nc = new.capsule(dict(QSAMPLE))
+    check(nc.get("text") == "Network 1.5 GB left" and nc.get("network") == 1,
+          "NQ this checkout's capsule says the quota under 10 %% (%s)" % nc)
+finally:
+    new._sample_override = saved_q
+    os.environ.pop("OOMPH_NET_RESERVATIONS", None)
+    new.release("all", ME)
+    if b14 is not None:
+        del b14
+        gc.collect()
+
 # --- S: the skill's vector syntax against older CLIs (roadmap 4.7: "the new skill's commands against a frozen CLI")
 SKILL = open(os.path.join(ROOT, "skills", "oomph", "SKILL.md"), encoding="utf-8").read()
 sec = SKILL[SKILL.index("**Reserving several resources**"):]

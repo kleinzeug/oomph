@@ -604,12 +604,18 @@ try:
     badp = [V(dict(q, res={"net": {"ask": 0.5}})), V(dict(q, res={"net": {"ask": 100, "min": 200}})),
             V(dict(q, res={"net": {"gb": 40}})), V(dict(q, res={"net": "lots"})),
             V(dict(q, res={"net": {"ask": 10, "min": 0}})), V(dict(q, res={"net": {"unmanaged": True}}))]
-    planted = V(dict(q, res={"net": {"ask": 10, "network": "../../etc x", "eta": "soon", "moved": -1}}))
-    check(oomph.weighable(good) and oomph.lease_need(good) == {"net.down": (50, 100)} and oomph.weighable(um)
-          and oomph.lease_need(um) == {} and not any(oomph.weighable(x) for x in badp)
-          and not {"network", "eta", "moved"} & set(planted["res"]["net"]),
-          "the ledger: a rate part asks net.down from its minimum; an unmanaged part asks no pool and is weighable; a "
-          "part this code cannot read is not; a planted network, eta or moved is dropped")
+    planted = V(dict(q, res={"net": {"ask": 10, "network": "../../etc x", "eta": "soon", "moved": -1, "metered": 1}}))
+    gm = V(dict(q, res={"net": {"ask": 100, "min": 50, "gb": 40, "metered": True}}))
+    umm = V(dict(q, res={"net": {"gb": 40, "unmanaged": True, "network": "gw:x", "metered": True}}))
+    check(oomph.weighable(good) and oomph.lease_need(good) == {"net.down": (50, 100)}
+          and oomph.weighable(um) and oomph.lease_need(um) == {}
+          and oomph.lease_need(gm) == {"net.down": (50, 100), "net.quota": (40, 40)}
+          and oomph.weighable(umm) and oomph.lease_need(umm) == {"net.quota": (40, 40)}
+          and not any(oomph.weighable(x) for x in badp)
+          and not {"network", "eta", "moved", "metered"} & set(planted["res"]["net"]),
+          "the ledger: a rate part asks net.down from its minimum; an unmanaged part asks no rate pool and is weighable; "
+          "on a metered network (`metered`) both ask net.quota for their volume (N3), elsewhere not; a part this code "
+          "cannot read is not; a planted network, eta, moved or metered is dropped")
     rec = oomph._valid_finished({"id": "r91", "gb": 0, "requested": 1e9, "event": "end", "key": "k",
                                  "res": {"net": 150, "net_up": 20, "net_gb": 40, "net_up_gb": 5, "net_network": C},
                                  "peak": {"net": 188, "net_gb": 39.8}}, log=True)

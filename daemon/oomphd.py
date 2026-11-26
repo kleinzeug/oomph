@@ -996,6 +996,7 @@ class Daemon:
         self.net_prev = {}         # the line's pools as the last sample smoothed them (others, busy samples)
         self.net_pools_said = False  # making them failed: said once per start
         self.net_err = False       # the network's reading failed: said once per start
+        self.net_days = None       # the day counters per network (NET 12.8, oomph_traffic.NetDays): netdays.json here
 
     # -- events
     def event(self, kind, **kw):
@@ -1187,10 +1188,22 @@ class Daemon:
         try:
             if self.net is None:
                 self.net = oomph._T().Sampler(P)
+            if self.net_days is None:
+                # the day counters go on where the last start left them: the metered quota's `used` (12.8); a file
+                # that cannot be read begins them anew, so counting always starts
+                path = os.path.join(LOG_DIR, "netdays.json")
+                try:
+                    self.net_days = oomph._T().NetDays(path).load()
+                except Exception as e:  # noqa: B902
+                    self.net_days = oomph._T().NetDays(path)
+                    self.soft_error("netdays", repr(e))
+            self.net.traffic.book = self.net_days
             ans = self.ledger.network(4 * INTERVAL)
             if ans:  # only an answer about the identity it holds now (after a move it asks about another)
                 self.net.adopt(ans.get("key"), ans.get("asked"), ans.get("entry"))
-            return self.net.read(procs, gap=bool(gap))
+            out = self.net.read(procs, gap=bool(gap))
+            self.save_net_days()
+            return out
         except Exception as e:  # noqa: B902
             if self.net is not None:
                 self.net.traffic.reset()
@@ -1198,6 +1211,20 @@ class Daemon:
                 self.net_err = True
                 self.event("daemon_error", where="net", error=repr(e)[:300])
             return None, {}, None
+
+    def save_net_days(self, force=False):
+        """netdays.json in the logger's own folder, at most once a minute (and at the stop): a failure is said at most
+        hourly and costs the counters nothing (they are written again the next minute)."""
+        b = self.net_days
+        if b is None or not b.due(time.monotonic(), force):
+            return
+        try:
+            write_atomic(os.path.join(LOG_DIR, "netdays.json"), b.dumps())
+            b.written(time.monotonic())
+        except Exception as e:  # noqa: B902
+            b.written(time.monotonic())   # tried: the next try in a minute
+            b.dirty = True
+            self.soft_error("netdays", repr(e))
 
     # -- notifications
     def notify(self, title, msg, **kw):
@@ -1565,7 +1592,7 @@ class Daemon:
             pools = {"t": s["t"], "cpu": cp}
         if net is not None:  # the line each way (NET 12.8), while this network has a figure: what admission needs
             try:
-                npools = T.pool_blocks(net, self.ledger.network(4 * INTERVAL), leases, self.net_prev)
+                npools = T.pool_blocks(net, self.ledger.network(4 * INTERVAL), leases, self.net_prev, self.net_days, t)
             except Exception as e:  # costs the pools, never the sample; said once per start
                 npools = None
                 self.net_prev.clear()
@@ -1892,6 +1919,7 @@ class Daemon:
             self.kills.stop()
         if self.full is not None:  # a reading this signal interrupts is not a crash of the helper
             self.full.close(final=True)
+        self.save_net_days(force=True)   # the day counters of the last minute (NET 12.8)
         if self.stream_proc:
             try:
                 self.stream_proc.terminate()

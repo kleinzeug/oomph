@@ -7402,7 +7402,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -7452,7 +7452,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -7502,7 +7502,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 2, "memory": 2, "text": "Memory critical"}
+   "out": {"disk": 0, "level": 2, "memory": 2, "network": 0, "text": "Memory critical"}
   },
   {
    "sample": {
@@ -7552,7 +7552,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -7602,7 +7602,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -7653,7 +7653,7 @@
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
     "unowned_gb": 22.0
    },
-   "out": {"disk": 0, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -7703,7 +7703,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 1, "level": 1, "memory": 0, "text": "Disk low"}
+   "out": {"disk": 1, "level": 1, "memory": 0, "network": 0, "text": "Disk low"}
   },
   {
    "sample": {
@@ -7753,7 +7753,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 2, "level": 2, "memory": 0, "text": "Disk critical"}
+   "out": {"disk": 2, "level": 2, "memory": 0, "network": 0, "text": "Disk critical"}
   },
   {
    "sample": {
@@ -7803,7 +7803,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 2, "level": 2, "memory": 2, "text": "Memory critical"}
+   "out": {"disk": 2, "level": 2, "memory": 2, "network": 0, "text": "Memory critical"}
   },
   {
    "sample": {
@@ -7853,7 +7853,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 1, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 1, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -7903,7 +7903,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 2, "level": 2, "memory": 1, "text": "Disk critical"}
+   "out": {"disk": 2, "level": 2, "memory": 1, "network": 0, "text": "Disk critical"}
   },
   {
    "sample": {
@@ -7953,7 +7953,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 1, "level": 2, "memory": 2, "text": "Memory critical"}
+   "out": {"disk": 1, "level": 2, "memory": 2, "network": 0, "text": "Memory critical"}
   },
   {
    "sample": {
@@ -8004,7 +8004,7 @@
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
     "os": "linux"
    },
-   "out": {"disk": 0, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -8054,7 +8054,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8104,7 +8104,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8154,7 +8154,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8204,7 +8204,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8242,7 +8242,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8280,7 +8280,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8316,7 +8316,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8377,7 +8377,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8438,7 +8438,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8499,7 +8499,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8536,7 +8536,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8581,7 +8581,7 @@
     "top_cpu": [],
     "top_io": "x"
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8631,7 +8631,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8681,7 +8681,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8731,7 +8731,7 @@
     "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}]
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8783,7 +8783,7 @@
     "os": "linux",
     "linux": {"overcommit": 2, "commit_pct": 96}
    },
-   "out": {"disk": 0, "level": 1, "memory": 1, "text": "Memory tight"}
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 0, "text": "Memory tight"}
   },
   {
    "sample": {
@@ -8835,7 +8835,7 @@
     "os": "linux",
     "linux": {"overcommit": 2, "commit_pct": 94.9}
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8887,7 +8887,7 @@
     "os": "linux",
     "linux": {"overcommit": 1, "commit_pct": 99}
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8939,7 +8939,7 @@
     "os": "linux",
     "linux": {"overcommit": 2, "commit_pct": 1e+20}
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -8991,7 +8991,7 @@
     "os": "linux",
     "linux": {"overcommit": true, "commit_pct": 99}
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -9043,7 +9043,7 @@
     "os": "linux",
     "linux": {"overcommit": 2, "commit_pct": "99"}
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   },
   {
    "sample": {
@@ -9094,7 +9094,1596 @@
     "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
     "linux": {"overcommit": 2, "commit_pct": 99}
    },
-   "out": {"disk": 0, "level": 0, "memory": 0, "text": "Normal"}
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 1.8 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.0,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.0001,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 2.0 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.25,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 1.8 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 25.0,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 0.0 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 19.95,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 0.1 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 12.4,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 2,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 1, "network": 1, "text": "Memory tight"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 4,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 2, "memory": 2, "network": 1, "text": "Memory critical"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 14.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 1, "level": 1, "memory": 0, "network": 1, "text": "Disk low"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 3.5,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 2, "level": 2, "memory": 0, "network": 1, "text": "Disk critical"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": true,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": "20",
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": -1,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 0.05,
+      "margin": 2,
+      "used": 0.049,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 1e+300,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 100000,
+      "margin": 2,
+      "used": 99999.5,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 0.5 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 100001,
+      "margin": 2,
+      "used": 100000.5,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": 5
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 1.8 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": "14 Dec",
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 1.8 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": true,
+      "period": "month",
+      "label": ["phone"]
+     }
+    }
+   },
+   "out": {"disk": 0, "level": 1, "memory": 0, "network": 1, "text": "Network 1.8 GB left"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": "x"
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {"net.quota": [1, 2]}
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {"net.quota": {"cap": 20}}
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {"t": 1795180000.0, "net.down": {"cap": 250, "margin": 62.5}}
+   },
+   "out": {"disk": 0, "level": 0, "memory": 0, "network": 0, "text": "Normal"}
   }
  ],
  "tiles": [
@@ -11052,6 +12641,1751 @@
    "waiting": {"memory": 1},
    "out": [
     ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.0,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.0001,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.25,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 25.0,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 19.95,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 12.4,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 2,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "tight", 1, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 4,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "critical ◻1", 2, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 14.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "low", 1, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 3.5,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "critical", 2, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": true,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": "20",
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": -1,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 0.05,
+      "margin": 2,
+      "used": 0.049,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 1e+300,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 100000,
+      "margin": 2,
+      "used": 99999.5,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 100001,
+      "margin": 2,
+      "used": 100000.5,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": 1797807600.0,
+      "period": "month",
+      "label": 5
+     }
+    }
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": "14 Dec",
+      "period": "month",
+      "label": "phone"
+     }
+    }
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {
+     "t": 1795180000.0,
+     "net.quota": {
+      "network": "rmac:00:00:5e:00:53:01",
+      "cap": 20,
+      "margin": 2,
+      "used": 18.2,
+      "from": 1795129200.0,
+      "to": true,
+      "period": "month",
+      "label": ["phone"]
+     }
+    }
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": "x"
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {"net.quota": [1, 2]}
+   },
+   "waiting": {"memory": 1},
+   "out": [
+    ["23.7 / 36 GB", "1 waiting", 0, 1, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {"net.quota": {"cap": 20}}
+   },
+   "waiting": {"memory": 2, "cpu": 1},
+   "out": [
+    ["23.7 / 36 GB", "2 waiting", 0, 2, "com.apple.WebKit.WebContent", 0.658333333],
+    ["9.1 / 14 cores", "1 waiting", 0, 1, "cargo", 0.652142857],
+    ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
+    ["63 GB free", "", 0, 0, "Finder", 0.063517588]
+   ]
+  },
+  {
+   "sample": {
+    "t": 1795180000.0,
+    "ram_gb": 36.0,
+    "app_gb": 14.6,
+    "wired_gb": 7.2,
+    "compressed_gb": 1.9,
+    "pressure": 1,
+    "swap_used_gb": 0.0,
+    "swap_total_gb": 0.0,
+    "disk_free_gb": 63.0,
+    "jetsam_kills": 0,
+    "cpu": {"n": 14, "p": 10, "e": 4, "busy": 9.13, "user": 7.6, "sys": 1.53, "therm": 0},
+    "gpu": [
+     {
+      "id": "gpu0",
+      "name": "Apple M3 Max",
+      "unified": true,
+      "util": 64.4,
+      "active": 87.0,
+      "src": "ioreport",
+      "mem_gb": 5.31,
+      "mem_alloc_gb": 9.0,
+      "mem_limit_gb": 27.0
+     }
+    ],
+    "disks": [
+     {
+      "id": "data",
+      "name": "Data",
+      "free_gb": 63.2,
+      "total_gb": 995.0,
+      "roles": ["home", "swap", "tmp"],
+      "watch": true,
+      "low_gb": 20,
+      "crit_gb": 5,
+      "level": "ok"
+     }
+    ],
+    "groups": [{"name": "com.apple.WebKit.WebContent", "mb": 4100, "n": 9}, {"name": "Xcode", "mb": 3000}],
+    "top_cpu": [
+     {"pid": 1, "name": "rustc", "g": "cargo", "cpu": 2.5},
+     {"pid": 2, "name": "rustc", "g": "cargo", "cpu": 2.0},
+     {"pid": 3, "name": "java", "g": "Code", "cpu": 3.9}
+    ],
+    "top_gpu": [{"pid": 4, "name": "python", "g": "python", "gpu": 51.0}],
+    "top_io": [{"pid": 5, "name": "cp", "g": "Finder", "w": 120.0}],
+    "pools": {"t": 1795180000.0, "net.down": {"cap": 250, "margin": 62.5}}
+   },
+   "waiting": {},
+   "out": [
+    ["23.7 / 36 GB", "", 0, 0, "com.apple.WebKit.WebContent", 0.658333333],
     ["9.1 / 14 cores", "", 0, 0, "cargo", 0.652142857],
     ["64 % · 5.3 GB", "", 0, 0, "python", 0.644],
     ["63 GB free", "", 0, 0, "Finder", 0.063517588]

@@ -2886,6 +2886,32 @@ def _verdict_parts(s):
 
 CAPSULE_WORDS = ("Normal", "tight", "critical")  # "Memory tight", "Disk critical" (02 §3.4.9, §15.13)
 DISK_WORDS = ("", "low", "critical")
+QUOTA_LOW_X = 0.1   # a metered network with less than this share of its cap left warns (NET D-N13, D-N20)
+
+
+def quota_low(s):
+    """The logger's metered quota (current.json's pools net.quota, NET 12.8) while less than QUOTA_LOW_X of its cap
+    is left: {"left", "cap", "to", "from", "label", "network"}; None otherwise. Read here, not in oomph_traffic: the
+    hook and the capsule never load that module. The app's Verdict.capsule reads the same two numbers."""
+    sp = s.get("pools") if isinstance(s, dict) else None
+    q = sp.get("net.quota") if isinstance(sp, dict) else None
+    if not isinstance(q, dict) or not _num(q.get("cap"), 0.1, 100000) or not _num(q.get("used"), 0, 1e6):
+        return None
+    left = q["cap"] - q["used"]
+    if not left < QUOTA_LOW_X * q["cap"]:
+        return None
+    return {"left": max(0.0, left), "cap": q["cap"], "to": q["to"] if _t(q.get("to")) else None,
+            "from": q["from"] if _t(q.get("from")) else None,
+            "label": q["label"] if isinstance(q.get("label"), str) and q["label"] else None,
+            "network": q["network"] if isinstance(q.get("network"), str) else None}
+
+
+def quota_line(q):
+    """The hook's words about a metered network under 10 % (12.17): `oomph: the metered network phone has 1.8 of 20
+    GB left until 14 Dec (oomph net)`."""
+    who = "the metered network %s" % term_text(q["label"])[:32] if q["label"] else "this metered network"
+    until = " until %s" % datetime.datetime.fromtimestamp(q["to"]).strftime("%-d %b") if q["to"] else ""
+    return "oomph: %s has %.1f of %g GB left%s (oomph net)" % (who, q["left"], round(q["cap"], 1), until)
 
 
 def capsule(s):
@@ -2895,18 +2921,23 @@ def capsule(s):
     names it ("Memory tight", "Memory critical", "Disk low", "Disk critical"; memory first on a
     tie), "Normal" without one. {"text", "level" 0–2, "memory" 0–2 (the chip's body), "disk" 0–2
     (its mark)}. CPU and GPU never change it. The machine-wide verdict only: never the raise one
-    caller's coordination applies, and no pins (the app and the dashboard are nobody's caller)."""
+    caller's coordination applies, and no pins (the app and the dashboard are nobody's caller). `network` 1 while a
+    metered network has less than 10 % of its cap left (quota_low; NET D-N13): amber "Network 1.8 GB left", after
+    memory and disk; nothing else of the network reaches it (D-N20)."""
     lv = {"memory": 0, "disk": 0}
     for level, res, _why in _verdict_parts(s):
         lv[res] = max(lv[res], level)
-    worst = max(lv.values())
+    nq = quota_low(s)
+    worst = max(lv["memory"], lv["disk"], 1 if nq else 0)
     if not worst:
         text = CAPSULE_WORDS[0]
-    elif lv["memory"] >= lv["disk"]:
+    elif lv["memory"] == worst:
         text = "Memory " + CAPSULE_WORDS[lv["memory"]]
-    else:
+    elif lv["disk"] == worst:
         text = "Disk " + DISK_WORDS[lv["disk"]]
-    return {"text": text, "level": worst, "memory": lv["memory"], "disk": lv["disk"]}
+    else:
+        text = "Network %.1f GB left" % nq["left"]
+    return {"text": text, "level": worst, "memory": lv["memory"], "disk": lv["disk"], "network": 1 if nq else 0}
 
 
 def verdict(s):
@@ -4055,6 +4086,7 @@ LIMITS = {                   # the one table of limits for what is read from the
     "keys": 256,             # keys per JSON object
     "depth": 32,             # nesting (newer Pythons parse far deeper than the recursion limit)
     "networks": 64 << 10,    # networks.json (NET, 1.15): bytes; a bigger one is treated as absent
+    "netdays": 256 << 10,    # the logger's day counters (netdays.json, NET 12.8): 64 networks × 62 days fit in 160 KB
 }
 LOCK_WAIT_S = 5.0            # interactive callers: a holder keeps the lock for milliseconds, so 5 s
                              # only runs out when it is stuck or hostile, yet survives a swapped-out
@@ -4445,8 +4477,9 @@ def _res(x):
         for f, n in (("name", 64), ("else_dev", 8)):  # the card's name and, for `elsewhere`, where the job is
             if f in o and not (isinstance(o[f], str) and 0 < len(o[f]) <= n and o[f].isprintable()):
                 del o[f]
-        for f in ("unified", "unmanaged", "auto"):  # unmanaged, auto (NET 1.15): a network part granted without a
-            # rate; one whose rate is half the line, asked again on each network
+        for f in ("unified", "unmanaged", "auto", "metered"):  # unmanaged, auto, metered (NET 1.15): a network part
+            # granted without a rate; one whose rate is half the line, asked again on each network; one on a metered
+            # network (its volume goes through net.quota)
             if f in o and not isinstance(o[f], bool):
                 del o[f]
         if "network" in o and not _str(80, _ID)(o["network"]):  # a network's key (NET 12.9): compared, never opened
@@ -5477,8 +5510,8 @@ def cpu_pool(s, leases, now):
             "idle": None if others is None else room - others}
 
 
-POOLS = frozenset(("ram", "cpu", "disk:*", "gpu:*", "vram:*", "net.down", "net.up"))  # every pool this code weighs
-                                                                                    # (<kind>:*: every one)
+POOLS = frozenset(("ram", "cpu", "disk:*", "gpu:*", "vram:*", "net.down", "net.up", "net.quota"))  # every pool this
+                                                                                    # code weighs (<kind>:*: every one)
 KNOWN_RES = frozenset(("ram", "cpu", "disk", "mem", "gpu", "vram", "net", "net_up"))  # the parts of a `res` it knows
                                                                                       # (mem: the mirror)
 
@@ -5629,6 +5662,12 @@ def _evaluate(L, s, procs, now, rated=False, net=None):
             blocked |= POOLS
             continue
         nshort = T.net_prepare(r, nv) if nv is not None and _net_parts(r) else ()  # managed here or unmanaged
+        never = T.net_never(r, nv) if nshort else None
+        if never:  # a metered network's volume this period can no longer cover it: refused, never held (NET 12.10)
+            r["note"] = never
+            _retire(L, r, "refused", now)
+            L["leases"].remove(r)
+            continue
         need = lease_need(r)
         if v["level"] == "critical":  # nothing new starts: anything new adds load
             _waits(r, {"critical"}, r.get("hold") or ())
@@ -5669,7 +5708,8 @@ def _evaluate(L, s, procs, now, rated=False, net=None):
             hold = set(r.get("hold") or ()) & (set(need) | gpools) | short
             _waits(r, short | behind, hold)
             turn = {p for p in short | behind if _rate(p)}  # waiting for a turn at the cores or a GPU: holds up only those
-            blocked |= (turn | {p for p in hold if _rate(p)}) if turn else (short | behind | hold)
+            # (and a metered network's volume it is short of: a period's cap is not taken from under it, NET 12.10)
+            blocked |= (turn | {p for p in hold if _rate(p)} | (short & {"net.quota"})) if turn else (short | behind | hold)
             continue
         r["state"], r["granted"] = "granted", round(now, 1)
         r["expires"] = round(now + r["ttl"], 1) if r.get("ttl") else None
@@ -6067,7 +6107,8 @@ def _available(st):
         out["gpu"] = {k: dict({"dev": v.get("dev")}, pct=max(0.0, v.get("pct", 0.0)),
                               **({"mem_gb": max(0.0, v["gb"])} if "gb" in v else {}))
                       for k, v in st["gpu"].items()}
-    if "net_down_available" in st or "net_up_available" in st:  # the line each way (NET 12.10)
+    if "net_down_available" in st or "net_up_available" in st or "net_quota_available" in st:  # the line each way, a
+        # metered network's volume (NET 12.10)
         _T().net_available(st, out)
     return out
 
@@ -6152,7 +6193,7 @@ def _status(L, rid, now):
         gw = [p for p in waiting if p.startswith(("gpu:", "vram:"))]
         if not why and gp and gw:
             why.append(_G()._gpu_wait_text(gp, gw, st))
-        if not why and np_ and set(waiting) & {"net.down", "net.up"}:
+        if not why and np_ and set(waiting) & {"net.down", "net.up", "net.quota"}:
             why.append(_T().net_wait_text(r, waiting, st))
         if not why and dk and "disk:" + dk["pool"] in waiting:
             left = (st.get("disk") or {}).get(dk["pool"])
@@ -7506,14 +7547,15 @@ def _hook_load(path):
     return prev
 
 
-def _hook_save(path, level):
+def _hook_save(path, level, t=None, netq=None):
     """The hook's state, by a new file renamed over the name: never written through a link
-    someone planted there (/tmp is everybody's)."""
+    someone planted there (/tmp is everybody's). `netq`: the metered networks and periods it warned about."""
     tmp = "%s.%s.tmp" % (path, secrets.token_hex(6))
     try:
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
         with os.fdopen(fd, "w") as f:
-            json.dump({"level": level, "t": time.time()}, f)
+            json.dump(dict({"level": level, "t": time.time() if t is None else t},
+                           **({"netq": netq} if netq else {})), f)
         os.rename(tmp, path)
     except OSError:
         try:
@@ -7525,7 +7567,8 @@ def _hook_save(path, level):
 def cmd_hook(args):
     """PostToolUse hook. Silent (exit 0) when memory is ok. When tight/critical, prints a short
     warning to stderr and exits 2, which Claude Code shows to the model. Warns again only when
-    the level changes or after 10 minutes."""
+    the level changes or after 10 minutes. Silent about the network (NET D-N20), except once per
+    session and period while a metered network has less than 10 % of its cap left (12.17)."""
     try:
         sys.stdin.read()  # the hook payload; not needed
     except Exception:
@@ -7533,19 +7576,28 @@ def cmd_hook(args):
     global _lock_wait
     _lock_wait = 0.25  # after every Bash call: never wait on a held lock (03 §10). On a Mac too, since 1.9.4:
     # the hook only reads the ledger, and a check without the coordination is better than a stalled Bash call
-    v = checked_verdict()
+    s = _sample_override() if _sample_override else sample(with_procs=False)
+    v = checked_verdict(s=s)
     hd = _hook_dir()
     state = os.path.join(hd, "oomph-hook-%d.json" % os.getppid()) if hd else None
     prev = _hook_load(state) if state else {}
-    if v["level"] == "ok":
-        if state and prev.get("level") not in (None, "ok"):
-            _hook_save(state, "ok")
-        return 0
-    if prev.get("level") == v["level"] and time.time() - prev["t"] < 600:
+    said = [x for x in prev.get("netq") or () if isinstance(x, str) and len(x) <= 200][-8:] \
+        if isinstance(prev.get("netq"), list) else []
+    q = quota_low(s)
+    token = "%s@%s" % (q["network"], q["from"]) if q else None
+    net = quota_line(q) if q and token not in said else None   # without a state (no folder of its own) every call, as
+    netq = (said + [token])[-8:] if net else said              # memory is
+    mem = v["level"] != "ok" and not (prev.get("level") == v["level"] and time.time() - prev["t"] < 600)
+    if not mem and not net:
+        if v["level"] == "ok" and state and prev.get("level") not in (None, "ok"):
+            _hook_save(state, "ok", netq=netq)
         return 0
     if state:
-        _hook_save(state, v["level"])
-    sys.stderr.write(verdict_line(v) + "\n")
+        if mem:
+            _hook_save(state, v["level"], netq=netq)
+        else:   # the network's line alone: memory ok (saved as such), or as warned before, whose clock goes on
+            _hook_save(state, v["level"], t=prev.get("t") if v["level"] != "ok" else None, netq=netq)
+    sys.stderr.write("\n".join(x for x in (verdict_line(v) if mem else None, net) if x) + "\n")
     return 2
 
 
@@ -7554,7 +7606,8 @@ MCP_TOOLS = [
     {"name": "memory_check",
      "description": "Verdict on this Mac's memory right now: level ok / tight / critical, the reasons, free physical "
                     "memory, pressure, swap and free disk, plus advice on what to do, and `network`: internet "
-                    "traffic now against the line's stored figure. Call it before memory-heavy "
+                    "traffic now against the line's stored figure, and on a metered network what is left of its "
+                    "cap (`metered.low`: under 10 %, move nothing big over it that can wait). Call it before memory-heavy "
                     "work (builds, test suites, containers, parallel jobs, sub-agents) and periodically in long runs.",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "reserve_memory",
@@ -7640,7 +7693,8 @@ MCP_TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "memory_status",
      "description": "The full latest sample: system memory breakdown, swap, disk, idle state, top processes, top apps "
-                    "and all Claude sessions, and `network`: internet traffic now against the line's stored figure.",
+                    "and all Claude sessions, and `network`: internet traffic now against the line's stored figure "
+                    "(and what is left of a metered network's cap).",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "wait_for_memory",
      "description": "Block until memory is back to ok (and optionally at least min_free_gb free), polling every 5 s, "

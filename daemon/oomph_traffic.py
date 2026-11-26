@@ -290,12 +290,13 @@ class Traffic:
     per direction is the larger of the attributed flows and (the interface's bytes − the LAN flows' wire bytes, their
     ACKs the other way included, − the ACKs of the internet's other direction) / WIRE_X, so the sum per process never exceeds the flows, nor those the total; where the interface's bytes are known the flows are
     cut to them (WIRE_CAP_X: a counter that cannot be true never reaches a rate, a day's total or a process).
-    `day`: internet bytes per network since local midnight (in memory: a restart begins again, 12.8's day counters
-    come with the metered quota)."""
+    `day`: internet bytes per network since local midnight in memory; `book` (the logger's NetDays, 12.8) keeps
+    them per date across restarts, and the day's in_gb and out_gb are its figures where it is set."""
 
-    def __init__(self):
+    def __init__(self, book=None):
         self.prev = None   # (mono, physical interface, (in, out) or None, {key: (in, out)}, complete, tunnel)
         self.day = {}      # network -> [date, in bytes, out bytes, an interval of totals only (the LAN's included)]
+        self.book = book   # NetDays, or None (a live reading)
 
     def reset(self):
         self.prev = None
@@ -366,8 +367,12 @@ class Traffic:
             block.update(down_mbps=rate(down), up_mbps=rate(up), lan_mbps=rate(lan[0] + lan[1]))
             if network:
                 self._add(network, now, down, up, block["src"] == "if")
-        if network and network in self.day and self.day[network][0] == _date(now):
+        kept = self.book.get(network, _date(now)) if network and self.book is not None else None
+        if kept:
+            block.update(in_gb=round(kept[0] / 1e9, 3), out_gb=round(kept[1] / 1e9, 3))
+        elif network and network in self.day and self.day[network][0] == _date(now):
             block.update(in_gb=round(self.day[network][1] / 1e9, 3), out_gb=round(self.day[network][2] / 1e9, 3))
+        if network and network in self.day and self.day[network][0] == _date(now):
             if self.day[network][3]:
                 block["day_src"] = "if"   # the day's figures hold some of the LAN's traffic too
         self.prev = (mono, phys, w, cur if complete and flows is not None else {}, bool(complete and flows is not None),
@@ -384,9 +389,13 @@ class Traffic:
         a[1] += down
         a[2] += up
         a[3] = a[3] or totals
+        if self.book is not None:
+            self.book.add(network, d, down, up, totals)
 
     def rename(self, old, new):
         """The day's counters of `old` carried over to `new` (Identity.adopt: one network, its stored key)."""
+        if self.book is not None and old in self.day:
+            self.book.rename(old, new, self.day[old][0])
         a = self.day.pop(old, None)
         if a is None or old == new:
             if a is not None:
@@ -771,7 +780,8 @@ def networks_edit(op, key, fields=None):
     """The one way networks.json is written (D-N10: by any local user): under the ledger lock, read, change one
     entry, written through the ledger's hardened path (a new file renamed over the old). `op` "set" (a figure:
     fields down/up/source/test/gw/subnet; what it replaces becomes `prev`), "name" (fields label; "" removes it),
-    "forget". Returns {"ok": True, "entry": …} or {"error": why, "code": exit status}."""
+    "metered" (fields cap_gb, period, from_day, gw, subnet; `off` removes it: D-N13), "forget". Returns {"ok": True,
+    "entry": …} or {"error": why, "code": exit status}."""
     if valid_key(key) is None:
         return {"error": "not a network: %s" % term_text(str(key)[:80]), "code": 2}
     fields, now, me = dict(fields or {}), round(time.time(), 3), _whoami()
@@ -826,6 +836,19 @@ def networks_edit(op, key, fields=None):
                 for k in ("gw", "subnet"):
                     if fields.get(k):
                         e[k] = fields[k]
+            elif op == "metered":
+                if fields.get("off"):
+                    if "metered" not in e:
+                        return {"ok": True, "entry": nets.get(key), "unchanged": True}
+                    del e["metered"]
+                else:
+                    m = {"cap_gb": round(float(fields["cap_gb"]), 2), "period": fields["period"], "set_by": me, "set": now}
+                    if fields.get("from_day") and fields["period"] in ("month", "week"):
+                        m["from_day"] = int(fields["from_day"])
+                    e["metered"] = m
+                    for k in ("gw", "subnet"):
+                        if fields.get(k) and k not in e:
+                            e[k] = fields[k]
             else:
                 return {"error": "unknown operation %s" % op, "code": 2}
             if e is not None:
@@ -905,6 +928,319 @@ def answer_entry(x):
         return None
     e = valid_entry(x.get("entry"))
     return {"asked": x["asked"], "key": x["key"], "entry": e} if e else None
+
+
+# ------------------------------------------------------------------ metered (N3; D-N13, 12.8)
+# A network marked metered by hand (`oomph net metered --cap 20G/month --from 14`) has a stock pool, net.quota: its cap
+# per period, 10 % of it kept back, this machine's internet bytes on that network since the period began (the logger's
+# day counters, netdays.json in its own folder) and the volumes grants have still to move. A request's volume is
+# granted in full or not at all. Under 10 % of the cap left is the one network state that warns (D-N20): the hook
+# once per session and period, and the capsule. Other devices on a hotspot are not counted (D-N13).
+NETDAYS_DAYS = 62        # dates kept per network (a month's period and the one before)
+NETDAYS_FLUSH_S = 60     # netdays.json is written at most this often (and at the logger's stop): a crash under-counts
+QUOTA_X = 0.1            # of a cap: kept back (the margin), and under this much left the network warns
+PERIOD_WORDS = {"month": "a month", "week": "a week", "day": "a day"}
+WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _day(x):
+    """A local date as the counters key it (2026-11-26), or None."""
+    if not isinstance(x, str) or not _DATE.fullmatch(x):
+        return None
+    try:
+        return datetime.date.fromisoformat(x).isoformat()
+    except ValueError:
+        return None
+
+
+def _latest(now=None):
+    """The latest date a counter may have (tomorrow): one later was written under a clock set forward, and would
+    never be trimmed (the oldest go first) while it pushed out the period's real dates."""
+    return (datetime.date.fromtimestamp(time.time() if now is None else now) + datetime.timedelta(days=1)).isoformat()
+
+
+def valid_netdays(v, now=None):
+    """netdays.json's content as {network: {date: [in bytes, out bytes, lan]}}: at most NETWORKS_MAX networks with a
+    valid key, each its NETDAYS_DAYS newest dates up to tomorrow with two GB figures 0–1 000 000 and, where totals
+    only were counted that day (the LAN's traffic in them), a third element 1; anything else is left out."""
+    days = v.get("days") if isinstance(v, dict) and v.get("v") == 1 else None
+    out, last = {}, _latest(now)
+    for k, d in (days.items() if isinstance(days, dict) else ()):
+        if len(out) >= NETWORKS_MAX:
+            break
+        if not valid_key(k) or not isinstance(d, dict):
+            continue
+        e = {}
+        for day, x in d.items():
+            day = _day(day)
+            if day and day <= last and isinstance(x, list) and len(x) in (2, 3) and all(_num(y, 0, 1e6) for y in x[:2]) \
+                    and (len(x) == 2 or x[2] == 1 and type(x[2]) is int):
+                e[day] = [float(x[0]) * 1e9, float(x[1]) * 1e9, len(x) == 3]
+        if e:
+            out[k] = {day: e[day] for day in sorted(e)[-NETDAYS_DAYS:]}
+    return out
+
+
+def netdays_path():
+    return os.path.join(_H.LOG_DIR, "netdays.json")
+
+
+def read_netdays():
+    """The logger's day counters as its readers see them (valid_netdays); {} without the file. The logger's folder is
+    its own (root's on a Mac, the service's on Linux): no one else writes there, and what is read is checked anyway."""
+    data = read_bounded(netdays_path(), LIMITS["netdays"])
+    return valid_netdays(loads_untrusted(data)) if data is not None else {}
+
+
+class NetDays:
+    """The day counters (12.8): this machine's internet bytes in and out per network and local date, the logger's.
+    Traffic adds each interval's payload (and whether it was totals only: the LAN's traffic is then in it, `lan`);
+    they are kept in netdays.json in the logger's folder (at most
+    NETWORKS_MAX networks × NETDAYS_DAYS dates; a network beyond that replaces the one seen longest ago), written at
+    most every NETDAYS_FLUSH_S and at the logger's stop, read back at its start: a restart goes on counting where it
+    stopped, a crash loses at most a minute (it under-counts, never over)."""
+
+    def __init__(self, path=None):
+        self.path, self.days, self.at, self.dirty = path, {}, None, False
+
+    def load(self):
+        try:
+            data = read_bounded(self.path, LIMITS["netdays"]) if self.path else None
+        except OSError:
+            data = None
+        self.days = valid_netdays(loads_untrusted(data)) if data is not None else {}
+        return self
+
+    def add(self, network, day, din, dout, lan=False):
+        if not valid_key(network) or not _day(day):
+            return
+        if network not in self.days and len(self.days) >= NETWORKS_MAX:
+            del self.days[min(self.days, key=lambda k: (max(self.days[k]), k))]
+        d = self.days.setdefault(network, {})
+        a = d.setdefault(day, [0.0, 0.0, False])
+        a[0] += max(0.0, float(din))
+        a[1] += max(0.0, float(dout))
+        if lan:
+            a[2:] = [True]
+        if len(d) > NETDAYS_DAYS:   # dates after tomorrow (a clock set forward, then back) go first, then the oldest
+            last = _latest()
+            for x in [x for x in d if x > last and x != day]:
+                del d[x]
+        while len(d) > NETDAYS_DAYS:
+            del d[min(d)]
+        self.dirty = True
+
+    def get(self, network, day):
+        """(in, out) bytes of a network on a date, or None."""
+        a = self.days.get(network, {}).get(day)
+        return (a[0], a[1]) if a else None
+
+    def rename(self, old, new, day):
+        """A date's counts of `old` carried over to `new` (one network, found under its router's MAC later): only that
+        date, since an older gw: key's days may be another router's behind the same address."""
+        a = self.days.get(old, {}).pop(day, None)
+        if a is None or old == new:
+            if a is not None:
+                self.days[old][day] = a
+            return
+        if not self.days.get(old):
+            self.days.pop(old, None)
+        self.add(new, day, a[0], a[1], len(a) > 2 and a[2])
+
+    def used(self, network, first, last):
+        """Bytes in and out of a network from date `first` to `last`, both included."""
+        return sum(a[0] + a[1] for day, a in self.days.get(network, {}).items() if first <= day <= last)
+
+    def lan(self, network, first, last):
+        """Whether totals only were counted on one of those dates: the figure may hold the LAN's traffic too."""
+        return any(len(a) > 2 and a[2] for day, a in self.days.get(network, {}).items() if first <= day <= last)
+
+    def dumps(self):
+        return json.dumps({"v": 1, "days": {k: {day: [round(a[0] / 1e9, 6), round(a[1] / 1e9, 6)] +
+                                                 ([1] if len(a) > 2 and a[2] else []) for day, a in sorted(d.items())}
+                                            for k, d in sorted(self.days.items())}}, separators=(",", ":"),
+                          allow_nan=False)
+
+    def due(self, mono, force=False):
+        """Whether to write the file now: something was added and NETDAYS_FLUSH_S passed since the last write (at
+        once the first time, and with `force`, at the stop)."""
+        return self.dirty and (force or self.at is None or mono - self.at >= NETDAYS_FLUSH_S)
+
+    def written(self, mono):
+        self.at, self.dirty = mono, False
+
+
+def _month_start(y, m, d):
+    """Day `d` of a month, or its last day where it has no day `d` (a period from the 31st begins on 28 February)."""
+    last = ((datetime.date(y + (m == 12), m % 12 + 1, 1)) - datetime.timedelta(days=1)).day
+    return datetime.date(y, m, min(d, last))
+
+
+def period(m, now):
+    """(first date, first date of the next period) of the metered period `now` is in (12.8): `month` from day
+    `from_day` (default 1; a month without that day: its last), `week` from weekday `from_day` (Monday 1, default),
+    `day` from midnight. By calendar dates, so a change to or from summer time moves nothing."""
+    today = datetime.date.fromtimestamp(now)
+    p, fd = m.get("period"), m.get("from_day")
+    if p == "day":
+        return today, today + datetime.timedelta(days=1)
+    if p == "week":
+        a = today - datetime.timedelta(days=(today.isoweekday() - (fd if _int(fd, 1, 7) else 1)) % 7)
+        return a, a + datetime.timedelta(days=7)
+    d = fd if _int(fd, 1, 31) else 1
+    a = _month_start(today.year, today.month, d)
+    if a > today:
+        a = _month_start(today.year - (today.month == 1), (today.month - 2) % 12 + 1, d)
+    return a, _month_start(a.year + (a.month == 12), a.month % 12 + 1, d)
+
+
+def local_midnight(day):
+    """The time a local date begins (time.mktime finds the summer or winter time of that date itself)."""
+    return time.mktime(day.timetuple())
+
+
+def quota_pool(m, key, used_gb, outstanding, now):
+    """net.quota (12.8) of a metered entry's `m` on network `key`: cap, margin (QUOTA_X), used (GB this period),
+    reserved (GB grants have still to move), from and to (local midnights), the period; `left` = cap − used (what the
+    warning reads), `room` = cap − margin − used − reserved (what can still be reserved)."""
+    a, b = period(m, now)
+    cap = float(m["cap_gb"])
+    margin = round(QUOTA_X * cap, 3)
+    return {"network": key, "cap": cap, "margin": margin, "used": round(used_gb, 3), "reserved": round(outstanding, 3),
+            "from": local_midnight(a), "to": local_midnight(b), "period": m["period"],
+            "left": round(cap - used_gb, 3), "room": round(cap - margin - used_gb - outstanding, 3)}
+
+
+def quota_low(q):
+    """Whether less than QUOTA_X of a quota's cap is left (oomph.quota_low reads the same off current.json)."""
+    return bool(q) and q["cap"] - q["used"] < QUOTA_X * q["cap"]
+
+
+def _outstanding(parts):
+    """GB a grant's parts have still to move (both directions): their volumes less what they moved."""
+    return sum(max(0.0, x["gb"] - (x["moved"] if _num(x.get("moved")) else 0.0)) for x in parts
+               if x and _num(x.get("gb")))
+
+
+def quota_view(s, key, entry, leases, now):
+    """The metered quota of network `key` as admission and the readers see it (None where the entry is not metered):
+    `used` from the logger's pool in current.json while it is fresh, on this network and in this period (`counted`),
+    else from its day counters (netdays.json: what was counted until the logger stopped); `reserved` what grants on
+    this network have still to move."""
+    m = (entry or {}).get("metered") if key else None
+    if not isinstance(m, dict) or not _num(m.get("cap_gb"), 0.1, 100000) or m.get("period") not in PERIOD_WORDS:
+        return None
+    a, _ = period(m, now)
+    sp = s.get("pools") if isinstance(s, dict) and isinstance(s.get("pools"), dict) else {}
+    P = sp.get("net.quota") if _t(sp.get("t")) and abs(now - sp["t"]) <= POOLS_MAX_AGE_S else None
+    counted = isinstance(P, dict) and P.get("network") == key and _num(P.get("used"), 0, 1e6) and \
+        _num(P.get("from")) and abs(P["from"] - local_midnight(a)) < 1
+    if counted:
+        used, lan = P["used"], P.get("lan") is True
+    else:
+        try:
+            days = read_netdays()
+        except Exception:  # noqa: B902  (no figure is no reason to fail a request: nothing counted)
+            days = {}
+        today = datetime.date.fromtimestamp(now).isoformat()
+        own = (net_block(s) or {}).get("network")   # counted under the sample's own key too (as quota_block)
+        mine = [x for k in dict.fromkeys((key, own)) if isinstance(k, str)
+                for day, x in days.get(k, {}).items() if a.isoformat() <= day <= today]
+        used, lan = sum(x[0] + x[1] for x in mine) / 1e9, any(x[2] for x in mine)
+    out = _outstanding([_part(r, k) for r in leases if r["state"] == "granted" for k, _, _, _ in NET_DIRS
+                        if (_part(r, k) or {}).get("network") == key])
+    q = quota_pool(m, key, used, out, now)
+    q["counted"] = bool(counted)
+    if lan:   # totals only were counted on some day (Linux without ss, nettop backing off): the LAN's traffic is in it
+        q["lan"] = True
+    return q
+
+
+def quota_block(ans, block, book, now):
+    """current.json's `pools` net.quota (12.5, 12.8) while the logger's network is metered (the ledger child's answer
+    `ans` names its entry: root never opens networks.json): its figures from the day counters `book`, `lan` where
+    some of them were totals only (the LAN's traffic in them), and the entry's label (the hook's words). None
+    otherwise. No `reserved`: the ledger's snapshot does not say on which network a grant is, so what grants have
+    still to move is the readers' (quota_view, from the leases)."""
+    key = block.get("network") if isinstance(block, dict) and block.get("if") else None
+    if not key or not isinstance(ans, dict) or key not in (ans.get("asked"), ans.get("key")) or book is None:
+        return None
+    e = ans.get("entry") or {}
+    m = e.get("metered")
+    if not isinstance(m, dict) or not _num(m.get("cap_gb"), 0.1, 100000) or m.get("period") not in PERIOD_WORDS:
+        return None
+    a, _ = period(m, now)
+    first, today = a.isoformat(), datetime.date.fromtimestamp(now).isoformat()
+    keys = dict.fromkeys((ans["key"], key))
+    used = sum(book.used(k, first, today) for k in keys)
+    q = quota_pool(m, ans["key"], used / 1e9, 0.0, now)
+    q = {k: q[k] for k in ("network", "cap", "margin", "used", "from", "to", "period")}
+    if any(book.lan(k, first, today) for k in keys):
+        q["lan"] = True
+    if e.get("label"):
+        q["label"] = e["label"]
+    return q
+
+
+def when_text(t):
+    """A reset time as people read it: 14 Dec."""
+    return datetime.datetime.fromtimestamp(t).strftime("%-d %b") if _t(t) else "?"
+
+
+def _gb1(x):
+    """GB of a quota: 1.8, 12.4, 20."""
+    return "%g" % round(max(0.0, x), 1)
+
+
+def metered_text(q, low_mark=True):
+    """A quota in words: `12.4 of 20 GB used this period, resets 14 Dec`; under 10 % left `▲ 1.8 of 20 GB left
+    until 14 Dec`."""
+    if quota_low(q):
+        return "%s%s of %s GB left until %s" % ("▲ " if low_mark else "", _gb1(q["left"]), _gb1(q["cap"]),
+                                                when_text(q["to"]))
+    return "%s of %s GB used this period, resets %s" % (_gb1(q["used"]), _gb1(q["cap"]), when_text(q["to"]))
+
+
+def metered_rule(m):
+    """How an entry is metered, in words: `20 GB a month from the 14th`, `5 GB a week from Monday`, `1 GB a day`."""
+    fd = m.get("from_day")
+    tail = ""
+    if m["period"] == "month" and _int(fd, 1, 31) and fd != 1:
+        tail = " from the %d%s" % (fd, "th" if 10 <= fd % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(fd % 10, "th"))
+    elif m["period"] == "week" and _int(fd, 1, 7) and fd != 1:
+        tail = " from %s" % datetime.date(2026, 11, 22 + fd).strftime("%A")   # 23 Nov 2026 is a Monday
+    return "%s GB %s%s" % (_gb1(m["cap_gb"]), PERIOD_WORDS[m["period"]], tail)
+
+
+def parse_cap(x):
+    """--cap's VOLUME/PERIOD (`20G/month`, `5G/week`, `1G/day`; `mo`, `w`, `d` too): (GB, period); ValueError."""
+    v, sep, p = str(x).strip().partition("/")
+    p = {"month": "month", "mo": "month", "monthly": "month", "week": "week", "w": "week", "weekly": "week",
+         "day": "day", "d": "day", "daily": "day"}.get(p.strip().lower())
+    if not sep or not p:
+        raise ValueError("a cap is a volume per period: 20G/month, 5G/week or 1G/day")
+    gb = parse_volume(v)
+    if not 0.1 <= gb <= 100000:
+        raise ValueError("a cap is 0.1G to 100000G")
+    return gb, p
+
+
+def parse_from(x, p):
+    """--from: a month's day (1–31) or a week's day (1–7, Monday 1, or its name); a day's period takes none."""
+    s = str(x).strip().lower()
+    if p == "day":
+        raise ValueError("a daily cap begins at midnight: it takes no --from")
+    names = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+    if p == "week" and (s in WEEKDAYS or s in names):
+        return (WEEKDAYS.index(s) if s in WEEKDAYS else names.index(s)) + 1
+    if not (s.isdigit() and s.isascii() and len(s) <= 2):
+        raise ValueError("--from takes %s" % ("a day of the month, 1 to 31" if p == "month" else
+                                             "a day of the week: 1 (Monday) to 7, or its name"))
+    n = int(s)
+    if not 1 <= n <= (31 if p == "month" else 7):
+        raise ValueError("--from takes %s" % ("1 to 31" if p == "month" else "1 (Monday) to 7 (Sunday)"))
+    return n
 
 
 # ------------------------------------------------------------------ what commands take (12.12)
@@ -1063,9 +1399,12 @@ def network_info(s, nets=None, samples=None, coord=None):
     network is measured. `room`: [down, up] Mbit/s that can still be reserved (`coord`: coordination's answer, whose
     `net` it is; {}: the pools less the grants the ledger holds, read without its lock; null without a pool, without
     `coord`, or where coordination failed, {"error": …}: room is never counted without the grants), `reservable` while
-    net_reservations is on and a pool exists (`reservable_off` the switch where it is off); `metered`
-    (N3) is null until that part exists. `id` is public_id: these answers go to a model's provider (`oomph net
-    --json` has the key itself). `src` "if": totals, the LAN's traffic included."""
+    net_reservations is on and a pool exists (`reservable_off` the switch where it is off, a metered network's too);
+    `metered` on a metered network (N3, D-N13): {"left_gb" (cap − used), "resets" (the local date), "cap_gb",
+    "used_gb", "period", "low" (under 10 % left: the one network state that warns), "lan" (true where totals only were
+    counted: used_gb may hold the LAN's traffic), "available_gb" (what can still be reserved, with `coord`, while
+    net_reservations is on)}, else null. `id` is public_id: these answers go to a model's provider (`oomph net --json` has the key itself).
+    `src` "if": totals, the LAN's traffic included."""
     b = net_block(s)
     if b is None:
         return None
@@ -1082,10 +1421,20 @@ def network_info(s, nets=None, samples=None, coord=None):
         c = net_coordination(s, _H._quietly_leases(), time.time())   # the grants as the ledger has them (no lock)
     c = c or {}
     room = [(c.get(d) or {}).get("available") for d in ("down", "up")] if c.get("down") or c.get("up") else None
+    q = quota_view(s, k, e, [], time.time()) if b.get("if") else None
+    metered = None
+    if q:
+        metered = {"left_gb": round(max(0.0, q["left"]), 2), "resets": datetime.date.fromtimestamp(q["to"]).isoformat(),
+                   "cap_gb": q["cap"], "used_gb": round(q["used"], 2), "period": q["period"], "low": quota_low(q)}
+        if q.get("lan"):   # totals only were counted some day: the LAN's traffic may be in used_gb
+            metered["lan"] = True
+        if isinstance(c.get("quota"), dict) and net_reservations_on():
+            metered["available_gb"] = c["quota"].get("available")
     return dict({"id": public_id(k), "label": (e or {}).get("label"), "if": b.get("if"), "down_mbps": b.get("down_mbps"),
-                 "up_mbps": b.get("up_mbps"), "cap": cap, "room": room, "vpn": bool(b.get("vpn")), "metered": None,
+                 "up_mbps": b.get("up_mbps"), "cap": cap, "room": room, "vpn": bool(b.get("vpn")), "metered": metered,
                  "stale": bool(st), "src": b.get("src"), "reservable": bool(c.get("reservable"))},
-                **({"reservable_off": c["reservable_off"]} if c.get("reservable_off") else {}))
+                **({"reservable_off": "net_reservations"} if c.get("reservable_off") or metered and not
+                   net_reservations_on() else {}))
 
 
 def resource_line(s, nets=None, samples=None):
@@ -1119,6 +1468,9 @@ def resource_line(s, nets=None, samples=None):
     st = stale(e, samples if samples is not None else recent_samples(), b.get("network"))
     if st:
         text += " · " + stale_text(st, cmd=False)
+    q = quota_view(s, k, e, [], time.time())
+    if q:   # a metered network (D-N13): what is left this period; under 10 % the line says so first
+        text += " · metered: " + metered_text(q)
     return ("net", text)
 
 
@@ -1144,6 +1496,10 @@ NET_USAGE = """usage: oomph net [--json]                 this network: identity,
        oomph net test [--yes] [--json]     macOS: measure the line (networkQuality); asks before storing
        oomph net set DOWN/UP [NETWORK]     store the line's figure in Mbit/s (250/40, 250/, /40)
        oomph net name LABEL [NETWORK]      name it ("" removes the name)
+       oomph net metered --cap 20G/month [--from 14] [NETWORK]
+                                           a data cap: per month (from that day), week (--from 1–7 or a
+                                           name: Monday 1) or day; this machine's traffic counts against it
+       oomph net metered --off [NETWORK]   no cap
        oomph net forget NETWORK            remove its entry
        oomph net list [--json]             every network this machine's users have stored
 NETWORK: a label, an id (net-…), a key (rmac:…, gw:…: net list), or `this` (the default)"""
@@ -1211,7 +1567,7 @@ def cmd_net(args):
     if args and args[0] in ("-h", "--help", "help"):
         print(NET_USAGE)
         return 0
-    sub = args[0] if args and args[0] in ("test", "set", "name", "forget", "list") else None
+    sub = args[0] if args and args[0] in ("test", "set", "name", "forget", "list", "metered") else None
     rest = args[1:] if sub else args
     try:
         if sub in (None, "list"):
@@ -1222,6 +1578,12 @@ def cmd_net(args):
             opts, pos = _strict(rest, flags=("--json",), npos=2)
             if not pos:
                 raise UsageError("%s needs a %s" % (sub, "figure" if sub == "set" else "label"))
+        elif sub == "metered":
+            opts, pos = _strict(rest, takes=("--cap", "--from"), flags=("--json", "--off"), npos=1)
+            if ("--off" in opts) == ("--cap" in opts):
+                raise UsageError("metered takes --cap VOLUME/PERIOD (e.g. 20G/month) or --off")
+            if "--off" in opts and "--from" in opts:
+                raise UsageError("--from goes with --cap")
         else:
             opts, pos = _strict(rest, flags=("--json",), npos=1)
             if not pos:
@@ -1241,6 +1603,8 @@ def cmd_net(args):
         return _net_list(nets_r, js)
     if sub == "test":
         return _net_test(nets, opts)
+    if sub == "metered":
+        return _net_metered(nets, opts, pos, js)
     if sub == "set":
         try:
             down, up = parse_rate_pair(pos[0])
@@ -1280,6 +1644,34 @@ def _net_done(r, k, js, text, fig=False):
     return 0
 
 
+def _net_metered(nets, opts, pos, js):
+    """`oomph net metered --cap 20G/month [--from 14] [NETWORK]` / `--off` (D-N13): stored in networks.json for any
+    local user to see; the logger counts this machine's internet traffic against it from then on (and from its day
+    counters back to the period's first day)."""
+    f = {"off": True} if "--off" in opts else {}
+    if not f:
+        try:
+            f["cap_gb"], f["period"] = parse_cap(opts["--cap"])
+            if "--from" in opts:
+                f["from_day"] = parse_from(opts["--from"], f["period"])
+        except ValueError as e:
+            return _usage_error("net metered", e, NET_USAGE)
+    k, eg = _target(pos[0] if pos else None, nets)
+    if k is None:
+        print("oomph net metered: %s" % eg, file=sys.stderr)
+        return 1
+    if eg:
+        f.update(gw=eg.get("gw"), subnet=eg.get("subnet"))
+    r = networks_edit("metered", k, f)
+    if f.get("off"):
+        text = "%s %s" % (shown(k, nets.get(k)), "was not metered" if r.get("unchanged") else "is not metered now")
+    else:
+        m = ((r.get("entry") or {}).get("metered")) or f
+        q = quota_view({}, k, r.get("entry"), [], time.time()) if r.get("entry") else None
+        text = "%s is metered now: %s%s" % (shown(k, nets.get(k)), metered_rule(m), " · " + metered_text(q) if q else "")
+    return _net_done(r, k, js, text)
+
+
 def _net_list(nets_r, js):
     b = net_block(_daemon_sample() or {})
     here = resolve(nets_r["networks"], b.get("network")) if b and b.get("network") else None
@@ -1298,6 +1690,9 @@ def _net_list(nets_r, js):
                    w, "", 16))
         fig = _figure_text(e)
         print(wrap(fig or "line not tested", w, " " * 16, 16))
+        if isinstance(e.get("metered"), dict):
+            print(wrap("metered: %s, set %s by %s" % (metered_rule(e["metered"]), _when(e["metered"].get("set")),
+                                                       term_text(e["metered"].get("set_by") or "?")), w, " " * 16, 16))
     if nets_r["unreadable"]:
         print("%d entr%s unreadable" % (nets_r["unreadable"], "y" if nets_r["unreadable"] == 1 else "ies"))
     return 0
@@ -1313,11 +1708,15 @@ def _net_show(nets, js):
     samples = recent_samples() if src == "daemon" else []
     st = stale(e, samples, block.get("network"))
     names = [x for x in (s or {}).get("net_names") or [] if isinstance(x, dict)][:3]
-    if js:
+    q = quota_view(s or {}, k, e, _H._quietly_leases(), time.time()) if block.get("if") else None
+    on = net_reservations_on()
+    if js:   # what can be reserved of the cap (room, reserved) only while reservations are on (net_reservations)
+        mq = dict({x: y for x, y in q.items() if on or x not in ("room", "reserved")}, low=quota_low(q),
+                  **({} if on else {"reservable_off": "net_reservations"})) if q else None
         print(json.dumps({"network": k, "label": (e or {}).get("label"), "if": block.get("if"), "vpn": block.get("vpn"),
                           "tun": block.get("tun"), "entry": e, "now": {x: block.get(x) for x in
                                                                         ("down_mbps", "up_mbps", "lan_mbps", "src")},
-                          "busiest": names, "stale": st, "source": src}))
+                          "busiest": names, "stale": st, "source": src, "metered": mq}))
         return 0
     w = max(80, term_width())
     if not block.get("if"):
@@ -1344,6 +1743,15 @@ def _net_show(nets, js):
     print(wrap(now + (" (a live reading)" if src == "live" else ""), w, "  %-6s " % "now", 9))
     if st:
         print(wrap(stale_text(st), w, "  ", 2))
+    if q:   # D-N13: this machine's traffic against the cap; what the period still lets reservations move (only while
+        # they are on); whether the figure may hold the LAN's traffic; whether the logger is counting
+        a = period(e["metered"], time.time())[0]
+        text = "%s, from %s (%s)%s%s%s" % (
+            metered_text(q), a.strftime("%-d %b"), metered_rule(e["metered"]),
+            " · may include LAN traffic (totals only were counted)" if q.get("lan") else "",
+            " · %s GB can be reserved" % _gb1(max(0.0, q["room"])) if on else " · reservable: off (net_reservations)",
+            "" if src == "daemon" else " · counted until the logger stopped")
+        print(wrap(text, w, "  %-6s " % "quota", 9))
     if e is None and k and k.startswith("rmac:"):
         eg, _ = _ident_live()
         g = "gw:%s/%s" % (eg.get("gw"), str(eg.get("subnet")).rpartition("/")[2]) if eg and eg.get("gw") and \
@@ -1706,13 +2114,19 @@ def net_parts(r):
 
 
 def net_need(r):
-    """What a lease asks of the network's pools (lease_need): {pool id: (least, wanted)} of its managed parts."""
+    """What a lease asks of the network's pools (lease_need): {pool id: (least, wanted)} of its managed parts, and
+    net.quota the volumes of its parts on a metered network (`metered`, as the request or the last evaluation found
+    the network; managed or not: a stock, all or nothing). A volume elsewhere asks no pool: it neither waits behind
+    nor holds up anyone's."""
     np_ = net_parts(r) or {}
     out = {}
     for k, pid, _, _ in NET_DIRS:
         x = np_.get(k)
         if x and not x.get("unmanaged") and "ask" in x:
             out[pid] = (x.get("min", x["ask"]), x["ask"])
+    v = round(sum(x["gb"] for x in np_.values() if x and x.get("metered") is True and _num(x.get("gb"))), 3)
+    if v > 0:
+        out["net.quota"] = (v, v)
     return out
 
 
@@ -1740,11 +2154,12 @@ def net_view(s, leases, now, nets=None):
     """The network as admission sees it (12.8): {"known": the sample names the network (or says it is offline),
     "network": the key networks.json keeps it under, "entry", "pools": {net.down, net.up: {cap, margin, reserved,
     room, others, idle, busy}} for each direction with a figure the household can share, "why": {pool id: why it
-    has none: "unknown", "slow", "offline"}}. `room` = cap − margin − Σ got of grants here; `others` the logger's
-    smoothed figure from current.json's pools while fresh, else the sample's rate less what grants use (each at
-    most what it got), else None (no logger: idle = room)."""
+    has none: "unknown", "slow", "offline"}, "quota": net.quota (quota_view) while the network is metered, else
+    None}. `room` = cap − margin − Σ got of grants here; `others` the logger's smoothed figure from current.json's pools
+    while fresh, else the sample's rate less what grants use (each at most what it got), else None (no logger: idle =
+    room)."""
     b = net_block(s)
-    out = {"known": b is not None, "network": None, "entry": None, "pools": {}, "why": {}}
+    out = {"known": b is not None, "network": None, "entry": None, "pools": {}, "why": {}, "quota": None}
     if b is None:
         return out
     key = b.get("network") if b.get("if") else None
@@ -1781,6 +2196,8 @@ def net_view(s, leases, now, nets=None):
         room = cap - margin - reserved
         out["pools"][pid] = {"cap": cap, "margin": margin, "reserved": reserved, "room": room, "others": others,
                              "idle": None if others is None else room - others, "busy": b.get(rk)}
+    if key:   # a metered network: its stock pool, with or without a figure (12.8)
+        out["quota"] = quota_view(s, key, out["entry"], leases, now)
     return out
 
 
@@ -1806,7 +2223,9 @@ def net_request(s, kw, now):
     """A new request's network parts (12.10) on the network `s` names (net_inputs): ({k: part}, refusal or None).
     A rate asks for itself, its minimum half of it unless named; a volume alone asks for half of what the line can
     share; on a network without a figure (offline, or too slow to share) a part is unmanaged from the start.
-    Refused: a minimum above what the line can share at all (it could never be granted)."""
+    Refused: a minimum above what the line can share at all (it could never be granted), and on a metered network
+    volumes above what is left of its cap this period less the margin (12.10; less than that but short because of
+    other grants' volumes waits on net.quota)."""
     nv = net_view(s, [], now)
     parts = {}
     for k, pid, fig, _ in NET_DIRS:
@@ -1836,8 +2255,32 @@ def net_request(s, kw, now):
             part["unmanaged"] = True
         if nv["network"]:
             part["network"] = nv["network"]
+        if nv["quota"]:
+            part["metered"] = True
         parts[k] = part
+    q, v = nv["quota"], round(sum(x.get("gb") or 0.0 for x in parts.values()), 3)
+    if q and v > q["cap"] - q["margin"] - q["used"] + 1e-9:
+        return None, quota_refusal(v, q)
     return parts, None
+
+
+def quota_refusal(v, q):
+    """Why `v` GB can never be granted on metered quota `q` this period (12.10): more than cap − margin − used."""
+    return ("Can't reserve %s GB on this metered network: %s of %s GB used this period; it resets on %s; %s GB can be "
+            "reserved (%s of it is kept back). Move less now, or wait for the reset." % (
+                _gbv(v), _gb1(q["used"]), _gb1(q["cap"]), when_text(q["to"]),
+                _gb1(q["cap"] - q["margin"] - q["used"]), _gb1(q["margin"])))
+
+
+def net_never(r, nv):
+    """Why a queued request's volume can no longer be granted this period on the metered network it is weighed on
+    (net_request's refusal, 12.10): this machine's traffic has raised `used` while it waited, past what a release could
+    ever free (cap − margin − used). None while it can still fit. _evaluate refuses it, so it holds net.quota for
+    nobody behind it until the reset."""
+    q, v = nv.get("quota"), net_need(r).get("net.quota")
+    if q and v and v[0] > q["cap"] - q["margin"] - q["used"] + 1e-9:
+        return quota_refusal(v[0], q)
+    return None
 
 
 def net_prepare(r, nv):
@@ -1864,6 +2307,10 @@ def net_prepare(r, nv):
             x["network"] = nv["network"]
         else:
             x.pop("network", None)
+        if nv["quota"]:   # its volume goes through net.quota here (net_need)
+            x["metered"] = True
+        else:
+            x.pop("metered", None)
     return net_fit(r, nv)
 
 
@@ -1872,6 +2319,10 @@ def net_fit(r, nv):
     its minimum; while no evaluation names the network, it waits for one that does."""
     short = set()
     for pid, (lo, _) in net_need(r).items():
+        if pid == "net.quota":   # a metered network's volume left this period, after what grants have still to move
+            if nv.get("quota") and nv["quota"]["room"] < lo - 1e-9:
+                short.add(pid)
+            continue
         P = nv["pools"].get(pid)
         if P is None or P["room"] < lo - 1e-9:
             short.add(pid)
@@ -1918,6 +2369,11 @@ def net_grant(r, nv, now):
         P["reserved"] += got
         if P["idle"] is not None:
             P["idle"] -= got
+    q, v = nv.get("quota"), net_need(r).get("net.quota")
+    if q and v:   # charged against the metered quota in full (12.10)
+        q["room"] -= v[0]
+        q["reserved"] += v[0]
+        notes.append("this network is metered: %s" % metered_text(q, low_mark=False))
     return list(dict.fromkeys(notes))
 
 
@@ -1937,7 +2393,9 @@ def net_rehome(L, nv, now):
             if x is None or x.get("network") == key:
                 continue
             P = nv["pools"].get(pid)
-            base = _clean(x, ("got", "unmanaged", "network"))
+            base = _clean(x, ("got", "unmanaged", "network", "metered"))
+            if nv.get("quota"):
+                base["metered"] = True
             if P:
                 was = x["got"] if not x.get("unmanaged") and _num(x.get("got")) else x.get("ask") or _half_line(P)[0]
                 full = P["room"] < 1 - 1e-9
@@ -2088,6 +2546,10 @@ def net_state(nv):
                         "net_%s_reserved" % fig: round(P["reserved"], 1), "net_%s_available" % fig: round(P["room"], 1)})
             if P["idle"] is not None:
                 out["net_%s_idle" % fig] = round(P["idle"], 1)
+    q = nv.get("quota")
+    if q:   # the metered quota: GB of its cap, used this period, still to move, what can be reserved; when it resets
+        out.update(net_quota_cap=q["cap"], net_quota_used=q["used"], net_quota_reserved=round(q["reserved"], 3),
+                   net_quota_available=round(q["room"], 3), net_quota_to=q["to"])
     return out
 
 
@@ -2173,6 +2635,16 @@ def net_wait_text(r, waiting, st):
             return "you asked for %s %s Mbit/s %s, and %g can be reserved now while other reservations hold %g" % (
                 "exactly" if lo >= ask else "at least", cores_text(lo), fig, round(max(0.0, room), 1),
                 round(st.get("net_%s_reserved" % fig) or 0, 1))
+    v = net_need(r).get("net.quota")
+    if "net.quota" in waiting and v:
+        room = st.get("net_quota_available")
+        if not _num(room):
+            return "this network's metered volume is not known right now: it is weighed once it is"
+        if room < v[0]:
+            return ("this network is metered: you asked to move %s GB, and %s GB of its cap can be reserved now while "
+                    "other reservations have %s GB still to move (it resets on %s)" % (
+                        _gbv(v[0]), _gb1(room), _gb1(st.get("net_quota_reserved") or 0),
+                        when_text(st.get("net_quota_to"))))
     return "an earlier request waits for the network"
 
 
@@ -2297,13 +2769,14 @@ def run_argv(cmd, st):
 
 
 # --- the logger's pools (12.5, 12.8)
-def pool_blocks(block, ans, leases, prev):
+def pool_blocks(block, ans, leases, prev, book=None, now=None):
     """current.json's `pools` net.down and net.up while this network has a figure the household can share: `network`,
     `cap` and `margin` (from the ledger child's answer `ans` about this very network: root never opens
     networks.json), `reserved` (Σ granted Mbit/s, from the ledger's snapshot), `busy` (this sample's rate) and
     `others`, what holds no grant (busy less what each grant uses, at most what it got), smoothed as ½ old + ½ new
     and begun anew on another network; `level` "busy" after NET_BUSY_N samples at NET_BUSY_X of the figure (the
-    tile's flag; never critical). `prev` ({} at first) keeps what the next sample smooths with. {} without a figure."""
+    tile's flag; never critical). `prev` ({} at first) keeps what the next sample smooths with. With the day counters
+    `book`, net.quota too while the network is metered (quota_block), with or without a figure. {} without either."""
     key = block.get("network") if isinstance(block, dict) and block.get("if") else None
     e = ans.get("entry") if isinstance(ans, dict) and key and key in (ans.get("asked"), ans.get("key")) else None
     if prev.get("network") not in (None, key, (ans or {}).get("key")):
@@ -2330,6 +2803,9 @@ def pool_blocks(block, ans, leases, prev):
                 P["level"] = "busy"
             prev[pid] = (others, n)
         out[pid] = P
+    q = quota_block(ans, block, book, time.time() if now is None else now) if book is not None else None
+    if q:
+        out["net.quota"] = q
     return out
 
 
@@ -2342,6 +2818,7 @@ def amend_net(L, r, kw, now):
     or be dropped, not grow."""
     change, np_, st = {}, net_parts(r) or {}, L.get("state", {})
     granted, on = r["state"] == "granted", net_reservations_on()
+    qroom, grew = st.get("net_quota_available"), False   # what of the cap can still be reserved, less what grew here
     for k, pid, fig, _ in NET_DIRS:
         up = k == "net_up"
         gb, ask, lo = kw.get(k + "_gb"), kw.get("net_up_mbps" if up else "net_mbps"), \
@@ -2398,13 +2875,39 @@ def amend_net(L, r, kw, now):
                 change["requeued"] = True
             change[k] = [was, ask]
         if gb:
-            if gb > (x.get("gb") or 0) and not on:
+            old = x.get("gb") or 0.0
+            if gb > old and not on:
                 return None, net_switch_text()
+            room = qroom
+            grew = grew or gb > old
+            if gb > old and _num(room) and granted:   # a metered network: more volume goes through net.quota (12.10)
+                waiting = [q for q in L["leases"] if q["state"] == "queued" and (not weighable(q) or (   # on it
+                    "net.quota" in lease_need(q) and "net.quota" in (q.get("waiting_on") or []) + (q.get("hold") or [])))]
+                if waiting or gb - old > room + 1e-9:
+                    return None, ("Can't grow %s's %s volume from %s to %s GB now: this network is metered, and %s. "
+                                  "Keep it, and reserve the extra separately (`oomph reserve %s %sG --for \"…\"`): it "
+                                  "queues fairly." % (
+                                      r["id"], "upload" if up else "download", _gbv(old), _gbv(gb),
+                                      "%d request(s) for its volume are queued and come first" % len(waiting) if waiting
+                                      else "%s GB of its cap can be reserved this period (it resets on %s)" % (
+                                          _gb1(room), when_text(st.get("net_quota_to"))),
+                                      flag, _gbv(round(gb - old, 3))))
+                qroom = room - (gb - old)   # the other direction grows into what is left
+            elif gb > old and _num(room) and r in L["leases"]:   # a bigger queued request: at the back
+                L["leases"].remove(r)
+                L["leases"].append(r)
+                change["requeued"] = True
             change[k + "_gb"] = [x.get("gb"), gb]
             x["gb"] = gb
         if granted:
             _vol_flag(x, now)
             _eta(x, now)
+    if grew and not granted and _num(st.get("net_quota_cap")) and _num(st.get("net_quota_used")):
+        v = net_need(r).get("net.quota")   # a queued request grown past what this period can ever grant (net_never)
+        q = {"cap": st["net_quota_cap"], "margin": round(QUOTA_X * st["net_quota_cap"], 3),
+             "used": st["net_quota_used"], "to": st.get("net_quota_to")}
+        if v and v[0] > q["cap"] - q["margin"] - q["used"] + 1e-9:
+            return None, quota_refusal(v[0], q).replace("Can't reserve", "Can't grow %s to" % r["id"], 1)
     return change, None
 
 
@@ -2417,8 +2920,8 @@ def net_coordination(s, leases, now):
         return None
     out = {"id": public_id(nv["network"]), "label": (nv["entry"] or {}).get("label"),
            "reservable": bool(nv["pools"]) and net_reservations_on()}
-    if not out["reservable"] and nv["pools"] and not net_reservations_on():
-        out["reservable_off"] = "net_reservations"
+    if not out["reservable"] and (nv["pools"] or nv.get("quota")) and not net_reservations_on():
+        out["reservable_off"] = "net_reservations"   # a metered network's volume too (net.quota)
     for _, pid, fig, _ in NET_DIRS:
         P = nv["pools"].get(pid)
         out[fig] = None if P is None else dict({"cap": P["cap"], "margin": P["margin"], "reserved": round(P["reserved"], 1),
@@ -2426,6 +2929,11 @@ def net_coordination(s, leases, now):
                                                **({"idle": round(max(0.0, P["idle"]), 1)} if P["idle"] is not None else {}))
         if P is None:
             out[fig + "_why"] = nv["why"].get(pid)
+    q = nv.get("quota")
+    if q:   # a metered network (12.8): GB of its cap, used this period, still to move, what can be reserved, the reset
+        out["quota"] = {"cap": q["cap"], "margin": q["margin"], "used": q["used"], "reserved": round(q["reserved"], 3),
+                        "available": round(max(0.0, q["room"]), 3), "left": round(max(0.0, q["left"]), 3),
+                        "resets": q["to"], "low": quota_low(q)}
     return out
 
 
@@ -2490,11 +2998,14 @@ def net_flag_advice(r, flags, now):
 
 
 def net_available(st, out):
-    """_available's network part: Mbit/s that can still be reserved each way, and of them idle."""
+    """_available's network part: Mbit/s that can still be reserved each way, and of them idle; on a metered network
+    the GB of its cap that can still be reserved this period."""
     for d in ("down", "up"):
         for k, f in (("net_%s_mbps", "net_%s_available"), ("net_%s_idle_mbps", "net_%s_idle")):
             if _num(st.get(f % d)):
                 out[k % d] = max(0.0, st[f % d])
+    if _num(st.get("net_quota_available")):
+        out["net_quota_gb"] = max(0.0, st["net_quota_available"])
 
 
 def net_refused(out, net, refused):

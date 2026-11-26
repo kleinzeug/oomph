@@ -187,7 +187,11 @@ samples with and without it (older samples have none).
   `down_mbps`, `up_mbps`, `lan_mbps`, and the day's `in_gb`/`out_gb` (`day_src` `if` when
   totals went into them). No remote address is ever kept. `net_names` (5): the busiest names,
   `{name, down, up, n}` in Mbit/s. `current.json` adds `top_net` (8, `oomph ps --net`) and
-  `daemon.net` (why the sample is totals only: "too many connections", "nettop failed").
+  `daemon.net` (why the sample is totals only: "too many connections", "nettop failed"), and
+  on a metered network (`oomph net metered`) `pools["net.quota"]` {network, cap, margin, used,
+  from, to, period, lan, label}: GB this machine moved over the internet this period, from the
+  logger's day counters (`netdays.json` in its folder, written at most once a minute); under
+  10 % of the cap left, the capsule, `oomph check` and the hook say so.
 
 On the wire (`serve`, mirrors), slim samples carry the numbers of `cpu`, `gpu` and `io`; the
 top lists and `disks` stay home (a mirror before 1.9.1 refuses a row whose `*_gb` exceeds

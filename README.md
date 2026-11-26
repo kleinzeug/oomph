@@ -309,7 +309,8 @@ oomph html --open               # HTML report of the last 24 h (switch to 6 h / 
 oomph top                       # the popup's dashboard, full screen in the terminal (see below)
 oomph doctor                    # what works here and what to fix: logger, versions, ledger, Claude setup (--json)
 oomph ps --cpu                  # the busiest processes now (--gpu, --io: writing to disk, --memory, --net: internet)
-oomph net                       # this network, its line's figure and the internet traffic now (test, set, name, list)
+oomph net                       # this network, its line's figure and the internet traffic now (test, set, name, metered, list)
+oomph net metered --cap 20G/month --from 14   # a data cap: this machine's internet bytes counted from the 14th (--off)
 oomph volumes --all             # the disks oomph records, and the ones it ignores and why
 oomph resources                 # memory, cores, GPU, disks and the network of this Mac, and which can be reserved
 ```
@@ -491,7 +492,7 @@ What a session gets:
 | `oomph wait --timeout 10m --free 4G` | blocks until memory is ok again |
 | `oomph status --json` | the full latest sample; from 1.15 with the internet traffic, the network named by its label or a hash of its identity, never the router's MAC |
 | MCP server `oomph mcp` | the same as tools: `memory_check`, `reserve_memory`, `update_reservation`, `release_memory`, `reservations`, `reservation_history`, `my_session`, `wait_for_memory`, `memory_status`, `incidents`, `incident` (from 1.15 `memory_check` and `memory_status` also answer with a `network` object). A server that outlives an update takes the installed new version at its next request, once the new code has passed a self-check, when the install is root's (a Mac, or Linux's system mode; a Linux user install is restarted with its session); the session keeps the tools it was shown at its start |
-| `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes) |
+| `oomph hook` | optional `PostToolUse` hook on Bash: silent while memory is fine, tells the model once when it turns tight or critical (and again only if it changes or after 10 minutes); about the network only one line, once per session and period, while a metered network has less than 10 % of its cap left (1.15) |
 
 The verdict is **tight** at macOS memory pressure *warning*, under 5 % physical memory
 free, under 20 GB free disk, right after jetsam kills, or when a large amount of
@@ -727,6 +728,7 @@ opens no port of its own: other machines watch it over ssh (the rest of `oomph s
 | `/Library/Logs/oomph/samples-YYYY-MM-DD.jsonl[.gz]` | one sample per line; older days compressed; kept 14 days |
 | `/Library/Logs/oomph/events.jsonl` | memory kills, pressure changes (flapping batched), sleep gaps vs. stalls, unowned memory, notifications; since 1.9.5 also `thermal`, `cpu_saturated` (and `_cleared`), `disk_low` per disk, `disk_filling` and `volume` |
 | `/Library/Logs/oomph/incidents/<id>/` | `report.html`, `incident.json`, `syslog.txt`; kept 90 days |
+| `/Library/Logs/oomph/netdays.json` | this machine's internet bytes per network and day (62 days), what a metered network's cap is counted from (1.15) |
 | `/Library/Logs/oomph/ioreport.json` | how often the IOReport helper crashed since the Mac started (only when it is switched on) |
 | `/usr/local/libexec/oomph/` | a link to the installed daemon and CLI, `/usr/local/libexec/oomph-<version>/` |
 | `/Library/LaunchDaemons/local.oomph.daemon.plist` | the daemon's launchd job (replaced by every install) |

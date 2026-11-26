@@ -252,6 +252,14 @@ struct Group: Decodable { var name: String; var mb: Int; var n: Int? }
 struct Session: Decodable { var pid: Int; var cwd: String?; var mb: Int; var n: Int }
 struct DaemonInfo: Decodable { var pid: Int?; var version: String?; var interval: Double?; var incident: String?; var root: Bool?
                                var machine: Soft<DaemonMachine>?; var all_procs: Soft<Bool>? }
+/// current.json's pools as the verdict reads them (NET 12.8): a metered network's quota, its cap and what this
+/// machine used this period (GB), and when it resets.
+/// `to` and `label` are only the tooltip's: a mistyped one costs that word, never the warning (as oomph.quota_low).
+struct QuotaPool: Decodable { var cap: Double?; var used: Double?; var to: Soft<Double>?; var label: Soft<String>? }
+struct PoolsBlock: Decodable {
+    var quota: Soft<QuotaPool>?
+    enum CodingKeys: String, CodingKey { case quota = "net.quota" }
+}
 
 struct Sample: Decodable {
     var t: Double
@@ -285,6 +293,8 @@ struct Sample: Decodable {
     var scope: Soft<ScopeBlock>?
     var cached_gb: Soft<Double>?
     var free_gb: Soft<Double>?
+    // what only current.json has: the pools (02 §5.2); the verdict reads a metered network's quota (NET 12.8)
+    var pools: Soft<PoolsBlock>?
 
     var isAway: Bool {
         guard let a = away else { return false }
@@ -921,7 +931,32 @@ struct Selection: Equatable {
 /// `capsule` over `_verdict_parts`, held together by tools/vectors/chart.json, so the chip agrees with
 /// `oomph check`. The machine-wide verdict: no one caller's coordination, no pins.
 enum Verdict {
-    struct Capsule: Equatable { var text: String; var level: Int; var memory: Int; var disk: Int }
+    struct Capsule: Equatable { var text: String; var level: Int; var memory: Int; var disk: Int; var network: Int = 0 }
+
+    /// GB left of a metered network's cap while under 10 % of it (oomph.quota_low; NET D-N13): the one network
+    /// state the capsule shows (D-N20). nil otherwise, and for figures oomph could not have written.
+    static func quotaLeft(_ s: Sample) -> Double? {
+        guard let q = s.pools?.v?.quota?.v, let cap = q.cap, let used = q.used, cap.isFinite, used.isFinite,
+              cap >= 0.1, cap <= 100000, used >= 0, used <= 1e6 else { return nil }
+        let left: Double = cap - used
+        return left < 0.1 * cap ? max(0, left) : nil
+    }
+
+    /// The capsule tooltip's line about a metered network under 10 % (NET 12.15), on a Mac's tab and a Linux
+    /// machine's: what is left, until when, and the command. nil while it is not under 10 %.
+    static func quotaHelp(_ s: Sample) -> String? {
+        guard let left = quotaLeft(s), let q = s.pools?.v?.quota?.v, let cap = q.cap else { return nil }
+        let label: String? = q.label?.v
+        let name: String = (label?.isEmpty == false) ? "the metered network " + String(label!.prefix(32)) : "this metered network"
+        var until = ""
+        if let t = q.to?.v, t.isFinite, t > 0, t < 1e11 {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "en_US_POSIX")   // "14 Dec", as the hook and `oomph net` say it
+            f.dateFormat = "d MMM"
+            until = " until " + f.string(from: Date(timeIntervalSince1970: t))
+        }
+        return String(format: "%@: %.1f of %g GB left%@ (oomph net)", name, left, cap, until)
+    }
 
     static func capsule(_ s: Sample) -> Capsule {
         let os = s.os?.v ?? "macos"
@@ -941,10 +976,20 @@ enum Verdict {
         }
         if (s.jetsam_kills ?? 0) > 0 { mem = max(mem, 1) }
         if let u = s.unowned_gb?.v, ram > 0, u >= max(16.0, 0.4 * ram) { mem = max(mem, 1) }
-        let worst = max(mem, dsk)
-        let text = worst == 0 ? "Normal" : mem >= dsk ? "Memory " + (mem == 2 ? "critical" : "tight")
-                                                       : "Disk " + (dsk == 2 ? "critical" : "low")
-        return Capsule(text: text, level: worst, memory: mem, disk: dsk)
+        let left = quotaLeft(s)
+        let net = left == nil ? 0 : 1
+        let worst: Int = max(mem, dsk, net)
+        var text: String = "Normal"
+        if worst == 0 {
+            text = "Normal"
+        } else if mem == worst {
+            text = mem == 2 ? "Memory critical" : "Memory tight"
+        } else if dsk == worst {
+            text = dsk == 2 ? "Disk critical" : "Disk low"
+        } else {
+            text = String(format: "Network %.1f GB left", left ?? 0)
+        }
+        return Capsule(text: text, level: worst, memory: mem, disk: dsk, network: net)
     }
 
     static func color(_ level: Int) -> Color { level >= 2 ? .red : level == 1 ? .yellow : .green }
@@ -1393,6 +1438,7 @@ enum LinuxTab {
             t += String(format: "; swap %.1f of %.0f GB", s.swap_used_gb, s.swap_total_gb)
         }
         lines.append(t + ".")
+        if let h = Verdict.quotaHelp(s) { lines.append(h) }   // a metered network under 10 % (NET 12.15)
         return lines.joined(separator: "\n")
     }
 
@@ -5037,6 +5083,9 @@ struct PopoverView: View {
         parts.append(String(format: "pressure %@ · %.1f GB free · swap %.1f / %.0f GB · %.0f GB disk free",
                             (Pressure(rawValue: c.pressure) ?? .unknown).label.lowercased(),
                             max(0, c.ram_gb - c.app_gb - c.wired_gb - c.compressed_gb), c.swap_used_gb, c.swap_total_gb, c.disk_free_gb))
+        // The metered warning is measuring, behind no switch (NET 12.11): with resourcesUI off the pressure capsule's
+        // tooltip carries this line too, the one place the switched-off popup says it (deliberate).
+        if let h = Verdict.quotaHelp(c) { parts.append(h) }
         return parts.joined(separator: "\n")
     }
 
@@ -9113,7 +9162,7 @@ func chartVectors(_ path: String) -> Int32 {
     out["capsule"] = cases("capsule").map { c -> Any in
         guard let s = sample(c["sample"]) else { return NSNull() }
         let v = Verdict.capsule(s)
-        return ["text": v.text, "level": v.level, "memory": v.memory, "disk": v.disk] as [String: Any]
+        return ["text": v.text, "level": v.level, "memory": v.memory, "disk": v.disk, "network": v.network] as [String: Any]
     }
     out["tiles"] = cases("tiles").map { c -> Any in
         guard let s = sample(c["sample"]) else { return NSNull() }

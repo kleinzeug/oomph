@@ -321,6 +321,7 @@ if hasattr(P_, "net_route"):
         tick()
         net_id = (d.net.ident.id if d.net else None) or "rmac:00:00:5e:00:53:03"
         rn_ = cli("net", "set", "250/40", net_id, "--json")
+        rm_ = cli("net", "metered", "--cap", "20G/month", net_id, "--json")   # N3: the quota, from the child's answer
         grow(10 ** 6)
         tick()
         grow(11 * 10 ** 6)
@@ -356,6 +357,17 @@ if hasattr(P_, "net_route"):
               and pl_["net.down"].get("network") == net_id,
               "net: current.json's pools net.down and net.up from the child's answer about this network (%s)"
               % pl_.get("net.down"))
+    if eg_.get("if"):  # N3: net.quota from the child's answer; the day counters in the logger's own folder, 0644
+        q_ = (json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json"))).get("pools") or {}).get("net.quota")
+        ndp = os.path.join(os.environ["OOMPH_DIR"], "netdays.json")
+        nds = os.lstat(ndp) if os.path.lexists(ndp) else None
+        ndv = json.load(open(ndp)) if nds else {}
+        check(rm_[0] == 0 and isinstance(q_, dict) and q_.get("cap") == 20.0 and q_.get("margin") == 2.0
+              and q_.get("network") == net_id and isinstance(q_.get("used"), (int, float)) and q_.get("to", 0) > time.time()
+              and nds and stat.S_IMODE(nds.st_mode) == 0o644 and (not REAL or nds.st_uid == 0)
+              and net_id in (ndv.get("days") or {}),
+              "net: `oomph net metered` reaches current.json's net.quota through the child; the logger keeps its day "
+              "counters in netdays.json in its own folder, 0644 (%s, %s, %s)" % (q_, nds and oct(nds.st_mode), rm_[2][-200:]))
     if not REAL and os.path.exists(nfx) and eg_.get("if"):
         cur_ = json.load(open(os.path.join(os.environ["OOMPH_DIR"], "current.json")))
         check(nb_.get("src") == "flows" and [x.get("pid") for x in cur_.get("top_net") or []] == [os.getpid()] and
