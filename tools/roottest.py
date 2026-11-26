@@ -358,8 +358,9 @@ if hasattr(P_, "net_route"):
                 print("info  nettop as %s: %r" % (who, e))
             rows_, why_ = oomph._T().nettop_flows(o, procs_, (), eg_.get("if"), eg_.get("tun"))
             seen[who] = (len(o.splitlines()), len(rows_ or []), len({r[0] for r in rows_ or [] if r[0] is not None}), why_)
+        r_, n_ = seen["root"], seen["nobody"]
         msg = ("nettop as root: %d rows, %d flows on %s, %d processes; as nobody: %d rows, %d flows, %d processes "
-               "(N1: whether the logger may run it as nobody)" % (seen["root"][:3] + (eg_.get("if"),) + seen["nobody"][:3])
+               "(N1: whether the logger may run it as nobody)" % ((r_[0], r_[1], eg_.get("if"), r_[2]) + n_[:3])
                if all(x[3] is None for x in seen.values()) else "nettop: %s" % (seen,))
         print("info  " + msg)
         if os.environ.get("GITHUB_ACTIONS"):   # in the run's summary, until the logger's choice follows it (12.19)
