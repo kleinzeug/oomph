@@ -65,7 +65,7 @@ STUDIO, AIR = "m-7f3a9c1e5b2d4a68", "m-4e5f607182930415"
 ALL = ([("fx", ai, []) for ai in (
     "", "loading", "callout", "top", "resmore", "on", "running", "connected:claude", "connected:openai",
     "connected:ollama", "connecting", "dialog-connected", "dialog-error", "upgrade", "check", "checking", "uptodate",
-    "build", "log", "6h", "1h", "blend:0.25", "blend:0.5", "blend:0.75", "hover:40", "hover:300", "hover:452",
+    "build", "log", "6h", "1h", "blend:0.25", "blend:0.5", "blend:0.75", "hover:40", "hover:300", "hover:548",
     "hoverlog:120", "hoverlog:300", "hoverlog:440", "rhover:420:30", "rhover:200:20:6h", "rhover:100:40:1h",
     "tour:1", "tour:2", "tour:3", "tour:4")]
     + [("fx", ai, ON) for ai in (

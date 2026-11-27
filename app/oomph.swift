@@ -45,7 +45,7 @@ let descriptor = ": memory monitor"  // what the header says after the name
 /// … and with the four resources (decided 2026-11-23: the brand stays, the header reads "oomph: resource monitor").
 let resourceDescriptor = ": resource monitor"
 let agentLabel = "local.oomph.menubar"
-let popupWidth: CGFloat = 480
+let popupWidth: CGFloat = 576  // 480 until 1.15.1; wider for the fifth tile (1.15.2)
 let statColumn: CGFloat = 96
 var renderHoverX: CGFloat?  // --ai hover:X / hoverlog:X renders the hover tooltip at x = X pt
 var renderBlend: Double?  // --ai blend:0.5 renders the 24h → ∞ morph halfway
@@ -3444,6 +3444,8 @@ struct ResourceTile: View {
         let c = resource.color
         let border: Color = tile.level >= 2 ? .red : tile.level == 1 ? .orange
             : role == .focus ? c.opacity(0.6) : role == .shown ? c.opacity(0.3) : Color.primary.opacity(0.08)
+        // a selected tile's border is thicker (1.15.2): 2 pt the focus, 1.5 the others shown, 1 the rest; a warning's 1.5 at least
+        let lineWidth: CGFloat = max(role == .focus ? 2 : role == .shown ? 1.5 : 1, tile.level > 0 ? 1.5 : 1)
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 3) {
                 Text(resource.name).font(.system(size: 10.5, weight: .semibold)).lineLimit(1).fixedSize()
@@ -3460,7 +3462,7 @@ struct ResourceTile: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(RoundedRectangle(cornerRadius: 7, style: .continuous)
             .fill(role == .focus ? c.opacity(0.10) : role == .shown ? c.opacity(0.045) : Color.primary.opacity(0.025)))
-        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(border, lineWidth: tile.level > 0 ? 1.5 : 1))
+        .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(border, lineWidth: lineWidth))
         .modifier(ShakeEffect(animatableData: CGFloat(shake)))
         .help(help)
     }
@@ -5827,7 +5829,7 @@ struct PopoverView: View {
                                                         recent: netRecent, hint: m.isLocal && store.netMetered) : [:]
         if m.isLinux, let s = m.current, let t = facts[.memory] { facts[.memory] = LinuxTab.memoryTile(t, s, m.facts) }
         let avail = Resource.available(m.current)
-        // equal tiles (02 §3.4.1: four of 108 pt, three of 146): the panel's content width shared out
+        // equal tiles (02 §3.4.1; at 576 pt since 1.15.2: five of 104.8 pt, four of 132.5, three of 178.7): the panel's content width shared out
         let n = CGFloat(avail.count)
         let width: CGFloat = (popupWidth - 28 - 6 * (n - 1)) / n
         return HStack(spacing: 6) {
