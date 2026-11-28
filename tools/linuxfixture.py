@@ -374,6 +374,15 @@ def s_scope_memory_high(root):
     _container_cg(root, d, None, 0.5, 0.4, 0.05, high=1)
 
 
+def s_logger_service(root):
+    """The logger in its systemd unit (MemoryMax=256M, linux/oomphd.service) on a 64 GB machine (1.15.3: the
+    Epyc's logger reported 0.25 GB of RAM and every sample was dropped by the mirrors). An agent in that unit
+    is scoped to it; the logger itself is not."""
+    d = "system.slice/oomphd.service"
+    base(root, meminfo(64, 44.5, anon=14.0, free=12.0, swap_total=8.0), [("/swap.img", "file", 8.0, 0.4)], self_cg="/" + d)
+    _container_cg(root, d, 0.25, 0.03, 0.02, 0.005)
+
+
 def s_container_thrash_roomy_host(root):
     """One container thrashing at its own limit: the machine's stall time is all its (some 97 %),
     but the machine has room; the level must stay normal and say who lost the time."""
@@ -406,6 +415,7 @@ SCENARIOS = {
     "container-2g-neighbour-thrash": (s_container_2g_neighbour_thrash, {"scope": "cgroup", "ram_gb": 2.0, "pressure": 2,
                                                                         "host_pressure": 2}),
     "scope-memory-high": (s_scope_memory_high, {"scope": "cgroup", "ram_gb": 1.0, "by": "high"}),
+    "logger-service": (s_logger_service, {"scope": "cgroup", "ram_gb": 0.25, "by": "max"}),
     "container-thrash-roomy-host": (s_container_thrash_roomy_host, {"pressure": 1, "limit": True}),
     "container-thrash-short-host": (s_container_thrash_short_host, {"pressure": 4}),
 }

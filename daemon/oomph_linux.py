@@ -50,6 +50,10 @@ try:
 except (AttributeError, ValueError, OSError):
     CLK_TCK = 100
 CG_ROOT = "/sys/fs/cgroup"
+# Set by the running logger (oomphd's Daemon.run): the limit of its own cgroup (the service's MemoryMax=256M)
+# is its own budget, not the machine's: the search for a limit starts one level up (1.15.3). A logger
+# inside a container still finds the container's limit there; an agent in a limited scope keeps its own.
+LOGGER = False
 PF_KTHREAD = 0x00200000
 
 P = {"some_warn": 10, "some_crit": 40, "full_warn": 5, "full_crit": 15,      # % of the last 10 s
@@ -253,6 +257,8 @@ def limit_of(ram_bytes):
     best = None
     if v == "v2":
         d = _cg_dir(path)
+        if LOGGER and len(d) > len(CG_ROOT):
+            d = os.path.dirname(d)
         for _hop in range(64):
             for name, by in (("memory.max", "max"), ("memory.high", "high")):
                 n = _cg_num(d, name)
@@ -265,6 +271,8 @@ def limit_of(ram_bytes):
         base = CG_ROOT + "/memory"
         d = base + ("" if path in ("", "/") else path)
         d = d if os.path.isdir(_p(d)) else base
+        if LOGGER and len(d) > len(base):
+            d = os.path.dirname(d)
         n = _cg_num(d, "memory.limit_in_bytes")
         if n is not None:
             best = {"dir": d, "limit": n, "by": "max"}

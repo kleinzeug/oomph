@@ -1872,6 +1872,8 @@ class Daemon:
                     self.vol_at[pid] = t
 
     def run(self):
+        if oomph.plat().OS == "linux":
+            oomph.plat().LOGGER = True  # its service's own memory limit is not the machine's (1.15.3)
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         self.event("daemon_start", version=VERSION, pid=os.getpid(), root=os.geteuid() == 0,

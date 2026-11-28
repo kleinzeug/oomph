@@ -191,6 +191,18 @@ def part_fixtures():
     check(sc["kind"] == "cgroup" and sc["id"] == "/" and sc["limit_gb"] == 2.0 and sc["host_ram_gb"] == 16.0 and
           L.machine()["kind"] == "container" and L.machine()["virt"] == "docker" and L.machine()["id"] is None,
           "a docker container with its own cgroup namespace: scope cgroup, 2 GB, the host's 16 GB beside it; no machine id")
+    L.LOGGER = True
+    sc = L.system_memory().get("scope") or {}
+    check(sc.get("id") == "/" and sc.get("limit_gb") == 2.0 and L.machine()["kind"] == "container",
+          "the logger inside that container: still the container's 2 GB")
+    L = backend("logger-service")
+    agent = L.system_memory()
+    L.LOGGER = True
+    lg = L.system_memory()
+    check(agent.get("scope", {}).get("limit_gb") == 0.25 and "scope" not in lg and lg["ram_gb"] == 64.0 and
+          L.scope() == {"kind": "host"} and L.machine()["kind"] != "container",
+          "the logger in its unit (MemoryMax=256M) measures the machine, 64 GB, not its own 0.25 (an agent in the unit "
+          "is scoped to it)")
 
     # the three invariants (03 §5.3, §15.2), table-driven over pure functions
     L = backend("ubuntu-server-idle")
